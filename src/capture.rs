@@ -138,25 +138,59 @@ fn call_openrouter(api_key: &str, model: &str, system: &str, user_msg: &str) -> 
         ]
     });
 
-    let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("X-Title", "proactive-context")
-        .json(&body)
-        .send()?;
+    // Capture is off the hot path and its whole value is not losing knowledge, so a transient
+    // network blip or rate-limit must not silently drop a guide. Retry transient failures
+    // (connection/timeout errors, 429, 5xx) a few times with backoff; fail fast on real 4xx.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::bail!("OpenRouter {}: {}", status, &text[..text.len().min(300)]);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let send_result = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("X-Title", "proactive-context")
+            .json(&body)
+            .send();
+
+        match send_result {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let data: serde_json::Value = resp.json()?;
+                    return Ok(data["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string());
+                }
+
+                let text = resp.text().unwrap_or_default();
+                let snippet = text[..text.len().min(300)].to_string();
+                // 429 + 5xx are transient; other 4xx are caller/config errors — fail fast.
+                let transient = status.as_u16() == 429 || status.is_server_error();
+                if !transient || attempt == MAX_ATTEMPTS {
+                    anyhow::bail!("OpenRouter {}: {}", status, snippet);
+                }
+                last_err = Some(anyhow::anyhow!("OpenRouter {}: {}", status, snippet));
+            }
+            Err(e) => {
+                // Connection refused / timeout / TLS reset — the "error sending request" case.
+                if attempt == MAX_ATTEMPTS {
+                    return Err(anyhow::Error::new(e));
+                }
+                last_err = Some(anyhow::Error::new(e));
+            }
+        }
+
+        // Backoff before retrying: 1s, then 2s.
+        eprintln!(
+            "capture: OpenRouter call failed (attempt {}/{}), retrying…",
+            attempt, MAX_ATTEMPTS
+        );
+        std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
     }
 
-    let data: serde_json::Value = resp.json()?;
-    Ok(data["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string())
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("OpenRouter call failed")))
 }
 
 fn strip_json_fences(s: &str) -> &str {
