@@ -75,6 +75,12 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
             "capture.lesson" => "++",
             "synth.write" => "=",
             "daemon.index" => "o",
+            "wiki.index_read" => "i",
+            "guide.read" => "r",
+            "link.follow" => "->",
+            "guide.create" => "+>",
+            "guide.update" => "*>",
+            "select.shortcircuit" => "/",
             "error" => "!",
             _ => ".",
         }
@@ -92,6 +98,12 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
             "capture.lesson" => "✚",
             "synth.write" => "✎",
             "daemon.index" => "⟳",
+            "wiki.index_read" => "▤",
+            "guide.read" => "▸",
+            "link.follow" => "↪",
+            "guide.create" => "✦",
+            "guide.update" => "✱",
+            "select.shortcircuit" => "⊘",
             "error" => "✗",
             _ => "·",
         }
@@ -112,6 +124,12 @@ pub(crate) fn event_color_ansi(event: &str) -> &'static str {
         "capture.lesson" => ANSI_GREEN,
         "synth.write" => ANSI_MAGENTA,
         "daemon.index" => ANSI_DIM,
+        "wiki.index_read" => ANSI_BLUE,
+        "guide.read" => ANSI_GREEN,
+        "link.follow" => ANSI_DIM,
+        "guide.create" => ANSI_BOLD_GREEN,
+        "guide.update" => ANSI_GREEN,
+        "select.shortcircuit" => ANSI_DIM,
         "error" => ANSI_BOLD_RED,
         _ => "",
     }
@@ -132,6 +150,7 @@ pub(crate) fn event_verbosity_tier(event: &str) -> Verbosity {
         "inject.start" | "inject.done" | "capture.start" | "capture.done" => Verbosity::Quiet,
         "error" => Verbosity::Quiet,
         "retrieve.subquery" | "retrieve.hit" => Verbosity::Verbose,
+        "guide.read" | "link.follow" => Verbosity::Verbose,
         _ => Verbosity::Default,
     }
 }
@@ -353,6 +372,39 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
             trunc(&format!("{} failed · {}", stage, msg), budget)
+        }
+        "wiki.index_read" => {
+            let count = p.get("guide_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if action.is_empty() {
+                format!("{} guides", count)
+            } else {
+                trunc(&format!("{} guides · {}", count, action), budget)
+            }
+        }
+        "guide.read" => {
+            let slug = p.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(slug, budget)
+        }
+        "link.follow" => {
+            let from = p.get("from_slug").and_then(|v| v.as_str()).unwrap_or("");
+            let to = p.get("to_slug").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(&format!("{} → {}", from, to), budget)
+        }
+        "guide.create" => {
+            let slug = p.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(&format!("{} · {}", slug, title), budget)
+        }
+        "guide.update" => {
+            let slug = p.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            let rule_added = p.get("rule_added").and_then(|v| v.as_bool()).unwrap_or(false);
+            let suffix = if rule_added { " (rule added)" } else { "" };
+            trunc(&format!("{}{}", slug, suffix), budget)
+        }
+        "select.shortcircuit" => {
+            let reason = p.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(&format!("shortcircuit · {}", reason), budget)
         }
         _ => {
             // Generic: show payload summary

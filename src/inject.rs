@@ -1,16 +1,29 @@
-use crate::config::{load_config, normalize_path, project_db_path};
+use crate::config::{load_config, normalize_path, project_db_path, project_context_dir};
 use crate::events::{init_context, log_event, truncate};
 use crate::query::{run_query, QueryResult};
 use crate::transcript::parse_transcript;
+use crate::wiki::{self, guide_path, IndexRow};
 use anyhow::Result;
 use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_core::completion::{Prompt, ToolDefinition};
 use rig_core::providers::openrouter;
+use rig_core::tool::Tool;
 use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::runtime::Runtime;
+
+// ─── Trivial-prompt stoplist ──────────────────────────────────────────────────
+
+const TRIVIAL_PHRASES: &[&str] = &[
+    "yes", "no", "ok", "okay", "sure", "thanks", "thank you", "go", "continue",
+    "next", "done", "stop", "wait", "help", "please", "hi", "hello", "hey",
+    "great", "good", "fine", "right", "correct", "wrong", "nope", "yep",
+];
 
 // ─── stdin contract ───────────────────────────────────────────────────────────
 
@@ -26,17 +39,151 @@ struct InjectInput {
     transcript_path: Option<String>,
 }
 
-// ─── Compile preamble (§1.5) ─────────────────────────────────────────────────
+// ─── Compile preamble (briefing step) ────────────────────────────────────────
 
 const COMPILE_PREAMBLE: &str = "\
 You are compiling a TIGHT briefing FOR an AI coding assistant (Claude Code) about what is relevant \
 to what the user is doing right now. You are given: the current user prompt, recent conversation, \
-retrieved project lessons/notes, and optionally the project's PRODUCT_MODEL.md.\n\n\
+and the curated wiki guide material selected by the navigation step.\n\n\
 Output only what is *directly relevant* to the current prompt. Ruthlessly filter — irrelevant \
-lessons must be dropped. Surface contradictions with a `[CONTRADICTION]` marker. Never dump \
-PRODUCT_MODEL.md verbatim; extract only the parts that bear on this prompt.\n\n\
+content must be dropped. Surface contradictions with a `[CONTRADICTION]` marker.\n\n\
 If nothing is relevant, output the single token `NONE`.\n\n\
 Be terse: this is injected before every prompt and every token costs latency.";
+
+// ─── Wiki navigation tool ─────────────────────────────────────────────────────
+
+/// Shared navigation state — tracks reads and see-also follows for event emission.
+#[derive(Debug, Default)]
+struct NavState {
+    /// Slugs already read (to avoid re-reading).
+    read_slugs: HashSet<String>,
+    /// See-also follows emitted: (from_slug, to_slug).
+    link_follows: Vec<(String, String)>,
+    /// Accumulated guide content for the compile step.
+    guide_content: Vec<(String, String)>, // (slug, content)
+}
+
+/// A batch read tool: takes an array of slugs/paths and returns all contents in one call.
+#[derive(Clone)]
+struct ReadGuidesTool {
+    wiki_dir: PathBuf,
+    state: Arc<Mutex<NavState>>,
+}
+
+#[derive(Deserialize)]
+struct ReadGuidesArgs {
+    slugs: Vec<String>,
+}
+
+impl Tool for ReadGuidesTool {
+    const NAME: &'static str = "read_guides";
+
+    type Error = std::io::Error;
+    type Args = ReadGuidesArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Read the full content of one or more wiki guides by slug. \
+Pass an array of slugs to read multiple guides in one call. \
+The response will contain all guide contents concatenated. \
+Use this to read guides from the wiki index, then follow their See Also links to read related guides.\
+".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "slugs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of guide slugs to read (e.g. [\"tdd-patterns\", \"rust-error-handling\"])"
+                    }
+                },
+                "required": ["slugs"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if args.slugs.is_empty() {
+            return Ok("(no slugs provided)".to_string());
+        }
+
+        let mut output = String::new();
+        let mut state = self.state.lock().unwrap();
+        let wiki_dir = self.wiki_dir.clone();
+
+        for slug in &args.slugs {
+            let slug = slug.trim().to_string();
+            if slug.is_empty() || slug == "_index" {
+                continue;
+            }
+
+            // Determine if this is a link-follow from a previously-read guide
+            let from_slug: Option<String> = state.guide_content.iter().find_map(|(s, content)| {
+                if wiki::extract_see_also_slugs(content).contains(&slug) {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            });
+
+            // Emit link.follow if this was referenced from another guide
+            if let Some(from) = &from_slug {
+                state.link_follows.push((from.clone(), slug.clone()));
+                // Log will happen after lock release
+            }
+
+            // Avoid re-reading
+            if state.read_slugs.contains(&slug) {
+                output.push_str(&format!("=== {} (already read) ===\n", slug));
+                continue;
+            }
+            state.read_slugs.insert(slug.clone());
+
+            let path = guide_path(&wiki_dir, &slug);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    output.push_str(&format!("=== {} ===\n{}\n\n", slug, content));
+                    state.guide_content.push((slug.clone(), content));
+                }
+                Err(_) => {
+                    output.push_str(&format!("=== {} (not found) ===\n", slug));
+                }
+            }
+        }
+
+        // Emit events outside the lock scope — do it by collecting what happened
+        let slugs_read: Vec<String> = args.slugs.iter().filter(|s| !s.is_empty()).cloned().collect();
+        let link_follows_new: Vec<(String, String)> = state.link_follows.clone();
+
+        drop(state); // release lock before emitting events
+
+        // Emit generate.tool_call
+        log_event("generate.tool_call", None, serde_json::json!({
+            "tool": "read_guides",
+            "slugs": slugs_read,
+            "count": args.slugs.len()
+        }));
+
+        // Emit guide.read for each
+        for slug in &args.slugs {
+            if !slug.is_empty() && slug != "_index" {
+                log_event("guide.read", None, serde_json::json!({ "slug": slug }));
+            }
+        }
+
+        // Emit link.follow for any new ones
+        for (from, to) in &link_follows_new {
+            log_event("link.follow", None, serde_json::json!({
+                "from_slug": from,
+                "to_slug": to
+            }));
+        }
+
+        Ok(output)
+    }
+}
 
 // ─── Fallback renderer ────────────────────────────────────────────────────────
 
@@ -55,6 +202,31 @@ fn render_raw_reminder(project_name: &str, hits: &[QueryResult]) -> String {
     out
 }
 
+// ─── Activation gate ─────────────────────────────────────────────────────────
+
+/// Returns true if the prompt should be skipped (trivial / too short).
+fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
+    let lower = prompt.trim().to_lowercase();
+
+    // Check exact trivial phrase match
+    if TRIVIAL_PHRASES.contains(&lower.as_str()) {
+        return true;
+    }
+
+    // Word count gate
+    let word_count = prompt.split_whitespace().count();
+    if word_count < min_words {
+        return true;
+    }
+
+    // Very short character check
+    if prompt.trim().len() < 8 {
+        return true;
+    }
+
+    false
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Always returns Ok(()). Every internal failure is swallowed and degrades gracefully.
@@ -64,7 +236,6 @@ pub fn run_inject() -> Result<()> {
     let _ = io::stdin().read_to_string(&mut raw);
     let raw = raw.trim();
 
-    // Guard: empty or unparseable
     if raw.is_empty() {
         return Ok(());
     }
@@ -73,41 +244,43 @@ pub fn run_inject() -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    // Guard: prompt too short
-    if input.prompt.trim().len() < 3 {
-        return Ok(());
-    }
-
-    // Guard: no project index
     let root = PathBuf::from(&input.cwd);
     let db_path = project_db_path(&root);
     if !db_path.exists() {
         return Ok(());
     }
 
-    // Load config
     let cfg = match load_config() {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
 
-    // Seed event context
+    // Seed event context early so all events have correct project/session
     let project = normalize_path(&root);
     init_context(&project, &input.session_id);
 
-    // Emit inject.start
     let start = Instant::now();
     let context_turns_used = cfg.inject_context_turns;
+
+    // ── Activation gate (runs AFTER init_context so events are attributed) ─
+    if input.prompt.trim().len() < 3 || should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words) {
+        log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+            "outcome": "skipped",
+            "reason": "trivial_prompt",
+            "prompt_chars": input.prompt.len()
+        }));
+        return Ok(());
+    }
+
+    // Emit inject.start
     log_event("inject.start", None, serde_json::json!({
         "prompt_chars": input.prompt.len(),
         "context_turns": context_turns_used,
-        "model": cfg.inject_model
+        "select_model": cfg.inject_select_model,
+        "compile_model": cfg.inject_compile_model
     }));
 
-    // ── 1. Recent-conversation context + enriched retrieval query ───────────────
-    // `recent` is labeled context for the compile step; `enriched_query` (recent + prompt)
-    // is only used to broaden semantic retrieval. The compile step keeps the CURRENT prompt
-    // as its focal message so the model knows what "relevant right now" means.
+    // ── 1. Recent context + enriched query ─────────────────────────────────
     let recent = recent_context_text(
         input.transcript_path.as_deref(),
         cfg.inject_context_turns,
@@ -119,7 +292,7 @@ pub fn run_inject() -> Result<()> {
         cap_tail(&format!("{}\n\n{}", recent, input.prompt), cfg.inject_query_char_cap)
     };
 
-    // ── 2. CHEAP RETRIEVAL (synchronous) ─────────────────────────────────────
+    // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
     let hits = match run_query(&root, &enriched_query, cfg.inject_top_k, cfg.inject_rerank, true) {
         Ok(h) => h,
         Err(e) => {
@@ -136,24 +309,22 @@ pub fn run_inject() -> Result<()> {
         }
     };
 
-    // Guard: no hits
-    if hits.is_empty() {
-        log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-            "outcome": "empty",
-            "hits": 0,
-            "out_chars": 0
-        }));
-        return Ok(());
-    }
-
-    // Hold the fallback block
+    // Compute fallback block upfront (before any async work)
     let project_basename = project_basename(&project);
     let fallback_block = render_raw_reminder(&project_basename, &hits);
 
-    // Guard: no API key → emit fallback
+    // Guard: no API key → emit fallback (if we have hits)
     let api_key = match cfg.openrouter_api_key.as_deref() {
         Some(k) if !k.is_empty() => k.to_string(),
         _ => {
+            if hits.is_empty() {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "empty",
+                    "hits": 0,
+                    "out_chars": 0
+                }));
+                return Ok(());
+            }
             let out_chars = fallback_block.len();
             print!("{}", fallback_block);
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
@@ -166,37 +337,56 @@ pub fn run_inject() -> Result<()> {
         }
     };
 
-    // ── 3. EXPENSIVE COMPILE under timeout ────────────────────────────────────
+    // ── 3. Wiki-based navigation under timeout ─────────────────────────────
+    let proj_dir = project_context_dir(&root);
+    let wiki_path = wiki::wiki_dir(&proj_dir);
+
+    // Check if wiki exists and has guides
+    let wiki_index_rows = if wiki_path.exists() {
+        wiki::read_index(&wiki_path)
+    } else {
+        vec![]
+    };
+
+    // Emit wiki.index_read
+    log_event("wiki.index_read", None, serde_json::json!({
+        "guide_count": wiki_index_rows.len()
+    }));
+
     let rt = match Runtime::new() {
         Ok(r) => r,
         Err(_) => {
-            print!("{}", fallback_block);
+            if !hits.is_empty() {
+                print!("{}", fallback_block);
+            }
             return Ok(());
         }
     };
 
-    let compile_result = rt.block_on(async {
-        let timeout = std::time::Duration::from_millis(cfg.inject_timeout_ms);
+    let browse_result = rt.block_on(async {
+        let timeout = std::time::Duration::from_millis(cfg.inject_browse_timeout_ms);
         tokio::time::timeout(
             timeout,
-            compile_briefing(
+            wiki_navigate_and_compile(
                 &api_key,
-                &cfg.inject_model,
+                &cfg.inject_select_model,
+                &cfg.inject_compile_model,
                 &input.prompt,
                 &recent,
                 &hits,
-                &root,
-                cfg.inject_max_prefetch,
+                &wiki_path,
+                &wiki_index_rows,
+                cfg.inject_max_guides,
+                cfg.inject_max_link_hops,
                 cfg.inject_max_tokens,
             )
         ).await
     });
 
-    match compile_result {
-        Ok(Ok(briefing)) => {
+    match browse_result {
+        Ok(Ok(NavigateResult::Briefing(briefing))) => {
             let trimmed = briefing.trim();
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-                // Model says nothing relevant
                 log_event("generate.briefing", None, serde_json::json!({
                     "briefing_chars": 0,
                     "summary": "NONE"
@@ -227,41 +417,247 @@ pub fn run_inject() -> Result<()> {
                 "out_chars": out_chars
             }));
         }
+
+        Ok(Ok(NavigateResult::ShortCircuit)) => {
+            // Fast model found nothing relevant
+            log_event("select.shortcircuit", None, serde_json::json!({
+                "reason": "no_relevant_guides"
+            }));
+            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                "outcome": "none",
+                "hits": hits.len(),
+                "out_chars": 0
+            }));
+        }
+
         Ok(Err(e)) => {
-            // Compile error → fallback
             log_event("error", None, serde_json::json!({
                 "stage": "generate.briefing",
                 "message": truncate(&format!("{}", e), 300)
             }));
-            let out_chars = fallback_block.len();
-            print!("{}", fallback_block);
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                "outcome": "fallback",
-                "reason": "compile_error",
-                "hits": hits.len(),
-                "out_chars": out_chars
-            }));
+            if !hits.is_empty() {
+                let out_chars = fallback_block.len();
+                print!("{}", fallback_block);
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "fallback",
+                    "reason": "compile_error",
+                    "hits": hits.len(),
+                    "out_chars": out_chars
+                }));
+            } else {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "empty",
+                    "hits": 0,
+                    "out_chars": 0
+                }));
+            }
         }
+
         Err(_timeout) => {
-            // Timeout → fallback
-            let out_chars = fallback_block.len();
-            print!("{}", fallback_block);
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                "outcome": "fallback",
-                "reason": "timeout",
-                "hits": hits.len(),
-                "out_chars": out_chars
-            }));
+            if !hits.is_empty() {
+                let out_chars = fallback_block.len();
+                print!("{}", fallback_block);
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "fallback",
+                    "reason": "timeout",
+                    "hits": hits.len(),
+                    "out_chars": out_chars
+                }));
+            } else {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "empty",
+                    "hits": 0,
+                    "out_chars": 0
+                }));
+            }
         }
     }
 
     Ok(())
 }
 
+// ─── Navigation result ────────────────────────────────────────────────────────
+
+enum NavigateResult {
+    /// The fast model found relevant guides and the strong model compiled a briefing.
+    Briefing(String),
+    /// The fast model determined nothing is relevant — short-circuit, emit nothing.
+    ShortCircuit,
+}
+
+// ─── Two-model wiki navigate + compile ───────────────────────────────────────
+
+async fn wiki_navigate_and_compile(
+    api_key: &str,
+    select_model: &str,
+    compile_model: &str,
+    current_prompt: &str,
+    recent: &str,
+    hits: &[QueryResult],
+    wiki_dir: &std::path::Path,
+    index_rows: &[IndexRow],
+    _max_guides: usize,
+    max_link_hops: usize,
+    max_tokens: usize,
+) -> Result<NavigateResult> {
+    // ── FAST MODEL: Navigate + curate ──────────────────────────────────────
+    // Build preamble with wiki index + vector preselect hints
+    let mut preamble = String::new();
+
+    preamble.push_str("You are a wiki navigator for a coding assistant context injector.\n\n");
+    preamble.push_str("Your job:\n");
+    preamble.push_str("1. Read the wiki index below to see all available guides\n");
+    preamble.push_str("2. Use the `read_guides` tool to read the guides most relevant to the user's prompt\n");
+    preamble.push_str("3. Follow See Also links in those guides if they lead to directly relevant content\n");
+    preamble.push_str("4. Once you have read all relevant guides, output ONLY the curated content\n\n");
+    preamble.push_str("IMPORTANT:\n");
+    preamble.push_str("- If NOTHING in the wiki is relevant to the prompt, output exactly: NOTHING_RELEVANT\n");
+    preamble.push_str("- Do NOT include irrelevant guides\n");
+    preamble.push_str("- You can read multiple guides in a single tool call\n");
+    preamble.push_str(&format!("- Read at most {} guides total (enforced by timeout; prioritize the most relevant)\n", _max_guides));
+    preamble.push_str(&format!("- After reading, follow at most {} hops of See Also links for directly relevant content\n\n", max_link_hops));
+
+    // Add wiki index
+    if index_rows.is_empty() {
+        preamble.push_str("WIKI INDEX: (empty — no guides yet)\n\n");
+    } else {
+        preamble.push_str(&wiki::render_index_for_inject(index_rows));
+        preamble.push('\n');
+    }
+
+    // Add vector preselect hints
+    if !hits.is_empty() {
+        preamble.push_str("VECTOR PRESELECT HINTS (guides/chunks likely relevant — check these first):\n");
+        for h in hits.iter().take(5) {
+            // Extract just the slug from path like "wiki/foo-bar.md"
+            let slug_hint = h.path
+                .strip_prefix("wiki/")
+                .unwrap_or(&h.path)
+                .strip_suffix(".md")
+                .unwrap_or(&h.path);
+            if slug_hint != "_index" {
+                preamble.push_str(&format!("  - {} (score {:.2})\n", slug_hint, h.score));
+            }
+        }
+        preamble.push('\n');
+    }
+
+    if !recent.is_empty() {
+        preamble.push_str("RECENT CONVERSATION (background context):\n\n");
+        preamble.push_str(recent);
+        preamble.push_str("\n\n");
+    }
+
+    // If wiki is empty and no hits, short-circuit immediately
+    if index_rows.is_empty() && hits.is_empty() {
+        return Ok(NavigateResult::ShortCircuit);
+    }
+
+    // If wiki is empty but we have hits, skip the nav step and go straight to compile
+    if index_rows.is_empty() {
+        // No wiki guides — fall through to compile with just hit snippets
+        let curated = build_hit_context(hits);
+        return compile_briefing(api_key, compile_model, current_prompt, recent, &curated, max_tokens).await
+            .map(NavigateResult::Briefing);
+    }
+
+    // Create the navigation tool with shared state
+    let nav_state = Arc::new(Mutex::new(NavState::default()));
+    let read_tool = ReadGuidesTool {
+        wiki_dir: wiki_dir.to_path_buf(),
+        state: Arc::clone(&nav_state),
+    };
+
+    let client = openrouter::Client::new(api_key.to_string())?;
+    let select_agent = client
+        .agent(select_model)
+        .preamble(&preamble)
+        .tool(read_tool)
+        .max_tokens(2000u64)
+        .build();
+
+    // Use max_turns to allow multi-turn tool execution (index read → follow links)
+    let max_nav_turns = (max_link_hops + 2).min(6);
+    let nav_response: String = select_agent
+        .prompt(current_prompt)
+        .max_turns(max_nav_turns)
+        .await?;
+
+    // ── Shortcircuit detection: gate on tool activity first ────────────────
+    // If the fast model read NO guides (read_slugs is empty), we know there's no
+    // curated wiki material — short-circuit regardless of what the model said.
+    // Primary: tool activity check (robust to any model prose response)
+    // Secondary: explicit sentinel phrases (lenient match)
+    {
+        let state = nav_state.lock().unwrap();
+        if state.read_slugs.is_empty() {
+            // Model decided nothing was worth reading — short-circuit
+            return Ok(NavigateResult::ShortCircuit);
+        }
+        drop(state);
+    }
+
+    // Even if guides were read, the model might still conclude nothing relevant
+    let nav_trimmed = nav_response.trim();
+    let lower = nav_trimmed.to_lowercase();
+    if lower.contains("nothing_relevant")
+        || lower.contains("nothing relevant")
+        || lower.contains("no relevant")
+        || lower.contains("not relevant")
+        || lower.eq("none")
+        || nav_trimmed.is_empty()
+    {
+        return Ok(NavigateResult::ShortCircuit);
+    }
+
+    // ── STRONG MODEL: Compile briefing from curated content ────────────────
+    compile_briefing(api_key, compile_model, current_prompt, recent, nav_trimmed, max_tokens).await
+        .map(NavigateResult::Briefing)
+}
+
+/// Compile final tight briefing using strong model.
+async fn compile_briefing(
+    api_key: &str,
+    model: &str,
+    current_prompt: &str,
+    recent: &str,
+    curated_content: &str,
+    max_tokens: usize,
+) -> Result<String> {
+    let mut context = String::new();
+    if !recent.is_empty() {
+        context.push_str("RECENT CONVERSATION (background only):\n\n");
+        context.push_str(recent);
+        context.push_str("\n\n");
+    }
+    context.push_str("CURATED WIKI CONTEXT (pre-selected as relevant):\n\n");
+    context.push_str(curated_content);
+
+    let client = openrouter::Client::new(api_key.to_string())?;
+    let agent = client
+        .agent(model)
+        .preamble(&format!("{}\n\n{}", COMPILE_PREAMBLE, context))
+        .max_tokens(max_tokens as u64)
+        .build();
+
+    let response: String = agent.prompt(current_prompt).await?;
+    Ok(response)
+}
+
+/// Build a context string from raw vector hits (used as fallback content for compile).
+fn build_hit_context(hits: &[QueryResult]) -> String {
+    let mut context = String::new();
+    for (i, h) in hits.iter().enumerate() {
+        context.push_str(&format!(
+            "--- [{}: {} (chunk {}, score {:.2})] ---\n{}\n\n",
+            i + 1, h.path, h.chunk_index, h.score, h.content
+        ));
+    }
+    context
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Extract recent conversation (last N exchanges) as a labeled transcript string, char-capped.
-/// Returns empty when there's no usable transcript or `context_turns == 0`.
 fn recent_context_text(
     transcript_path: Option<&str>,
     context_turns: usize,
@@ -278,7 +674,7 @@ fn recent_context_text(
             let last_n: Vec<_> = turns
                 .iter()
                 .rev()
-                .take(context_turns * 2) // each exchange = user + assistant
+                .take(context_turns * 2)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -296,7 +692,6 @@ fn recent_context_text(
     cap_tail(&text, char_cap)
 }
 
-/// Hard-cap a string by keeping its tail (the most recent content), trimmed to a char boundary.
 fn cap_tail(s: &str, char_cap: usize) -> String {
     if s.len() <= char_cap {
         return s.to_string();
@@ -309,7 +704,6 @@ fn cap_tail(s: &str, char_cap: usize) -> String {
     s[boundary..].to_string()
 }
 
-/// The project basename from a normalized path (last segment).
 fn project_basename(normalized: &str) -> String {
     normalized
         .rsplit('_')
@@ -317,56 +711,4 @@ fn project_basename(normalized: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(normalized)
         .to_string()
-}
-
-/// Run the LLM compile step to produce the tight briefing.
-async fn compile_briefing(
-    api_key: &str,
-    model: &str,
-    current_prompt: &str,
-    recent: &str,
-    hits: &[QueryResult],
-    root: &std::path::Path,
-    max_prefetch: usize,
-    max_tokens: usize,
-) -> Result<String> {
-    // Build context block. Recent conversation goes here as labeled CONTEXT — the current
-    // prompt is sent as the focal user message below so the model knows what "relevant right
-    // now" refers to (passing the whole enriched blob as the message made it answer NONE).
-    let mut context = String::new();
-    if !recent.is_empty() {
-        context.push_str(
-            "RECENT CONVERSATION (background only — the CURRENT prompt is the user message):\n\n",
-        );
-        context.push_str(recent);
-        context.push_str("\n\n");
-    }
-    context.push_str("RETRIEVED CONTEXT:\n\n");
-    for (i, h) in hits.iter().enumerate() {
-        context.push_str(&format!(
-            "--- [{}: {} (chunk {}, score {:.2})] ---\n{}\n\n",
-            i + 1, h.path, h.chunk_index, h.score, h.content
-        ));
-    }
-
-    // Optionally prefetch PRODUCT_MODEL.md as input
-    let proj_context_dir = crate::config::project_context_dir(root);
-    let model_path = proj_context_dir.join("PRODUCT_MODEL.md");
-    if max_prefetch > 0 && model_path.exists() {
-        if let Ok(product_model) = std::fs::read_to_string(&model_path) {
-            context.push_str("\nPRODUCT_MODEL.md (project guide — extract only what is relevant):\n\n");
-            context.push_str(&product_model);
-            context.push('\n');
-        }
-    }
-
-    let client = openrouter::Client::new(api_key.to_string())?;
-    let agent = client
-        .agent(model)
-        .preamble(&format!("{}\n\n{}", COMPILE_PREAMBLE, context))
-        .max_tokens(max_tokens as u64)
-        .build();
-
-    let response: String = agent.prompt(current_prompt).await?;
-    Ok(response)
 }

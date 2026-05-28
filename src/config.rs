@@ -72,8 +72,11 @@ pub struct Config {
     pub log_retention: usize,
 
     // ---- Inject budget ----
-    /// Faster/cheaper model for the inject compile step (hot path). Distinct from generate_model.
+    /// DEPRECATED — replaced by inject_select_model + inject_compile_model (wiki v2).
+    /// Kept for backward compatibility with existing config.json files; ignored by inject.
+    /// Will be removed in a future release.
     #[serde(default = "default_inject_model")]
+    #[allow(dead_code)]
     pub inject_model: String,
 
     /// Last N transcript turns folded into the retrieval query (0 = bare prompt).
@@ -100,17 +103,45 @@ pub struct Config {
     #[serde(default = "default_inject_max_prefetch")]
     pub inject_max_prefetch: usize,
 
-    /// Give compile agent the read_file tool (default false — bounds turns).
-    #[serde(default = "default_inject_allow_read_file")]
-    pub inject_allow_read_file: bool,
-
     /// Max tokens for the compile step output (default 700).
     #[serde(default = "default_inject_max_tokens")]
     pub inject_max_tokens: usize,
 
     /// Hard timeout for the WHOLE compile step in ms (default 4000).
+    /// NOTE: this field is kept for backward compatibility but inject now
+    /// uses inject_browse_timeout_ms for wiki navigation.
     #[serde(default = "default_inject_timeout_ms")]
     pub inject_timeout_ms: u64,
+
+    // ---- Wiki navigation (inject v2) ----
+    /// Fast/cheap model for wiki index navigation + guide selection (gates the strong model).
+    /// Default: anthropic/claude-haiku-4-5
+    #[serde(default = "default_inject_select_model")]
+    pub inject_select_model: String,
+
+    /// Strong model for compiling the final tight briefing from curated guide material.
+    /// Default: anthropic/claude-sonnet-4-6
+    #[serde(default = "default_inject_compile_model")]
+    pub inject_compile_model: String,
+
+    /// Timeout in ms for the wiki browse + compile step (default 8000).
+    /// On timeout, falls back to the cheap raw-hits <system-reminder>.
+    #[serde(default = "default_inject_browse_timeout_ms")]
+    pub inject_browse_timeout_ms: u64,
+
+    /// Maximum number of wiki guides to fetch during inject navigation (default 8).
+    #[serde(default = "default_inject_max_guides")]
+    pub inject_max_guides: usize,
+
+    /// Maximum See-Also link-follow hops during inject navigation (default 2).
+    #[serde(default = "default_inject_max_link_hops")]
+    pub inject_max_link_hops: usize,
+
+    /// Minimum number of words in the prompt to attempt wiki navigation.
+    /// Prompts below this threshold are skipped (outcome="skipped").
+    /// Default: 4
+    #[serde(default = "default_inject_min_prompt_words")]
+    pub inject_min_prompt_words: usize,
 }
 
 fn default_generate_model() -> String {
@@ -193,16 +224,39 @@ fn default_inject_max_prefetch() -> usize {
     2
 }
 
-fn default_inject_allow_read_file() -> bool {
-    false
-}
-
 fn default_inject_max_tokens() -> usize {
     700
 }
 
 fn default_inject_timeout_ms() -> u64 {
     4000
+}
+
+fn default_inject_select_model() -> String {
+    "anthropic/claude-haiku-4-5".to_string()
+}
+
+fn default_inject_compile_model() -> String {
+    "anthropic/claude-sonnet-4-6".to_string()
+}
+
+fn default_inject_browse_timeout_ms() -> u64 {
+    // Haiku select + Sonnet compile run back-to-back; 8s was too tight (always fell
+    // back). 25s lets the compiled path finish while the short-circuit path still
+    // returns in a couple seconds for irrelevant prompts.
+    25000
+}
+
+fn default_inject_max_guides() -> usize {
+    8
+}
+
+fn default_inject_max_link_hops() -> usize {
+    2
+}
+
+fn default_inject_min_prompt_words() -> usize {
+    4
 }
 
 /// Sanitize fan-out related tunables after deserialization.
@@ -291,6 +345,41 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_model = default_inject_model();
     }
 
+    // Wiki navigation fields
+    if c.inject_browse_timeout_ms < 1000 {
+        c.inject_browse_timeout_ms = 1000;
+    } else if c.inject_browse_timeout_ms > 60000 {
+        eprintln!("proactive-context: clamping inject_browse_timeout_ms to 60000");
+        c.inject_browse_timeout_ms = 60000;
+    }
+
+    if c.inject_max_guides < 1 {
+        c.inject_max_guides = 1;
+    } else if c.inject_max_guides > 20 {
+        eprintln!("proactive-context: clamping inject_max_guides to 20");
+        c.inject_max_guides = 20;
+    }
+
+    if c.inject_max_link_hops > 5 {
+        eprintln!("proactive-context: clamping inject_max_link_hops to 5");
+        c.inject_max_link_hops = 5;
+    }
+
+    if c.inject_select_model.trim().is_empty() {
+        c.inject_select_model = default_inject_select_model();
+    }
+
+    if c.inject_compile_model.trim().is_empty() {
+        c.inject_compile_model = default_inject_compile_model();
+    }
+
+    if c.inject_min_prompt_words == 0 {
+        c.inject_min_prompt_words = 1;
+    } else if c.inject_min_prompt_words > 20 {
+        eprintln!("proactive-context: clamping inject_min_prompt_words to 20");
+        c.inject_min_prompt_words = 20;
+    }
+
     c
 }
 
@@ -337,9 +426,15 @@ impl Default for Config {
             inject_rerank: default_inject_rerank(),
             inject_max_fanout: default_inject_max_fanout(),
             inject_max_prefetch: default_inject_max_prefetch(),
-            inject_allow_read_file: default_inject_allow_read_file(),
             inject_max_tokens: default_inject_max_tokens(),
             inject_timeout_ms: default_inject_timeout_ms(),
+            // Wiki navigation
+            inject_select_model: default_inject_select_model(),
+            inject_compile_model: default_inject_compile_model(),
+            inject_browse_timeout_ms: default_inject_browse_timeout_ms(),
+            inject_max_guides: default_inject_max_guides(),
+            inject_max_link_hops: default_inject_max_link_hops(),
+            inject_min_prompt_words: default_inject_min_prompt_words(),
         }
     }
 }
