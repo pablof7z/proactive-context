@@ -15,6 +15,7 @@ mod inject;
 mod query;
 mod tail;
 mod transcript;
+mod tui;
 
 use crate::config::{load_config, normalize_path, project_context_dir, save_config};
 use crate::daemon::{daemonize, index_files_into_db, list_daemons, stop_daemon};
@@ -141,6 +142,9 @@ enum Commands {
         /// Use ASCII glyph fallbacks (auto-detected for non-Unicode terminals)
         #[arg(long)]
         ascii: bool,
+        /// Force the non-interactive streaming printer even on a TTY (escape hatch; disables TUI)
+        #[arg(long)]
+        plain: bool,
     },
 }
 
@@ -265,6 +269,7 @@ fn main() -> Result<()> {
             event,
             no_color,
             ascii,
+            plain,
         } => {
             crate::tail::run_tail(
                 project,
@@ -278,6 +283,7 @@ fn main() -> Result<()> {
                 event,
                 no_color,
                 ascii,
+                plain,
             )?;
         }
     }

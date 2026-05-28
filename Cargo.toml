@@ -23,3 +23,5 @@ tokio = { version = "1", features = ["full"] }
 walkdir = "2"
 rig-core = "0.37"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+ratatui = "0.29"
+crossterm = "0.28"

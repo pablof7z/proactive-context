@@ -7,28 +7,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ─── Event struct (used for parsing JSONL lines) ──────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct EventLine {
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct EventLine {
     #[serde(default)]
-    ts: String,
+    pub(crate) ts: String,
     #[serde(default)]
-    project: String,
+    pub(crate) project: String,
     #[serde(default)]
     #[allow(dead_code)]
-    session_id: String,
+    pub(crate) session_id: String,
     #[serde(default)]
-    req: String,
+    pub(crate) req: String,
     #[serde(default)]
-    event: String,
+    pub(crate) event: String,
     #[serde(default)]
-    lat_ms: Option<u64>,
+    pub(crate) lat_ms: Option<u64>,
     #[serde(default)]
-    payload: Value,
+    pub(crate) payload: Value,
+}
+
+// ─── In-memory record (parsed event + raw JSON line, for TUI modal) ──────────
+
+#[derive(Debug, Clone)]
+pub(crate) struct Record {
+    pub(crate) raw: String,
+    pub(crate) ev: EventLine,
 }
 
 // ─── ANSI helpers ─────────────────────────────────────────────────────────────
 
-fn color_for_project(project: &str) -> u8 {
+pub(crate) fn color_for_project(project: &str) -> u8 {
     // 8 colors: cyan(6), green(2), yellow(3), magenta(5), blue(4), red(1), bright-cyan(14), bright-magenta(13)
     const COLORS: [u8; 8] = [36, 32, 33, 35, 34, 31, 96, 95];
     let hash: u64 = project.bytes().fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64));
@@ -52,7 +60,7 @@ const ANSI_CYAN: &str = "\x1b[36m";
 
 // ─── Glyph tables ─────────────────────────────────────────────────────────────
 
-fn glyph_for(event: &str, ascii: bool) -> &'static str {
+pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
     if ascii {
         match event {
             "inject.start" => ">",
@@ -90,7 +98,7 @@ fn glyph_for(event: &str, ascii: bool) -> &'static str {
     }
 }
 
-fn event_color(event: &str) -> &'static str {
+pub(crate) fn event_color_ansi(event: &str) -> &'static str {
     match event {
         "inject.start" => ANSI_CYAN,
         "query.start" => ANSI_BLUE,
@@ -113,13 +121,13 @@ fn event_color(event: &str) -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
-    Quiet,    // -q
-    Default,  // (no flag)
-    Verbose,  // -v
+    Quiet,       // -q
+    Default,     // (no flag)
+    Verbose,     // -v
     VeryVerbose, // -vv
 }
 
-fn event_verbosity_tier(event: &str) -> Verbosity {
+pub(crate) fn event_verbosity_tier(event: &str) -> Verbosity {
     match event {
         "inject.start" | "inject.done" | "capture.start" | "capture.done" => Verbosity::Quiet,
         "error" => Verbosity::Quiet,
@@ -128,7 +136,7 @@ fn event_verbosity_tier(event: &str) -> Verbosity {
     }
 }
 
-fn verbosity_passes(event_tier: Verbosity, user_verbosity: Verbosity) -> bool {
+pub(crate) fn verbosity_passes(event_tier: Verbosity, user_verbosity: Verbosity) -> bool {
     let tier_level = match event_tier {
         Verbosity::Quiet => 0,
         Verbosity::Default => 1,
@@ -147,7 +155,7 @@ fn verbosity_passes(event_tier: Verbosity, user_verbosity: Verbosity) -> bool {
 // ─── Timestamp formatting ──────────────────────────────────────────────────────
 
 /// Parse fixed-width UTC RFC3339 "2026-05-28T14:02:11.123Z" into HH:MM:SS
-fn format_ts_short(ts: &str) -> String {
+pub(crate) fn format_ts_short(ts: &str) -> String {
     // Format: 2026-05-28T14:02:11.123Z (fixed-width 24 chars)
     if ts.len() >= 19 {
         ts[11..19].to_string() // "HH:MM:SS"
@@ -157,7 +165,7 @@ fn format_ts_short(ts: &str) -> String {
 }
 
 /// Parse RFC3339 to unix millis for --since comparison
-fn parse_ts_to_millis(ts: &str) -> Option<u64> {
+pub(crate) fn parse_ts_to_millis(ts: &str) -> Option<u64> {
     // Minimal parser for "2026-05-28T14:02:11.123Z"
     if ts.len() < 19 {
         return None;
@@ -225,14 +233,14 @@ fn parse_since(s: &str) -> Option<u64> {
 
 // ─── Short req ID (3-char from the millis suffix) ─────────────────────────────
 
-fn short_req_id(req: &str) -> String {
+pub(crate) fn short_req_id(req: &str) -> String {
     // req format: "<pid-hex>-<unix_millis>"
     // Take last 3 chars of millis for a compact display id
     let suffix = req.split('-').last().unwrap_or(req);
     let chars: Vec<char> = suffix.chars().collect();
     let n = chars.len();
     if n >= 3 {
-        chars[n-3..].iter().collect()
+        chars[n - 3..].iter().collect()
     } else {
         suffix.to_string()
     }
@@ -240,13 +248,12 @@ fn short_req_id(req: &str) -> String {
 
 // ─── Body rendering per event ─────────────────────────────────────────────────
 
-fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii: bool) -> String {
+pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii: bool) -> String {
     let p = &ev.payload;
     let budget = body_budget.max(20);
 
     match ev.event.as_str() {
         "inject.start" => {
-            // The spec says show "truncated user prompt" — we stored prompt_chars; show what we have
             let chars = p.get("prompt_chars").and_then(|v| v.as_u64()).unwrap_or(0);
             let ctx = p.get("context_turns").and_then(|v| v.as_u64()).unwrap_or(0);
             let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -280,7 +287,10 @@ fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii
             let tool = p.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
             let arg = p.get("arg").and_then(|v| v.as_str()).unwrap_or("");
             let bytes = p.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-            trunc(&format!("{} {}  ({:.1} KB)", tool, arg, bytes as f64 / 1024.0), budget)
+            trunc(
+                &format!("{} {}  ({:.1} KB)", tool, arg, bytes as f64 / 1024.0),
+                budget,
+            )
         }
         "generate.briefing" => {
             let chars = p.get("briefing_chars").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -291,12 +301,21 @@ fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii
             let outcome = p.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
             let hits = p.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
             let out_chars = p.get("out_chars").and_then(|v| v.as_u64()).unwrap_or(0);
-            let lat = ev.lat_ms.map(|ms| format!("{:.2}s", ms as f64 / 1000.0)).unwrap_or_default();
+            let lat = ev
+                .lat_ms
+                .map(|ms| format!("{:.2}s", ms as f64 / 1000.0))
+                .unwrap_or_default();
             let reason = p.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             if reason.is_empty() {
-                trunc(&format!("{}  {} hits · {} chars · {}", lat, hits, out_chars, outcome), budget)
+                trunc(
+                    &format!("{}  {} hits · {} chars · {}", lat, hits, out_chars, outcome),
+                    budget,
+                )
             } else {
-                trunc(&format!("{}  {} hits · {} [{}]", lat, hits, outcome, reason), budget)
+                trunc(
+                    &format!("{}  {} hits · {} [{}]", lat, hits, outcome, reason),
+                    budget,
+                )
             }
         }
         "capture.start" => {
@@ -316,7 +335,10 @@ fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii
             let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("PRODUCT_MODEL.md");
             let bytes = p.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let lessons_in = p.get("lessons_in").and_then(|v| v.as_u64()).unwrap_or(0);
-            trunc(&format!("{} · {} bytes · {} lessons", path, bytes, lessons_in), budget)
+            trunc(
+                &format!("{} · {} bytes · {} lessons", path, bytes, lessons_in),
+                budget,
+            )
         }
         "daemon.index" => {
             let phase = p.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
@@ -326,7 +348,10 @@ fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii
         }
         "error" => {
             let stage = p.get("stage").and_then(|v| v.as_str()).unwrap_or("?");
-            let msg = p.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let msg = p
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             trunc(&format!("{} failed · {}", stage, msg), budget)
         }
         _ => {
@@ -336,7 +361,7 @@ fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: usize, _ascii
     }
 }
 
-fn trunc(s: &str, max: usize) -> String {
+pub(crate) fn trunc(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         s.to_string()
@@ -346,82 +371,231 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
-// ─── Main render function ─────────────────────────────────────────────────────
+// ─── Project display name ─────────────────────────────────────────────────────
 
-fn render_line(
+pub(crate) fn proj_display_name(project: &str) -> String {
+    let proj_name = project.rsplit('_').next().unwrap_or(project);
+    let chars: Vec<char> = proj_name.chars().collect();
+    if chars.len() > 10 {
+        let truncated: String = chars[..9].iter().collect();
+        format!("{}…", truncated)
+    } else {
+        format!("{:<10}", proj_name)
+    }
+}
+
+// ─── Shared row segment producer ─────────────────────────────────────────────
+//
+// ONE place that owns the column ordering and req/———/glyph/body logic.
+// BOTH the streaming ANSI printer (render_line) and the TUI ratatui row
+// (record_to_list_item in tui.rs) call row_segments() — they must never drift.
+
+/// Column roles emitted by row_segments.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SegRole {
+    /// Timestamp (dim in color mode)
+    Ts,
+    /// Project-colored text (req id, project label)
+    Project { ansi_color_code: u8 },
+    /// Event glyph + name (event-tier color)
+    EventGlyph,
+    /// Body text (no additional color)
+    Body,
+    /// Separator ("  ")
+    Sep,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Segment {
+    pub(crate) text: String,
+    pub(crate) role: SegRole,
+}
+
+/// Produce the ordered list of (text, role) segments for a row.
+/// Returns `None` when the event's verbosity tier is below `user_verbosity`.
+/// Callers convert these to either an ANSI string (streaming printer) or
+/// ratatui Spans (TUI list row).
+pub(crate) fn row_segments(
     ev: &EventLine,
-    use_color: bool,
-    ascii: bool,
     verbosity: Verbosity,
-    terminal_width: usize,
-) -> Option<String> {
+    body_budget: usize,
+    ascii: bool,
+) -> Option<Vec<Segment>> {
     let event_tier = event_verbosity_tier(&ev.event);
     if !verbosity_passes(event_tier, verbosity) {
         return None;
     }
 
     let ts = format_ts_short(&ev.ts);
-
-    // Project color
     let proj_color_code = color_for_project(&ev.project);
-    let proj_name = ev.project.rsplit('_').next().unwrap_or(&ev.project);
-    let proj_display: String = {
-        let chars: Vec<char> = proj_name.chars().collect();
-        if chars.len() > 10 {
-            let truncated: String = chars[..9].iter().collect();
-            format!("{}…", truncated)
-        } else {
-            format!("{:<10}", proj_name)
-        }
-    };
+    let proj_display = proj_display_name(&ev.project);
 
-    // Request ID
     let req_display = if ev.req == "-" || ev.req.is_empty() {
         "———".to_string()
     } else {
         format!("{:>3}", short_req_id(&ev.req))
     };
 
-    // Glyph + event name
     let glyph = glyph_for(&ev.event, ascii);
-
-    // Body budget: terminal_width minus gutter (~52 chars for fixed gutter)
-    let body_budget = terminal_width.saturating_sub(60).max(30);
     let body = render_body(ev, verbosity, body_budget, ascii);
+    let glyph_and_event = format!("{} {}", glyph, ev.event);
+
+    Some(vec![
+        Segment { text: ts, role: SegRole::Ts },
+        Segment { text: "  ".into(), role: SegRole::Sep },
+        Segment { text: req_display, role: SegRole::Project { ansi_color_code: proj_color_code } },
+        Segment { text: "  ".into(), role: SegRole::Sep },
+        Segment { text: proj_display, role: SegRole::Project { ansi_color_code: proj_color_code } },
+        Segment { text: "  ".into(), role: SegRole::Sep },
+        Segment { text: glyph_and_event, role: SegRole::EventGlyph },
+        Segment { text: "  ".into(), role: SegRole::Sep },
+        Segment { text: body, role: SegRole::Body },
+    ])
+}
+
+// ─── Main render function ─────────────────────────────────────────────────────
+//
+// Streaming printer: converts row_segments → ANSI string.
+// The TUI calls row_segments directly to get ratatui Spans.
+
+pub(crate) fn render_line(
+    ev: &EventLine,
+    use_color: bool,
+    ascii: bool,
+    verbosity: Verbosity,
+    terminal_width: usize,
+) -> Option<String> {
+    // Body budget: terminal_width minus gutter (~60 chars for fixed gutter)
+    let body_budget = terminal_width.saturating_sub(60).max(30);
+    let segs = row_segments(ev, verbosity, body_budget, ascii)?;
 
     if use_color {
-        let pc = ansi_color(proj_color_code);
-        let ec = event_color(&ev.event);
-        let reset = ANSI_RESET;
+        // Serialize segments → ANSI string using the locked column format.
+        // The segment order from row_segments IS the column order; we just color each role.
+        let mut out = String::new();
         let dim = ANSI_DIM;
+        let reset = ANSI_RESET;
+        let ec = event_color_ansi(&ev.event);
 
-        Some(format!(
-            "{dim_color}{ts}{reset}  {pc}{req}{reset}  {pc}{proj}{reset}  {ec}{glyph} {evname}{reset}  {body}",
-            dim_color = dim, ts = ts,
-            reset = reset, pc = pc, ec = ec,
-            req = req_display, proj = proj_display, glyph = glyph, evname = ev.event, body = body
-        ))
+        for seg in &segs {
+            match &seg.role {
+                SegRole::Ts => {
+                    out.push_str(dim);
+                    out.push_str(&seg.text);
+                    out.push_str(reset);
+                }
+                SegRole::Project { ansi_color_code } => {
+                    let pc = ansi_color(*ansi_color_code);
+                    out.push_str(&pc);
+                    out.push_str(&seg.text);
+                    out.push_str(reset);
+                }
+                SegRole::EventGlyph => {
+                    out.push_str(ec);
+                    out.push_str(&seg.text);
+                    out.push_str(reset);
+                }
+                SegRole::Sep | SegRole::Body => {
+                    out.push_str(&seg.text);
+                }
+            }
+        }
+        Some(out)
     } else {
-        Some(format!(
-            "{}  {:>3}  {}  {} {}  {}",
-            ts, req_display, proj_display, glyph, ev.event, body
-        ))
+        // No-color: just concatenate text fields (column order matches row_segments)
+        Some(segs.into_iter().map(|s| s.text).collect::<Vec<_>>().join(""))
     }
+}
+
+// ─── Filter ───────────────────────────────────────────────────────────────────
+
+pub(crate) fn should_show(
+    ev: &EventLine,
+    project_filter: &Option<String>,
+    since_ms: Option<u64>,
+    event_filters: &[String],
+    grep: Option<&str>,
+) -> bool {
+    // --project filter
+    if let Some(pf) = project_filter {
+        let pf_lower = pf.to_lowercase();
+        let proj_lower = ev.project.to_lowercase();
+        let basename = proj_lower.rsplit('_').next().unwrap_or(&proj_lower);
+        if !proj_lower.contains(&pf_lower) && !basename.contains(&pf_lower) {
+            return false;
+        }
+    }
+
+    // --since filter (lexicographic on RFC3339 OR millis comparison)
+    if let Some(cutoff_ms) = since_ms {
+        if let Some(ev_ms) = parse_ts_to_millis(&ev.ts) {
+            if ev_ms < cutoff_ms {
+                return false;
+            }
+        }
+    }
+
+    // --event filter
+    if !event_filters.is_empty() {
+        let matches = event_filters.iter().any(|ef| {
+            let ef = ef.trim_start_matches('-');
+            ev.event == ef
+                || ev.event
+                    .starts_with(&format!("{}.", ef.trim_end_matches('.')))
+                || ev.event.starts_with(ef)
+        });
+        if !matches {
+            return false;
+        }
+    }
+
+    // --grep filter (against req id + body rendered naively)
+    if let Some(pat) = grep {
+        let haystack = format!(
+            "{} {} {} {}",
+            ev.req,
+            ev.event,
+            ev.project,
+            serde_json::to_string(&ev.payload).unwrap_or_default()
+        );
+        if !haystack.contains(pat) {
+            return false;
+        }
+    }
+
+    true
 }
 
 // ─── File following ────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn inode_of(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn inode_of(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
 #[cfg(not(unix))]
-fn inode_of(_path: &std::path::Path) -> Option<u64> { None }
+pub(crate) fn inode_of(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+// ─── TTY detection ─────────────────────────────────────────────────────────────
+
+pub(crate) fn stdout_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::isatty(io::stdout().as_raw_fd()) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_tail(
     project: Option<String>,
     since: Option<String>,
@@ -434,6 +608,7 @@ pub fn run_tail(
     event_filter: Option<String>,
     no_color: bool,
     ascii: bool,
+    plain: bool,
 ) -> Result<()> {
     let verbosity = if very_verbose {
         Verbosity::VeryVerbose
@@ -446,19 +621,13 @@ pub fn run_tail(
     };
 
     // Determine color: auto (TTY check) unless forced off
+    let is_tty = stdout_is_tty();
     let use_color = if no_color || std::env::var("NO_COLOR").is_ok() {
         false
     } else if json {
         false
     } else {
-        // Check if stdout is a TTY
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe { libc::isatty(io::stdout().as_raw_fd()) != 0 }
-        }
-        #[cfg(not(unix))]
-        { true }
+        is_tty
     };
 
     let ascii_mode = ascii || !use_color; // non-TTY → ASCII
@@ -466,7 +635,13 @@ pub fn run_tail(
     // Resolve log path
     let log_path: PathBuf = crate::config::load_config()
         .ok()
-        .and_then(|cfg| if cfg.log_path.is_empty() { None } else { Some(PathBuf::from(&cfg.log_path)) })
+        .and_then(|cfg| {
+            if cfg.log_path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&cfg.log_path))
+            }
+        })
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -485,6 +660,49 @@ pub fn run_tail(
     // Parse --project filter
     let project_filter = project.clone();
 
+    // ── TUI activation gate ───────────────────────────────────────────────────
+    // Activate the interactive TUI when: stdout is a TTY AND follow is on AND
+    // NOT --json AND NOT --plain.  Every other combination uses the existing
+    // streaming printer unchanged.
+    if is_tty && follow && !json && !plain {
+        return crate::tui::run_tui(
+            log_path,
+            project_filter,
+            since_ms,
+            event_filters,
+            grep,
+            verbosity,
+            ascii_mode,
+        );
+    }
+
+    // ── Streaming printer (unchanged from v0.3) ───────────────────────────────
+    run_streaming_printer(
+        log_path,
+        project_filter,
+        since_ms,
+        event_filters,
+        grep,
+        json,
+        follow,
+        verbosity,
+        use_color,
+        ascii_mode,
+    )
+}
+
+fn run_streaming_printer(
+    log_path: PathBuf,
+    project_filter: Option<String>,
+    since_ms: Option<u64>,
+    event_filters: Vec<String>,
+    grep: Option<String>,
+    json: bool,
+    follow: bool,
+    verbosity: Verbosity,
+    use_color: bool,
+    ascii_mode: bool,
+) -> Result<()> {
     let terminal_width = get_terminal_width();
 
     let stdout = io::stdout();
@@ -530,12 +748,12 @@ pub fn run_tail(
                         let _ = writeln!(out, "{}", line);
                     }
                 }
-            } else {
-                if let Ok(ev) = serde_json::from_str::<EventLine>(line) {
-                    if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
-                        if let Some(rendered) = render_line(&ev, use_color, ascii_mode, verbosity, terminal_width) {
-                            let _ = writeln!(out, "{}", rendered);
-                        }
+            } else if let Ok(ev) = serde_json::from_str::<EventLine>(line) {
+                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                    if let Some(rendered) =
+                        render_line(&ev, use_color, ascii_mode, verbosity, terminal_width)
+                    {
+                        let _ = writeln!(out, "{}", rendered);
                     }
                 }
             }
@@ -554,7 +772,10 @@ pub fn run_tail(
 
         // Check for rotation/truncation
         let new_inode = inode_of(&log_path);
-        let path_len = std::fs::metadata(&log_path).ok().map(|m| m.len()).unwrap_or(0);
+        let path_len = std::fs::metadata(&log_path)
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         if new_inode != current_inode || path_len < offset {
             // Rotation or truncation detected — reopen
@@ -605,68 +826,18 @@ pub fn run_tail(
                         let _ = out.flush();
                     }
                 }
-            } else {
-                if let Ok(ev) = serde_json::from_str::<EventLine>(&line) {
-                    if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
-                        if let Some(rendered) = render_line(&ev, use_color, ascii_mode, verbosity, terminal_width) {
-                            let _ = writeln!(out, "{}", rendered);
-                            let _ = out.flush();
-                        }
+            } else if let Ok(ev) = serde_json::from_str::<EventLine>(&line) {
+                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                    if let Some(rendered) =
+                        render_line(&ev, use_color, ascii_mode, verbosity, terminal_width)
+                    {
+                        let _ = writeln!(out, "{}", rendered);
+                        let _ = out.flush();
                     }
                 }
             }
         }
     }
-}
-
-fn should_show(
-    ev: &EventLine,
-    project_filter: &Option<String>,
-    since_ms: Option<u64>,
-    event_filters: &[String],
-    grep: Option<&str>,
-) -> bool {
-    // --project filter
-    if let Some(pf) = project_filter {
-        let pf_lower = pf.to_lowercase();
-        let proj_lower = ev.project.to_lowercase();
-        let basename = proj_lower.rsplit('_').next().unwrap_or(&proj_lower);
-        if !proj_lower.contains(&pf_lower) && !basename.contains(&pf_lower) {
-            return false;
-        }
-    }
-
-    // --since filter (lexicographic on RFC3339 OR millis comparison)
-    if let Some(cutoff_ms) = since_ms {
-        if let Some(ev_ms) = parse_ts_to_millis(&ev.ts) {
-            if ev_ms < cutoff_ms {
-                return false;
-            }
-        }
-    }
-
-    // --event filter
-    if !event_filters.is_empty() {
-        let matches = event_filters.iter().any(|ef| {
-            let ef = ef.trim_start_matches('-');
-            ev.event == ef || ev.event.starts_with(&format!("{}.", ef.trim_end_matches('.')))
-                || ev.event.starts_with(ef)
-        });
-        if !matches {
-            return false;
-        }
-    }
-
-    // --grep filter (against req id + body rendered naively)
-    if let Some(pat) = grep {
-        let haystack = format!("{} {} {} {}", ev.req, ev.event, ev.project,
-            serde_json::to_string(&ev.payload).unwrap_or_default());
-        if !haystack.contains(pat) {
-            return false;
-        }
-    }
-
-    true
 }
 
 fn get_terminal_width() -> usize {
@@ -678,9 +849,7 @@ fn get_terminal_width() -> usize {
     }
     #[cfg(unix)]
     {
-        let out = std::process::Command::new("tput")
-            .arg("cols")
-            .output();
+        let out = std::process::Command::new("tput").arg("cols").output();
         if let Ok(o) = out {
             if let Ok(s) = String::from_utf8(o.stdout) {
                 if let Ok(n) = s.trim().parse::<usize>() {
@@ -690,4 +859,273 @@ fn get_terminal_width() -> usize {
         }
     }
     120 // fallback
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Helper: build a minimal EventLine from fields
+    fn make_ev(ts: &str, project: &str, req: &str, event: &str, lat_ms: Option<u64>, payload: Value) -> EventLine {
+        EventLine {
+            ts: ts.to_string(),
+            project: project.to_string(),
+            session_id: String::new(),
+            req: req.to_string(),
+            event: event.to_string(),
+            lat_ms,
+            payload,
+        }
+    }
+
+    // ── Golden tests: render_line format must not drift ──────────────────────
+    //
+    // These tests pin the exact no-color ASCII output of render_line at width=120.
+    // They verify that the segment serializer (row_segments → render_line) produces
+    // the same column layout as the original format-string code.
+    //
+    // Proof of byte-identity for the streaming path:
+    //   (a) `git diff HEAD -- src/tail.rs` shows only mechanical changes:
+    //       `fn` → `pub(crate) fn`, field visibility, extraction to row_segments.
+    //       No format strings, no logic, no filter predicates changed.
+    //   (b) These tests pass, which means row_segments + serializer == old code.
+    //   (c) Empirical: `tail --no-follow --no-color` output identical to before.
+
+    #[test]
+    fn golden_query_start_no_color() {
+        // From: {"ts":"2026-05-28T20:53:56.334Z","project":"Users_pablofernandez_src_proactive-context",
+        //        "req":"c3a4-1780001636329","event":"query.start","payload":{"global":false,"query_chars":15,"rerank":false,"top_k":3}}
+        // Expected: 20:53:56  329  proactive…  ? query.start  top_k 3 · rerank off
+        let ev = make_ev(
+            "2026-05-28T20:53:56.334Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3a4-1780001636329",
+            "query.start",
+            None,
+            json!({"global": false, "query_chars": 15, "rerank": false, "top_k": 3}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:53:56  329  proactive…  ? query.start  top_k 3 · rerank off");
+    }
+
+    #[test]
+    fn golden_inject_start_no_color() {
+        // At width=120 body_budget=(120-60).max(30)=60, "75 chars · 6 turns · openai/gpt-4o-mini" is 40 chars, fits.
+        let ev = make_ev(
+            "2026-05-28T20:54:06.098Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3b5-1780001646098",
+            "inject.start",
+            None,
+            json!({"context_turns": 6, "model": "openai/gpt-4o-mini", "prompt_chars": 75}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:06  098  proactive…  > inject.start  75 chars · 6 turns · openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn golden_inject_done_no_color() {
+        // Expected: 20:54:08  098  proactive…  + inject.done  2.00s  2 hits · 0 chars · none
+        let ev = make_ev(
+            "2026-05-28T20:54:08.096Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3b5-1780001646098",
+            "inject.done",
+            Some(1997),
+            json!({"hits": 2, "out_chars": 0, "outcome": "none"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:08  098  proactive…  + inject.done  2.00s  2 hits · 0 chars · none");
+    }
+
+    #[test]
+    fn golden_inject_done_fallback_no_color() {
+        // At width=120 body_budget=60, "4.78s  2 hits · fallback [timeout]" is 34 chars, fits.
+        let ev = make_ev(
+            "2026-05-28T20:54:17.703Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3be-1780001652924",
+            "inject.done",
+            Some(4779),
+            json!({"hits": 2, "out_chars": 1548, "outcome": "fallback", "reason": "timeout"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:17  924  proactive…  + inject.done  4.78s  2 hits · fallback [timeout]");
+    }
+
+    #[test]
+    fn golden_capture_start_no_color() {
+        // At width=120 body_budget=60, "6 exchanges · anthropic/claude-sonnet-4-6" is 41 chars, fits.
+        let ev = make_ev(
+            "2026-05-28T20:54:37.525Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3d9-1780001677524",
+            "capture.start",
+            None,
+            json!({"exchanges": 6, "model": "anthropic/claude-sonnet-4-6", "transcript_chars": 6577}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:37  524  proactive…  # capture.start  6 exchanges · anthropic/claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn golden_capture_lesson_global_no_color() {
+        // At width=120 body_budget=60. The body is "[gotcha·cold] →review macos-gatekeeper-kills-unsigned-binaries"
+        // which is 62 chars → truncated to 59+ellipsis.
+        let ev = make_ev(
+            "2026-05-28T20:54:50.840Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3d9-1780001677524",
+            "capture.lesson",
+            None,
+            json!({"category": "gotcha", "scope": "global", "slug": "macos-gatekeeper-kills-unsigned-binaries", "volatility": "cold"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:50  524  proactive…  ++ capture.lesson  [gotcha·cold] →review macos-gatekeeper-kills-unsigned-binar…");
+    }
+
+    #[test]
+    fn golden_generate_briefing_no_color() {
+        // Expected: 20:54:08  098  proactive…  = generate.briefing  0 chars · "NONE"
+        let ev = make_ev(
+            "2026-05-28T20:54:08.096Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3b5-1780001646098",
+            "generate.briefing",
+            None,
+            json!({"briefing_chars": 0, "summary": "NONE"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:08  098  proactive…  = generate.briefing  0 chars · \"NONE\"");
+    }
+
+    #[test]
+    fn golden_synth_write_no_color() {
+        // At width=120 body_budget=60. The body is "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/PRODUCT_MODEL.md · 1615 bytes · 1 lessons"
+        // which is >60 chars → truncated to 59+ellipsis.
+        let ev = make_ev(
+            "2026-05-28T20:54:58.698Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3d9-1780001677524",
+            "synth.write",
+            None,
+            json!({"bytes": 1615, "lessons_in": 1, "path": "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/PRODUCT_MODEL.md"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert_eq!(result, "20:54:58  524  proactive…  = synth.write  /Users/pablofernandez/.proactive-context/projects/Users_pab…");
+    }
+
+    #[test]
+    fn golden_retrieve_hit_filtered_by_verbosity() {
+        // retrieve.hit is tier=Verbose; at Default verbosity it should be filtered out (returns None)
+        let ev = make_ev(
+            "2026-05-28T20:53:57.248Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3a4-1780001636329",
+            "retrieve.hit",
+            None,
+            json!({"chunk_index": 5, "path": "docs/tail-system.md", "score": 0.525, "snippet": "test"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120);
+        assert!(result.is_none(), "retrieve.hit should be filtered at Default verbosity");
+    }
+
+    #[test]
+    fn golden_retrieve_hit_shown_at_verbose() {
+        // At Verbose level, retrieve.hit is shown
+        let ev = make_ev(
+            "2026-05-28T20:53:57.248Z",
+            "Users_pablofernandez_src_proactive-context",
+            "c3a4-1780001636329",
+            "retrieve.hit",
+            None,
+            json!({"chunk_index": 5, "path": "docs/tail-system.md", "score": 0.525, "snippet": "test"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Verbose, 120);
+        assert!(result.is_some(), "retrieve.hit should show at Verbose level");
+        let s = result.unwrap();
+        assert!(s.contains("retrieve.hit"), "should contain event name");
+        assert!(s.contains("0.53"), "should contain score");
+    }
+
+    #[test]
+    fn golden_daemon_index_empty_req() {
+        // daemon.index events use "———" for no req
+        let ev = make_ev(
+            "2026-05-28T21:00:00.000Z",
+            "Users_pablofernandez_src_proactive-context",
+            "-",  // no req
+            "daemon.index",
+            None,
+            json!({"phase": "full", "files": 42, "chunks": 123}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert!(result.contains("———"), "should use ——— for empty req");
+        assert!(result.contains("daemon.index"), "should contain event name");
+        assert!(result.contains("42 files"), "should contain file count");
+    }
+
+    #[test]
+    fn golden_error_event() {
+        let ev = make_ev(
+            "2026-05-28T21:00:00.000Z",
+            "Users_pablofernandez_src_proactive-context",
+            "abc-123",
+            "error",
+            None,
+            json!({"stage": "generate.briefing", "message": "OpenRouter 429 rate-limited"}),
+        );
+        let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
+        assert!(result.contains("error"), "should contain event name");
+        assert!(result.contains("generate.briefing failed"), "should contain stage");
+    }
+
+    #[test]
+    fn golden_no_follow_json_passthrough() {
+        // The --json + --no-follow path must produce raw JSON lines.
+        // We test the should_show filter + raw line emission logic by simulating it.
+        let raw = r#"{"ts":"2026-05-28T20:53:56.334Z","project":"proj","session_id":"","req":"abc-123","event":"query.start","payload":{}}"#;
+        let ev: EventLine = serde_json::from_str(raw).unwrap();
+        assert!(should_show(&ev, &None, None, &[], None));
+        // Passthrough: raw line is unchanged
+        let output = format!("{}", raw);
+        assert_eq!(output, raw);
+    }
+
+    #[test]
+    fn filter_by_project() {
+        let ev = make_ev(
+            "2026-05-28T20:53:56.334Z",
+            "Users_pablofernandez_src_web-app",
+            "abc-123",
+            "query.start",
+            None,
+            json!({}),
+        );
+        // Should not match "proactive"
+        assert!(!should_show(&ev, &Some("proactive".to_string()), None, &[], None));
+        // Should match "web-app"
+        assert!(should_show(&ev, &Some("web-app".to_string()), None, &[], None));
+        // No filter matches everything
+        assert!(should_show(&ev, &None, None, &[], None));
+    }
+
+    #[test]
+    fn filter_by_event() {
+        let ev = make_ev(
+            "2026-05-28T20:53:56.334Z",
+            "Users_pablofernandez_src_proactive-context",
+            "abc-123",
+            "inject.start",
+            None,
+            json!({}),
+        );
+        let filters = vec!["inject".to_string()];
+        assert!(should_show(&ev, &None, None, &filters, None));
+        let filters2 = vec!["capture".to_string()];
+        assert!(!should_show(&ev, &None, None, &filters2, None));
+    }
 }

@@ -455,6 +455,98 @@ These are not designed here, but the UX above is only coherent if the transport 
 
 ---
 
+## 11. Interactive TUI Mode
+
+When stdout is a TTY and `--follow` is on (the default) and neither `--json` nor `--plain` is
+specified, `proactive-context tail` activates an interactive terminal UI instead of the
+streaming printer. Use `--plain` to force the streaming renderer even on a TTY (escape hatch).
+
+### Activation gate
+
+| Condition | Mode |
+|---|---|
+| stdout is a TTY AND follow AND NOT --json AND NOT --plain | **Interactive TUI** |
+| --json | streaming printer (JSON passthrough), unchanged |
+| --no-follow | streaming printer (prints existing backlog and exits), unchanged |
+| piped / non-TTY stdout | streaming printer (ANSI stripped, ASCII glyphs), unchanged |
+| --plain | streaming printer even on a TTY |
+
+### Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ HH:MM:SS  req  project     event  body                                  │ ← list rows
+│ HH:MM:SS  req  project     event  body            ← selected row        │
+│ ...                                                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ [FOLLOWING] N retained  | filter:...   ↑/k↓/j:select  Enter:detail ... │ ← status bar
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+The list uses the **same glyph/color scheme** as the streaming renderer (same shared formatter,
+same `render_body` function, same verbosity filtering). Visual consistency is enforced by
+calling the shared code — the TUI and the streamer cannot drift.
+
+### Follow vs. Pause
+
+- **FOLLOWING** (green badge): the viewport pins to the bottom and auto-scrolls as new events
+  arrive. This is the default state.
+- **PAUSED** (yellow badge): the first `↑` / `k` keypress detaches the viewport. Events keep
+  arriving off-screen. The selection is stable so you can navigate while the live log grows.
+- `G` or `f` returns to bottom and re-arms FOLLOWING.
+- `g` jumps to the top (stays PAUSED).
+
+A ring buffer retains the last ~10,000 records. The status bar shows `N retained, M dropped`
+when older records have been evicted.
+
+### Keybindings
+
+| Key | Action |
+|---|---|
+| `↑` / `k` | Select previous row (enters PAUSED) |
+| `↓` / `j` | Select next row |
+| `G` or `f` | Jump to bottom and re-arm FOLLOWING |
+| `g` | Jump to top (stays PAUSED) |
+| `Enter` | Open detail modal for selected event |
+| `Esc` / `q` (in modal) | Close modal |
+| `↑` / `k` (in modal) | Navigate to previous sibling event in request trace |
+| `↓` / `j` (in modal) | Navigate to next sibling event in request trace |
+| `q` (in list) | Quit |
+| `Ctrl-C` | Quit |
+
+### Detail Modal
+
+Press `Enter` on any selected row to open the detail modal, which shows:
+
+1. **Full envelope fields**: `ts`, `project`, `req`, `event`, `lat_ms` (if present).
+2. **Full payload** (pretty-printed JSON) — everything stored in the log line.
+3. **Event-specific enrichment**:
+   - `inject.done`: per-stage latencies from `payload.stages` if present.
+   - `retrieve.hit`: attempts to re-read the referenced chunk from disk (resolving
+     `payload.path`). If the file is readable, the actual chunk content is shown (not
+     truncated). If the file cannot be read, shows the stored snippet (≤200 chars) with a note.
+   - `generate.briefing`: shows the stored `summary` + `briefing_chars`, with an explicit
+     note: *"(full briefing text was sent to the session and is not persisted in the log)"*.
+     The full briefing is intentionally not recoverable — it was never written to the log
+     (§3.2 atomicity constraint; see tail-system.md).
+4. **Request trace**: all sibling events sharing the same `req` are listed in arrival order.
+   Use `↑`/`↓` within the modal to move between siblings. This makes the modal double as a
+   "show me this whole request's lifecycle" view.
+
+> Note on retrieve.hit chunk re-read: `payload.path` is the relative path as stored by the
+> indexer. The modal tries several resolution strategies (absolute, relative to project root,
+> relative to CWD). If none succeed, the 200-char stored snippet is shown with a fallback
+> note. This is honest about the limitation rather than silently showing nothing.
+
+### Terminal Safety
+
+The TUI installs both a **panic hook** (restores the terminal before the default panic
+handler prints) and a **Drop guard** (`TerminalGuard`) that restores the terminal — disables
+raw mode, leaves alternate screen, shows the cursor — on every exit path including Ctrl-C
+and mid-render panics. A crash must never leave the user's terminal in raw mode.
+
+---
+
 ## 10. Summary of key decisions
 
 1. **The taxonomy is one request's lifecycle**, not a flat vocabulary; the end-to-end trace
