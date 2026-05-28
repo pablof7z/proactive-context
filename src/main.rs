@@ -15,6 +15,7 @@ mod inject;
 mod query;
 mod tail;
 mod transcript;
+mod wiki;
 
 use crate::config::{load_config, normalize_path, project_context_dir, save_config};
 use crate::daemon::{daemonize, index_files_into_db, list_daemons, stop_daemon};
