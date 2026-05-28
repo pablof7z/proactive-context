@@ -72,8 +72,11 @@ pub struct Config {
     pub log_retention: usize,
 
     // ---- Inject budget ----
-    /// Faster/cheaper model for the inject compile step (hot path). Distinct from generate_model.
+    /// DEPRECATED — replaced by inject_select_model + inject_compile_model (wiki v2).
+    /// Kept for backward compatibility with existing config.json files; ignored by inject.
+    /// Will be removed in a future release.
     #[serde(default = "default_inject_model")]
+    #[allow(dead_code)]
     pub inject_model: String,
 
     /// Last N transcript turns folded into the retrieval query (0 = bare prompt).

@@ -55,11 +55,22 @@ pub fn parse_guide(content: &str) -> Option<Guide> {
     }
 
     // Find closing ---
+    // content = "---\n<fm>\n---\n\n<body>"
+    // rest starts AFTER the opening "---"
     let rest = &content[3..];
+    // Find the "\n---" that closes the frontmatter block
     let close = rest.find("\n---")?;
     let fm_text = &rest[..close];
-    let body_start = rest[close..].find('\n').map(|i| close + i + 1).unwrap_or(close + 4);
-    let body = rest[body_start..].trim_start_matches('\n').to_string();
+    // body_start: skip "\n---" (4 chars) and any immediately-following newline
+    let after_closer = close + 4; // skip "\n---"
+    let body_start = if rest.as_bytes().get(after_closer) == Some(&b'\n') {
+        after_closer + 1
+    } else {
+        after_closer
+    };
+    let body = rest[body_start.min(rest.len())..]
+        .trim_start_matches('\n')
+        .to_string();
 
     let mut fm = GuideFrontmatter::default();
     let mut current_key: Option<String> = None;
@@ -748,5 +759,24 @@ mod tests {
         let serialized = serialize_guide(&guide);
         let reparsed = parse_guide(&serialized).expect("reparse failed");
         assert_eq!(reparsed.frontmatter.summary, "A guide to: testing");
+    }
+
+    #[test]
+    fn test_body_no_leading_separator() {
+        // The body must NOT start with "---" after a round-trip
+        let input = "---\ntitle: Test\nslug: test\nsummary: summary\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-01-01\nupdated: 2026-01-01\nverified: 2026-01-01\ncompiled-from: conversation\nsources: []\n---\n\n# Test\n\nBody content.\n";
+        let guide = parse_guide(input).expect("parse failed");
+        assert!(!guide.body.starts_with("---"), "body must not start with '---': got {:?}", &guide.body[..20.min(guide.body.len())]);
+        assert!(guide.body.contains("# Test"), "body must contain title");
+
+        // Serialize and re-parse — body must be stable
+        let serialized = serialize_guide(&guide);
+        let reparsed = parse_guide(&serialized).expect("reparse failed");
+        assert_eq!(reparsed.body, guide.body, "body changed after round-trip");
+
+        // Third parse must also be stable
+        let serialized2 = serialize_guide(&reparsed);
+        let reparsed2 = parse_guide(&serialized2).expect("third parse failed");
+        assert_eq!(reparsed2.body, guide.body, "body not idempotent after second round-trip");
     }
 }

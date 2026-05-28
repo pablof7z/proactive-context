@@ -514,7 +514,8 @@ async fn wiki_navigate_and_compile(
     preamble.push_str("- If NOTHING in the wiki is relevant to the prompt, output exactly: NOTHING_RELEVANT\n");
     preamble.push_str("- Do NOT include irrelevant guides\n");
     preamble.push_str("- You can read multiple guides in a single tool call\n");
-    preamble.push_str("- After reading, follow at most 2 hops of See Also links\n\n");
+    preamble.push_str(&format!("- Read at most {} guides total (enforced by timeout; prioritize the most relevant)\n", _max_guides));
+    preamble.push_str(&format!("- After reading, follow at most {} hops of See Also links for directly relevant content\n\n", max_link_hops));
 
     // Add wiki index
     if index_rows.is_empty() {
@@ -582,10 +583,28 @@ async fn wiki_navigate_and_compile(
         .max_turns(max_nav_turns)
         .await?;
 
-    // Check if fast model short-circuited
+    // ── Shortcircuit detection: gate on tool activity first ────────────────
+    // If the fast model read NO guides (read_slugs is empty), we know there's no
+    // curated wiki material — short-circuit regardless of what the model said.
+    // Primary: tool activity check (robust to any model prose response)
+    // Secondary: explicit sentinel phrases (lenient match)
+    {
+        let state = nav_state.lock().unwrap();
+        if state.read_slugs.is_empty() {
+            // Model decided nothing was worth reading — short-circuit
+            return Ok(NavigateResult::ShortCircuit);
+        }
+        drop(state);
+    }
+
+    // Even if guides were read, the model might still conclude nothing relevant
     let nav_trimmed = nav_response.trim();
-    if nav_trimmed.eq_ignore_ascii_case("NOTHING_RELEVANT")
-        || nav_trimmed.eq_ignore_ascii_case("NONE")
+    let lower = nav_trimmed.to_lowercase();
+    if lower.contains("nothing_relevant")
+        || lower.contains("nothing relevant")
+        || lower.contains("no relevant")
+        || lower.contains("not relevant")
+        || lower.eq("none")
         || nav_trimmed.is_empty()
     {
         return Ok(NavigateResult::ShortCircuit);
