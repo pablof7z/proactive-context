@@ -9,11 +9,16 @@ mod config;
 mod daemon;
 mod db;
 mod embed;
+mod events;
 mod generate;
+mod inject;
 mod query;
+mod tail;
+mod transcript;
 
-use crate::config::{load_config, project_context_dir, save_config};
+use crate::config::{load_config, normalize_path, project_context_dir, save_config};
 use crate::daemon::{daemonize, index_files_into_db, list_daemons, stop_daemon};
+use crate::events::init_context;
 use crate::query::{print_results, run_query};
 
 #[derive(Parser)]
@@ -95,6 +100,48 @@ enum Commands {
     /// Distill lessons from a completed session transcript (invoked via SessionEnd hook).
     /// Reads { session_id, cwd, transcript_path } JSON from stdin.
     Capture,
+
+    /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
+    /// Reads { prompt, cwd, session_id, transcript_path } JSON from stdin.
+    /// Writes a <system-reminder> block to stdout. Never blocks or errors out the prompt.
+    Inject,
+
+    /// Follow the proactive-context event log live across all projects.
+    Tail {
+        /// Only show events for this project (matched against normalized cwd; accepts a path or a substring)
+        #[arg(long)]
+        project: Option<String>,
+        /// Only show events at or after this time (RFC3339, or a relative like "10m", "1h")
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit raw JSONL lines instead of the rendered view (passthrough)
+        #[arg(long)]
+        json: bool,
+        /// Print existing matching events and exit instead of following (follow is the default).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_follow: bool,
+        /// Quiet: one line per request (inject.start + inject.done + errors only)
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Verbose: adds retrieve.subquery, individual hits, per-stage latency
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Very verbose: adds full prompts, full briefings, raw sub-query dumps
+        #[arg(long = "vv")]
+        very_verbose: bool,
+        /// Show only lines matching this pattern (checked against req id + body)
+        #[arg(long)]
+        grep: Option<String>,
+        /// Comma-list of event names or prefixes to include (e.g. inject.*,error)
+        #[arg(long)]
+        event: Option<String>,
+        /// Force-disable ANSI color even on a TTY (also: NO_COLOR env var)
+        #[arg(long)]
+        no_color: bool,
+        /// Use ASCII glyph fallbacks (auto-detected for non-Unicode terminals)
+        #[arg(long)]
+        ascii: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -125,6 +172,9 @@ fn main() -> Result<()> {
         }
 
         Commands::Query { query, top_k, rerank, global } => {
+            // Seed event context so run_query emits with correct project/req
+            let project = normalize_path(&root);
+            init_context(&project, "");
             let results = run_query(&root, &query, top_k, rerank, global)?;
             print_results(&results, &root);
         }
@@ -142,6 +192,8 @@ fn main() -> Result<()> {
         }
 
         Commands::Generate { query } => {
+            let project = normalize_path(&root);
+            init_context(&project, "");
             crate::generate::run_generate(&root, &query)?;
         }
 
@@ -195,6 +247,38 @@ fn main() -> Result<()> {
 
         Commands::Capture => {
             crate::capture::run_capture()?;
+        }
+
+        Commands::Inject => {
+            crate::inject::run_inject()?;
+        }
+
+        Commands::Tail {
+            project,
+            since,
+            json,
+            no_follow,
+            quiet,
+            verbose,
+            very_verbose,
+            grep,
+            event,
+            no_color,
+            ascii,
+        } => {
+            crate::tail::run_tail(
+                project,
+                since,
+                json,
+                !no_follow, // follow is on by default
+                quiet,
+                verbose,
+                very_verbose,
+                grep,
+                event,
+                no_color,
+                ascii,
+            )?;
         }
     }
 

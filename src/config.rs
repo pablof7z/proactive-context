@@ -53,6 +53,64 @@ pub struct Config {
     /// Model used for lesson distillation and synthesis (a reasoning task — use a capable model).
     #[serde(default = "default_capture_model")]
     pub capture_model: String,
+
+    // ---- Observability log ----
+    /// Enable or disable the structured event log.
+    #[serde(default = "default_logging_enabled")]
+    pub logging_enabled: bool,
+
+    /// Absolute path to the event log. Empty -> ~/.proactive-context/logs/events.jsonl.
+    #[serde(default)]
+    pub log_path: String,
+
+    /// Rotate when the log exceeds this size (default 16 MiB).
+    #[serde(default = "default_log_max_bytes")]
+    pub log_max_bytes: u64,
+
+    /// Number of rotated files to keep (default 2).
+    #[serde(default = "default_log_retention")]
+    pub log_retention: usize,
+
+    // ---- Inject budget ----
+    /// Faster/cheaper model for the inject compile step (hot path). Distinct from generate_model.
+    #[serde(default = "default_inject_model")]
+    pub inject_model: String,
+
+    /// Last N transcript turns folded into the retrieval query (0 = bare prompt).
+    #[serde(default = "default_inject_context_turns")]
+    pub inject_context_turns: usize,
+
+    /// Hard cap on enriched query length in chars (default 2000).
+    #[serde(default = "default_inject_query_char_cap")]
+    pub inject_query_char_cap: usize,
+
+    /// Number of hits for cheap retrieval (default 6).
+    #[serde(default = "default_inject_top_k")]
+    pub inject_top_k: usize,
+
+    /// Use cross-encoder reranking in inject (default false — avoids per-call model load).
+    #[serde(default = "default_inject_rerank")]
+    pub inject_rerank: bool,
+
+    /// Extra sub-queries via decompose (default 0 = skip decompose call).
+    #[serde(default = "default_inject_max_fanout")]
+    pub inject_max_fanout: usize,
+
+    /// Full documents prefetched during inject compile (default 2).
+    #[serde(default = "default_inject_max_prefetch")]
+    pub inject_max_prefetch: usize,
+
+    /// Give compile agent the read_file tool (default false — bounds turns).
+    #[serde(default = "default_inject_allow_read_file")]
+    pub inject_allow_read_file: bool,
+
+    /// Max tokens for the compile step output (default 700).
+    #[serde(default = "default_inject_max_tokens")]
+    pub inject_max_tokens: usize,
+
+    /// Hard timeout for the WHOLE compile step in ms (default 4000).
+    #[serde(default = "default_inject_timeout_ms")]
+    pub inject_timeout_ms: u64,
 }
 
 fn default_generate_model() -> String {
@@ -95,6 +153,58 @@ fn default_capture_model() -> String {
     "anthropic/claude-sonnet-4-6".to_string()
 }
 
+fn default_logging_enabled() -> bool {
+    true
+}
+
+fn default_log_max_bytes() -> u64 {
+    16 * 1024 * 1024 // 16 MiB
+}
+
+fn default_log_retention() -> usize {
+    2
+}
+
+fn default_inject_model() -> String {
+    "openai/gpt-4o-mini".to_string()
+}
+
+fn default_inject_context_turns() -> usize {
+    6
+}
+
+fn default_inject_query_char_cap() -> usize {
+    2000
+}
+
+fn default_inject_top_k() -> usize {
+    6
+}
+
+fn default_inject_rerank() -> bool {
+    false
+}
+
+fn default_inject_max_fanout() -> usize {
+    0
+}
+
+fn default_inject_max_prefetch() -> usize {
+    2
+}
+
+fn default_inject_allow_read_file() -> bool {
+    false
+}
+
+fn default_inject_max_tokens() -> usize {
+    700
+}
+
+fn default_inject_timeout_ms() -> u64 {
+    4000
+}
+
 /// Sanitize fan-out related tunables after deserialization.
 /// Provides sensible validation + fallbacks so bad user edits (0, empty, huge values) never break behavior.
 /// Uses the default_* fns as source of truth.
@@ -129,6 +239,77 @@ fn sanitize_fanout(cfg: Config) -> Config {
     c
 }
 
+fn sanitize_inject(cfg: Config) -> Config {
+    let mut c = cfg;
+
+    if c.inject_context_turns > 40 {
+        eprintln!("proactive-context: clamping inject_context_turns to 40");
+        c.inject_context_turns = 40;
+    }
+
+    if c.inject_query_char_cap < 200 {
+        eprintln!("proactive-context: clamping inject_query_char_cap to 200");
+        c.inject_query_char_cap = 200;
+    } else if c.inject_query_char_cap > 8000 {
+        eprintln!("proactive-context: clamping inject_query_char_cap to 8000");
+        c.inject_query_char_cap = 8000;
+    }
+
+    if c.inject_top_k < 1 {
+        c.inject_top_k = 1;
+    } else if c.inject_top_k > 20 {
+        eprintln!("proactive-context: clamping inject_top_k to 20");
+        c.inject_top_k = 20;
+    }
+
+    if c.inject_max_fanout > 8 {
+        eprintln!("proactive-context: clamping inject_max_fanout to 8");
+        c.inject_max_fanout = 8;
+    }
+
+    if c.inject_max_prefetch > 8 {
+        eprintln!("proactive-context: clamping inject_max_prefetch to 8");
+        c.inject_max_prefetch = 8;
+    }
+
+    if c.inject_max_tokens < 100 {
+        c.inject_max_tokens = 100;
+    } else if c.inject_max_tokens > 4000 {
+        eprintln!("proactive-context: clamping inject_max_tokens to 4000");
+        c.inject_max_tokens = 4000;
+    }
+
+    if c.inject_timeout_ms < 500 {
+        c.inject_timeout_ms = 500;
+    } else if c.inject_timeout_ms > 30000 {
+        eprintln!("proactive-context: clamping inject_timeout_ms to 30000");
+        c.inject_timeout_ms = 30000;
+    }
+
+    if c.inject_model.trim().is_empty() {
+        eprintln!("proactive-context: empty inject_model in config, using default");
+        c.inject_model = default_inject_model();
+    }
+
+    c
+}
+
+fn sanitize_logging(cfg: Config) -> Config {
+    let mut c = cfg;
+
+    if c.log_max_bytes < 1024 * 1024 {
+        eprintln!("proactive-context: clamping log_max_bytes to 1 MiB");
+        c.log_max_bytes = 1024 * 1024;
+    }
+
+    if c.log_retention > 10 {
+        eprintln!("proactive-context: clamping log_retention to 10");
+        c.log_retention = 10;
+    }
+
+    c
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -143,6 +324,22 @@ impl Default for Config {
             decompose_model: default_decompose_model(),
             capture_enabled: default_capture_enabled(),
             capture_model: default_capture_model(),
+            // Observability
+            logging_enabled: default_logging_enabled(),
+            log_path: String::new(),
+            log_max_bytes: default_log_max_bytes(),
+            log_retention: default_log_retention(),
+            // Inject
+            inject_model: default_inject_model(),
+            inject_context_turns: default_inject_context_turns(),
+            inject_query_char_cap: default_inject_query_char_cap(),
+            inject_top_k: default_inject_top_k(),
+            inject_rerank: default_inject_rerank(),
+            inject_max_fanout: default_inject_max_fanout(),
+            inject_max_prefetch: default_inject_max_prefetch(),
+            inject_allow_read_file: default_inject_allow_read_file(),
+            inject_max_tokens: default_inject_max_tokens(),
+            inject_timeout_ms: default_inject_timeout_ms(),
         }
     }
 }
@@ -160,8 +357,7 @@ pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
         // Create default config on first run
-        use std::default::Default;
-        let cfg = sanitize_fanout(Config::default());
+        let cfg = sanitize_logging(sanitize_inject(sanitize_fanout(Config::default())));
         save_config(&cfg)?;
         return Ok(cfg);
     }
@@ -170,7 +366,7 @@ pub fn load_config() -> Result<Config> {
         .with_context(|| format!("Failed to read config at {}", path.display()))?;
     let cfg: Config = serde_json::from_str(&data)
         .with_context(|| format!("Failed to parse config at {}", path.display()))?;
-    Ok(sanitize_fanout(cfg))
+    Ok(sanitize_logging(sanitize_inject(sanitize_fanout(cfg))))
 }
 
 pub fn save_config(cfg: &Config) -> Result<()> {

@@ -1,4 +1,5 @@
 use crate::config::load_config;
+use crate::events::log_event;
 use crate::query::{run_query, QueryResult};
 use anyhow::{Context, Result};
 use rig_core::client::CompletionClient;
@@ -15,13 +16,13 @@ use tokio::runtime::Runtime;
 
 /// Tool that lets the LLM read the full content of any markdown file in the watched directory.
 #[derive(Clone)]
-struct ReadFileTool {
-    root: PathBuf,
+pub(crate) struct ReadFileTool {
+    pub(crate) root: PathBuf,
 }
 
 #[derive(Deserialize)]
-struct ReadFileArgs {
-    path: String,
+pub(crate) struct ReadFileArgs {
+    pub(crate) path: String,
 }
 
 impl Tool for ReadFileTool {
@@ -63,10 +64,19 @@ impl Tool for ReadFileTool {
             }
         }
 
-        match fs::read_to_string(&full_path) {
-            Ok(content) => Ok(content),
-            Err(e) => Ok(format!("Error reading file: {}", e)),
-        }
+        let content = match fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(e) => return Ok(format!("Error reading file: {}", e)),
+        };
+
+        // Emit generate.tool_call event
+        log_event("generate.tool_call", None, serde_json::json!({
+            "tool": "read_file",
+            "arg": args.path,
+            "bytes": content.len()
+        }));
+
+        Ok(content)
     }
 }
 
@@ -117,8 +127,17 @@ pub fn run_generate(root: &Path, user_query: &str) -> Result<()> {
     fanout_queries.extend(sub_queries);
 
     let mut retrieval_handles = Vec::new();
-    for q in fanout_queries {
+    for (i, q) in fanout_queries.iter().enumerate() {
+        // Emit retrieve.subquery for fan-out angles
+        if i > 0 {
+            log_event("retrieve.subquery", None, serde_json::json!({
+                "index": i,
+                "text": crate::events::truncate(q, 200),
+                "kind": "fanout"
+            }));
+        }
         let r = root.to_path_buf();
+        let q = q.clone();
         let handle = rt.spawn_blocking(move || run_query(&r, &q, 6, true, false));
         retrieval_handles.push(handle);
     }
@@ -210,13 +229,19 @@ pub fn run_generate(root: &Path, user_query: &str) -> Result<()> {
 
     let response = rt.block_on(async { agent.prompt(user_query).await })?;
 
+    // Emit generate.briefing
+    log_event("generate.briefing", None, serde_json::json!({
+        "briefing_chars": response.len(),
+        "summary": crate::events::truncate(&response, 200)
+    }));
+
     println!("{}\n", response);
     Ok(())
 }
 
 // --- Fan-out helpers ---
 
-async fn generate_sub_queries(
+pub(crate) async fn generate_sub_queries(
     api_key: &str,
     model: &str,
     user_query: &str,
@@ -247,7 +272,7 @@ async fn generate_sub_queries(
     Ok(subs)
 }
 
-async fn prefetch_files_parallel(
+pub(crate) async fn prefetch_files_parallel(
     root: &Path,
     paths: &[String],
 ) -> Result<HashMap<String, String>> {

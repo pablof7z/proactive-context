@@ -1,7 +1,8 @@
-use crate::config::{config_dir, project_context_dir, project_pid_path, Config};
+use crate::config::{config_dir, normalize_path, project_context_dir, project_pid_path, Config};
 use crate::db::{content_hash, delete_chunks_for_path, index_stats, insert_chunks, open_db, open_db_at};
 use crate::embed::{build_embedder, Embedder};
 use crate::chunker::chunk_markdown;
+use crate::events::{log_event, new_pass};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -325,17 +326,28 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
         }
     }
 
-    println!("Found {} markdown files. Indexing...", files.len());
+    let file_count_before = files.len();
+    println!("Found {} markdown files. Indexing...", file_count_before);
 
-    for path in files {
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
-        if let Err(e) = index_single_file(root, conn, embedder, cfg, &path, &rel) {
+    for path in &files {
+        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        if let Err(e) = index_single_file(root, conn, embedder, cfg, path, &rel) {
             eprintln!("Warning: failed to index {}: {}", rel, e);
         }
     }
 
     let (file_count, chunk_count) = index_stats(conn)?;
     println!("Index complete: {} files, {} chunks", file_count, chunk_count);
+
+    // Emit daemon.index event (full phase)
+    let project = normalize_path(root);
+    new_pass(&project);
+    log_event("daemon.index", None, serde_json::json!({
+        "phase": "full",
+        "files": file_count,
+        "chunks": chunk_count
+    }));
+
     Ok(())
 }
 
@@ -439,6 +451,11 @@ pub fn run_daemon(root: &Path) -> Result<()> {
                     let mut unique = std::collections::HashSet::new();
                     pending.retain(|p| unique.insert(p.clone()));
 
+                    // Set a fresh req for this incremental pass
+                    let project = normalize_path(root);
+                    new_pass(&project);
+
+                    let mut updated_count = 0usize;
                     for abs_path in pending.drain(..) {
                         let rel = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_string_lossy().to_string();
 
@@ -448,13 +465,27 @@ pub fn run_daemon(root: &Path) -> Result<()> {
                                 eprintln!("Error removing chunks for deleted {}: {}", rel, e);
                             } else {
                                 println!("Removed: {}", rel);
+                                updated_count += 1;
                             }
                             continue;
                         }
 
                         match index_single_file(root, &conn, embedder.as_mut(), &cfg, &abs_path, &rel) {
-                            Ok(_) => println!("Updated: {}", rel),
+                            Ok(_) => {
+                                println!("Updated: {}", rel);
+                                updated_count += 1;
+                            }
                             Err(e) => eprintln!("Error reindexing {}: {}", rel, e),
+                        }
+                    }
+
+                    if updated_count > 0 {
+                        if let Ok((fc, cc)) = index_stats(&conn) {
+                            log_event("daemon.index", None, serde_json::json!({
+                                "phase": "incremental",
+                                "files": fc,
+                                "chunks": cc
+                            }));
                         }
                     }
                 }

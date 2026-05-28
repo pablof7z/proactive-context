@@ -1,6 +1,7 @@
 use crate::config::load_config;
 use crate::db::{open_db, open_db_at, vector_search, SearchHit};
 use crate::embed::build_embedder;
+use crate::events::{log_event, truncate};
 use anyhow::Result;
 use fastembed::{RerankerModel, RerankResult, TextRerank};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ pub struct QueryResult {
     pub path: String,
     pub chunk_index: i64,
     pub content: String,
+    #[allow(dead_code)]
     pub content_hash: String,
     /// Similarity score in 0..1 range (1 = perfect match). Computed as 1 - cosine_distance.
     pub score: f64,
@@ -27,6 +29,7 @@ fn global_db_path() -> Option<PathBuf> {
 }
 
 /// Run a semantic query against the local index, optionally also querying the global db.
+/// Emits query.start, retrieve.subquery (primary), retrieve.hit* events.
 pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: bool) -> Result<Vec<QueryResult>> {
     let cfg = load_config()?;
     let mut embedder = build_embedder(&cfg)?;
@@ -37,6 +40,21 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
             "No index found for this directory. Run `proactive-context init` first (in or pointing at this directory)."
         );
     }
+
+    // Emit query.start
+    log_event("query.start", None, serde_json::json!({
+        "query_chars": query.len(),
+        "top_k": top_k,
+        "rerank": rerank,
+        "global": global
+    }));
+
+    // Emit retrieve.subquery for this primary query
+    log_event("retrieve.subquery", None, serde_json::json!({
+        "index": 0,
+        "text": truncate(query, 200),
+        "kind": "primary"
+    }));
 
     // Embed the query once
     let q_embs = embedder.embed(&[query.to_string()])?;
@@ -97,15 +115,23 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
         merged.into_iter().take(top_k).collect()
     };
 
-    let results = final_hits
+    // Emit retrieve.hit for each returned result
+    let results: Vec<QueryResult> = final_hits
         .into_iter()
         .map(|h| {
+            let score = 1.0 - h.distance;
+            log_event("retrieve.hit", None, serde_json::json!({
+                "path": h.path,
+                "chunk_index": h.chunk_index,
+                "score": score,
+                "snippet": truncate(&h.content, 200)
+            }));
             QueryResult {
                 path: h.path,
                 chunk_index: h.chunk_index,
                 content: h.content,
                 content_hash: h.content_hash,
-                score: 1.0 - h.distance,
+                score,
             }
         })
         .collect();
@@ -113,10 +139,12 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
     Ok(results)
 }
 
-fn rerank_hits(hits: &[SearchHit], query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
+pub(crate) fn rerank_hits(hits: &[SearchHit], query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
     if hits.is_empty() {
         return Ok(vec![]);
     }
+
+    let candidates = hits.len();
 
     let mut reranker = TextRerank::try_new(
         fastembed::RerankInitOptions::new(RerankerModel::BGERerankerBase)
@@ -139,6 +167,15 @@ fn rerank_hits(hits: &[SearchHit], query: &str, top_k: usize) -> Result<Vec<Sear
         }
     }
 
+    let kept = reranked_hits.len();
+
+    // Emit retrieve.rerank
+    log_event("retrieve.rerank", None, serde_json::json!({
+        "candidates": candidates,
+        "kept": kept,
+        "model": "BGERerankerBase"
+    }));
+
     Ok(reranked_hits)
 }
 
@@ -158,15 +195,7 @@ pub fn print_results(results: &[QueryResult], root: &Path) {
             full_path.display(),
             r.chunk_index,
             r.score * 100.0,
-            truncate(&r.content, 280)
+            &truncate(&r.content, 280)
         );
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
     }
 }

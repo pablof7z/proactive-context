@@ -183,6 +183,7 @@ pub struct SearchHit {
     pub path: String,
     pub chunk_index: i64,
     pub content: String,
+    #[allow(dead_code)]
     pub content_hash: String,
     pub distance: f64,
 }
