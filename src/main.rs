@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
+mod archeologist;
 mod capture;
 mod chunker;
 mod config;
@@ -146,6 +147,39 @@ enum Commands {
         /// Also hit GET /api/v1/generation?id=<id> to check post-hoc cost endpoint
         #[arg(long)]
         with_generation: bool,
+    },
+
+    /// Bulk-historical capture: replay ~/.claude/projects/**/*.jsonl backlog through
+    /// the capture pipeline to retroactively populate the per-project wiki.
+    /// Without flags, opens an interactive project picker.
+    Archeologist {
+        /// Scope to exactly one project (real cwd path or normalized key). Bypasses picker.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only replay sessions whose first timestamp is >= DATE (YYYY-MM-DD or RFC3339).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Estimate only: scan, count, and print cost estimate — no LLM calls.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Across-projects parallelism (default 1 = serial). Implies line-log (no TUI).
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        jobs: usize,
+
+        /// Structural-maintenance checkpoint cadence in sessions (default 12).
+        #[arg(long, default_value_t = 12, value_name = "K")]
+        synth_every: usize,
+
+        /// Non-interactive: mine every project without the picker.
+        #[arg(long = "yes", alias = "all")]
+        yes: bool,
+
+        /// Also replay isSidechain/isMeta turns (default: skip).
+        #[arg(long)]
+        include_sidechains: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -312,6 +346,26 @@ fn main() -> Result<()> {
             let api_key = cfg.openrouter_api_key
                 .context("No openrouter_api_key in ~/.proactive-context/config.json")?;
             probe_openrouter(&api_key, &model, &prompt, with_generation)?;
+        }
+
+        Commands::Archeologist {
+            project,
+            since,
+            dry_run,
+            jobs,
+            synth_every,
+            yes,
+            include_sidechains,
+        } => {
+            crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
+                project,
+                since,
+                dry_run,
+                jobs,
+                synth_every,
+                yes,
+                include_sidechains,
+            })?;
         }
 
         Commands::Tail {

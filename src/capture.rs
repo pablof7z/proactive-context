@@ -16,7 +16,7 @@ use crate::config::{load_config, normalize_path};
 use crate::provider::{ModelSpec, Provider, build_ollama_client, build_openrouter_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
-use crate::transcript::{build_transcript_string, parse_transcript};
+use crate::transcript::{build_transcript_string, parse_transcript, parse_transcript_meta};
 use crate::wiki::{
     self, add_statement_to_section, guide_path, load_guide,
     new_guide, read_index, rebuild_index, revise_section, save_guide, slugify, wiki_dir,
@@ -33,6 +33,21 @@ struct CaptureInput {
     cwd: String,
     #[serde(default)]
     transcript_path: String,
+    /// Override the capture date (YYYY-MM-DD). `None` → uses `today()` (live hook default).
+    /// Set by `archeologist` to the session's real historical date.
+    #[serde(default)]
+    today_override: Option<String>,
+    /// When `true`, skip the per-session structural-maintenance block (bidir links, index
+    /// rebuild, db embed). Defaults to `false` → live hook behavior unchanged.
+    /// `archeologist` sets this for non-checkpoint sessions and runs maintenance at checkpoints.
+    #[serde(default)]
+    skip_structural_maintenance: bool,
+    /// When `true`, filter out `isSidechain` and `isMeta` turns before processing.
+    /// Defaults to `false` → live hook behavior unchanged (live path uses `parse_transcript`
+    /// which is blind to these flags). `archeologist` sets this to `true` (unless
+    /// `--include-sidechains` is given) so sidechain/meta chatter is not captured.
+    #[serde(default)]
+    filter_sidechains: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1358,15 +1373,36 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         return Ok(());
     }
 
-    let turns = match parse_transcript(&input.transcript_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("capture: transcript error: {}", e);
-            log_event("error", None, serde_json::json!({
-                "stage": "capture.start",
-                "message": truncate(&format!("transcript parse error: {}", e), 300)
-            }));
-            return Ok(());
+    // When `filter_sidechains` is set (archeologist path), use the richer parser and
+    // strip sub-agent / harness-meta turns before processing.  Otherwise use the fast
+    // parse_transcript path that capture.rs and inject.rs have always used (no change).
+    let turns: Vec<(String, String)> = if input.filter_sidechains {
+        match parse_transcript_meta(&input.transcript_path) {
+            Ok(msgs) => msgs
+                .into_iter()
+                .filter(|m| !m.is_sidechain && !m.is_meta)
+                .map(|m| (m.role, m.text))
+                .collect(),
+            Err(e) => {
+                eprintln!("capture: transcript error: {}", e);
+                log_event("error", None, serde_json::json!({
+                    "stage": "capture.start",
+                    "message": truncate(&format!("transcript parse error: {}", e), 300)
+                }));
+                return Ok(());
+            }
+        }
+    } else {
+        match parse_transcript(&input.transcript_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("capture: transcript error: {}", e);
+                log_event("error", None, serde_json::json!({
+                    "stage": "capture.start",
+                    "message": truncate(&format!("transcript parse error: {}", e), 300)
+                }));
+                return Ok(());
+            }
         }
     };
 
@@ -1415,7 +1451,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
 
     let proj_dir = project_dir_from_cwd(&input.cwd);
     let wiki_path = wiki_dir(&proj_dir);
-    let today_str = today();
+    let today_str = input.today_override.clone().unwrap_or_else(today);
 
     // Fast triage (with wiki index for "already specified" check — spec Open Q5)
     if !cfg.capture_triage_model.is_empty() {
@@ -1521,33 +1557,12 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
-    // Structural maintenance: run once after the loop.
-    // Deviation from literal spec (per-call): per-call bidir+index+embed would be redundant
-    // since wiki_list scans live files and all tools use point-in-time reads.
-    // The final state is identical to what per-call would produce.
-    if wiki_path.exists() {
-        let link_count = wiki::enforce_bidirectional_links(&wiki_path, &today_str)
-            .unwrap_or_else(|e| { eprintln!("capture: bidir links failed: {}", e); 0 });
-        if link_count > 0 {
-            eprintln!("capture: added {} bidirectional link(s)", link_count);
-        }
-
-        match rebuild_index(&wiki_path, &today_str) {
-            Ok(rows) => {
-                log_event("wiki.index_read", None, serde_json::json!({
-                    "guide_count": rows.len(),
-                    "action": "rebuilt"
-                }));
-                eprintln!("capture: rebuilt _index.md ({} guide(s))", rows.len());
-            }
-            Err(e) => eprintln!("capture: index rebuild failed: {}", e),
-        }
-
-        let db_path = proj_dir.join("index.db");
-        match index_files_into_db(&wiki_path, &db_path) {
-            Ok(_) => eprintln!("capture: indexed wiki into index.db"),
-            Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
-        }
+    // Structural maintenance: run once after the loop unless suppressed.
+    // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
+    // archeologist calls `run_structural_maintenance` directly at checkpoints.
+    // Default (false) → live hook behavior unchanged byte-for-byte.
+    if !input.skip_structural_maintenance {
+        run_structural_maintenance(&wiki_path, &proj_dir, &today_str);
     }
 
     log_event("capture.done", Some(capture_start.elapsed().as_millis() as u64), serde_json::json!({
@@ -1555,6 +1570,89 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     }));
 
     Ok(())
+}
+
+// ─── Structural maintenance helper ───────────────────────────────────────────
+
+/// Run the three post-session maintenance passes: bidirectional links, `_index.md`
+/// rebuild, and `index.db` re-embed. Called after every session in the live hook path
+/// and at checkpoints by `archeologist`.
+pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, today: &str) {
+    if !wiki_path.exists() {
+        return;
+    }
+    let link_count = wiki::enforce_bidirectional_links(wiki_path, today)
+        .unwrap_or_else(|e| { eprintln!("capture: bidir links failed: {}", e); 0 });
+    if link_count > 0 {
+        eprintln!("capture: added {} bidirectional link(s)", link_count);
+    }
+
+    match rebuild_index(wiki_path, today) {
+        Ok(rows) => {
+            log_event("wiki.index_read", None, serde_json::json!({
+                "guide_count": rows.len(),
+                "action": "rebuilt"
+            }));
+            eprintln!("capture: rebuilt _index.md ({} guide(s))", rows.len());
+        }
+        Err(e) => eprintln!("capture: index rebuild failed: {}", e),
+    }
+
+    let db_path = proj_dir.join("index.db");
+    match index_files_into_db(wiki_path, &db_path) {
+        Ok(_) => eprintln!("capture: indexed wiki into index.db"),
+        Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
+    }
+}
+
+// ─── archeologist entry point ─────────────────────────────────────────────────
+
+/// Drive capture for one historical session. Called by `archeologist`.
+///
+/// Parameters:
+/// - `session_id` — transcript basename (without extension)
+/// - `cwd` — the real cwd from inside the transcript
+/// - `transcript_path` — absolute path to the JSONL file
+/// - `today_override` — YYYY-MM-DD derived from the session's first timestamp
+/// - `skip_maint` — true for non-checkpoint sessions; archeologist calls
+///   `run_structural_maintenance` directly at K-session checkpoints
+/// - `filter_sidechains` — true to strip `isSidechain`/`isMeta` turns (archeologist default)
+pub(crate) fn run_capture_for_archeologist(
+    session_id: &str,
+    cwd: &str,
+    transcript_path: &str,
+    today_override: Option<String>,
+    skip_maint: bool,
+    filter_sidechains: bool,
+) -> Result<()> {
+    run_capture_from_input(CaptureInput {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        transcript_path: transcript_path.to_string(),
+        today_override,
+        skip_structural_maintenance: skip_maint,
+        filter_sidechains,
+    })
+}
+
+/// Expose `project_dir_from_cwd` for `archeologist`'s checkpoint maintenance calls.
+pub(crate) fn archeologist_project_dir(cwd: &str) -> std::path::PathBuf {
+    project_dir_from_cwd(cwd)
+}
+
+/// Expose the captured-sessions directory for the archeologist picker's "New" count.
+#[allow(dead_code)] // available to archeologist; currently uses archeologist_is_already_captured instead
+pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
+    captured_sessions_dir()
+}
+
+/// Expose `is_already_captured` for archeologist's work-list filtering.
+/// A session is "new" when this returns false.
+pub(crate) fn archeologist_is_already_captured(session_id: &str) -> bool {
+    // We don't know the exchange count in the picker phase; use 0 so any existing marker
+    // causes a skip (markers only grow). On actual replay, `run_capture_from_input`
+    // re-checks with the real exchange count.
+    is_already_captured(session_id, 0)
 }
 
 // ─── SessionEnd entry point ───────────────────────────────────────────────────
@@ -1721,5 +1819,8 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
         session_id: pending.session_id,
         cwd: pending.cwd,
         transcript_path: pending.transcript_path,
+        today_override: None,
+        skip_structural_maintenance: false,
+        filter_sidechains: false,
     })
 }
