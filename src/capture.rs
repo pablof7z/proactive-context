@@ -190,7 +190,7 @@ fn acquire_project_wiki_lock(project_key: &str) -> Result<fs::File> {
 
 // ─── Unix timestamp helper ───────────────────────────────────────────────────
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -231,7 +231,7 @@ fn civil_date_from_days(days: i64) -> String {
 }
 
 /// RFC3339-ish timestamp (UTC). No chrono dep — hand-rolled from epoch secs.
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -251,7 +251,7 @@ fn rfc3339_now() -> String {
 
 // ─── LLM completion (blocking, OpenAI-compat) ────────────────────────────────
 
-fn call_model_blocking(
+pub(crate) fn call_model_blocking(
     spec: &ModelSpec,
     openrouter_api_key: &str,
     ollama_base_url: &str,
@@ -1606,6 +1606,20 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // Doing this after the loop means a pre-write API failure doesn't permanently suppress retry.
     let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
 
+    // Open-question extraction: detect undefined nouns in the transcript for the
+    // SessionStart hook to resolve in the next session. Skip in archeologist bulk mode.
+    if !input.skip_structural_maintenance {
+        extract_open_questions(
+            &triage_spec,
+            &openrouter_api_key,
+            &ollama_base_url,
+            ollama_api_key.as_deref(),
+            &wiki_path,
+            &proj_dir,
+            &plain_ts,
+        );
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
@@ -1619,6 +1633,110 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     }));
 
     Ok(())
+}
+
+// ─── Open-question extraction ─────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub(crate) struct OpenQuestion {
+    pub noun: String,
+    pub slug: String,
+    pub question: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OpenQuestionsFile {
+    generated_at: String,
+    questions: Vec<OpenQuestion>,
+}
+
+fn extract_open_questions(
+    triage_spec: &crate::provider::ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    wiki_path: &std::path::Path,
+    proj_dir: &std::path::Path,
+    plain_ts: &str,
+) {
+    let index_rows = read_index(wiki_path);
+    let wiki_index = if index_rows.is_empty() {
+        "(empty — no guides yet)".to_string()
+    } else {
+        index_rows.iter()
+            .map(|r| format!("  {} | {} | {}", r.slug, r.title, r.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let tail_start = plain_ts.len().saturating_sub(6000);
+    let transcript_tail = &plain_ts[tail_start..];
+
+    let system = "You identify undefined concepts in software project conversations. \
+                  Return ONLY valid JSON, nothing else.";
+    let user = format!(
+        "WIKI INDEX (already documented concepts):\n{wiki_index}\n\n\
+         TRANSCRIPT (tail):\n{transcript_tail}\n\n\
+         List up to 8 nouns or named concepts used in this transcript that are NOT \
+         described in the wiki index above. Skip generic programming words. \
+         Return ONLY valid JSON array: \
+         [{{\"noun\": \"TUI client\", \"slug\": \"tui-client\", \
+         \"question\": \"What is the TUI client in this project?\"}}]\n\n\
+         If nothing meaningful is missing, return: []"
+    );
+
+    let raw = match call_model_blocking(triage_spec, openrouter_api_key, ollama_base_url, ollama_api_key, system, &user) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("capture: open-question extraction failed: {}", e);
+            return;
+        }
+    };
+
+    // Strip markdown code fences if present
+    let cleaned = raw.trim();
+    let cleaned = cleaned.strip_prefix("```json").unwrap_or(cleaned);
+    let cleaned = cleaned.strip_prefix("```").unwrap_or(cleaned);
+    let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+
+    let new_questions: Vec<OpenQuestion> = match serde_json::from_str(cleaned) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("capture: open-question parse failed: {} | raw: {}", e, &cleaned[..cleaned.len().min(200)]);
+            return;
+        }
+    };
+
+    if new_questions.is_empty() {
+        eprintln!("capture: open-question extraction found nothing new");
+        return;
+    }
+
+    // Merge with existing questions, deduplicating by slug
+    let oq_path = proj_dir.join("open-questions.json");
+    let mut existing: Vec<OpenQuestion> = std::fs::read_to_string(&oq_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<OpenQuestionsFile>(&s).ok())
+        .map(|f| f.questions)
+        .unwrap_or_default();
+
+    for q in &new_questions {
+        if !existing.iter().any(|e| e.slug == q.slug) {
+            existing.push(q.clone());
+        }
+    }
+
+    let file = OpenQuestionsFile { generated_at: rfc3339_now(), questions: existing };
+    match serde_json::to_string_pretty(&file) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&oq_path, json) {
+                eprintln!("capture: failed to write open-questions.json: {}", e);
+            } else {
+                eprintln!("capture: wrote {} open question(s) to open-questions.json", new_questions.len());
+            }
+        }
+        Err(e) => eprintln!("capture: failed to serialize open-questions: {}", e),
+    }
 }
 
 // ─── Structural maintenance helper ───────────────────────────────────────────

@@ -4,7 +4,10 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod archeologist;
+mod autodoc;
+mod awareness;
 mod capture;
+mod session_start;
 mod chunker;
 mod config;
 mod configure;
@@ -126,6 +129,24 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Cross-agent awareness hook (invoked from Claude Code hooks). Reads the hook
+    /// JSON ({ session_id, cwd, transcript_path, prompt }) from stdin. On PostToolUse,
+    /// prints peer-delta additionalContext; other hooks run side-effects only.
+    /// Always exits 0; never blocks a prompt or tool.
+    Awareness {
+        /// Which hook fired: UserPromptSubmit | PostToolUse | Stop | SessionEnd.
+        #[arg(long)]
+        hook: Option<String>,
+
+        // Internal: run the detached intent distill for this session_id.
+        #[arg(long, hide = true)]
+        distill: Option<String>,
+
+        // Internal: cwd to locate the per-repo agents.db for --distill.
+        #[arg(long, hide = true)]
+        cwd: Option<String>,
+    },
+
     /// Render a one-line Claude Code status bar indicator (invoked via statusLine.command).
     /// Reads the Claude Code status-line JSON from stdin; prints one styled line to stdout.
     /// Always exits 0. No LLM, no network, sub-10ms.
@@ -226,6 +247,25 @@ enum Commands {
         /// Force the non-interactive streaming printer even on a TTY (escape hatch; disables TUI)
         #[arg(long)]
         plain: bool,
+    },
+
+    /// Fired by the Claude Code SessionStart hook. Reads open questions from the previous
+    /// session and dispatches background autodoc agents for undefined concepts.
+    /// Reads { session_id, cwd, source } JSON from stdin. Always exits 0.
+    SessionStart,
+
+    /// Auto-document an undefined concept by reading the project codebase.
+    /// Internal — spawned by session-start. Writes a low-confidence definition guide.
+    Autodoc {
+        /// The noun/concept to document (e.g. "TUI client")
+        #[arg(long)]
+        noun: String,
+        /// The question to answer (e.g. "What is the TUI client in this project?")
+        #[arg(long)]
+        question: String,
+        /// Project working directory
+        #[arg(long)]
+        cwd: std::path::PathBuf,
     },
 }
 
@@ -345,6 +385,18 @@ fn main() -> Result<()> {
             crate::inject::run_inject(verbose)?;
         }
 
+        Commands::Awareness { hook, distill, cwd } => {
+            if let Some(session_id) = distill {
+                // Detached worker spawned by a hook tick.
+                let cwd = cwd.unwrap_or_default();
+                if let Err(e) = crate::awareness::run_distill(&session_id, &cwd) {
+                    eprintln!("awareness distill: {}", e);
+                }
+            } else if let Some(hook) = hook {
+                let _ = crate::awareness::run_hook(&hook);
+            }
+        }
+
         Commands::Statusline { with_context } => {
             crate::statusline::run_statusline(with_context);
             // run_statusline calls process::exit(0) — never returns
@@ -407,6 +459,14 @@ fn main() -> Result<()> {
                 ascii,
                 plain,
             )?;
+        }
+
+        Commands::SessionStart => {
+            crate::session_start::run_session_start()?;
+        }
+
+        Commands::Autodoc { noun, question, cwd } => {
+            crate::autodoc::run_autodoc(&noun, &question, &cwd)?;
         }
     }
 
