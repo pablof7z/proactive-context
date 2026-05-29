@@ -49,14 +49,14 @@ struct Role {
 const ROLES: &[Role] = &[
     Role {
         key: "generate_model",
-        label: "Ask",
-        description: "Answers your questions by reading your notes (multi-turn, uses tools)",
+        label: "pc generate",
+        description: "`pc generate \"question\"` — answers from your notes, can read files",
         suggestion: "→ Use a capable model  e.g. sonnet, gpt-4o, llama3.3:70b",
     },
     Role {
         key: "decompose_model",
-        label: "Search",
-        description: "Splits your question into multiple searches to find more relevant notes",
+        label: "pc generate (search)",
+        description: "Splits your question into sub-searches to find more notes (part of generate)",
         suggestion: "→ Use a fast/cheap model  e.g. haiku, gpt-4o-mini, qwen2.5:7b",
     },
     Role {
