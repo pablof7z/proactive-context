@@ -1,5 +1,5 @@
-use crate::config::{config_dir, normalize_path, project_context_dir, project_pid_path, Config};
-use crate::db::{content_hash, delete_chunks_for_path, index_stats, insert_chunks, open_db, open_db_at};
+use crate::config::{config_dir, normalize_path, project_context_dir, project_db_path, project_pid_path, Config};
+use crate::db::{content_hash, delete_chunks_for_path, index_stats, indexed_paths, insert_chunks, open_db, open_db_at};
 use crate::embed::{build_embedder, Embedder};
 use crate::chunker::chunk_markdown;
 use crate::events::{log_event, new_pass};
@@ -62,6 +62,42 @@ impl std::fmt::Display for AlreadyRunning {
 }
 
 impl std::error::Error for AlreadyRunning {}
+
+/// RAII guard that holds an indexing lock on a DB file (`.db.indexing`).
+/// Dropped when the guard goes out of scope.
+pub struct IndexLock {
+    path: PathBuf,
+}
+
+impl IndexLock {
+    /// Try to acquire. Returns Err if another process is already indexing.
+    pub fn acquire(db_path: &Path) -> Result<Self> {
+        let lock_path = db_path.with_extension("db.indexing");
+        let current_pid = std::process::id() as i32;
+
+        if lock_path.exists() {
+            if let Ok(content) = fs::read_to_string(&lock_path) {
+                if let Ok(pid) = content.trim().parse::<i32>() {
+                    if pid != current_pid && is_process_alive(pid) {
+                        anyhow::bail!("Indexing already in progress (PID {}). Wait for it to finish or kill it first.", pid);
+                    }
+                }
+            }
+            let _ = fs::remove_file(&lock_path);
+        }
+
+        let tmp = lock_path.with_extension("db.indexing.tmp");
+        fs::write(&tmp, format!("{}\n", current_pid))?;
+        fs::rename(&tmp, &lock_path)?;
+        Ok(Self { path: lock_path })
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 /// Try to acquire the daemon lock. Returns Ok(()) if we are the owner.
 /// If another live daemon is running, returns `Err(AlreadyRunning { pid })`.
@@ -326,6 +362,18 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
         }
     }
 
+    // Sweep: remove DB entries for files that no longer exist on disk.
+    if let Ok(db_paths) = indexed_paths(conn) {
+        for rel in db_paths {
+            let abs = root.join(&rel);
+            if !abs.exists() {
+                if let Err(e) = delete_chunks_for_path(conn, &rel) {
+                    eprintln!("Warning: failed to remove stale entry {}: {}", rel, e);
+                }
+            }
+        }
+    }
+
     let total = files.len();
     eprintln!("Found {} markdown files. Indexing...", total);
 
@@ -418,8 +466,10 @@ pub fn run_daemon(root: &Path) -> Result<()> {
 
     let conn = open_db(root, embedder.as_ref())?;
 
-    // Initial full index (idempotent)
+    // Initial full index (idempotent) — guard against concurrent index-files runs
+    let _index_lock = IndexLock::acquire(&project_db_path(root))?;
     full_index(root, &conn, embedder.as_mut(), &cfg)?;
+    drop(_index_lock);
 
     // --- File watcher ---
     let (tx, rx) = std_channel();
@@ -509,6 +559,8 @@ pub fn run_daemon(root: &Path) -> Result<()> {
 /// Index all .md files in `src_dir` (recursively) into the database at `db_path`.
 /// This is a one-shot, no-daemon function used by the `index-files` subcommand.
 pub fn index_files_into_db(src_dir: &Path, db_path: &Path) -> Result<()> {
+    let _index_lock = IndexLock::acquire(db_path)?;
+
     let cfg = crate::config::load_config()?;
     let mut embedder = build_embedder(&cfg)?;
 

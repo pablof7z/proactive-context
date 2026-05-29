@@ -135,6 +135,15 @@ pub fn delete_chunks_for_path(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Return all distinct file paths currently in the index.
+pub fn indexed_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT path FROM vec_chunks")?;
+    let paths = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(paths)
+}
+
 /// Insert a batch of chunks + their embeddings for one file.
 /// This should be called inside a transaction for atomicity.
 pub fn insert_chunks(
