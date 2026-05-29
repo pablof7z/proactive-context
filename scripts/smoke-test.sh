@@ -109,13 +109,13 @@ log_step "Building binary (cargo build --quiet)"
 cd "$PROJECT_ROOT"
 cargo build --quiet 2>&1 | tail -n 5 || fail "cargo build failed"
 
-BIN="$PROJECT_ROOT/target/debug/proactive-context"
+BIN="$PROJECT_ROOT/target/debug/pc"
 if [ ! -x "$BIN" ]; then
-  # Some Rust setups produce the binary under a different name; try common variants
-  if [ -x "$PROJECT_ROOT/target/debug/proactive_context" ]; then
-    BIN="$PROJECT_ROOT/target/debug/proactive_context"
+  # Fall back to the legacy binary name if an older build is present.
+  if [ -x "$PROJECT_ROOT/target/debug/proactive-context" ]; then
+    BIN="$PROJECT_ROOT/target/debug/proactive-context"
   else
-    fail "Could not find executable binary after build (looked for proactive-context / proactive_context)"
+    fail "Could not find executable binary after build (looked for pc / proactive-context)"
   fi
 fi
 

@@ -4,7 +4,7 @@
 # into the DB to simulate a completed distill). Exercises every delta path.
 set -uo pipefail
 
-BIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug/proactive-context"
+BIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug/pc"
 TMP="$(mktemp -d /tmp/pc-aw-XXXXXX)"
 export HOME="$TMP"           # redirects ~/.proactive-context into the sandbox
 REPO="$TMP/repo"
