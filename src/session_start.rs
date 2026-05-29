@@ -30,7 +30,7 @@ pub fn run_session_start() -> Result<()> {
 
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
     let proj_dir = project_context_dir(&root);
-    let wiki_path = wiki_dir(&proj_dir);
+    let wiki_path = wiki_dir(&root); // wiki lives at <project>/docs/wiki/
 
     let oq_path = proj_dir.join("open-questions.json");
     let questions: Vec<OpenQuestion> = match fs::read_to_string(&oq_path) {
