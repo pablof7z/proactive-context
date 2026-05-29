@@ -268,6 +268,16 @@ fn maybe_rotate(path: &PathBuf, max_bytes: u64, retention: usize) {
     drop(lock_file);
 }
 
+/// Return (current_req_id, events_log_path) — used by openrouter.rs for sidecar naming.
+pub fn log_cfg_path_and_req() -> (String, std::path::PathBuf) {
+    let req = ctx()
+        .read()
+        .map(|c| c.req.clone())
+        .unwrap_or_else(|_| "unknown".into());
+    let path = log_cfg().path.clone();
+    (req, path)
+}
+
 /// Truncate a string to at most `max` bytes (UTF-8 safe), appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {

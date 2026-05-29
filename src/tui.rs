@@ -353,6 +353,9 @@ fn event_ratatui_style(event: &str) -> Style {
         "capture.lesson" => Style::default().fg(Color::Green),
         "synth.write" => Style::default().fg(Color::Magenta),
         "daemon.index" => Style::default().add_modifier(Modifier::DIM),
+        "llm.request" => Style::default().fg(Color::Blue),
+        "llm.response" => Style::default().fg(Color::Cyan),
+        "llm.error" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         "error" => Style::default()
             .fg(Color::Red)
             .add_modifier(Modifier::BOLD),
@@ -575,6 +578,9 @@ fn render_modal_event_detail(
 
     // Event-specific enrichment
     match ev.event.as_str() {
+        "llm.request" | "llm.response" => {
+            lines.extend(llm_sidecar_lines(ev));
+        }
         "generate.briefing" => {
             lines.push(Line::from(Span::styled(
                 "  note: (full briefing text was sent to the session and is not persisted in the log)",
@@ -617,6 +623,113 @@ fn render_modal_event_detail(
 
     let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(para, area);
+}
+
+/// Read the sidecar JSON for llm.request/llm.response and render the full prompt+completion.
+fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    // The sidecar path is stored in the payload of llm.response (not llm.request)
+    let sidecar_path = ev.payload.get("sidecar").and_then(|v| v.as_str());
+    let path_to_try = sidecar_path.map(|s| std::path::PathBuf::from(s));
+
+    let sidecar = path_to_try.and_then(|p| {
+        std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    });
+
+    if let Some(sc) = sidecar {
+        // Show usage + cost
+        if let Some(usage) = sc.pointer("/response/usage") {
+            let pt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+            let ct = usage["completion_tokens"].as_u64().unwrap_or(0);
+            let cost = usage["cost"].as_f64();
+            let cost_str = cost
+                .map(|c| format!("  ${:.7}", c))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("  tokens: {}pt / {}ct{}", pt, ct, cost_str),
+                Style::default().fg(Color::LightCyan),
+            )));
+        }
+
+        // Show request messages
+        lines.push(Line::from(Span::styled(
+            "prompt messages:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if let Some(msgs) = sc.pointer("/request/messages").and_then(|v| v.as_array()) {
+            for msg in msgs {
+                let role = msg["role"].as_str().unwrap_or("?");
+                let content = msg["content"].as_str().unwrap_or("");
+                let role_style = match role {
+                    "system" => Style::default().fg(Color::DarkGray),
+                    "user" => Style::default().fg(Color::Yellow),
+                    "assistant" => Style::default().fg(Color::Cyan),
+                    "tool" => Style::default().fg(Color::Green),
+                    _ => Style::default(),
+                };
+                for (i, chunk) in content.chars().collect::<Vec<_>>().chunks(120).enumerate() {
+                    let prefix = if i == 0 {
+                        format!("  [{role}] ")
+                    } else {
+                        "         ".to_string()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, role_style),
+                        Span::styled(chunk.iter().collect::<String>(), Style::default()),
+                    ]));
+                    if i >= 4 { // cap at 5 lines per message
+                        if content.len() > 600 {
+                            lines.push(Line::from(Span::styled(
+                                format!("         … ({} chars total)", content.len()),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Show response content
+        if let Some(resp_content) = sc.pointer("/response/content").and_then(|v| v.as_str()) {
+            if !resp_content.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "response:",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, chunk) in resp_content.chars().collect::<Vec<_>>().chunks(120).enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", chunk.iter().collect::<String>()),
+                        Style::default().fg(Color::LightGreen),
+                    )));
+                    if i >= 8 {
+                        if resp_content.len() > 1080 {
+                            lines.push(Line::from(Span::styled(
+                                format!("  … ({} chars total)", resp_content.len()),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    } else if sidecar_path.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  (sidecar not yet written — available on llm.response events)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  (sidecar not readable: {})", sidecar_path.unwrap_or("")),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines
 }
 
 fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'static>> {

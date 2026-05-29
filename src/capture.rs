@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use rig_core::client::CompletionClient;
 use rig_core::completion::{Prompt, ToolDefinition};
-use rig_core::providers::openrouter;
 use rig_core::tool::Tool;
 use tokio::runtime::Runtime;
 
 use crate::config::{load_config, normalize_path};
+use crate::provider::{ModelSpec, Provider, build_ollama_client, build_openrouter_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
 use crate::transcript::{build_transcript_string, parse_transcript};
@@ -222,15 +222,36 @@ fn rfc3339_now() -> String {
     format!("{}T{:02}:{:02}:{:02}Z", date, h, min, s)
 }
 
-// ─── OpenRouter (blocking) ────────────────────────────────────────────────────
+// ─── LLM completion (blocking, OpenAI-compat) ────────────────────────────────
 
-fn call_openrouter(api_key: &str, model: &str, system: &str, user_msg: &str) -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
+fn call_model_blocking(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    system: &str,
+    user_msg: &str,
+) -> Result<String> {
+    let (url, auth_header) = match spec.provider {
+        Provider::OpenRouter => (
+            "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            Some(format!("Bearer {}", openrouter_api_key)),
+        ),
+        Provider::Ollama => (
+            format!(
+                "{}/v1/chat/completions",
+                ollama_base_url.trim_end_matches('/')
+            ),
+            ollama_api_key.map(|k| format!("Bearer {}", k)),
+        ),
+    };
+
+    let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
     let body = serde_json::json!({
-        "model": model,
+        "model": spec.model,
         "temperature": 0,
         "messages": [
             { "role": "system", "content": system },
@@ -242,15 +263,17 @@ fn call_openrouter(api_key: &str, model: &str, system: &str, user_msg: &str) -> 
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let send_result = client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .header("X-Title", "proactive-context")
-            .json(&body)
-            .send();
+        let mut req = http
+            .post(&url)
+            .header("Content-Type", "application/json");
+        if let Some(ref auth) = auth_header {
+            req = req.header("Authorization", auth);
+        }
+        if spec.provider == Provider::OpenRouter {
+            req = req.header("X-Title", "proactive-context");
+        }
 
-        match send_result {
+        match req.json(&body).send() {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -265,9 +288,9 @@ fn call_openrouter(api_key: &str, model: &str, system: &str, user_msg: &str) -> 
                 let snippet = text[..text.len().min(300)].to_string();
                 let transient = status.as_u16() == 429 || status.is_server_error();
                 if !transient || attempt == MAX_ATTEMPTS {
-                    anyhow::bail!("OpenRouter {}: {}", status, snippet);
+                    anyhow::bail!("{} error {}: {}", spec.provider_name(), status, snippet);
                 }
-                last_err = Some(anyhow::anyhow!("OpenRouter {}: {}", status, snippet));
+                last_err = Some(anyhow::anyhow!("{} error {}: {}", spec.provider_name(), status, snippet));
             }
             Err(e) => {
                 if attempt == MAX_ATTEMPTS {
@@ -278,18 +301,25 @@ fn call_openrouter(api_key: &str, model: &str, system: &str, user_msg: &str) -> 
         }
 
         eprintln!(
-            "capture: OpenRouter call failed (attempt {}/{}), retrying…",
-            attempt, MAX_ATTEMPTS
+            "capture: {} call failed (attempt {}/{}), retrying…",
+            spec.provider_name(), attempt, MAX_ATTEMPTS
         );
         std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("OpenRouter call failed")))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{} call failed", spec.provider_name())))
 }
 
 // ─── Triage ───────────────────────────────────────────────────────────────────
 
-fn triage_transcript(api_key: &str, model: &str, transcript: &str, wiki_index: &str) -> Result<bool> {
+fn triage_transcript(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    transcript: &str,
+    wiki_index: &str,
+) -> Result<bool> {
     let system = "You scan AI coding assistant conversations for durable lessons worth capturing.";
     let wiki_note = if !wiki_index.is_empty() {
         format!("\n\nCURRENT WIKI INDEX (for 'already specified' check):\n{}", wiki_index)
@@ -309,7 +339,7 @@ fn triage_transcript(api_key: &str, model: &str, transcript: &str, wiki_index: &
         specified in the wiki above.{wiki_note}\n\n\
         TRANSCRIPT:\n{transcript}"
     );
-    let raw = call_openrouter(api_key, model, system, &user_msg)?;
+    let raw = call_model_blocking(spec, openrouter_api_key, ollama_base_url, ollama_api_key, system, &user_msg)?;
     let answer = raw.trim().lines().next().unwrap_or("").to_uppercase();
     Ok(answer.starts_with("YES"))
 }
@@ -1226,41 +1256,54 @@ Do NOT create global/user-preference entries. Project-scoped spec facts only.\n\
 Do NOT capture purely transient facts (one-off debugging steps that resolved).\n";
 
 async fn run_wiki_agent(
-    api_key: &str,
-    model: &str,
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
     max_turns: usize,
     ctx: Arc<WikiAgentCtx>,
     numbered_transcript: &str,
 ) -> Result<String> {
-    let client = openrouter::Client::new(api_key.to_string())?;
-
     let preamble = format!(
         "{}\n\n## LINE-NUMBERED TRANSCRIPT\n\n{}",
         WIKI_AGENT_PREAMBLE, numbered_transcript
     );
 
-    let agent = client
-        .agent(model)
-        .preamble(&preamble)
-        .max_tokens(2000u64)
-        // Pass max_tokens via additional_params so OpenRouter forwards it to Anthropic
-        // (rig's openrouter client doesn't include max_tokens in its request struct).
-        .additional_params(serde_json::json!({"max_tokens": 2000}))
-        .tool(WikiListTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiReadTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiCreateTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiAddStatementTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiReviseStatementTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiRemoveStatementTool { ctx: Arc::clone(&ctx) })
-        .tool(WikiLinkTool { ctx: Arc::clone(&ctx) })
-        .default_max_turns(max_turns)
-        .build();
+    macro_rules! build_agent {
+        ($client:expr) => {
+            $client
+                .agent(&spec.model)
+                .preamble(&preamble)
+                .max_tokens(2000u64)
+                .additional_params(serde_json::json!({"max_tokens": 2000}))
+                .tool(WikiListTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiReadTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiCreateTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiAddStatementTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiReviseStatementTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiRemoveStatementTool { ctx: Arc::clone(&ctx) })
+                .tool(WikiLinkTool { ctx: Arc::clone(&ctx) })
+                .default_max_turns(max_turns)
+                .build()
+        };
+    }
 
-    let response: String = agent
-        .prompt("Analyze this conversation and update the wiki to capture all product spec facts, decisions, and requirements. Be thorough.")
-        .await?;
+    let agent_result: String = match spec.provider {
+        Provider::OpenRouter => {
+            let client = build_openrouter_client(openrouter_api_key)?;
+            build_agent!(client)
+                .prompt("Analyze this conversation and update the wiki to capture all product spec facts, decisions, and requirements. Be thorough.")
+                .await?
+        }
+        Provider::Ollama => {
+            let client = build_ollama_client(ollama_base_url, ollama_api_key)?;
+            build_agent!(client)
+                .prompt("Analyze this conversation and update the wiki to capture all product spec facts, decisions, and requirements. Be thorough.")
+                .await?
+        }
+    };
 
-    Ok(response)
+    Ok(agent_result)
 }
 
 // ─── Core capture logic ───────────────────────────────────────────────────────
@@ -1289,13 +1332,20 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         return Ok(());
     }
 
-    let api_key = match cfg.openrouter_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
-            eprintln!("capture: no openrouter_api_key — skipping");
-            return Ok(());
-        }
-    };
+    let capture_spec = ModelSpec::parse(&cfg.capture_model);
+    let triage_spec = ModelSpec::parse(&cfg.capture_triage_model);
+
+    let openrouter_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+
+    let needs_key = capture_spec.needs_openrouter_key()
+        || (!cfg.capture_triage_model.is_empty() && triage_spec.needs_openrouter_key());
+    if needs_key && openrouter_api_key.is_empty() {
+        eprintln!("capture: no openrouter_api_key — skipping");
+        return Ok(());
+    }
+
     let model = cfg.capture_model.clone();
     let max_turns = cfg.capture_max_turns;
 
@@ -1384,7 +1434,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
                 .join("\n")
         };
 
-        match triage_transcript(&api_key, &cfg.capture_triage_model, &plain_ts, &wiki_index_text) {
+        match triage_transcript(&triage_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(), &plain_ts, &wiki_index_text) {
             Ok(worth_it) => {
                 if !worth_it {
                     eprintln!("capture: triage says nothing worth capturing — skipping");
@@ -1444,7 +1494,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         let timeout = std::time::Duration::from_secs(300); // 5 min max
         tokio::time::timeout(
             timeout,
-            run_wiki_agent(&api_key, &model, max_turns, Arc::clone(&ctx), &truncated_numbered)
+            run_wiki_agent(&capture_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(), max_turns, Arc::clone(&ctx), &truncated_numbered)
         ).await
     });
 

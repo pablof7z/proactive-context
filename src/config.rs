@@ -6,10 +6,21 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// OpenRouter API key (required for generate and optional for OpenRouter embeddings)
+    /// OpenRouter API key (required when any model uses the "openrouter:" provider)
     pub openrouter_api_key: Option<String>,
 
-    /// Model to use for the `generate` command (e.g. "anthropic/claude-3-5-sonnet-20241022")
+    /// Base URL for Ollama (used when any model spec is "ollama:<model>").
+    /// Defaults to the standard local Ollama address. Override for cloud/remote instances.
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+
+    /// Optional API key for Ollama (for secured or cloud Ollama deployments).
+    /// Leave unset for standard local Ollama which requires no authentication.
+    pub ollama_api_key: Option<String>,
+
+    /// Model to use for the `generate` command.
+    /// Format: "provider:model" (e.g. "openrouter:anthropic/claude-3-5-sonnet-20241022"
+    /// or "ollama:llama3.2"). Provider prefix is optional; unprefixed strings default to openrouter.
     #[serde(default = "default_generate_model")]
     pub generate_model: String,
 
@@ -42,7 +53,7 @@ pub struct Config {
     pub max_parallel_prefetch: usize,
 
     /// Cheap/fast model used for query decomposition into sub-queries (fan-out).
-    /// Recommended: a low-cost model like "openai/gpt-4o-mini" or equivalent.
+    /// Accepts "provider:model" format (e.g. "ollama:qwen2.5:7b" or "openrouter:openai/gpt-4o-mini").
     #[serde(default = "default_decompose_model")]
     pub decompose_model: String,
 
@@ -165,6 +176,10 @@ pub struct Config {
 
 fn default_generate_model() -> String {
     "anthropic/claude-3-5-sonnet-20241022".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
 }
 
 fn default_embed_provider() -> String {
@@ -442,6 +457,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             openrouter_api_key: None,
+            ollama_base_url: default_ollama_base_url(),
+            ollama_api_key: None,
             generate_model: default_generate_model(),
             embed_provider: default_embed_provider(),
             embed_model: default_embed_model(),

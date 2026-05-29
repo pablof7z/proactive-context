@@ -81,6 +81,9 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
             "guide.create" => "+>",
             "guide.update" => "*>",
             "select.shortcircuit" => "/",
+            "llm.request" => "=>",
+            "llm.response" => "<=",
+            "llm.error" => "!L",
             "error" => "!",
             _ => ".",
         }
@@ -104,6 +107,9 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
             "guide.create" => "✦",
             "guide.update" => "✱",
             "select.shortcircuit" => "⊘",
+            "llm.request" => "⇢",
+            "llm.response" => "⇠",
+            "llm.error" => "✗L",
             "error" => "✗",
             _ => "·",
         }
@@ -130,6 +136,9 @@ pub(crate) fn event_color_ansi(event: &str) -> &'static str {
         "guide.create" => ANSI_BOLD_GREEN,
         "guide.update" => ANSI_GREEN,
         "select.shortcircuit" => ANSI_DIM,
+        "llm.request" => ANSI_BLUE,
+        "llm.response" => ANSI_CYAN,
+        "llm.error" => ANSI_BOLD_RED,
         "error" => ANSI_BOLD_RED,
         _ => "",
     }
@@ -148,9 +157,10 @@ pub enum Verbosity {
 pub(crate) fn event_verbosity_tier(event: &str) -> Verbosity {
     match event {
         "inject.start" | "inject.done" | "capture.start" | "capture.done" => Verbosity::Quiet,
-        "error" => Verbosity::Quiet,
+        "error" | "llm.error" => Verbosity::Quiet,
         "retrieve.subquery" | "retrieve.hit" => Verbosity::Verbose,
         "guide.read" | "link.follow" => Verbosity::Verbose,
+        "llm.request" | "llm.response" => Verbosity::Default,
         _ => Verbosity::Default,
     }
 }
@@ -405,6 +415,50 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
         "select.shortcircuit" => {
             let reason = p.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             trunc(&format!("shortcircuit · {}", reason), budget)
+        }
+        "llm.request" => {
+            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let turn = p.get("turn").and_then(|v| v.as_u64()).unwrap_or(0);
+            let _n_msg = p.get("n_messages").and_then(|v| v.as_u64()).unwrap_or(0);
+            let preview = p.get("prompt_preview").and_then(|v| v.as_str()).unwrap_or("");
+            let has_tools = p.get("has_tools").and_then(|v| v.as_bool()).unwrap_or(false);
+            let tools_tag = if has_tools { " +tools" } else { "" };
+            trunc(
+                &format!("t{}  {}{}  {}", turn, model, tools_tag, preview),
+                budget,
+            )
+        }
+        "llm.response" => {
+            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let turn = p.get("turn").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pt = p.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ct = p.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cost = p.get("cost_usd").and_then(|v| v.as_f64());
+            let n_tools = p.get("n_tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+            let preview = p.get("response_preview").and_then(|v| v.as_str()).unwrap_or("");
+            let lat = ev
+                .lat_ms
+                .map(|ms| format!("{:.2}s", ms as f64 / 1000.0))
+                .unwrap_or_default();
+            let cost_str = cost
+                .map(|c| format!("  ${:.7}", c))
+                .unwrap_or_default();
+            let tools_str = if n_tools > 0 {
+                format!("  {}tc", n_tools)
+            } else {
+                String::new()
+            };
+            trunc(
+                &format!("t{}  {}{}  {}  {}pt/{}ct{}  \"{}\"",
+                    turn, model, tools_str, lat, pt, ct, cost_str, preview),
+                budget,
+            )
+        }
+        "llm.error" => {
+            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+            let err = p.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let status = p.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+            trunc(&format!("{} HTTP {} — {}", model, status, err), budget)
         }
         _ => {
             // Generic: show payload summary

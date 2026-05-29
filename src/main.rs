@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
@@ -6,12 +6,15 @@ use std::path::PathBuf;
 mod capture;
 mod chunker;
 mod config;
+mod configure;
 mod daemon;
 mod db;
 mod embed;
 mod events;
 mod generate;
 mod inject;
+mod openrouter;
+mod provider;
 mod query;
 mod statusline;
 mod tail;
@@ -100,6 +103,10 @@ enum Commands {
         action: Option<ConfigAction>,
     },
 
+    /// Interactive TUI for configuring LLM models for each role.
+    /// Fetches available models from OpenRouter and/or Ollama automatically.
+    Configure,
+
     /// Distill lessons from a completed session transcript.
     /// Reads { session_id, cwd, transcript_path } JSON from stdin.
     ///
@@ -133,6 +140,20 @@ enum Commands {
         /// Append context-window usage % (green <70, yellow 70-89, red >=90).
         #[arg(long)]
         with_context: bool,
+    },
+
+    /// Test OpenRouter connectivity and print the raw response (status + headers + body).
+    /// Use this to inspect cost metadata, usage fields, and generation IDs.
+    Probe {
+        /// Prompt to send
+        #[arg(default_value = "Say hello in exactly 5 words.")]
+        prompt: String,
+        /// Model to use (defaults to openai/gpt-4o-mini for cheap probing)
+        #[arg(long, default_value = "openai/gpt-4o-mini")]
+        model: String,
+        /// Also hit GET /api/v1/generation?id=<id> to check post-hoc cost endpoint
+        #[arg(long)]
+        with_generation: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -277,6 +298,10 @@ fn main() -> Result<()> {
             handle_config(action)?;
         }
 
+        Commands::Configure => {
+            crate::configure::run_configure()?;
+        }
+
         Commands::Capture { r#in, deferred } => {
             if let Some(session_id) = deferred {
                 crate::capture::run_deferred_capture(&session_id)?;
@@ -294,6 +319,13 @@ fn main() -> Result<()> {
         Commands::Statusline { with_context } => {
             crate::statusline::run_statusline(with_context);
             // run_statusline calls process::exit(0) — never returns
+        }
+
+        Commands::Probe { prompt, model, with_generation } => {
+            let cfg = load_config()?;
+            let api_key = cfg.openrouter_api_key
+                .context("No openrouter_api_key in ~/.proactive-context/config.json")?;
+            probe_openrouter(&api_key, &model, &prompt, with_generation)?;
         }
 
         Commands::Tail {
@@ -433,6 +465,71 @@ fn print_stats(
         println!("  {} {}", "at".dimmed(), now.dimmed());
     }
     println!();
+}
+
+// ─── Probe ───────────────────────────────────────────────────────────────────
+
+fn probe_openrouter(api_key: &str, model: &str, prompt: &str, with_generation: bool) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 64
+    });
+
+    println!("POST https://openrouter.ai/api/v1/chat/completions");
+    println!("model: {}   prompt: {:?}\n", model, prompt);
+
+    let resp = client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()?;
+
+    let status = resp.status();
+    println!("Status: {}\n", status);
+
+    println!("Response headers:");
+    for (k, v) in resp.headers() {
+        println!("  {}: {}", k, v.to_str().unwrap_or("(non-utf8)"));
+    }
+    println!();
+
+    let body_str = resp.text()?;
+    println!("Response body:");
+    match serde_json::from_str::<serde_json::Value>(&body_str) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        Err(_) => println!("{}", body_str),
+    }
+
+    // Optionally hit the per-generation endpoint to see post-hoc cost info
+    if with_generation {
+        let gen_id = serde_json::from_str::<serde_json::Value>(&body_str)
+            .ok()
+            .and_then(|v| v["id"].as_str().map(|s| s.to_string()));
+
+        if let Some(id) = gen_id {
+            println!("\n--- GET /api/v1/generation?id={} ---", id);
+            std::thread::sleep(std::time::Duration::from_millis(500)); // give OR a moment to finalize
+            let gen_resp = client
+                .get(format!("https://openrouter.ai/api/v1/generation?id={}", id))
+                .bearer_auth(api_key)
+                .send()?;
+            println!("Status: {}", gen_resp.status());
+            let gen_body = gen_resp.text()?;
+            match serde_json::from_str::<serde_json::Value>(&gen_body) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                Err(_) => println!("{}", gen_body),
+            }
+        } else {
+            println!("\n(could not extract generation id from response)");
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_config(action: Option<ConfigAction>) -> Result<()> {

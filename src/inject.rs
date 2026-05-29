@@ -1,5 +1,7 @@
 use crate::config::{load_config, normalize_path, project_db_path, project_context_dir};
 use crate::events::{init_context, log_event, truncate};
+use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
+use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::query::{run_query, QueryResult};
 use crate::transcript::parse_transcript;
 use crate::wiki::{self, guide_path, IndexRow};
@@ -7,7 +9,6 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 use rig_core::client::CompletionClient;
 use rig_core::completion::Prompt;
-use rig_core::providers::openrouter;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::{self, Read};
@@ -319,35 +320,40 @@ pub fn run_inject(verbose: bool) -> Result<()> {
     let project_basename = project_basename(&project);
     let fallback_block = render_raw_reminder(&project_basename, &hits);
 
-    // Guard: no API key → emit fallback (if we have hits)
-    let api_key = match cfg.openrouter_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
-            if hits.is_empty() {
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                    "outcome": "empty",
-                    "hits": 0,
-                    "out_chars": 0
-                }));
-                emit(verbose, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
-                    start.elapsed().as_millis()));
-                return Ok(());
-            }
-            let elapsed_ms = start.elapsed().as_millis();
-            let out_chars = fallback_block.len();
-            let hits_list = format_hits(&hits);
-            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                "outcome": "fallback",
-                "reason": "no_api_key",
-                "hits": hits.len(),
-                "out_chars": out_chars
+    let select_spec = ModelSpec::parse(&cfg.inject_select_model);
+    let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
+    let needs_key = select_spec.needs_openrouter_key() || compile_spec.needs_openrouter_key();
+
+    // Guard: no API key when OpenRouter models are configured → emit fallback
+    let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    if needs_key && api_key.is_empty() {
+        if hits.is_empty() {
+            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                "outcome": "empty",
+                "hits": 0,
+                "out_chars": 0
             }));
-            emit(verbose, Some(&fallback_block), &format!(
-                "inject [{}ms] | {} hits | fallback (no API key) | injected {}c\n\nHits:\n{}",
-                elapsed_ms, hits.len(), out_chars, hits_list));
+            emit(verbose, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
+                start.elapsed().as_millis()));
             return Ok(());
         }
-    };
+        let elapsed_ms = start.elapsed().as_millis();
+        let out_chars = fallback_block.len();
+        let hits_list = format_hits(&hits);
+        log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+            "outcome": "fallback",
+            "reason": "no_api_key",
+            "hits": hits.len(),
+            "out_chars": out_chars
+        }));
+        emit(verbose, Some(&fallback_block), &format!(
+            "inject [{}ms] | {} hits | fallback (no API key) | injected {}c\n\nHits:\n{}",
+            elapsed_ms, hits.len(), out_chars, hits_list));
+        return Ok(());
+    }
+
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
 
     // ── 3. Wiki-based navigation under timeout ─────────────────────────────
     let proj_dir = project_context_dir(&root);
@@ -381,8 +387,10 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             timeout,
             wiki_navigate_and_compile(
                 &api_key,
-                &cfg.inject_select_model,
-                &cfg.inject_compile_model,
+                ollama_api_key.as_deref(),
+                &ollama_base_url,
+                &select_spec,
+                &compile_spec,
                 &input.prompt,
                 &recent,
                 &hits,
@@ -760,8 +768,10 @@ context is worse than injecting nothing.";
 
 async fn wiki_navigate_and_compile(
     api_key: &str,
-    select_model: &str,
-    compile_model: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    select_spec: &ModelSpec,
+    compile_spec: &ModelSpec,
     current_prompt: &str,
     recent: &str,
     hits: &[QueryResult],
@@ -796,16 +806,22 @@ async fn wiki_navigate_and_compile(
         preamble.push_str("\n\n");
     }
 
-    let client = openrouter::Client::new(api_key.to_string())?;
-    let select_agent = client
-        .agent(select_model)
-        .preamble(&preamble)
-        .max_tokens(300u64)
-        // rig drops max_tokens from the OpenRouter request unless also in additional_params
-        // (otherwise it defaults to the model's 64k cap — a silent cost/runaway risk).
-        .additional_params(serde_json::json!({"max_tokens": 300}))
-        .build();
-    let selection: String = select_agent.prompt(current_prompt).await?;
+    let selection: String = match select_spec.provider {
+        Provider::OpenRouter => {
+            let client = make_client();
+            let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
+            chat_once(&client, api_key, &select_spec.model, &msgs, None, 300, 0).await?.content
+        }
+        Provider::Ollama => {
+            build_ollama_client(ollama_base_url, ollama_api_key)?
+                .agent(&select_spec.model)
+                .preamble(&preamble)
+                .max_tokens(300u64)
+                .additional_params(serde_json::json!({"max_tokens": 300}))
+                .build()
+                .prompt(current_prompt).await?
+        }
+    };
 
     let sel = selection.trim();
     if sel.is_empty() || sel.to_uppercase().contains("NOTHING_RELEVANT") {
@@ -844,7 +860,9 @@ async fn wiki_navigate_and_compile(
     // ── STRONG MODEL (librarian): pick verbatim line ranges from the sources ───
     compile_briefing(
         api_key,
-        compile_model,
+        ollama_api_key,
+        ollama_base_url,
+        compile_spec,
         current_prompt,
         recent,
         &guides,
@@ -898,7 +916,9 @@ fn render_guides_for_select(guides: &[(String, String)]) -> String {
 /// keeping its output (and thus latency) tiny on this pre-prompt hot path.
 async fn compile_briefing(
     api_key: &str,
-    model: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    spec: &ModelSpec,
     current_prompt: &str,
     recent: &str,
     guides: &[(String, String)],
@@ -916,17 +936,23 @@ async fn compile_briefing(
     context.push_str("WIKI GUIDES (line-numbered; select the relevant ranges):\n\n");
     context.push_str(&render_guides_for_select(guides));
 
-    let client = openrouter::Client::new(api_key.to_string())?;
-    let agent = client
-        .agent(model)
-        .preamble(&format!("{}\n\n{}", COMPILE_PREAMBLE, context))
-        .max_tokens(max_tokens as u64)
-        // rig drops max_tokens from the OpenRouter request unless also in additional_params
-        // (otherwise it defaults to the model's 64k cap — a silent cost/runaway risk).
-        .additional_params(serde_json::json!({"max_tokens": max_tokens}))
-        .build();
-
-    let response: String = agent.prompt(current_prompt).await?;
+    let preamble = format!("{}\n\n{}", COMPILE_PREAMBLE, context);
+    let response: String = match spec.provider {
+        Provider::OpenRouter => {
+            let client = make_client();
+            let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
+            chat_once(&client, api_key, &spec.model, &msgs, None, max_tokens as u32, 0).await?.content
+        }
+        Provider::Ollama => {
+            build_ollama_client(ollama_base_url, ollama_api_key)?
+                .agent(&spec.model)
+                .preamble(&preamble)
+                .max_tokens(max_tokens as u64)
+                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
+                .build()
+                .prompt(current_prompt).await?
+        }
+    };
 
     let selection = parse_selection(&response)
         .ok_or_else(|| anyhow::anyhow!("compile: could not parse selection JSON"))?;
