@@ -86,7 +86,6 @@ fn init_schema(conn: &mut Connection, embedder: &dyn Embedder) -> Result<()> {
                 dim, current_dim
             );
             conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
-            conn.execute_batch("DELETE FROM chunks;")?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_dim', ?)",
                 params![current_dim.to_string()],
