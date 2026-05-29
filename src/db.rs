@@ -45,29 +45,29 @@ pub fn open_db(root: &Path, embedder: &dyn Embedder) -> Result<Connection> {
 }
 
 fn init_schema(conn: &mut Connection, embedder: &dyn Embedder) -> Result<()> {
-    // Meta table for tracking embedding configuration and schema version
     conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        "#,
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
 
-    const SCHEMA_VERSION: &str = "2"; // bumped when virtual-table schema changes
-
+    const SCHEMA_VERSION: &str = "2";
     let current_dim: i64 = embedder.dimension() as i64;
-    let current_model = "local"; // we only support local today in the DB layer
 
-    // Check existing dimension + schema version
-    let existing_dim: Option<i64> = conn
+    // Read the dimension actually encoded in the vec_chunks schema string — this is the
+    // ground truth. meta.embed_dim can drift out of sync when old/new binaries race.
+    let actual_vec_dim: Option<i64> = conn
         .query_row(
-            "SELECT value FROM meta WHERE key = 'embed_dim'",
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
-        .ok();
+        .ok()
+        .and_then(|sql| {
+            // Schema contains "embedding FLOAT[1536]" — parse the number.
+            let start = sql.find("FLOAT[")? + 6;
+            let end = start + sql[start..].find(']')?;
+            sql[start..end].parse().ok()
+        });
+
     let existing_version: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",
@@ -76,40 +76,30 @@ fn init_schema(conn: &mut Connection, embedder: &dyn Embedder) -> Result<()> {
         )
         .ok();
 
-    if let Some(dim) = existing_dim {
-        let schema_changed = existing_version.as_deref() != Some(SCHEMA_VERSION);
-        if dim != current_dim || schema_changed {
-            // Dimension or schema changed — wipe vector data and metadata so the
-            // daemon's next full_index re-embeds everything with the new model.
-            eprintln!(
-                "proactive-context: embed model changed (dim {} → {}), wiping index for re-embedding",
-                dim, current_dim
-            );
-            conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_dim', ?)",
-                params![current_dim.to_string()],
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-                params![SCHEMA_VERSION],
-            )?;
-        }
-    } else {
-        // First time setup
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_dim', ?)",
-            params![current_dim.to_string()],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_provider', ?)",
-            params![current_model],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-            params![SCHEMA_VERSION],
-        )?;
+    let dim_mismatch = actual_vec_dim.map_or(false, |d| d != current_dim);
+    let schema_changed = existing_version.as_deref() != Some(SCHEMA_VERSION);
+
+    if dim_mismatch || schema_changed {
+        eprintln!(
+            "proactive-context: embed dim changed ({} → {}), wiping index for re-embedding",
+            actual_vec_dim.unwrap_or(0), current_dim
+        );
+        conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
     }
+
+    // Always keep meta in sync with current embedder.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_dim', ?)",
+        params![current_dim.to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_provider', ?)",
+        params!["local"],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+        params![SCHEMA_VERSION],
+    )?;
 
     // Create the vector table with the correct dimension and cosine distance metric.
     // We use the `+` prefix so path/content are stored as metadata columns (no extra JOIN needed).
