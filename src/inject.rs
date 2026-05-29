@@ -6,15 +6,12 @@ use crate::wiki::{self, guide_path, IndexRow};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rig_core::client::CompletionClient;
-use rig_core::completion::{Prompt, ToolDefinition};
+use rig_core::completion::Prompt;
 use rig_core::providers::openrouter;
-use rig_core::tool::Tool;
 use serde::Deserialize;
-use serde_json::json;
 use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::runtime::Runtime;
 
@@ -79,141 +76,6 @@ fn strip_title_line(text: &str) -> (Option<String>, &str) {
         return (title, rest);
     }
     (None, text)
-}
-
-// ─── Wiki navigation tool ─────────────────────────────────────────────────────
-
-/// Shared navigation state — tracks reads and see-also follows for event emission.
-#[derive(Debug, Default)]
-struct NavState {
-    /// Slugs already read (to avoid re-reading).
-    read_slugs: HashSet<String>,
-    /// See-also follows emitted: (from_slug, to_slug).
-    link_follows: Vec<(String, String)>,
-    /// Accumulated guide content for the compile step.
-    guide_content: Vec<(String, String)>, // (slug, content)
-}
-
-/// A batch read tool: takes an array of slugs/paths and returns all contents in one call.
-#[derive(Clone)]
-struct ReadGuidesTool {
-    wiki_dir: PathBuf,
-    state: Arc<Mutex<NavState>>,
-}
-
-#[derive(Deserialize)]
-struct ReadGuidesArgs {
-    slugs: Vec<String>,
-}
-
-impl Tool for ReadGuidesTool {
-    const NAME: &'static str = "read_guides";
-
-    type Error = std::io::Error;
-    type Args = ReadGuidesArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Read the full content of one or more wiki guides by slug. \
-Pass an array of slugs to read multiple guides in one call. \
-The response will contain all guide contents concatenated. \
-Use this to read guides from the wiki index, then follow their See Also links to read related guides.\
-".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "slugs": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of guide slugs to read (e.g. [\"tdd-patterns\", \"rust-error-handling\"])"
-                    }
-                },
-                "required": ["slugs"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if args.slugs.is_empty() {
-            return Ok("(no slugs provided)".to_string());
-        }
-
-        let mut output = String::new();
-        let mut state = self.state.lock().unwrap();
-        let wiki_dir = self.wiki_dir.clone();
-
-        for slug in &args.slugs {
-            let slug = slug.trim().to_string();
-            if slug.is_empty() || slug == "_index" {
-                continue;
-            }
-
-            // Determine if this is a link-follow from a previously-read guide
-            let from_slug: Option<String> = state.guide_content.iter().find_map(|(s, content)| {
-                if wiki::extract_see_also_slugs(content).contains(&slug) {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            });
-
-            // Emit link.follow if this was referenced from another guide
-            if let Some(from) = &from_slug {
-                state.link_follows.push((from.clone(), slug.clone()));
-                // Log will happen after lock release
-            }
-
-            // Avoid re-reading
-            if state.read_slugs.contains(&slug) {
-                output.push_str(&format!("=== {} (already read) ===\n", slug));
-                continue;
-            }
-            state.read_slugs.insert(slug.clone());
-
-            let path = guide_path(&wiki_dir, &slug);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    output.push_str(&format!("=== {} ===\n{}\n\n", slug, content));
-                    state.guide_content.push((slug.clone(), content));
-                }
-                Err(_) => {
-                    output.push_str(&format!("=== {} (not found) ===\n", slug));
-                }
-            }
-        }
-
-        // Emit events outside the lock scope — do it by collecting what happened
-        let slugs_read: Vec<String> = args.slugs.iter().filter(|s| !s.is_empty()).cloned().collect();
-        let link_follows_new: Vec<(String, String)> = state.link_follows.clone();
-
-        drop(state); // release lock before emitting events
-
-        // Emit generate.tool_call
-        log_event("generate.tool_call", None, serde_json::json!({
-            "tool": "read_guides",
-            "slugs": slugs_read,
-            "count": args.slugs.len()
-        }));
-
-        // Emit guide.read for each
-        for slug in &args.slugs {
-            if !slug.is_empty() && slug != "_index" {
-                log_event("guide.read", None, serde_json::json!({ "slug": slug }));
-            }
-        }
-
-        // Emit link.follow for any new ones
-        for (from, to) in &link_follows_new {
-            log_event("link.follow", None, serde_json::json!({
-                "from_slug": from,
-                "to_slug": to
-            }));
-        }
-
-        Ok(output)
-    }
 }
 
 // ─── Output helper ───────────────────────────────────────────────────────────
@@ -526,8 +388,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 &hits,
                 &wiki_path,
                 &wiki_index_rows,
+                &root,
                 cfg.inject_max_guides,
-                cfg.inject_max_link_hops,
                 cfg.inject_max_tokens,
             )
         ).await
@@ -665,7 +527,236 @@ enum NavigateResult {
     ShortCircuit { guides_read: Vec<String> },
 }
 
-// ─── Two-model wiki navigate + compile ───────────────────────────────────────
+// ─── Catalog (selection front-end) ────────────────────────────────────────────
+
+/// Max catalog entries presented to the selector (titles+summaries kept compact).
+const CATALOG_MAX: usize = 150;
+
+/// A selectable context source: a wiki guide (keyed by bare slug) or a committed
+/// project markdown file (keyed by its repo-relative path — contains '/' or ends ".md").
+struct CatalogItem {
+    key: String,
+    title: String,
+    summary: String,
+    score: Option<f64>,
+}
+
+/// List committed markdown files (repo-relative paths) under `root`. Uses `git ls-files`
+/// for the exact committed set; falls back to a gitignore-aware walk when there's no repo.
+fn list_committed_markdown(root: &Path) -> Vec<String> {
+    use std::process::Command;
+    if let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--", "*.md"])
+        .output()
+    {
+        if out.status.success() {
+            return out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    // Fallback: gitignore-aware walk (no git repo / git unavailable).
+    let mut files = Vec::new();
+    for entry in WalkBuilder::new(root).hidden(false).build().flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(rel) = p.strip_prefix(root) {
+                    files.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Derive (title, summary): prefer YAML frontmatter title/summary, else first `# heading`
+/// (or filename) for the title and the first non-empty body line for the summary.
+fn derive_title_summary(content: &str, fallback_name: &str) -> (String, String) {
+    let mut title = String::new();
+    let mut summary = String::new();
+
+    let mut it = content.lines().peekable();
+    if it.peek().map(|l| l.trim() == "---").unwrap_or(false) {
+        it.next();
+        for line in it.by_ref() {
+            let t = line.trim();
+            if t == "---" {
+                break;
+            }
+            if let Some(v) = t.strip_prefix("title:") {
+                title = v.trim().trim_matches('"').to_string();
+            } else if let Some(v) = t.strip_prefix("summary:") {
+                summary = v.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+
+    if title.is_empty() || summary.is_empty() {
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() || t == "---" {
+                continue;
+            }
+            if title.is_empty() {
+                if let Some(h) = t.strip_prefix('#') {
+                    title = h.trim_start_matches('#').trim().to_string();
+                    continue;
+                }
+            }
+            if summary.is_empty() && !t.starts_with('#') {
+                summary = t.to_string();
+            }
+            if !title.is_empty() && !summary.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if title.is_empty() {
+        title = fallback_name.to_string();
+    }
+    (truncate(&title, 80), truncate(&summary, 100))
+}
+
+/// Read up to `cap` bytes of a file's head (cheap, for title/summary derivation).
+fn read_head(path: &Path, cap: usize) -> String {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(cap as u64).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// Full content of a catalog source by key (wiki slug → wiki_dir; repo path → root).
+fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<String> {
+    let path = if key.ends_with(".md") || key.contains('/') {
+        root.join(key)
+    } else {
+        guide_path(wiki_dir, key)
+    };
+    std::fs::read_to_string(path).ok()
+}
+
+/// Build the candidate catalog: wiki guides (free title/summary from the index) ∪ committed
+/// project markdown, annotated with vector-preselect scores, capped at CATALOG_MAX. File
+/// heads are read ONLY for post-cap survivors so a big repo never pays hundreds of opens.
+fn build_catalog(
+    root: &Path,
+    _wiki_dir: &Path,
+    index_rows: &[IndexRow],
+    hits: &[QueryResult],
+    max: usize,
+) -> Vec<CatalogItem> {
+    // RAG hit → best score, keyed by filename stem for loose matching across path schemes.
+    let mut hit_score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for h in hits {
+        let stem = Path::new(&h.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&h.path)
+            .to_string();
+        let e = hit_score.entry(stem).or_insert(h.score);
+        if h.score > *e {
+            *e = h.score;
+        }
+    }
+
+    let mut items: Vec<CatalogItem> = Vec::new();
+
+    for r in index_rows {
+        if r.slug == "_index" {
+            continue;
+        }
+        items.push(CatalogItem {
+            key: r.slug.clone(),
+            title: r.title.clone(),
+            summary: r.summary.clone(),
+            score: hit_score.get(&r.slug).copied(),
+        });
+    }
+
+    for path in list_committed_markdown(root) {
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        items.push(CatalogItem {
+            key: path,
+            title: String::new(),
+            summary: String::new(),
+            score: hit_score.get(&stem).copied(),
+        });
+    }
+
+    // Scored entries first (desc), then the rest; cap before any file reads.
+    items.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if items.len() > max {
+        items.truncate(max);
+    }
+
+    // Derive title/summary for project survivors that still lack them (head reads, bounded).
+    for it in items.iter_mut() {
+        if it.title.is_empty() {
+            let fname = Path::new(&it.key)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&it.key)
+                .to_string();
+            let head = read_head(&root.join(&it.key), 4000);
+            let (t, s) = derive_title_summary(&head, &fname);
+            it.title = t;
+            it.summary = s;
+        }
+    }
+
+    items
+}
+
+/// Render the catalog for the selector preamble: one compact line per source.
+fn render_catalog(items: &[CatalogItem]) -> String {
+    let mut out = String::new();
+    for it in items {
+        let hint = it
+            .score
+            .map(|s| format!("  [similar {:.2}]", s))
+            .unwrap_or_default();
+        if it.summary.is_empty() {
+            out.push_str(&format!("- {} — {}{}\n", it.key, it.title, hint));
+        } else {
+            out.push_str(&format!("- {} — {} — {}{}\n", it.key, it.title, it.summary, hint));
+        }
+    }
+    out
+}
+
+const SELECT_PREAMBLE: &str = "\
+You are a relevance gate for a coding assistant's context injector. You are given a CATALOG of \
+available context sources (committed project docs and distilled wiki guides), each as \
+`key — title — summary`. The user message is a SEARCH QUERY describing what the assistant is about \
+to work on — do NOT answer it.\n\n\
+Decide which sources (if any) contain context DIRECTLY relevant to the query. You may decide from \
+the titles and summaries alone — you have no tools and read nothing here.\n\n\
+Output rules:\n\
+- If one or more sources are directly relevant, output their keys, ONE PER LINE, exactly as shown \
+in the catalog (the part before the first ' — '). Output nothing else.\n\
+- If NOTHING is directly relevant, output exactly: NOTHING_RELEVANT\n\
+- Do not include marginally-related sources — when in doubt, leave it out. Injecting irrelevant \
+context is worse than injecting nothing.";
+
+// ─── Two-model navigate + compile ─────────────────────────────────────────────
 
 async fn wiki_navigate_and_compile(
     api_key: &str,
@@ -674,130 +765,93 @@ async fn wiki_navigate_and_compile(
     current_prompt: &str,
     recent: &str,
     hits: &[QueryResult],
-    wiki_dir: &std::path::Path,
+    wiki_dir: &Path,
     index_rows: &[IndexRow],
-    _max_guides: usize,
-    max_link_hops: usize,
+    root: &Path,
+    max_guides: usize,
     max_tokens: usize,
 ) -> Result<NavigateResult> {
-    // ── FAST MODEL: Navigate + curate ──────────────────────────────────────
-    // Build preamble with wiki index + vector preselect hints
-    let mut preamble = String::new();
+    // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
+    let catalog = build_catalog(root, wiki_dir, index_rows, hits, CATALOG_MAX);
+    log_event("wiki.index_read", None, serde_json::json!({ "guide_count": catalog.len() }));
 
-    preamble.push_str("You are a wiki navigator for a coding assistant context injector.\n\n");
-    preamble.push_str("Your job:\n");
-    preamble.push_str("1. Read the wiki index below to see all available guides\n");
-    preamble.push_str("2. Use the `read_guides` tool to read the guides most relevant to the user's prompt\n");
-    preamble.push_str("3. Follow See Also links in those guides if they lead to directly relevant content\n");
-    preamble.push_str("4. Once you have read every relevant guide, judge whether ANY of them is directly relevant\n\n");
-    preamble.push_str("IMPORTANT:\n");
-    preamble.push_str("- A later step extracts the exact passages — your only job is to READ the right guides and judge relevance.\n");
-    preamble.push_str("- After reading, respond with exactly ONE word: RELEVANT if at least one guide is directly relevant, otherwise NOTHING_RELEVANT\n");
-    preamble.push_str("- Do NOT read irrelevant guides\n");
-    preamble.push_str("- You can read multiple guides in a single tool call\n");
-    preamble.push_str(&format!("- Read at most {} guides total (enforced by timeout; prioritize the most relevant)\n", _max_guides));
-    preamble.push_str(&format!("- After reading, follow at most {} hops of See Also links for directly relevant content\n\n", max_link_hops));
-
-    // Add wiki index
-    if index_rows.is_empty() {
-        preamble.push_str("WIKI INDEX: (empty — no guides yet)\n\n");
-    } else {
-        preamble.push_str(&wiki::render_index_for_inject(index_rows));
-        preamble.push('\n');
-    }
-
-    // Add vector preselect hints
-    if !hits.is_empty() {
-        preamble.push_str("VECTOR PRESELECT HINTS (guides/chunks likely relevant — check these first):\n");
-        for h in hits.iter().take(5) {
-            // Extract just the slug from path like "wiki/foo-bar.md"
-            let slug_hint = h.path
-                .strip_prefix("wiki/")
-                .unwrap_or(&h.path)
-                .strip_suffix(".md")
-                .unwrap_or(&h.path);
-            if slug_hint != "_index" {
-                preamble.push_str(&format!("  - {} (score {:.2})\n", slug_hint, h.score));
-            }
+    if catalog.is_empty() {
+        // Nothing enumerable. If the vector index still surfaced raw chunks, cite them verbatim.
+        if hits.is_empty() {
+            return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
         }
-        preamble.push('\n');
-    }
-
-    if !recent.is_empty() {
-        preamble.push_str("RECENT CONVERSATION (background context):\n\n");
-        preamble.push_str(recent);
-        preamble.push_str("\n\n");
-    }
-
-    // If wiki is empty and no hits, short-circuit immediately
-    if index_rows.is_empty() && hits.is_empty() {
-        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
-    }
-
-    // If wiki is empty but we have hits, there are no line-numbered guides to select from.
-    // Surface the raw hit chunks verbatim (cited by path + chunk) — no LLM, so no paraphrase.
-    if index_rows.is_empty() {
         return Ok(NavigateResult::Briefing {
             text: render_hits_librarian(hits),
             guides_read: vec![],
         });
     }
 
-    // Create the navigation tool with shared state
-    let nav_state = Arc::new(Mutex::new(NavState::default()));
-    let read_tool = ReadGuidesTool {
-        wiki_dir: wiki_dir.to_path_buf(),
-        state: Arc::clone(&nav_state),
-    };
+    // ── TURN 1 (fast model, NO TOOLS): select relevant source keys, or bail ────
+    let mut preamble = String::from(SELECT_PREAMBLE);
+    preamble.push_str("\n\nCATALOG:\n");
+    preamble.push_str(&render_catalog(&catalog));
+    if !recent.is_empty() {
+        preamble.push_str("\nRECENT CONVERSATION (background context):\n\n");
+        preamble.push_str(recent);
+        preamble.push_str("\n\n");
+    }
 
     let client = openrouter::Client::new(api_key.to_string())?;
     let select_agent = client
         .agent(select_model)
         .preamble(&preamble)
-        .tool(read_tool)
-        .max_tokens(2000u64)
+        .max_tokens(300u64)
         .build();
+    let selection: String = select_agent.prompt(current_prompt).await?;
 
-    // Use max_turns to allow multi-turn tool execution (index read → follow links)
-    let max_nav_turns = (max_link_hops + 2).min(6);
-    let nav_response: String = select_agent
-        .prompt(current_prompt)
-        .max_turns(max_nav_turns)
-        .await?;
+    let sel = selection.trim();
+    if sel.is_empty() || sel.to_uppercase().contains("NOTHING_RELEVANT") {
+        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
+    }
 
-    // ── Shortcircuit detection: gate on tool activity first ────────────────
-    // Pull both the slugs read (for events) and their verbatim content (for the
-    // compile step, which slices exact line ranges — never the nav model's prose).
-    let (guides_read, guides): (Vec<String>, Vec<(String, String)>) = {
-        let state = nav_state.lock().unwrap();
-        (
-            state.read_slugs.iter().cloned().collect(),
-            state.guide_content.clone(),
-        )
-    };
+    // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
+    let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
+    let selected: Vec<String> = sel
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*', '•', ' ']).trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| valid.contains(*l))
+        .take(max_guides)
+        .map(|s| s.to_string())
+        .collect();
 
-    if guides_read.is_empty() {
+    if selected.is_empty() {
+        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
+    }
+
+    // ── Deterministic read of the selected sources (no tool round-trips) ───────
+    let mut guides: Vec<(String, String)> = Vec::new();
+    let mut guides_read: Vec<String> = Vec::new();
+    for key in &selected {
+        if let Some(content) = read_catalog_content(root, wiki_dir, key) {
+            log_event("guide.read", None, serde_json::json!({ "slug": key }));
+            guides.push((key.clone(), content));
+            guides_read.push(key.clone());
+        }
+    }
+    if guides.is_empty() {
         return Ok(NavigateResult::ShortCircuit { guides_read });
     }
 
-    // Nav now emits a one-word verdict (RELEVANT / NOTHING_RELEVANT). Short-circuit only on
-    // an explicit negative — a tight match avoids false-triggering on stray words.
-    let nav_trimmed = nav_response.trim();
-    let lower = nav_trimmed.to_lowercase();
-    if nav_trimmed.is_empty()
-        || lower.contains("nothing_relevant")
-        || lower.contains("nothing relevant")
-        || lower == "none"
-    {
-        return Ok(NavigateResult::ShortCircuit { guides_read });
-    }
-
-    // ── STRONG MODEL: select relevant line ranges from the verbatim guides ──
+    // ── STRONG MODEL (librarian): pick verbatim line ranges from the sources ───
     compile_briefing(
-        api_key, compile_model, current_prompt, recent,
-        &guides, index_rows, wiki_dir, max_tokens,
-    ).await
-        .map(|text| NavigateResult::Briefing { text, guides_read })
+        api_key,
+        compile_model,
+        current_prompt,
+        recent,
+        &guides,
+        index_rows,
+        wiki_dir,
+        root,
+        max_tokens,
+    )
+    .await
+    .map(|text| NavigateResult::Briefing { text, guides_read })
 }
 
 // ─── Structured selection (compile model output) ──────────────────────────────
@@ -847,6 +901,7 @@ async fn compile_briefing(
     guides: &[(String, String)],
     index_rows: &[IndexRow],
     wiki_dir: &Path,
+    root: &Path,
     max_tokens: usize,
 ) -> Result<String> {
     let mut context = String::new();
@@ -870,7 +925,7 @@ async fn compile_briefing(
     let selection = parse_selection(&response)
         .ok_or_else(|| anyhow::anyhow!("compile: could not parse selection JSON"))?;
 
-    Ok(render_selection(&selection, guides, index_rows, wiki_dir))
+    Ok(render_selection(&selection, guides, index_rows, wiki_dir, root))
 }
 
 /// Extract the JSON object from a model response (tolerates fences / stray prose around it).
@@ -891,6 +946,7 @@ fn render_selection(
     guides: &[(String, String)],
     index_rows: &[IndexRow],
     wiki_dir: &Path,
+    root: &Path,
 ) -> String {
     let mut body = String::new();
 
@@ -923,7 +979,13 @@ fn render_selection(
             .map(|u| format!(" (updated {})", relative_date(&u)))
             .unwrap_or_default();
 
-        let abs = guide_path(wiki_dir, &s.slug);
+        // Resolve the citation path: wiki guides are keyed by bare slug (live under wiki_dir);
+        // committed project files are keyed by their repo-relative path (contain '/' or end ".md").
+        let abs = if s.slug.ends_with(".md") || s.slug.contains('/') {
+            root.join(&s.slug)
+        } else {
+            guide_path(wiki_dir, &s.slug)
+        };
         let mut header = format!("{}:{}-{}{}", abs.display(), start, end, date_str);
         if s.contradiction {
             header.push_str(" [CONTRADICTION]");

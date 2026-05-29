@@ -695,6 +695,7 @@ fn find_see_also_pos(body: &str) -> Option<usize> {
 
 /// Render the wiki index as a compact text listing for the LLM's preamble.
 /// Format: slug | title | summary [volatility]
+#[allow(dead_code)] // superseded by inject's catalog renderer; kept for reuse
 pub fn render_index_for_inject(rows: &[IndexRow]) -> String {
     if rows.is_empty() {
         return String::new();
