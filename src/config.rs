@@ -154,6 +154,13 @@ pub struct Config {
     /// Default: 4
     #[serde(default = "default_inject_min_prompt_words")]
     pub inject_min_prompt_words: usize,
+
+    // ---- Citation-anchored capture (v0.4) ----
+    /// Maximum number of turns the wiki_* tool-calling agent loop may take during capture.
+    /// Higher values allow more thorough wiki edits at the cost of latency/tokens.
+    /// Default: 16
+    #[serde(default = "default_capture_max_turns")]
+    pub capture_max_turns: usize,
 }
 
 fn default_generate_model() -> String {
@@ -279,6 +286,10 @@ fn default_inject_min_prompt_words() -> usize {
     4
 }
 
+fn default_capture_max_turns() -> usize {
+    16
+}
+
 /// Sanitize fan-out related tunables after deserialization.
 /// Provides sensible validation + fallbacks so bad user edits (0, empty, huge values) never break behavior.
 /// Uses the default_* fns as source of truth.
@@ -400,6 +411,14 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_min_prompt_words = 20;
     }
 
+    // Citation-anchored capture: max turns for wiki_* agent loop
+    if c.capture_max_turns < 1 {
+        c.capture_max_turns = 1;
+    } else if c.capture_max_turns > 64 {
+        eprintln!("proactive-context: clamping capture_max_turns to 64");
+        c.capture_max_turns = 64_usize;
+    }
+
     c
 }
 
@@ -457,6 +476,8 @@ impl Default for Config {
             inject_max_guides: default_inject_max_guides(),
             inject_max_link_hops: default_inject_max_link_hops(),
             inject_min_prompt_words: default_inject_min_prompt_words(),
+            // Citation-anchored capture (v0.4)
+            capture_max_turns: default_capture_max_turns(), // usize
         }
     }
 }

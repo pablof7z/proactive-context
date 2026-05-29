@@ -659,6 +659,8 @@ pub fn new_guide(
 
 /// Append a new rule block to an existing guide's body (never full-rewrite).
 /// Bumps `updated` and `verified`. Adds session source if not already present.
+/// NOTE: v0.3 only — kept for compatibility; v0.4 agent loop supersedes this.
+#[allow(dead_code)]
 pub fn enrich_guide(guide: &mut Guide, rule_text: &str, session_id: &str, today: &str) {
     // Update timestamps
     guide.frontmatter.updated = today.to_string();
@@ -689,6 +691,220 @@ fn find_see_also_pos(body: &str) -> Option<usize> {
         offset += line.len() + 1;
     }
     None
+}
+
+// ─── Citation-anchored section operations ────────────────────────────────────
+
+/// Collect all `[^<id>]` citation markers present in a string.
+pub fn collect_citation_markers(text: &str) -> Vec<String> {
+    let mut markers = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+            if let Some(close) = text[i..].find(']') {
+                let marker = &text[i..i + close + 1];
+                // Basic validity: non-empty id, no spaces
+                let id = &marker[2..marker.len() - 1];
+                if !id.is_empty() && !id.contains(' ') {
+                    markers.push(marker.to_string());
+                }
+                i += close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    markers
+}
+
+/// Find the byte range [start, end) of the section body with the given heading.
+///
+/// There are two modes:
+/// - `full_section = true`: range from heading to next same-or-higher-level heading.
+///   Used by `wiki_remove_statement` to remove the whole section block including children.
+/// - `full_section = false`: range from heading to next heading of ANY level.
+///   Used by `revise_section` to replace only the direct prose of a section,
+///   leaving child subsections in place.
+///
+/// Returns None if the heading is not found.
+pub fn find_section_range(body: &str, heading: &str) -> Option<(usize, usize)> {
+    find_section_range_mode(body, heading, false)
+}
+
+/// Find the full section range (heading through all child subsections, to the
+/// next same-or-higher-level heading). Used by remove_statement.
+pub fn find_full_section_range(body: &str, heading: &str) -> Option<(usize, usize)> {
+    find_section_range_mode(body, heading, true)
+}
+
+fn find_section_range_mode(body: &str, heading: &str, full_section: bool) -> Option<(usize, usize)> {
+    // Determine the level of the target heading (number of leading #s)
+    let target_level = heading.chars().take_while(|c| *c == '#').count();
+    let target_trimmed = heading.trim();
+
+    let mut offset = 0usize;
+    let mut section_start: Option<usize> = None;
+
+    for line in body.lines() {
+        let line_len = line.len() + 1; // +1 for \n
+
+        if section_start.is_some() {
+            let level = line.chars().take_while(|c| *c == '#').count();
+            if level > 0 {
+                let ends_section = if full_section {
+                    // Full mode: end at same or higher level (child headings continue)
+                    level <= target_level
+                } else {
+                    // Prose mode: end at ANY heading (preserve children)
+                    true
+                };
+                if ends_section {
+                    return Some((section_start.unwrap(), offset));
+                }
+            }
+        } else {
+            // Look for our target heading
+            let trimmed = line.trim();
+            if trimmed == target_trimmed {
+                section_start = Some(offset);
+            }
+        }
+
+        offset += line_len;
+    }
+
+    // Handle last line missing newline or section at end of body
+    if section_start.is_some() {
+        return Some((section_start.unwrap(), body.len()));
+    }
+
+    None
+}
+
+/// Replace the prose of a section, preserving all existing `[^id]` markers and
+/// appending a new citation marker. This is the "revise_statement" carry-forward:
+///
+/// 1. Extract prior `[^id]` markers from the OLD section text.
+/// 2. Replace the section content with `new_text`.
+/// 3. Append a trailing citations line: `<!-- citations: [^old1] [^old2] [^new] -->`.
+///
+/// Returns the new body. Returns Err if the heading is not found.
+pub fn revise_section(body: &str, heading: &str, new_text: &str, new_marker: &str) -> Result<String, String> {
+    let (start, end) = find_section_range(body, heading)
+        .ok_or_else(|| {
+            // Collect available headings for the error message
+            let headings: Vec<&str> = body.lines()
+                .filter(|l| l.trim_start().starts_with('#'))
+                .take(10)
+                .collect();
+            format!(
+                "section '{}' not found in guide. Available headings: {}",
+                heading,
+                if headings.is_empty() { "(none)".to_string() } else { headings.join(", ") }
+            )
+        })?;
+
+    let old_section = &body[start..end];
+    let prior_markers = collect_citation_markers(old_section);
+
+    // Build the new section: heading line + new_text + citations trailer
+    // The heading itself is the first line in the range; reconstruct it
+    let heading_line = old_section.lines().next().unwrap_or(heading.trim());
+
+    let mut new_section = String::new();
+    new_section.push_str(heading_line);
+    new_section.push('\n');
+    let trimmed_new = new_text.trim();
+    if !trimmed_new.is_empty() {
+        new_section.push('\n');
+        new_section.push_str(trimmed_new);
+        new_section.push('\n');
+    }
+
+    // Build the citations trailer line (only if there are any markers)
+    let mut all_markers = prior_markers;
+    if !new_marker.is_empty() {
+        all_markers.push(new_marker.to_string());
+    }
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    all_markers.retain(|m| seen.insert(m.clone()));
+
+    if !all_markers.is_empty() {
+        new_section.push('\n');
+        new_section.push_str("<!-- citations: ");
+        new_section.push_str(&all_markers.join(" "));
+        new_section.push_str(" -->\n");
+    }
+
+    // Ensure trailing newline before the next section
+    if !new_section.ends_with('\n') {
+        new_section.push('\n');
+    }
+
+    let mut result = String::with_capacity(body.len() - (end - start) + new_section.len());
+    result.push_str(&body[..start]);
+    result.push_str(&new_section);
+    result.push_str(&body[end..]);
+    Ok(result)
+}
+
+/// Add a statement to an existing section (appends before citations trailer if present).
+/// Creates a new section with `heading` if it doesn't exist (before See Also).
+/// Appends a new `[^id]` marker.
+pub fn add_statement_to_section(
+    body: &str,
+    heading: &str,
+    text: &str,
+    marker: &str,
+    today: &str,
+) -> String {
+    // If section exists, append the statement and the new marker
+    if let Some((start, end)) = find_section_range(body, heading) {
+        let section = &body[start..end];
+        // Find insertion point: before citations comment if present, else at end of section
+        let insert_pos = if let Some(cit_pos) = section.find("\n<!-- citations:") {
+            start + cit_pos
+        } else {
+            // Before the trailing newline(s) at the end of section
+            end
+        };
+
+        // Check if we need to add a newline separator
+        let prefix = &body[start..insert_pos];
+        let needs_newline = !prefix.trim_end().ends_with('\n') || {
+            let trimmed = prefix.trim_end();
+            !trimmed.ends_with('\n')
+        };
+
+        let statement_block = if needs_newline || !prefix.ends_with('\n') {
+            format!("\n{} {}\n", text.trim(), marker)
+        } else {
+            format!("{} {}\n", text.trim(), marker)
+        };
+
+        let mut result = String::with_capacity(body.len() + statement_block.len());
+        result.push_str(&body[..insert_pos]);
+        result.push_str(&statement_block);
+        result.push_str(&body[insert_pos..]);
+        return result;
+    }
+
+    // Section not found — create it before See Also (or at end)
+    let insert_pos = find_see_also_pos(body).unwrap_or(body.len());
+
+    // Determine heading level for new section (default to ## for top-level sections)
+    let new_section = format!("\n{}\n\n{} {}\n", heading.trim(), text.trim(), marker);
+
+    // Update body timestamps via caller (caller owns guide frontmatter)
+    let _ = today; // used to signal caller should bump frontmatter.updated
+
+    let mut result = String::with_capacity(body.len() + new_section.len());
+    result.push_str(&body[..insert_pos]);
+    result.push_str(&new_section);
+    result.push_str(&body[insert_pos..]);
+    result
 }
 
 // ─── Text rendering of index for inject ─────────────────────────────────────
@@ -760,6 +976,110 @@ mod tests {
         let serialized = serialize_guide(&guide);
         let reparsed = parse_guide(&serialized).expect("reparse failed");
         assert_eq!(reparsed.frontmatter.summary, "A guide to: testing");
+    }
+
+    // ─── Citation carry-forward tests ─────────────────────────────────────────
+
+    /// MANDATORY: revise_section must preserve ALL prior [^id] markers AND add the new one.
+    /// This is the spec's core integrity invariant for revise_statement.
+    #[test]
+    fn test_revise_section_carries_forward_citations() {
+        let body = "\
+# Avatar Behavior
+
+On the feed, tapping an avatar navigates to the profile page. [^abc12-1] [^abc12-2]
+
+<!-- citations: [^abc12-1] [^abc12-2] -->
+
+## See Also
+
+- [[feed-navigation|Feed Navigation]] — related guide
+";
+        // Revise the section with new prose and a new marker
+        let result = revise_section(
+            body,
+            "# Avatar Behavior",
+            "On the feed, tapping an avatar opens a hovercard with the user's details.",
+            "[^abc12-3]",
+        )
+        .expect("revise_section should succeed");
+
+        // Every prior marker must still be present
+        assert!(
+            result.contains("[^abc12-1]"),
+            "prior marker [^abc12-1] must survive revision; got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("[^abc12-2]"),
+            "prior marker [^abc12-2] must survive revision; got:\n{}",
+            result
+        );
+        // New marker must be present
+        assert!(
+            result.contains("[^abc12-3]"),
+            "new marker [^abc12-3] must be added; got:\n{}",
+            result
+        );
+        // New prose must be present
+        assert!(
+            result.contains("opens a hovercard"),
+            "new prose must be present; got:\n{}",
+            result
+        );
+        // Old prose must be gone
+        assert!(
+            !result.contains("navigates to the profile page"),
+            "old prose must be replaced; got:\n{}",
+            result
+        );
+        // See Also section must be preserved
+        assert!(
+            result.contains("## See Also"),
+            "See Also section must be preserved; got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_revise_section_no_prior_citations() {
+        let body = "\
+# Feature Spec
+
+The system should process requests in order.
+
+## Details
+
+More info.
+";
+        let result = revise_section(
+            body,
+            "# Feature Spec",
+            "The system should process requests asynchronously.",
+            "[^xyz99-1]",
+        )
+        .expect("revise_section should succeed on body without prior citations");
+
+        assert!(result.contains("[^xyz99-1]"), "new marker must be added");
+        assert!(result.contains("asynchronously"), "new prose must be present");
+        assert!(!result.contains("in order"), "old prose must be gone");
+        assert!(result.contains("## Details"), "subsequent sections preserved");
+    }
+
+    #[test]
+    fn test_revise_section_not_found() {
+        let body = "# Section A\n\nContent A.\n";
+        let result = revise_section(body, "## NonExistent", "new text", "[^id-1]");
+        assert!(result.is_err(), "should return Err for missing heading");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("not found"), "error message should indicate not found");
+    }
+
+    #[test]
+    fn test_collect_citation_markers() {
+        let text = "Some text [^abc12-1] and more [^abc12-2] content [^xyz99-5].";
+        let markers = collect_citation_markers(text);
+        assert_eq!(markers, vec!["[^abc12-1]", "[^abc12-2]", "[^xyz99-5]"]);
     }
 
     #[test]

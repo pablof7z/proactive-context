@@ -1010,7 +1010,23 @@ fn render_selection(
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .unwrap_or("relevant wiki context");
-    format!("TITLE: {}\n{}", title, body)
+
+    // Conditionally prepend the citation-log preamble when the body contains [^id] markers.
+    // Spec: "Inline [^id] markers cite verbatim source-conversation evidence in
+    // <wiki>/_citations.log; read it to see why a statement exists."
+    // No preamble when no marker is present (keeps injection noise-free until citations exist).
+    let preamble = if body.contains("[^") {
+        let citations_log = wiki_dir.join("_citations.log");
+        format!(
+            "Inline [^id] markers cite verbatim source-conversation evidence in {}; \
+             read it to see why a statement exists.\n\n",
+            citations_log.display()
+        )
+    } else {
+        String::new()
+    };
+
+    format!("TITLE: {}\n{}{}", title, preamble, body)
 }
 
 /// Pull the `updated:` value out of a guide's leading YAML frontmatter, if present.
