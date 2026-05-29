@@ -48,6 +48,11 @@ struct CaptureInput {
     /// `--include-sidechains` is given) so sidechain/meta chatter is not captured.
     #[serde(default)]
     filter_sidechains: bool,
+    /// Redirect wiki output and capture markers to this directory instead of the default
+    /// `~/.proactive-context` tree. `None` → standard paths (live hook default).
+    /// Set by archeologist `--output-dir` for isolated test runs.
+    #[serde(default)]
+    output_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -112,11 +117,11 @@ fn project_lock_dir() -> PathBuf {
 
 // ─── Capture marker (dedup by transcript extent) ──────────────────────────────
 
-fn is_already_captured(session_id: &str, current_exchanges: usize) -> bool {
+fn is_already_captured_in(session_id: &str, current_exchanges: usize, marker_dir: &PathBuf) -> bool {
     if session_id.is_empty() {
         return false;
     }
-    let path = captured_sessions_dir().join(format!("{}.json", session_id));
+    let path = marker_dir.join(format!("{}.json", session_id));
     if let Ok(data) = fs::read_to_string(&path) {
         if let Ok(marker) = serde_json::from_str::<CaptureMarker>(&data) {
             return current_exchanges <= marker.captured_at_exchanges;
@@ -125,15 +130,22 @@ fn is_already_captured(session_id: &str, current_exchanges: usize) -> bool {
     false
 }
 
-fn mark_captured(session_id: &str, exchanges: usize) -> Result<()> {
+fn is_already_captured(session_id: &str, current_exchanges: usize) -> bool {
+    is_already_captured_in(session_id, current_exchanges, &captured_sessions_dir())
+}
+
+fn mark_captured_in(session_id: &str, exchanges: usize, marker_dir: &PathBuf) -> Result<()> {
     if session_id.is_empty() {
         return Ok(());
     }
-    let dir = captured_sessions_dir();
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(marker_dir)?;
     let marker = CaptureMarker { captured_at_exchanges: exchanges };
-    fs::write(dir.join(format!("{}.json", session_id)), serde_json::to_string(&marker)?)?;
+    fs::write(marker_dir.join(format!("{}.json", session_id)), serde_json::to_string(&marker)?)?;
     Ok(())
+}
+
+fn mark_captured(session_id: &str, exchanges: usize) -> Result<()> {
+    mark_captured_in(session_id, exchanges, &captured_sessions_dir())
 }
 
 // ─── Per-session flock ────────────────────────────────────────────────────────
@@ -247,17 +259,21 @@ fn call_model_blocking(
     system: &str,
     user_msg: &str,
 ) -> Result<String> {
-    let (url, auth_header) = match spec.provider {
+    // Ollama uses its native /api/chat endpoint (works for both local and cloud);
+    // /v1/chat/completions returns 401 on api.ollama.com.
+    let (url, auth_header, is_ollama) = match spec.provider {
         Provider::OpenRouter => (
             "https://openrouter.ai/api/v1/chat/completions".to_string(),
             Some(format!("Bearer {}", openrouter_api_key)),
+            false,
         ),
         Provider::Ollama => (
             format!(
-                "{}/v1/chat/completions",
+                "{}/api/chat",
                 ollama_base_url.trim_end_matches('/')
             ),
             ollama_api_key.map(|k| format!("Bearer {}", k)),
+            true,
         ),
     };
 
@@ -265,14 +281,25 @@ fn call_model_blocking(
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let body = serde_json::json!({
-        "model": spec.model,
-        "temperature": 0,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user",   "content": user_msg }
-        ]
-    });
+    let body = if is_ollama {
+        serde_json::json!({
+            "model": spec.model,
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user",   "content": user_msg }
+            ]
+        })
+    } else {
+        serde_json::json!({
+            "model": spec.model,
+            "temperature": 0,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user",   "content": user_msg }
+            ]
+        })
+    };
 
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err: Option<anyhow::Error> = None;
@@ -293,10 +320,17 @@ fn call_model_blocking(
                 let status = resp.status();
                 if status.is_success() {
                     let data: serde_json::Value = resp.json()?;
-                    return Ok(data["choices"][0]["message"]["content"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string());
+                    // Ollama native: {message:{content:"..."}}
+                    // OpenRouter:    {choices:[{message:{content:"..."}}]}
+                    let content = if is_ollama {
+                        data["message"]["content"].as_str().unwrap_or("").to_string()
+                    } else {
+                        data["choices"][0]["message"]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    return Ok(content);
                 }
 
                 let text = resp.text().unwrap_or_default();
@@ -449,6 +483,7 @@ fn append_citation_log(
     session_id: &str,
     sliced_text: &str,
 ) -> Result<()> {
+    fs::create_dir_all(wiki_dir)?;
     let log_path = wiki_dir.join("_citations.log");
     // Flatten embedded newlines so each entry is exactly one line
     let flat_text = sliced_text.replace('\n', " \\n ");
@@ -1411,8 +1446,13 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         .filter(|w| w[0].0 == "user" && w[1].0 == "assistant")
         .count();
 
+    // Resolve output paths (output_dir override for isolated archeologist runs)
+    let marker_dir = input.output_dir.as_ref()
+        .map(|d| d.join("captured-sessions"))
+        .unwrap_or_else(captured_sessions_dir);
+
     // Fast dedup check
-    if is_already_captured(&input.session_id, exchanges) {
+    if is_already_captured_in(&input.session_id, exchanges, &marker_dir) {
         eprintln!("capture: already captured {} exchanges for session {} — skipping",
             exchanges, input.session_id);
         return Ok(());
@@ -1444,12 +1484,17 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     };
 
     // Re-check after acquiring lock (TOCTOU guard)
-    if is_already_captured(&input.session_id, exchanges) {
+    if is_already_captured_in(&input.session_id, exchanges, &marker_dir) {
         eprintln!("capture: already captured (post-lock check) — skipping");
         return Ok(());
     }
 
-    let proj_dir = project_dir_from_cwd(&input.cwd);
+    let proj_dir = if let Some(ref out) = input.output_dir {
+        let normalized = normalize_path(&resolve_project_root(&PathBuf::from(&input.cwd)));
+        out.join("projects").join(normalized)
+    } else {
+        project_dir_from_cwd(&input.cwd)
+    };
     let wiki_path = wiki_dir(&proj_dir);
     let today_str = input.today_override.clone().unwrap_or_else(today);
 
@@ -1519,10 +1564,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         numbered_transcript
     };
 
-    // Mark captured now (before the agent loop to prevent concurrent duplicates)
-    let _ = mark_captured(&input.session_id, exchanges);
-
     // Run the async wiki agent loop
+    // NOTE: mark_captured_in is called AFTER the loop so that a failed agent
+    // (API error, early timeout) doesn't permanently suppress a retry.
+    // Concurrency is already serialized by the per-session flock above.
     let rt = Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
 
@@ -1556,6 +1601,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
             }));
         }
     }
+
+    // Mark session as captured now that the agent loop has run (success or partial).
+    // Doing this after the loop means a pre-write API failure doesn't permanently suppress retry.
+    let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
 
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
@@ -1624,6 +1673,7 @@ pub(crate) fn run_capture_for_archeologist(
     today_override: Option<String>,
     skip_maint: bool,
     filter_sidechains: bool,
+    output_dir: Option<PathBuf>,
 ) -> Result<()> {
     run_capture_from_input(CaptureInput {
         session_id: session_id.to_string(),
@@ -1632,12 +1682,18 @@ pub(crate) fn run_capture_for_archeologist(
         today_override,
         skip_structural_maintenance: skip_maint,
         filter_sidechains,
+        output_dir,
     })
 }
 
 /// Expose `project_dir_from_cwd` for `archeologist`'s checkpoint maintenance calls.
-pub(crate) fn archeologist_project_dir(cwd: &str) -> std::path::PathBuf {
-    project_dir_from_cwd(cwd)
+pub(crate) fn archeologist_project_dir(cwd: &str, output_dir: Option<&PathBuf>) -> std::path::PathBuf {
+    if let Some(out) = output_dir {
+        let normalized = normalize_path(&resolve_project_root(&PathBuf::from(cwd)));
+        out.join("projects").join(normalized)
+    } else {
+        project_dir_from_cwd(cwd)
+    }
 }
 
 /// Expose the captured-sessions directory for the archeologist picker's "New" count.
@@ -1648,11 +1704,10 @@ pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
 
 /// Expose `is_already_captured` for archeologist's work-list filtering.
 /// A session is "new" when this returns false.
-pub(crate) fn archeologist_is_already_captured(session_id: &str) -> bool {
-    // We don't know the exchange count in the picker phase; use 0 so any existing marker
-    // causes a skip (markers only grow). On actual replay, `run_capture_from_input`
-    // re-checks with the real exchange count.
-    is_already_captured(session_id, 0)
+/// Pass `marker_dir` to check against an isolated output dir; `None` uses the global default.
+pub(crate) fn archeologist_is_already_captured(session_id: &str, marker_dir: Option<&PathBuf>) -> bool {
+    let dir = marker_dir.cloned().unwrap_or_else(captured_sessions_dir);
+    is_already_captured_in(session_id, 0, &dir)
 }
 
 // ─── SessionEnd entry point ───────────────────────────────────────────────────
@@ -1822,5 +1877,6 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
         today_override: None,
         skip_structural_maintenance: false,
         filter_sidechains: false,
+        output_dir: None,
     })
 }

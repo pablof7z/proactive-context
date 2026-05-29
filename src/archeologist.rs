@@ -24,7 +24,7 @@ use crate::capture::{
     archeologist_is_already_captured, archeologist_project_dir,
     run_capture_for_archeologist, run_structural_maintenance,
 };
-use crate::config::normalize_path;
+use crate::config::{normalize_path, resolve_project_root};
 use crate::transcript::{transcript_cwd, transcript_first_ts, transcript_message_count};
 use crate::wiki::wiki_dir;
 
@@ -46,6 +46,9 @@ pub struct ArcheologistArgs {
     /// Also replay isSidechain/isMeta turns.
     #[allow(dead_code)] // filtering is archeologist-side; plumbing exists, full use in v0.5+
     pub include_sidechains: bool,
+    /// Redirect all wiki output and capture markers to this directory instead of the
+    /// default ~/.proactive-context tree. Useful for isolated test runs.
+    pub output_dir: Option<std::path::PathBuf>,
 }
 
 pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
@@ -233,7 +236,7 @@ fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo
             // Routing key: normalize_path(cwd) or fall back to encoded dir name
             let (routing_key, display_name) = match &cwd {
                 Some(c) if !c.is_empty() => {
-                    let key = normalize_path(&PathBuf::from(c));
+                    let key = normalize_path(&resolve_project_root(&PathBuf::from(c)));
                     let name = PathBuf::from(c)
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -289,7 +292,7 @@ fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo
 
             let new_sessions = sessions
                 .iter()
-                .filter(|s| !archeologist_is_already_captured(&s.session_id))
+                .filter(|s| !archeologist_is_already_captured(&s.session_id, None))
                 .count();
 
             let total_bytes: u64 = sessions.iter().map(|s| s.size_bytes).sum();
@@ -539,17 +542,20 @@ struct WorkItem {
     checkpoint_after: bool,
     /// true → this is the last session of its project (final checkpoint runs after)
     project_last: bool,
+    /// Forwarded from ArcheologistArgs::output_dir
+    output_dir: Option<std::path::PathBuf>,
 }
 
 /// Build the flattened, ordered work-list across all selected projects.
 /// Filters already-captured sessions; computes checkpoint flags from `synth_every`.
-fn build_work_plan(projects: &[ProjectInfo], synth_every: usize) -> Vec<WorkItem> {
+fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Option<&std::path::PathBuf>) -> Vec<WorkItem> {
+    let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
     let mut plan = Vec::new();
     for (proj_idx, project) in projects.iter().enumerate() {
         let work_list: Vec<&SessionInfo> = project
             .sessions
             .iter()
-            .filter(|s| !archeologist_is_already_captured(&s.session_id))
+            .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
             .collect();
         let n_new = work_list.len();
         for (sess_idx, session) in work_list.iter().enumerate() {
@@ -573,6 +579,7 @@ fn build_work_plan(projects: &[ProjectInfo], synth_every: usize) -> Vec<WorkItem
                 message_count: session.message_count,
                 checkpoint_after,
                 project_last: is_last,
+                output_dir: output_dir.cloned(),
             });
         }
     }
@@ -619,6 +626,7 @@ fn replay_worker(
             Some(item.date.clone()),
             true, // skip_maint — worker owns all maintenance via checkpoints below
             filter_sidechains,
+            item.output_dir.clone(),
         );
 
         let error = result.err().map(|e| e.to_string());
@@ -626,7 +634,7 @@ fn replay_worker(
 
         // K-cadence checkpoint
         if item.checkpoint_after {
-            run_checkpoint(&item.cwd);
+            run_checkpoint(&item.cwd, item.output_dir.as_ref());
             let _ = tx.send(WorkerMsg::Checkpoint {
                 final_for_project: false,
             });
@@ -634,7 +642,7 @@ fn replay_worker(
 
         // Mandatory final checkpoint at project end
         if item.project_last {
-            run_checkpoint(&item.cwd);
+            run_checkpoint(&item.cwd, item.output_dir.as_ref());
             let _ = tx.send(WorkerMsg::Checkpoint {
                 final_for_project: true,
             });
@@ -645,11 +653,11 @@ fn replay_worker(
 }
 
 /// Run the three structural-maintenance passes for one project (by cwd).
-fn run_checkpoint(cwd: &str) {
+fn run_checkpoint(cwd: &str, output_dir: Option<&std::path::PathBuf>) {
     if cwd.is_empty() {
         return;
     }
-    let proj_dir = archeologist_project_dir(cwd);
+    let proj_dir = archeologist_project_dir(cwd, output_dir);
     let wiki_path = wiki_dir(&proj_dir);
     let today = date_str_today();
     run_structural_maintenance(&wiki_path, &proj_dir, &today);
@@ -748,7 +756,7 @@ fn run_linelog(
     // Build the flattened, ordered work-list and run the worker on this thread.
     // Counters are derived from the run's events (read after the loop) so we report
     // the true captured / triage-skip / too-short split, not "every Ok() is captured".
-    let worker_plan = build_work_plan(&projects, args.synth_every);
+    let worker_plan = build_work_plan(&projects, args.synth_every, args.output_dir.as_ref());
     let run_start = Instant::now();
     let since_ms = unix_now_millis();
 
@@ -1019,7 +1027,7 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs) -> Result<(
     use std::sync::mpsc;
 
     // ── Pre-flight: build plan & totals (cheap, before touching the terminal) ──
-    let plan = build_work_plan(&projects, args.synth_every);
+    let plan = build_work_plan(&projects, args.synth_every, args.output_dir.as_ref());
     let total_sessions = plan.len();
     if total_sessions == 0 {
         println!("archeologist: nothing new to capture — all selected sessions already done");

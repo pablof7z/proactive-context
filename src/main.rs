@@ -180,6 +180,12 @@ enum Commands {
         /// Also replay isSidechain/isMeta turns (default: skip).
         #[arg(long)]
         include_sidechains: bool,
+
+        /// Write wiki output and capture markers to this directory instead of the default
+        /// ~/.proactive-context tree. All sessions are treated as new (isolated dedup).
+        /// Safe to delete afterwards.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<std::path::PathBuf>,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -359,6 +365,7 @@ fn main() -> Result<()> {
             synth_every,
             yes,
             include_sidechains,
+            output_dir,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
                 project,
@@ -368,6 +375,7 @@ fn main() -> Result<()> {
                 synth_every,
                 yes,
                 include_sidechains,
+                output_dir,
             })?;
         }
 
