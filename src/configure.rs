@@ -45,33 +45,33 @@ struct Role {
 const ROLES: &[Role] = &[
     Role {
         key: "generate_model",
-        label: "generate",
-        description: "Main RAG answer synthesis (supports tools)",
+        label: "Answer",
+        description: "Answers questions from your notes (multi-turn, supports tools)",
     },
     Role {
         key: "decompose_model",
-        label: "decompose",
-        description: "Cheap fan-out query decomposition",
+        label: "Search expand",
+        description: "Breaks your question into parallel sub-searches for better recall",
     },
     Role {
         key: "inject_select_model",
-        label: "inject_select",
-        description: "Fast wiki guide selection (turn 1)",
+        label: "Pre-prompt picker",
+        description: "Picks which docs are relevant before each prompt (fast, cheap)",
     },
     Role {
         key: "inject_compile_model",
-        label: "inject_compile",
-        description: "Strong briefing compilation (turn 2)",
+        label: "Pre-prompt writer",
+        description: "Writes the briefing injected before each prompt (strong model)",
     },
     Role {
         key: "capture_model",
-        label: "capture",
-        description: "Session wiki agent (tool-calling)",
+        label: "Session capture",
+        description: "Reads finished sessions and updates the project wiki (tool-calling)",
     },
     Role {
         key: "capture_triage_model",
-        label: "capture_triage",
-        description: "Cheap triage — skip capture if nothing learnable",
+        label: "Capture filter",
+        description: "Quickly decides if a session has anything worth capturing",
     },
 ];
 
@@ -107,10 +107,12 @@ pub struct ModelEntry {
     pub spec: String,
     /// Human-friendly name (may equal spec for Ollama)
     pub display: String,
-    /// Optional context length
+    /// Optional context length in tokens
     pub ctx_len: Option<u64>,
-    /// Optional pricing info (per-million tokens)
+    /// OpenRouter: price per input token (we display as $/M)
     pub price_prompt: Option<f64>,
+    /// Ollama local: model size in GB
+    pub size_gb: Option<f64>,
     pub provider: Provider,
 }
 
@@ -200,6 +202,7 @@ fn fetch_openrouter_models(api_key: &str) -> Result<Vec<ModelEntry>> {
                 display: name,
                 ctx_len,
                 price_prompt,
+                size_gb: None,
                 provider: Provider::OpenRouter,
             });
         }
@@ -211,40 +214,84 @@ fn fetch_openrouter_models(api_key: &str) -> Result<Vec<ModelEntry>> {
 }
 
 fn fetch_ollama_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEntry>> {
-    let url = format!(
-        "{}/api/tags",
-        base_url.trim_end_matches('/')
-    );
-
+    let base = base_url.trim_end_matches('/');
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build()?;
 
-    let mut req = client.get(&url);
-    if let Some(k) = api_key.filter(|k| !k.is_empty()) {
-        req = req.bearer_auth(k);
-    }
+    let make_req = |url: &str| {
+        let mut r = client.get(url);
+        if let Some(k) = api_key.filter(|k| !k.is_empty()) {
+            r = r.bearer_auth(k);
+        }
+        r
+    };
 
-    let resp: serde_json::Value = req.send()?.json()?;
+    // Try local-style /api/tags first, fall back to OpenAI-compat /v1/models
+    // (Ollama cloud at api.ollama.com uses the /v1/models endpoint)
+    let resp = make_req(&format!("{}/api/tags", base)).send();
+
+    let (resp_json, use_tags_format) = match resp {
+        Ok(r) if r.status().is_success() => {
+            let j: serde_json::Value = r.json()?;
+            // /api/tags returns {"models": [...]}
+            if j.get("models").and_then(|v| v.as_array()).is_some() {
+                (j, true)
+            } else {
+                // Got 200 but wrong shape — try /v1/models
+                let r2 = make_req(&format!("{}/v1/models", base)).send()?;
+                (r2.json()?, false)
+            }
+        }
+        _ => {
+            // /api/tags failed — try /v1/models (Ollama cloud)
+            let r2 = make_req(&format!("{}/v1/models", base)).send()?;
+            (r2.json()?, false)
+        }
+    };
 
     let mut entries = Vec::new();
-    if let Some(models) = resp["models"].as_array() {
-        for m in models {
-            let name = m["name"].as_str().unwrap_or("").to_string();
-            if name.is_empty() {
-                continue;
+
+    if use_tags_format {
+        // Local format: {"models": [{"name": "llama3.2:latest", ...}]}
+        if let Some(models) = resp_json["models"].as_array() {
+            for m in models {
+                let name = m["name"].as_str().unwrap_or("").to_string();
+                if name.is_empty() { continue; }
+                let size_gb = m["size"].as_u64().map(|b| b as f64 / 1e9);
+                entries.push(ModelEntry {
+                    spec: format!("ollama:{}", name),
+                    display: name.clone(),
+                    ctx_len: None,
+                    price_prompt: None,
+                    size_gb,
+                    provider: Provider::Ollama,
+                });
             }
-            entries.push(ModelEntry {
-                spec: format!("ollama:{}", name),
-                display: name.clone(),
-                ctx_len: None,
-                price_prompt: None,
-                provider: Provider::Ollama,
-            });
         }
-        entries.sort_by(|a, b| a.spec.cmp(&b.spec));
+    } else {
+        // OpenAI-compat format: {"data": [{"id": "llama3.2", ...}]}
+        if let Some(data) = resp_json["data"].as_array() {
+            for m in data {
+                let id = m["id"].as_str().unwrap_or("").to_string();
+                if id.is_empty() { continue; }
+                let display = m["name"].as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&id)
+                    .to_string();
+                entries.push(ModelEntry {
+                    spec: format!("ollama:{}", id),
+                    display,
+                    ctx_len: m["context_length"].as_u64(),
+                    price_prompt: None,
+                    size_gb: None,
+                    provider: Provider::Ollama,
+                });
+            }
+        }
     }
 
+    entries.sort_by(|a, b| a.spec.cmp(&b.spec));
     Ok(entries)
 }
 
@@ -525,9 +572,20 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
     let active = state.pane == Pane::Models;
 
     let current_model = get_role_value(&state.cfg, state.current_role().key);
+
+    // Count OR / OL models to show in title
+    let or_count = state.models.iter().filter(|m| m.provider == Provider::OpenRouter).count();
+    let ol_count = state.models.iter().filter(|m| m.provider == Provider::Ollama).count();
+    let counts = if or_count > 0 || ol_count > 0 {
+        format!(" {or_count}×OR {ol_count}×OL")
+    } else {
+        String::new()
+    };
+
     let title = format!(
-        " Models for [{}]{}",
+        " Models for '{}'{}{} ",
         state.current_role().label,
+        counts,
         if state.dirty { " *" } else { "" }
     );
 
@@ -544,10 +602,15 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Filter bar (1 line) + list below
+    // Filter bar (1 line) + list + optional error lines
+    let error_lines = state.fetch_errors.len() as u16;
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1),              // filter bar
+            Constraint::Min(1),                  // model list
+            Constraint::Length(error_lines),     // fetch errors (0 if none)
+        ])
         .split(inner);
 
     // Filter bar
@@ -695,6 +758,21 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
             frame.render_stateful_widget(list, list_area, list_state);
         }
     }
+
+    // Fetch errors (bottom of model pane, always visible)
+    if !state.fetch_errors.is_empty() && v_chunks[2].height > 0 {
+        let err_lines: Vec<Line> = state
+            .fetch_errors
+            .iter()
+            .map(|e| {
+                Line::from(vec![
+                    Span::styled(" ⚠ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(e.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(err_lines), v_chunks[2]);
+    }
 }
 
 fn build_meta_span(m: &ModelEntry, _pane_width: u16) -> Span<'static> {
@@ -707,11 +785,13 @@ fn build_meta_span(m: &ModelEntry, _pane_width: u16) -> Span<'static> {
         }
     }
     if let Some(p) = m.price_prompt {
-        // price is per-token; show as $/M tokens
         let per_m = p * 1_000_000.0;
         if per_m > 0.0 {
             parts.push(format!("${:.2}/M", per_m));
         }
+    }
+    if let Some(gb) = m.size_gb {
+        parts.push(format!("{:.1}GB", gb));
     }
     if parts.is_empty() {
         Span::raw("")
