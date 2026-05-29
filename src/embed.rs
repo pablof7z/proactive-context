@@ -57,7 +57,7 @@ impl Embedder for LocalEmbedder {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embeddings = self
             .model
-            .embed(refs, None)
+            .embed(refs, Some(32))
             .context("fastembed embedding failed")?;
         Ok(embeddings)
     }

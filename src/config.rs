@@ -74,13 +74,6 @@ pub struct Config {
     pub log_retention: usize,
 
     // ---- Inject budget ----
-    /// DEPRECATED — replaced by inject_select_model + inject_compile_model (wiki v2).
-    /// Kept for backward compatibility with existing config.json files; ignored by inject.
-    /// Will be removed in a future release.
-    #[serde(default = "default_inject_model")]
-    #[allow(dead_code)]
-    pub inject_model: String,
-
     /// Last N transcript turns folded into the retrieval query (0 = bare prompt).
     #[serde(default = "default_inject_context_turns")]
     pub inject_context_turns: usize,
@@ -201,9 +194,6 @@ fn default_log_retention() -> usize {
     2
 }
 
-fn default_inject_model() -> String {
-    "openai/gpt-4o-mini".to_string()
-}
 
 fn default_inject_context_turns() -> usize {
     6
@@ -315,10 +305,7 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_timeout_ms = 30000;
     }
 
-    if c.inject_model.trim().is_empty() {
-        eprintln!("proactive-context: empty inject_model in config, using default");
-        c.inject_model = default_inject_model();
-    }
+
 
     // Wiki navigation fields
     if c.inject_browse_timeout_ms < 1000 {
@@ -402,7 +389,6 @@ impl Default for Config {
             log_max_bytes: default_log_max_bytes(),
             log_retention: default_log_retention(),
             // Inject
-            inject_model: default_inject_model(),
             inject_context_turns: default_inject_context_turns(),
             inject_query_char_cap: default_inject_query_char_cap(),
             inject_top_k: default_inject_top_k(),

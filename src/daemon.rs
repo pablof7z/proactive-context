@@ -326,15 +326,21 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
         }
     }
 
-    let file_count_before = files.len();
-    println!("Found {} markdown files. Indexing...", file_count_before);
+    let total = files.len();
+    eprintln!("Found {} markdown files. Indexing...", total);
 
-    for path in &files {
+    for (i, path) in files.iter().enumerate() {
         let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        let pct = (i + 1) * 100 / total.max(1);
+        let filled = pct / 5;
+        let bar: String = format!("[{}>{}]", "#".repeat(filled), ".".repeat(20 - filled.min(20)));
+        eprint!("\r{} {:>3}% ({}/{}) {}", bar, pct, i + 1, total, rel);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         if let Err(e) = index_single_file(root, conn, embedder, cfg, path, &rel) {
-            eprintln!("Warning: failed to index {}: {}", rel, e);
+            eprintln!("\nWarning: failed to index {}: {}", rel, e);
         }
     }
+    eprintln!();
 
     let (file_count, chunk_count) = index_stats(conn)?;
     println!("Index complete: {} files, {} chunks", file_count, chunk_count);
@@ -511,14 +517,21 @@ pub fn index_files_into_db(src_dir: &Path, db_path: &Path) -> Result<()> {
     let mut files = Vec::new();
     collect_md_files(src_dir, &mut files)?;
 
-    println!("Found {} markdown files. Indexing...", files.len());
+    let total = files.len();
+    eprintln!("Found {} markdown files. Indexing...", total);
 
-    for abs_path in &files {
+    for (i, abs_path) in files.iter().enumerate() {
         let rel = abs_path.strip_prefix(src_dir).unwrap_or(abs_path).to_string_lossy().to_string();
+        let pct = (i + 1) * 100 / total.max(1);
+        let filled = pct / 5;
+        let bar: String = format!("[{}>{}]", "#".repeat(filled), ".".repeat(20 - filled.min(20)));
+        eprint!("\r{} {:>3}% ({}/{}) {}", bar, pct, i + 1, total, rel);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         if let Err(e) = index_single_file(src_dir, &conn, embedder.as_mut(), &cfg, abs_path, &rel) {
-            eprintln!("Warning: failed to index {}: {}", rel, e);
+            eprintln!("\nWarning: failed to index {}: {}", rel, e);
         }
     }
+    eprintln!();
 
     let (file_count, chunk_count) = index_stats(&conn)?;
     println!("Index complete: {} files, {} chunks", file_count, chunk_count);

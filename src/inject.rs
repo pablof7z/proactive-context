@@ -831,7 +831,7 @@ async fn wiki_navigate_and_compile(
                 .agent(&select_spec.model)
                 .preamble(&preamble)
                 .max_tokens(300u64)
-                .additional_params(serde_json::json!({"max_tokens": 300}))
+                .additional_params(serde_json::json!({"max_tokens": 300, "think": true}))
                 .build()
                 .prompt(current_prompt).await?;
             crate::openrouter::record_external_turn(
@@ -968,7 +968,7 @@ async fn compile_briefing(
                 .agent(&spec.model)
                 .preamble(&preamble)
                 .max_tokens(max_tokens as u64)
-                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
+                .additional_params(serde_json::json!({"max_tokens": max_tokens, "think": true}))
                 .build()
                 .prompt(current_prompt).await?;
             crate::openrouter::record_external_turn(
