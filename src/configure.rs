@@ -38,40 +38,50 @@ use crate::provider::{ModelSpec, Provider};
 
 struct Role {
     key: &'static str,
+    /// Short name shown in the list
     label: &'static str,
+    /// One sentence — what does this model DO?
     description: &'static str,
+    /// What kind of model to pick
+    suggestion: &'static str,
 }
 
 const ROLES: &[Role] = &[
     Role {
         key: "generate_model",
-        label: "Answer",
-        description: "Answers questions from your notes (multi-turn, supports tools)",
+        label: "Ask",
+        description: "Answers your questions by reading your notes (multi-turn, uses tools)",
+        suggestion: "→ Use a capable model  e.g. sonnet, gpt-4o, llama3.3:70b",
     },
     Role {
         key: "decompose_model",
-        label: "Search expand",
-        description: "Breaks your question into parallel sub-searches for better recall",
+        label: "Search",
+        description: "Splits your question into multiple searches to find more relevant notes",
+        suggestion: "→ Use a fast/cheap model  e.g. haiku, gpt-4o-mini, qwen2.5:7b",
     },
     Role {
         key: "inject_select_model",
-        label: "Pre-prompt picker",
-        description: "Picks which docs are relevant before each prompt (fast, cheap)",
+        label: "Context scan",
+        description: "Runs before EVERY prompt — scans your wiki and picks what's relevant",
+        suggestion: "→ Must be fast  e.g. haiku, gpt-4o-mini, qwen2.5:7b",
     },
     Role {
         key: "inject_compile_model",
-        label: "Pre-prompt writer",
-        description: "Writes the briefing injected before each prompt (strong model)",
+        label: "Context write",
+        description: "Runs before EVERY prompt — writes the context block Claude reads",
+        suggestion: "→ Use a capable model  e.g. sonnet, gpt-4o, llama3.3:70b",
     },
     Role {
         key: "capture_model",
-        label: "Session capture",
-        description: "Reads finished sessions and updates the project wiki (tool-calling)",
+        label: "Wiki update",
+        description: "After sessions end — reads the conversation, updates the project wiki",
+        suggestion: "→ Use a capable model with tool-calling  e.g. sonnet, gpt-4o",
     },
     Role {
         key: "capture_triage_model",
-        label: "Capture filter",
-        description: "Quickly decides if a session has anything worth capturing",
+        label: "Skip check",
+        description: "Quick yes/no: does this session have anything worth capturing?",
+        suggestion: "→ Use the cheapest model you have  e.g. haiku, gpt-4o-mini, qwen:3b",
     },
 ];
 
@@ -454,10 +464,10 @@ fn render(frame: &mut Frame, state: &AppState, role_list_state: &mut ListState, 
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    // Main split: roles (left) | models (right)
+    // Main split: roles (left, wider) | models (right)
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(32), Constraint::Min(40)])
+        .constraints([Constraint::Length(38), Constraint::Min(40)])
         .split(inner);
 
     render_roles(frame, h_chunks[0], state, role_list_state);
@@ -488,9 +498,10 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Leave bottom 1 line for help
+    // Leave bottom 3 lines for description + suggestion
+    let info_lines = 3u16;
     let list_area = Rect {
-        height: inner.height.saturating_sub(1),
+        height: inner.height.saturating_sub(info_lines),
         ..inner
     };
 
@@ -513,10 +524,11 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
             };
 
             let model_id = spec.model;
-            // Truncate long model ids to fit the pane
-            let max_id_chars = 18usize;
-            let model_short = if model_id.len() > max_id_chars {
-                format!("{}…", &model_id[..max_id_chars.saturating_sub(1)])
+            let pane_width = inner.width as usize;
+            // label takes ~14 chars, badge 4, leave rest for model id
+            let max_id = pane_width.saturating_sub(20);
+            let model_short = if model_id.len() > max_id && max_id > 3 {
+                format!("{}…", &model_id[..max_id - 1])
             } else {
                 model_id
             };
@@ -545,27 +557,47 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
         .collect();
 
     list_state.select(Some(state.role_sel));
-
     let list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, list_area, list_state);
 
-    // Role description at bottom
-    let desc_area = Rect {
-        y: inner.y + inner.height.saturating_sub(1),
-        height: 1,
-        ..inner
-    };
-    let desc = ROLES[state.role_sel].description;
-    let trunc = if desc.len() > inner.width as usize {
-        format!("{}…", &desc[..inner.width.saturating_sub(1) as usize])
-    } else {
-        desc.to_string()
-    };
+    // Info block: divider + description + suggestion for selected role
+    let info_y = inner.y + inner.height.saturating_sub(info_lines);
+    let w = inner.width as usize;
+    let role = &ROLES[state.role_sel];
+
+    // Divider
     frame.render_widget(
-        Paragraph::new(Span::styled(trunc, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
-        desc_area,
+        Paragraph::new(Span::styled(
+            "─".repeat(w),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )),
+        Rect { x: inner.x, y: info_y, width: inner.width, height: 1 },
     );
+
+    // Description line
+    let desc = truncate_to(role.description, w);
+    frame.render_widget(
+        Paragraph::new(Span::styled(desc, Style::default().fg(Color::White))),
+        Rect { x: inner.x, y: info_y + 1, width: inner.width, height: 1 },
+    );
+
+    // Suggestion line (colored hint)
+    let sug = truncate_to(role.suggestion, w);
+    frame.render_widget(
+        Paragraph::new(Span::styled(sug, Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM))),
+        Rect { x: inner.x, y: info_y + 2, width: inner.width, height: 1 },
+    );
+}
+
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max > 1 {
+        format!("{}…", &s[..max - 1])
+    } else {
+        s[..max].to_string()
+    }
 }
 
 fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
