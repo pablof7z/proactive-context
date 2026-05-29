@@ -1495,7 +1495,8 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     } else {
         project_dir_from_cwd(&input.cwd)
     };
-    let wiki_path = wiki_dir(&proj_dir);
+    let project_root = resolve_project_root(&PathBuf::from(&input.cwd));
+    let wiki_path = wiki_dir(&project_root);
     let today_str = input.today_override.clone().unwrap_or_else(today);
 
     // Fast triage (with wiki index for "already specified" check — spec Open Q5)
@@ -1616,7 +1617,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
             ollama_api_key.as_deref(),
             &wiki_path,
             &proj_dir,
-            &plain_ts,
+            &turns,
         );
     }
 
@@ -1650,6 +1651,61 @@ struct OpenQuestionsFile {
     questions: Vec<OpenQuestion>,
 }
 
+/// Strip known harness XML blocks from a turn's text so they don't pollute the
+/// open-questions prompt. Removes `<tag>...</tag>` for known harness tags.
+fn strip_harness_xml(text: &str) -> String {
+    const TAGS: &[&str] = &[
+        "system-reminder", "task-notification", "open-questions",
+        "antml:function_calls", "function_calls", "user-prompt-submit-hook",
+    ];
+    let mut result = text.to_string();
+    for tag in TAGS {
+        loop {
+            let open = format!("<{}", tag);
+            let close = format!("</{}>", tag);
+            match (result.find(&open), result.find(&close)) {
+                (Some(s), Some(e)) if s < e => {
+                    let after = e + close.len();
+                    result = format!("{}{}", result[..s].trim_end(), &result[after..]);
+                }
+                _ => break,
+            }
+        }
+    }
+    result
+}
+
+/// Build a clean User:/Assistant: attributed transcript from turns, stripping harness
+/// XML from each turn's text. Truncates by dropping the OLDEST turns when over
+/// `max_chars` — preserves whole turns rather than cutting mid-sentence.
+///
+/// Note: tool_result and tool_use content blocks are already excluded upstream by
+/// `parse_transcript` / `extract_text` (only `type:"text"` blocks reach `turns`).
+fn build_open_questions_transcript(turns: &[(String, String)], max_chars: usize) -> String {
+    let labeled: Vec<String> = turns.iter().filter_map(|(role, text)| {
+        let cleaned = strip_harness_xml(text);
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.is_empty() { return None; }
+        let label = if role == "user" { "User" } else { "Assistant" };
+        Some(format!("{}: {}", label, cleaned))
+    }).collect();
+
+    if labeled.is_empty() { return String::new(); }
+
+    // Try the full transcript first; if too long, drop from the front one turn at a time
+    let full = labeled.join("\n\n");
+    if full.len() <= max_chars { return full; }
+
+    for start in 1..labeled.len() {
+        let candidate = labeled[start..].join("\n\n");
+        if candidate.len() <= max_chars { return candidate; }
+    }
+
+    // Last resort: hard-truncate the last turn at a char boundary
+    let last = labeled.last().map(|s| s.as_str()).unwrap_or("");
+    last[last.len().saturating_sub(max_chars)..].to_string()
+}
+
 fn extract_open_questions(
     triage_spec: &crate::provider::ModelSpec,
     openrouter_api_key: &str,
@@ -1657,7 +1713,7 @@ fn extract_open_questions(
     ollama_api_key: Option<&str>,
     wiki_path: &std::path::Path,
     proj_dir: &std::path::Path,
-    plain_ts: &str,
+    turns: &[(String, String)],
 ) {
     let index_rows = read_index(wiki_path);
     let wiki_index = if index_rows.is_empty() {
@@ -1669,15 +1725,17 @@ fn extract_open_questions(
             .join("\n")
     };
 
-    let tail_start = plain_ts.len().saturating_sub(6000);
-    let transcript_tail = &plain_ts[tail_start..];
+    let transcript = build_open_questions_transcript(turns, 8000);
+    if transcript.is_empty() {
+        return;
+    }
 
     let system = "You identify undefined concepts in software project conversations. \
                   Return ONLY valid JSON, nothing else.";
     let user = format!(
         "WIKI INDEX (already documented concepts):\n{wiki_index}\n\n\
-         TRANSCRIPT (tail):\n{transcript_tail}\n\n\
-         List up to 8 nouns or named concepts used in this transcript that are NOT \
+         CONVERSATION:\n{transcript}\n\n\
+         List up to 8 nouns or named concepts used in this conversation that are NOT \
          described in the wiki index above. Skip generic programming words. \
          Return ONLY valid JSON array: \
          [{{\"noun\": \"TUI client\", \"slug\": \"tui-client\", \
