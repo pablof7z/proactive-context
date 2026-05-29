@@ -398,6 +398,103 @@ fn render(deltas: &[Delta]) -> String {
     out
 }
 
+// ─── On-demand board viewer (`pc agents`) ──────────────────────────────────────
+
+/// Print the current standup board for the repo room containing `cwd`.
+/// Shows every agent's branch, age, status, and distilled intent. Unlike the
+/// ephemeral PostToolUse deltas, this is a full snapshot you can run any time.
+pub fn print_board(cwd: &str, show_all: bool) -> Result<()> {
+    let cfg = load_config()?;
+    let root = resolve_project_root(Path::new(cwd));
+    let db = agents_db_path(&root);
+    if !db.exists() {
+        println!("No agent activity recorded for this repo yet ({}).", db.display());
+        return Ok(());
+    }
+    let conn = open_agents_db(&root)?;
+    let now = unix_now_secs() as i64;
+    let expiry = cfg.awareness_expiry_secs as i64;
+
+    let mut stmt = conn.prepare(
+        "SELECT session_id, branch, worktree, intent_summary, initial_task,
+                last_active_at, last_distill_at, ended_at, started_at
+           FROM agents ORDER BY last_active_at DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
+        ))
+    })?;
+
+    let mut shown = 0;
+    let mut hidden_expired = 0;
+    println!("Agent standup board — {}", root.display());
+    println!();
+    for row in rows {
+        let (sid, branch, worktree, intent, initial, last_active, _last_distill, ended, _started) = row?;
+        let age = now - last_active;
+        let status = if ended > 0 {
+            "done"
+        } else if age <= expiry {
+            "active"
+        } else {
+            "expired"
+        };
+        if status == "expired" && !show_all {
+            hidden_expired += 1;
+            continue;
+        }
+        shown += 1;
+        let branch = branch.unwrap_or_else(|| "(no branch)".into());
+        let body = intent
+            .filter(|s| !s.trim().is_empty())
+            .or(initial)
+            .unwrap_or_else(|| "(intent not yet distilled)".into());
+        println!(
+            "● {:<8} {:<7} {:<22} {}",
+            &sid[..sid.len().min(8)],
+            status,
+            format!("[{}, {}]", branch, fmt_age(age)),
+            body
+        );
+        // show the worktree on a dim second line when it differs from the room root
+        if Path::new(&worktree) != root {
+            println!("    ↳ {}", worktree);
+        }
+    }
+    if shown == 0 {
+        println!("(no active agents)");
+    }
+    if hidden_expired > 0 {
+        println!();
+        println!("({} expired agent(s) hidden — pass --all to show)", hidden_expired);
+    }
+    Ok(())
+}
+
+fn fmt_age(secs: i64) -> String {
+    if secs < 0 {
+        return "just now".into();
+    }
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 // ─── Detached distill ───────────────────────────────────────────────────────────
 
 /// Spawn `pc awareness --distill <session_id> --cwd <cwd>` as a detached background

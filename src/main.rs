@@ -147,6 +147,15 @@ enum Commands {
         cwd: Option<String>,
     },
 
+    /// Show the cross-agent standup board for this repo: every concurrent Claude Code
+    /// agent's branch, age, status, and distilled intent. On-demand snapshot (the
+    /// awareness hooks otherwise only surface ephemeral deltas after tool calls).
+    Agents {
+        /// Also show expired agents (inactive > awareness_expiry_secs).
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Render a one-line Claude Code status bar indicator (invoked via statusLine.command).
     /// Reads the Claude Code status-line JSON from stdin; prints one styled line to stdout.
     /// Always exits 0. No LLM, no network, sub-10ms.
@@ -395,6 +404,11 @@ fn main() -> Result<()> {
             } else if let Some(hook) = hook {
                 let _ = crate::awareness::run_hook(&hook);
             }
+        }
+
+        Commands::Agents { all } => {
+            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+            crate::awareness::print_board(&cwd, all)?;
         }
 
         Commands::Statusline { with_context } => {
