@@ -11,55 +11,12 @@ use crate::wiki::wiki_dir;
 #[derive(Deserialize, Default)]
 struct SessionStartInput {
     #[serde(default)]
-    session_id: String,
-    #[serde(default)]
     cwd: String,
-    #[serde(default)]
-    source: String,
 }
 
 #[derive(Deserialize)]
 struct OpenQuestionsFile {
     questions: Vec<OpenQuestion>,
-}
-
-fn recently_attempted(proj_dir: &std::path::Path, slug: &str, ttl_days: u64) -> bool {
-    let path = proj_dir.join("autodoc-attempts").join(format!("{}.json", slug));
-    let Ok(content) = fs::read_to_string(&path) else { return false };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else { return false };
-    let Some(ts) = val["attempted_at_secs"].as_u64() else { return false };
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    now.saturating_sub(ts) < ttl_days * 86400
-}
-
-fn spawn_autodoc(noun: &str, question: &str, cwd: &str) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("autodoc")
-        .arg("--noun")
-        .arg(noun)
-        .arg("--question")
-        .arg(question)
-        .arg("--cwd")
-        .arg(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    let _ = cmd.spawn();
 }
 
 pub fn run_session_start() -> Result<()> {
@@ -71,8 +28,6 @@ pub fn run_session_start() -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("session-start: source={} cwd={}", input.source, input.cwd);
-
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
     let proj_dir = project_context_dir(&root);
     let wiki_path = wiki_dir(&proj_dir);
@@ -82,38 +37,36 @@ pub fn run_session_start() -> Result<()> {
         Ok(s) => serde_json::from_str::<OpenQuestionsFile>(&s)
             .map(|f| f.questions)
             .unwrap_or_default(),
-        Err(_) => {
-            eprintln!("session-start: no open-questions.json found");
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
-    if questions.is_empty() {
-        eprintln!("session-start: no open questions");
+    // Filter out questions that already have a guide; cap at 8 to avoid overwhelming the model
+    let unanswered: Vec<&OpenQuestion> = questions.iter()
+        .filter(|q| !wiki_path.join(format!("{}.md", q.slug)).exists())
+        .take(8)
+        .collect();
+
+    if unanswered.is_empty() {
         return Ok(());
     }
 
-    eprintln!("session-start: {} open question(s)", questions.len());
-
-    let mut dispatched = 0usize;
-    for q in &questions {
-        let guide_file = wiki_path.join(format!("{}.md", q.slug));
-
-        if guide_file.exists() {
-            eprintln!("session-start: '{}' already has a guide — skipping", q.slug);
-            continue;
-        }
-
-        if recently_attempted(&proj_dir, &q.slug, 7) {
-            eprintln!("session-start: '{}' attempted recently — skipping", q.slug);
-            continue;
-        }
-
-        eprintln!("session-start: dispatching autodoc for '{}': {}", q.noun, q.question);
-        spawn_autodoc(&q.noun, &q.question, &input.cwd);
-        dispatched += 1;
+    // Inject the open questions as additionalContext so Claude answers them naturally
+    let mut ctx = String::from(
+        "<open-questions>\nThe wiki is missing definitions for these concepts. \
+        Please document them in the wiki during this session using the wiki_create tool:\n\n"
+    );
+    for q in &unanswered {
+        ctx.push_str(&format!("- {}\n", q.question));
     }
+    ctx.push_str("</open-questions>");
 
-    eprintln!("session-start: dispatched {} autodoc agent(s)", dispatched);
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": ctx
+        }
+    });
+    print!("{}", serde_json::to_string(&out)?);
+
     Ok(())
 }

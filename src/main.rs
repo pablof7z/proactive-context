@@ -4,7 +4,6 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod archeologist;
-mod autodoc;
 mod awareness;
 mod capture;
 mod session_start;
@@ -258,24 +257,11 @@ enum Commands {
         plain: bool,
     },
 
-    /// Fired by the Claude Code SessionStart hook. Reads open questions from the previous
-    /// session and dispatches background autodoc agents for undefined concepts.
-    /// Reads { session_id, cwd, source } JSON from stdin. Always exits 0.
+    /// Fired by the Claude Code SessionStart hook. Reads open questions left by the previous
+    /// session's capture pass and injects them as additionalContext so Claude can answer
+    /// them naturally during the session. Reads { session_id, cwd, source } JSON from stdin.
+    /// Always exits 0.
     SessionStart,
-
-    /// Auto-document an undefined concept by reading the project codebase.
-    /// Internal — spawned by session-start. Writes a low-confidence definition guide.
-    Autodoc {
-        /// The noun/concept to document (e.g. "TUI client")
-        #[arg(long)]
-        noun: String,
-        /// The question to answer (e.g. "What is the TUI client in this project?")
-        #[arg(long)]
-        question: String,
-        /// Project working directory
-        #[arg(long)]
-        cwd: std::path::PathBuf,
-    },
 }
 
 #[derive(Subcommand)]
@@ -477,10 +463,6 @@ fn main() -> Result<()> {
 
         Commands::SessionStart => {
             crate::session_start::run_session_start()?;
-        }
-
-        Commands::Autodoc { noun, question, cwd } => {
-            crate::autodoc::run_autodoc(&noun, &question, &cwd)?;
         }
     }
 
