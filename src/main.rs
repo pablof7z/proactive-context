@@ -106,7 +106,11 @@ enum Commands {
     /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
     /// Reads { prompt, cwd, session_id, transcript_path } JSON from stdin.
     /// Writes a <system-reminder> block to stdout. Never blocks or errors out the prompt.
-    Inject,
+    Inject {
+        /// Show a systemMessage with hits, guides read, and the generated briefing
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
 
     /// Follow the proactive-context event log live across all projects.
     Tail {
@@ -254,8 +258,8 @@ fn main() -> Result<()> {
             crate::capture::run_capture()?;
         }
 
-        Commands::Inject => {
-            crate::inject::run_inject()?;
+        Commands::Inject { verbose } => {
+            crate::inject::run_inject(verbose)?;
         }
 
         Commands::Tail {

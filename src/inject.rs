@@ -4,6 +4,7 @@ use crate::query::{run_query, QueryResult};
 use crate::transcript::parse_transcript;
 use crate::wiki::{self, guide_path, IndexRow};
 use anyhow::Result;
+use ignore::WalkBuilder;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{Prompt, ToolDefinition};
 use rig_core::providers::openrouter;
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -185,6 +186,30 @@ Use this to read guides from the wiki index, then follow their See Also links to
     }
 }
 
+// ─── Output helper ───────────────────────────────────────────────────────────
+
+/// Non-verbose: prints `context_block` as plain text (→ context injection).
+/// Verbose: prints JSON with `systemMessage` (visible to user) and, if there is
+/// a context block, `hookSpecificOutput.additionalContext` (context injection).
+fn emit(verbose: bool, context_block: Option<&str>, verbose_msg: &str) {
+    if verbose {
+        let obj = if let Some(block) = context_block {
+            serde_json::json!({
+                "systemMessage": verbose_msg,
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": block
+                }
+            })
+        } else {
+            serde_json::json!({ "systemMessage": verbose_msg })
+        };
+        print!("{}", serde_json::to_string(&obj).unwrap_or_default());
+    } else if let Some(block) = context_block {
+        print!("{}", block);
+    }
+}
+
 // ─── Fallback renderer ────────────────────────────────────────────────────────
 
 fn render_raw_reminder(project_name: &str, hits: &[QueryResult]) -> String {
@@ -227,10 +252,97 @@ fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
     false
 }
 
+// ─── No-index bootstrap logic ────────────────────────────────────────────────
+
+/// Called when no project DB exists. Scans for indexable files and either:
+/// - does nothing (≤5 files),
+/// - auto-inits the daemon (>5 files, ≤5000 total LOC), or
+/// - emits a suggestion block to Claude Code (>5 files, >5000 LOC).
+fn handle_no_index(root: &Path, verbose: bool) -> Result<()> {
+    let candidates = scan_indexable_files(root);
+
+    if candidates.len() <= 5 {
+        return Ok(());
+    }
+
+    let total_loc: usize = candidates.iter().map(|(_, loc)| loc).sum();
+
+    if total_loc <= 5000 {
+        // Small enough — silently bootstrap the daemon and move on.
+        let _ = crate::daemon::daemonize(root);
+        return Ok(());
+    }
+
+    // Large project: tell Claude Code to ask the user.
+    let mut block = String::from(
+        "[proactive-context] No index found. Candidate files for indexing:\n",
+    );
+    for (path, loc) in candidates.iter().take(100) {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        block.push_str(&format!("- {} ({} LOC)\n", rel.display(), loc));
+    }
+    let shown = candidates.len().min(100);
+    if candidates.len() > shown {
+        block.push_str(&format!("  ... and {} more\n", candidates.len() - shown));
+    }
+    block.push_str(&format!(
+        "\n({} files total, ~{} LOC)\n",
+        candidates.len(),
+        total_loc
+    ));
+    block.push_str(
+        "\nAsk the user: \"Would you like me to index this project's docs for better context?\"\n",
+    );
+    block.push_str("If yes, run: proactive-context init\n");
+
+    emit(
+        verbose,
+        Some(&block),
+        &format!(
+            "inject | no-index | {} files ~{} LOC — suggestion emitted",
+            candidates.len(),
+            total_loc
+        ),
+    );
+    Ok(())
+}
+
+/// Scan `root` for indexable markdown files (same extensions as the daemon).
+/// Returns (abs_path, line_count) sorted largest-first.
+fn scan_indexable_files(root: &Path) -> Vec<(PathBuf, usize)> {
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    let mut files = Vec::new();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "md" || ext == "markdown" {
+                    let loc = std::fs::read_to_string(path)
+                        .map(|s| s.lines().count())
+                        .unwrap_or(0);
+                    files.push((path.to_path_buf(), loc));
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Always returns Ok(()). Every internal failure is swallowed and degrades gracefully.
-pub fn run_inject() -> Result<()> {
+pub fn run_inject(verbose: bool) -> Result<()> {
     // Read stdin
     let mut raw = String::new();
     let _ = io::stdin().read_to_string(&mut raw);
@@ -247,7 +359,7 @@ pub fn run_inject() -> Result<()> {
     let root = PathBuf::from(&input.cwd);
     let db_path = project_db_path(&root);
     if !db_path.exists() {
-        return Ok(());
+        return handle_no_index(&root, verbose);
     }
 
     let cfg = match load_config() {
@@ -269,6 +381,8 @@ pub fn run_inject() -> Result<()> {
             "reason": "trivial_prompt",
             "prompt_chars": input.prompt.len()
         }));
+        let preview = input.prompt.chars().take(40).collect::<String>();
+        emit(verbose, None, &format!("inject | skipped trivial prompt: {:?}", preview));
         return Ok(());
     }
 
@@ -323,16 +437,22 @@ pub fn run_inject() -> Result<()> {
                     "hits": 0,
                     "out_chars": 0
                 }));
+                emit(verbose, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
+                    start.elapsed().as_millis()));
                 return Ok(());
             }
+            let elapsed_ms = start.elapsed().as_millis();
             let out_chars = fallback_block.len();
-            print!("{}", fallback_block);
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+            let hits_list = format_hits(&hits);
+            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                 "outcome": "fallback",
                 "reason": "no_api_key",
                 "hits": hits.len(),
                 "out_chars": out_chars
             }));
+            emit(verbose, Some(&fallback_block), &format!(
+                "inject [{}ms] | {} hits | fallback (no API key) | injected {}c\n\nHits:\n{}",
+                elapsed_ms, hits.len(), out_chars, hits_list));
             return Ok(());
         }
     };
@@ -384,18 +504,22 @@ pub fn run_inject() -> Result<()> {
     });
 
     match browse_result {
-        Ok(Ok(NavigateResult::Briefing(briefing))) => {
+        Ok(Ok(NavigateResult::Briefing { text: briefing, guides_read })) => {
             let trimmed = briefing.trim();
+            let elapsed_ms = start.elapsed().as_millis();
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
                 log_event("generate.briefing", None, serde_json::json!({
                     "briefing_chars": 0,
                     "summary": "NONE"
                 }));
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "none",
                     "hits": hits.len(),
                     "out_chars": 0
                 }));
+                emit(verbose, None, &format!(
+                    "inject [{}ms] | {} hits | guides: {} | briefing: NONE",
+                    elapsed_ms, hits.len(), format_guides(&guides_read)));
                 return Ok(());
             }
 
@@ -410,65 +534,83 @@ pub fn run_inject() -> Result<()> {
             }));
 
             let out_chars = out.len();
-            print!("{}", out);
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                 "outcome": "compiled",
                 "hits": hits.len(),
                 "out_chars": out_chars
             }));
+            emit(verbose, Some(&out), &format!(
+                "inject [{}ms] | {} hits | guides: {} | compiled {}c\n\nHits:\n{}\n\nBriefing:\n{}",
+                elapsed_ms, hits.len(), format_guides(&guides_read),
+                out_chars, format_hits(&hits), trimmed));
         }
 
-        Ok(Ok(NavigateResult::ShortCircuit)) => {
-            // Fast model found nothing relevant
+        Ok(Ok(NavigateResult::ShortCircuit { guides_read })) => {
+            let elapsed_ms = start.elapsed().as_millis();
             log_event("select.shortcircuit", None, serde_json::json!({
                 "reason": "no_relevant_guides"
             }));
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                 "outcome": "none",
                 "hits": hits.len(),
                 "out_chars": 0
             }));
+            emit(verbose, None, &format!(
+                "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
+                elapsed_ms, hits.len(), format_guides(&guides_read)));
         }
 
         Ok(Err(e)) => {
+            let elapsed_ms = start.elapsed().as_millis();
             log_event("error", None, serde_json::json!({
                 "stage": "generate.briefing",
                 "message": truncate(&format!("{}", e), 300)
             }));
             if !hits.is_empty() {
                 let out_chars = fallback_block.len();
-                print!("{}", fallback_block);
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "fallback",
                     "reason": "compile_error",
                     "hits": hits.len(),
                     "out_chars": out_chars
                 }));
+                emit(verbose, Some(&fallback_block), &format!(
+                    "inject [{}ms] | {} hits | error: {} | fallback {}c\n\nHits:\n{}",
+                    elapsed_ms, hits.len(), truncate(&format!("{}", e), 120),
+                    out_chars, format_hits(&hits)));
             } else {
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
                     "hits": 0,
                     "out_chars": 0
                 }));
+                emit(verbose, None, &format!(
+                    "inject [{}ms] | 0 hits | error: {}",
+                    elapsed_ms, truncate(&format!("{}", e), 120)));
             }
         }
 
         Err(_timeout) => {
+            let elapsed_ms = start.elapsed().as_millis();
             if !hits.is_empty() {
                 let out_chars = fallback_block.len();
-                print!("{}", fallback_block);
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "fallback",
                     "reason": "timeout",
                     "hits": hits.len(),
                     "out_chars": out_chars
                 }));
+                emit(verbose, Some(&fallback_block), &format!(
+                    "inject [{}ms] | {} hits | timeout → fallback {}c\n\nHits:\n{}",
+                    elapsed_ms, hits.len(), out_chars, format_hits(&hits)));
             } else {
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
                     "hits": 0,
                     "out_chars": 0
                 }));
+                emit(verbose, None, &format!(
+                    "inject [{}ms] | 0 hits | timeout — nothing injected", elapsed_ms));
             }
         }
     }
@@ -480,9 +622,9 @@ pub fn run_inject() -> Result<()> {
 
 enum NavigateResult {
     /// The fast model found relevant guides and the strong model compiled a briefing.
-    Briefing(String),
+    Briefing { text: String, guides_read: Vec<String> },
     /// The fast model determined nothing is relevant — short-circuit, emit nothing.
-    ShortCircuit,
+    ShortCircuit { guides_read: Vec<String> },
 }
 
 // ─── Two-model wiki navigate + compile ───────────────────────────────────────
@@ -550,7 +692,7 @@ async fn wiki_navigate_and_compile(
 
     // If wiki is empty and no hits, short-circuit immediately
     if index_rows.is_empty() && hits.is_empty() {
-        return Ok(NavigateResult::ShortCircuit);
+        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
     }
 
     // If wiki is empty but we have hits, skip the nav step and go straight to compile
@@ -558,7 +700,7 @@ async fn wiki_navigate_and_compile(
         // No wiki guides — fall through to compile with just hit snippets
         let curated = build_hit_context(hits);
         return compile_briefing(api_key, compile_model, current_prompt, recent, &curated, max_tokens).await
-            .map(NavigateResult::Briefing);
+            .map(|text| NavigateResult::Briefing { text, guides_read: vec![] });
     }
 
     // Create the navigation tool with shared state
@@ -584,17 +726,14 @@ async fn wiki_navigate_and_compile(
         .await?;
 
     // ── Shortcircuit detection: gate on tool activity first ────────────────
-    // If the fast model read NO guides (read_slugs is empty), we know there's no
-    // curated wiki material — short-circuit regardless of what the model said.
-    // Primary: tool activity check (robust to any model prose response)
-    // Secondary: explicit sentinel phrases (lenient match)
-    {
+    // Extract guides_read once; all returns below include it.
+    let guides_read: Vec<String> = {
         let state = nav_state.lock().unwrap();
-        if state.read_slugs.is_empty() {
-            // Model decided nothing was worth reading — short-circuit
-            return Ok(NavigateResult::ShortCircuit);
-        }
-        drop(state);
+        state.read_slugs.iter().cloned().collect()
+    };
+
+    if guides_read.is_empty() {
+        return Ok(NavigateResult::ShortCircuit { guides_read });
     }
 
     // Even if guides were read, the model might still conclude nothing relevant
@@ -607,12 +746,12 @@ async fn wiki_navigate_and_compile(
         || lower.eq("none")
         || nav_trimmed.is_empty()
     {
-        return Ok(NavigateResult::ShortCircuit);
+        return Ok(NavigateResult::ShortCircuit { guides_read });
     }
 
     // ── STRONG MODEL: Compile briefing from curated content ────────────────
     compile_briefing(api_key, compile_model, current_prompt, recent, nav_trimmed, max_tokens).await
-        .map(NavigateResult::Briefing)
+        .map(|text| NavigateResult::Briefing { text, guides_read })
 }
 
 /// Compile final tight briefing using strong model.
@@ -711,4 +850,19 @@ fn project_basename(normalized: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(normalized)
         .to_string()
+}
+
+fn format_hits(hits: &[QueryResult]) -> String {
+    hits.iter()
+        .map(|h| format!("  • {} chunk {} (score {:.2})", h.path, h.chunk_index, h.score))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_guides(guides: &[String]) -> String {
+    if guides.is_empty() {
+        "(none)".to_string()
+    } else {
+        guides.join(", ")
+    }
 }
