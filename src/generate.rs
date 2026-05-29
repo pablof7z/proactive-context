@@ -222,6 +222,9 @@ pub fn run_generate(root: &Path, user_query: &str) -> Result<()> {
             root: root.to_path_buf(),
         })
         .max_tokens(4000)
+        // rig drops max_tokens from the OpenRouter request unless also in additional_params
+        // (otherwise it defaults to the model's 64k cap — a silent cost/runaway risk).
+        .additional_params(serde_json::json!({"max_tokens": 4000}))
         .build();
 
     // 6. Run the (now much better informed) multi-turn agent
@@ -259,6 +262,7 @@ pub(crate) async fn generate_sub_queries(
              Output one query per line. Keep them concise and natural."
         )
         .max_tokens(200)
+        .additional_params(serde_json::json!({"max_tokens": 200}))
         .build();
 
     let response: String = agent.prompt(user_query).await?;

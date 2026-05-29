@@ -801,6 +801,9 @@ async fn wiki_navigate_and_compile(
         .agent(select_model)
         .preamble(&preamble)
         .max_tokens(300u64)
+        // rig drops max_tokens from the OpenRouter request unless also in additional_params
+        // (otherwise it defaults to the model's 64k cap — a silent cost/runaway risk).
+        .additional_params(serde_json::json!({"max_tokens": 300}))
         .build();
     let selection: String = select_agent.prompt(current_prompt).await?;
 
@@ -918,6 +921,9 @@ async fn compile_briefing(
         .agent(model)
         .preamble(&format!("{}\n\n{}", COMPILE_PREAMBLE, context))
         .max_tokens(max_tokens as u64)
+        // rig drops max_tokens from the OpenRouter request unless also in additional_params
+        // (otherwise it defaults to the model's 64k cap — a silent cost/runaway risk).
+        .additional_params(serde_json::json!({"max_tokens": max_tokens}))
         .build();
 
     let response: String = agent.prompt(current_prompt).await?;
