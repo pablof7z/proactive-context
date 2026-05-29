@@ -12,7 +12,7 @@ use rig_core::completion::{Prompt, ToolDefinition};
 use rig_core::tool::Tool;
 use tokio::runtime::Runtime;
 
-use crate::config::{load_config, normalize_path};
+use crate::config::{load_config, normalize_path, resolve_project_root};
 use crate::provider::{ModelSpec, Provider, build_ollama_client, build_openrouter_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
@@ -184,7 +184,7 @@ fn unix_now_secs() -> u64 {
 }
 
 fn project_dir_from_cwd(cwd: &str) -> PathBuf {
-    let root = PathBuf::from(cwd);
+    let root = resolve_project_root(&PathBuf::from(cwd));
     let normalized = normalize_path(&root);
     home_dir()
         .join(".proactive-context")

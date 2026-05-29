@@ -445,6 +445,36 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// If `path` is inside a git worktree, return the main (primary) worktree root.
+/// Otherwise return `path` (canonicalized). Falls through unchanged for non-git directories.
+///
+/// Detection: `git rev-parse --git-common-dir` returns ".git" (relative) in the main
+/// worktree and an absolute path to `<main>/.git` in a linked worktree.
+pub fn resolve_project_root(path: &std::path::Path) -> PathBuf {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let output = std::process::Command::new("git")
+        .args(["-C", &abs.to_string_lossy().as_ref(), "rev-parse", "--git-common-dir"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return abs,
+    };
+
+    let common_dir_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let common_dir = PathBuf::from(&common_dir_str);
+
+    // Absolute path → linked worktree; its parent is the main worktree root.
+    if common_dir.is_absolute() {
+        if let Some(main_root) = common_dir.parent() {
+            return main_root.to_path_buf();
+        }
+    }
+
+    abs
+}
+
 /// Normalize a directory path into a safe filesystem name.
 /// e.g. "/Users/pablo/src/foo" → "Users_pablo_src_foo"
 pub fn normalize_path(root: &std::path::Path) -> String {

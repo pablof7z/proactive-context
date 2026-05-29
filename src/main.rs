@@ -22,7 +22,7 @@ mod transcript;
 mod tui;
 mod wiki;
 
-use crate::config::{load_config, normalize_path, project_context_dir, save_config};
+use crate::config::{load_config, normalize_path, project_context_dir, resolve_project_root, save_config};
 use crate::daemon::{daemonize, index_files_into_db, list_daemons, stop_daemon};
 use crate::events::init_context;
 use crate::query::{print_results, run_query};
@@ -237,10 +237,13 @@ enum ConfigAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let root = cli
-        .dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().expect("could not get current directory"));
+    let root = {
+        let raw = cli
+            .dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().expect("could not get current directory"));
+        resolve_project_root(&raw)
+    };
 
     // Ensure the per-project .proactive-context directory exists for lock/db
     let _ = std::fs::create_dir_all(project_context_dir(&root));

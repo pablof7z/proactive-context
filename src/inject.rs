@@ -1,4 +1,4 @@
-use crate::config::{load_config, normalize_path, project_db_path, project_context_dir};
+use crate::config::{load_config, normalize_path, project_db_path, project_context_dir, resolve_project_root};
 use crate::events::{init_context, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
@@ -41,24 +41,23 @@ struct InjectInput {
 // ─── Compile preamble (briefing step) ────────────────────────────────────────
 
 const COMPILE_PREAMBLE: &str = "\
-You are a LIBRARIAN for an AI coding assistant (Claude Code) — NOT its answerer. The text given as the \
-user prompt is a SEARCH QUERY describing what the assistant is about to work on. Do NOT answer it, do \
-NOT explain anything, do NOT write prose of your own.\n\n\
-You are given wiki guides, each line-numbered, under a header naming its slug. Your only job is to SELECT \
-the line ranges that are directly relevant to the query, so the assistant can read them verbatim. A later \
-step slices the exact text — you only choose ranges.\n\n\
-Respond with ONLY a JSON object (no markdown fences, no commentary) in EXACTLY this shape:\n\
-{\n\
-  \"title\": \"<2-8 words naming the topic the assistant is working on, or null if nothing is relevant>\",\n\
-  \"selections\": [\n\
-    { \"slug\": \"<guide-slug>\", \"start\": <first line number>, \"end\": <last line number>, \"note\": \"<optional one-line why-relevant; omit if obvious>\", \"contradiction\": <true ONLY if this passage conflicts with another selection> }\n\
-  ]\n\
-}\n\n\
-Rules:\n\
-- Select GENEROUSLY: include every directly-relevant section (it is fine to return ~10 ranges across several guides). Drop anything not relevant.\n\
-- start/end are the line numbers shown by the `N|` prefix. Cover whole coherent sections, not fragments.\n\
-- Use each slug EXACTLY as shown in its `=== guide slug: ... ===` header.\n\
-- If NOTHING in the guides is relevant to the query, return {\"title\": null, \"selections\": []}.";
+You are a context compiler for an AI coding assistant (Claude Code). The text given as the user \
+prompt is a SEARCH QUERY describing what the assistant is about to work on. You are given SOURCE \
+DOCUMENTS, line-numbered, each under a header naming its absolute file path.\n\n\
+Write a TIGHT, synthesized briefing containing ONLY the information relevant to the query, drawn \
+strictly from the provided sources. Be dense and specific. Do NOT answer the query, do NOT write \
+code, do NOT restate the query or pad with filler — surface the relevant facts so the assistant \
+can reason from them.\n\n\
+HARD REQUIREMENT — CITATIONS: every factual claim MUST be immediately followed by an inline source \
+citation in the form (path:line) or (path:start-end), using the EXACT absolute path from the \
+source header and the line numbers shown by the `N|` prefix. A claim with no citation is invalid. \
+Never invent paths or line numbers — cite only what is shown. Synthesize in your own words; do not \
+paste whole sections verbatim.\n\n\
+Output EXACTLY this shape:\n\
+TITLE: <2-8 words naming the topic, or the single word none if nothing is relevant>\n\
+<the synthesized briefing, with an inline (path:line) citation after every claim>\n\n\
+If NOTHING in the sources is relevant to the query, output exactly:\n\
+TITLE: none";
 
 // ─── Title stripping ──────────────────────────────────────────────────────────
 
@@ -249,7 +248,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let root = PathBuf::from(&input.cwd);
+    let root = resolve_project_root(&PathBuf::from(&input.cwd));
     let db_path = project_db_path(&root);
     if !db_path.exists() {
         return handle_no_index(&root, verbose);
@@ -344,7 +343,6 @@ pub fn run_inject(verbose: bool) -> Result<()> {
         }
         let elapsed_ms = start.elapsed().as_millis();
         let out_chars = fallback_block.len();
-        let hits_list = format_hits(&hits);
         log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
             "outcome": "fallback",
             "reason": "no_api_key",
@@ -353,8 +351,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             "prompt_preview": &prompt_preview
         }));
         emit(verbose, Some(&fallback_block), &format!(
-            "inject [{}ms] | {} hits | fallback (no API key) | injected {}c\n\nHits:\n{}",
-            elapsed_ms, hits.len(), out_chars, hits_list));
+            "inject [{}ms] | {} hits | fallback (no API key) | injected {}c",
+            elapsed_ms, hits.len(), out_chars));
         return Ok(());
     }
 
@@ -456,9 +454,9 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             }
             log_event("inject.done", Some(elapsed_ms as u64), done_payload);
             emit(verbose, Some(&out), &format!(
-                "inject [{}ms] | {} hits | guides: {} | compiled {}c\n\nHits:\n{}\n\nBriefing:\n{}",
+                "inject [{}ms] | {} hits | guides: {} | compiled {}c\n\nBriefing:\n{}",
                 elapsed_ms, hits.len(), format_guides(&guides_read),
-                out_chars, format_hits(&hits), body));
+                out_chars, body));
         }
 
         Ok(Ok(NavigateResult::ShortCircuit { guides_read })) => {
@@ -493,9 +491,9 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, Some(&fallback_block), &format!(
-                    "inject [{}ms] | {} hits | error: {} | fallback {}c\n\nHits:\n{}",
+                    "inject [{}ms] | {} hits | error: {} | fallback {}c",
                     elapsed_ms, hits.len(), truncate(&format!("{}", e), 120),
-                    out_chars, format_hits(&hits)));
+                    out_chars));
             } else {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
@@ -521,8 +519,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, Some(&fallback_block), &format!(
-                    "inject [{}ms] | {} hits | timeout → fallback {}c\n\nHits:\n{}",
-                    elapsed_ms, hits.len(), out_chars, format_hits(&hits)));
+                    "inject [{}ms] | {} hits | timeout → fallback {}c",
+                    elapsed_ms, hits.len(), out_chars));
             } else {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
@@ -831,7 +829,7 @@ async fn wiki_navigate_and_compile(
                 .agent(&select_spec.model)
                 .preamble(&preamble)
                 .max_tokens(300u64)
-                .additional_params(serde_json::json!({"max_tokens": 300, "think": true}))
+                .additional_params(serde_json::json!({"max_tokens": 300}))
                 .build()
                 .prompt(current_prompt).await?;
             crate::openrouter::record_external_turn(
@@ -876,7 +874,7 @@ async fn wiki_navigate_and_compile(
         return Ok(NavigateResult::ShortCircuit { guides_read });
     }
 
-    // ── STRONG MODEL (librarian): pick verbatim line ranges from the sources ───
+    // ── STRONG MODEL (compiler): synthesize a cited briefing from the sources ──
     compile_briefing(
         api_key,
         ollama_api_key,
@@ -885,7 +883,6 @@ async fn wiki_navigate_and_compile(
         current_prompt,
         recent,
         &guides,
-        index_rows,
         wiki_dir,
         root,
         max_tokens,
@@ -894,34 +891,16 @@ async fn wiki_navigate_and_compile(
     .map(|text| NavigateResult::Briefing { text, guides_read })
 }
 
-// ─── Structured selection (compile model output) ──────────────────────────────
+// ─── Source rendering (compile model input) ───────────────────────────────────
 
-#[derive(Deserialize)]
-struct CompileSelection {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    selections: Vec<Selection>,
-}
-
-#[derive(Deserialize)]
-struct Selection {
-    slug: String,
-    start: usize,
-    end: usize,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    contradiction: bool,
-}
-
-/// Render verbatim guides as line-numbered text for the compile model to select from.
-/// Line numbers are 1-based over `content.lines()` — the SAME enumeration used when
-/// slicing, so the model's chosen ranges map exactly back to the source.
-fn render_guides_for_select(guides: &[(String, String)]) -> String {
+/// Render the selected sources as line-numbered text for the compile model to synthesize from.
+/// Each `(label, content)` is headed by `=== source: <label> ===`, where `label` is the
+/// ABSOLUTE file path the model must cite. Line numbers are 1-based over `content.lines()`,
+/// matching the `N|` prefix the model is told to cite.
+fn render_guides_for_select(sources: &[(String, String)]) -> String {
     let mut out = String::new();
-    for (slug, content) in guides {
-        out.push_str(&format!("=== guide slug: {} ===\n", slug));
+    for (label, content) in sources {
+        out.push_str(&format!("=== source: {} ===\n", label));
         for (i, line) in content.lines().enumerate() {
             out.push_str(&format!("{:>4}| {}\n", i + 1, line));
         }
@@ -930,9 +909,10 @@ fn render_guides_for_select(guides: &[(String, String)]) -> String {
     out
 }
 
-/// Ask the compile model which line ranges are relevant, then slice the verbatim text
-/// out of `guides` in Rust. The model never reproduces text — guaranteeing fidelity and
-/// keeping its output (and thus latency) tiny on this pre-prompt hot path.
+/// Ask the compile model to synthesize a dense, relevant briefing from the selected sources,
+/// requiring an inline `(path:line)` citation after every claim (enforced by prompt, then
+/// surfaced verbatim to Claude Code). The model's prose IS the output — sources are presented
+/// line-numbered under their absolute path so its citations point back at openable locations.
 async fn compile_briefing(
     api_key: &str,
     ollama_api_key: Option<&str>,
@@ -941,19 +921,32 @@ async fn compile_briefing(
     current_prompt: &str,
     recent: &str,
     guides: &[(String, String)],
-    index_rows: &[IndexRow],
     wiki_dir: &Path,
     root: &Path,
     max_tokens: usize,
 ) -> Result<String> {
+    // Label each source by the ABSOLUTE path the model must cite (wiki guides live under
+    // wiki_dir keyed by bare slug; committed project files are keyed by their repo-relative path).
+    let sources: Vec<(String, String)> = guides
+        .iter()
+        .map(|(slug, content)| {
+            let abs = if slug.ends_with(".md") || slug.contains('/') {
+                root.join(slug)
+            } else {
+                guide_path(wiki_dir, slug)
+            };
+            (abs.display().to_string(), content.clone())
+        })
+        .collect();
+
     let mut context = String::new();
     if !recent.is_empty() {
         context.push_str("RECENT CONVERSATION (background only):\n\n");
         context.push_str(recent);
         context.push_str("\n\n");
     }
-    context.push_str("WIKI GUIDES (line-numbered; select the relevant ranges):\n\n");
-    context.push_str(&render_guides_for_select(guides));
+    context.push_str("SOURCE DOCUMENTS (line-numbered; synthesize only what is relevant):\n\n");
+    context.push_str(&render_guides_for_select(&sources));
 
     let preamble = format!("{}\n\n{}", COMPILE_PREAMBLE, context);
     let response: String = match spec.provider {
@@ -968,7 +961,7 @@ async fn compile_briefing(
                 .agent(&spec.model)
                 .preamble(&preamble)
                 .max_tokens(max_tokens as u64)
-                .additional_params(serde_json::json!({"max_tokens": max_tokens, "think": true}))
+                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
                 .build()
                 .prompt(current_prompt).await?;
             crate::openrouter::record_external_turn(
@@ -979,132 +972,28 @@ async fn compile_briefing(
         }
     };
 
-    let selection = parse_selection(&response)
-        .ok_or_else(|| anyhow::anyhow!("compile: could not parse selection JSON"))?;
-
-    Ok(render_selection(&selection, guides, index_rows, wiki_dir, root))
-}
-
-/// Extract the JSON object from a model response (tolerates fences / stray prose around it).
-fn parse_selection(text: &str) -> Option<CompileSelection> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    serde_json::from_str(&text[start..=end]).ok()
-}
-
-/// Slice the selected line ranges verbatim and render the cited briefing body.
-/// Each excerpt is headed by an ABSOLUTE `path:start-end (updated <date> · <relative>)`
-/// citation so Claude Code can open the source. Returns `NONE` if nothing usable.
-fn render_selection(
-    sel: &CompileSelection,
-    guides: &[(String, String)],
-    index_rows: &[IndexRow],
-    wiki_dir: &Path,
-    root: &Path,
-) -> String {
-    let mut body = String::new();
-
-    for s in &sel.selections {
-        let content = match guides.iter().find(|(slug, _)| slug == &s.slug) {
-            Some((_, c)) => c,
-            None => continue,
-        };
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.is_empty() {
-            continue;
-        }
-        let start = s.start.max(1);
-        if start > lines.len() {
-            continue;
-        }
-        let end = s.end.min(lines.len()).max(start);
-        let excerpt = lines[(start - 1)..end].join("\n");
-
-        // Prefer the guide's own frontmatter `updated:` (always present in the verbatim
-        // content); fall back to the index row if the frontmatter lacks it.
-        let date_str = extract_updated(content)
-            .or_else(|| {
-                index_rows
-                    .iter()
-                    .find(|r| r.slug == s.slug)
-                    .map(|r| r.updated.clone())
-                    .filter(|u| !u.is_empty())
-            })
-            .map(|u| format!(" (updated {})", relative_date(&u)))
-            .unwrap_or_default();
-
-        // Resolve the citation path: wiki guides are keyed by bare slug (live under wiki_dir);
-        // committed project files are keyed by their repo-relative path (contain '/' or end ".md").
-        let abs = if s.slug.ends_with(".md") || s.slug.contains('/') {
-            root.join(&s.slug)
-        } else {
-            guide_path(wiki_dir, &s.slug)
-        };
-        let mut header = format!("{}:{}-{}{}", abs.display(), start, end, date_str);
-        if s.contradiction {
-            header.push_str(" [CONTRADICTION]");
-        }
-        if let Some(note) = s.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            header.push_str(&format!(" — {}", note));
-        }
-
-        body.push_str(&header);
-        body.push('\n');
-        body.push_str(&excerpt);
-        body.push_str("\n\n");
+    // The synthesized briefing is the output as-is. Its leading `TITLE:` line is stripped by the
+    // caller for the status bar; an empty body or `TITLE: none` degrades to a no-inject outcome.
+    let resp = response.trim();
+    if resp.is_empty() {
+        return Ok("NONE".to_string());
     }
 
-    let body = body.trim_end();
-    if body.is_empty() {
-        return "NONE".to_string();
-    }
-    let title = sel
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("relevant wiki context");
-
-    // Conditionally prepend the citation-log preamble when the body contains [^id] markers.
-    // Spec: "Inline [^id] markers cite verbatim source-conversation evidence in
-    // <wiki>/_citations.log; read it to see why a statement exists."
-    // No preamble when no marker is present (keeps injection noise-free until citations exist).
-    let preamble = if body.contains("[^") {
+    // If the synthesis carried any [^id] markers (copied from source prose), prepend the
+    // citation-log preamble — but keep the leading TITLE: line first so the status bar reads it.
+    if resp.contains("[^") {
         let citations_log = wiki_dir.join("_citations.log");
-        format!(
+        let pre = format!(
             "Inline [^id] markers cite verbatim source-conversation evidence in {}; \
              read it to see why a statement exists.\n\n",
             citations_log.display()
-        )
-    } else {
-        String::new()
-    };
-
-    format!("TITLE: {}\n{}{}", title, preamble, body)
-}
-
-/// Pull the `updated:` value out of a guide's leading YAML frontmatter, if present.
-fn extract_updated(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    if lines.next()?.trim() != "---" {
-        return None;
-    }
-    for line in lines {
-        let t = line.trim();
-        if t == "---" {
-            break;
-        }
-        if let Some(rest) = t.strip_prefix("updated:") {
-            let v = rest.trim().trim_matches('"').trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
+        );
+        if let Some(nl) = resp.find('\n') {
+            return Ok(format!("{}\n{}{}", &resp[..nl], pre, resp[nl + 1..].trim_start()));
         }
     }
-    None
+
+    Ok(resp.to_string())
 }
 
 /// Render raw vector hits verbatim as a librarian briefing (used when the wiki is empty
@@ -1123,59 +1012,6 @@ fn render_hits_librarian(hits: &[QueryResult]) -> String {
         return "NONE".to_string();
     }
     format!("TITLE: relevant project files\n{}", body)
-}
-
-// ─── Relative-date helper ──────────────────────────────────────────────────────
-
-/// Days since the civil epoch (1970-01-01) for a Gregorian date. Howard Hinnant's algorithm.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-fn today_days() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / 86400) as i64
-}
-
-/// Format a `YYYY-MM-DD` date as `YYYY-MM-DD · <relative>` (e.g. "2026-05-26 · 3 days ago").
-/// Falls back to the raw string if it can't be parsed.
-fn relative_date(updated: &str) -> String {
-    let parts: Vec<&str> = updated.split('-').collect();
-    let (y, m, d) = match parts.as_slice() {
-        [y, m, d] => match (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) {
-            (Ok(y), Ok(m), Ok(d)) => (y, m, d),
-            _ => return updated.to_string(),
-        },
-        _ => return updated.to_string(),
-    };
-    let diff = today_days() - days_from_civil(y, m, d);
-    let rel = if diff <= 0 {
-        "today".to_string()
-    } else if diff == 1 {
-        "yesterday".to_string()
-    } else if diff < 7 {
-        format!("{} days ago", diff)
-    } else if diff < 30 {
-        let w = diff / 7;
-        format!("{} week{} ago", w, if w == 1 { "" } else { "s" })
-    } else if diff < 365 {
-        let mo = diff / 30;
-        format!("{} month{} ago", mo, if mo == 1 { "" } else { "s" })
-    } else {
-        let yr = diff / 365;
-        format!("{} year{} ago", yr, if yr == 1 { "" } else { "s" })
-    };
-    format!("{} · {}", updated, rel)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1233,13 +1069,6 @@ fn project_basename(normalized: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(normalized)
         .to_string()
-}
-
-fn format_hits(hits: &[QueryResult]) -> String {
-    hits.iter()
-        .map(|h| format!("  • {} chunk {} (score {:.2})", h.path, h.chunk_index, h.score))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn format_guides(guides: &[String]) -> String {
