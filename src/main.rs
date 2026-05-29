@@ -11,7 +11,6 @@ mod daemon;
 mod db;
 mod embed;
 mod events;
-mod generate;
 mod inject;
 mod openrouter;
 mod provider;
@@ -75,13 +74,6 @@ enum Commands {
         /// Explicit path to index.db (defaults to <dir>/../index.db)
         #[arg(long)]
         index_db: Option<PathBuf>,
-    },
-
-    /// Ask a question and get a high-quality synthesized answer from an LLM (via OpenRouter).
-    /// The model can use a `read_file` tool to pull full documents when needed (multi-turn).
-    Generate {
-        /// The question
-        query: String,
     },
 
     /// Stop the background daemon for this directory (if running).
@@ -242,12 +234,6 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| dir.join("index.db"))
             });
             index_files_into_db(&dir, &db_path)?;
-        }
-
-        Commands::Generate { query } => {
-            let project = normalize_path(&root);
-            init_context(&project, "");
-            crate::generate::run_generate(&root, &query)?;
         }
 
         Commands::Stop => {

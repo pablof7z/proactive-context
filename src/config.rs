@@ -18,12 +18,6 @@ pub struct Config {
     /// Leave unset for standard local Ollama which requires no authentication.
     pub ollama_api_key: Option<String>,
 
-    /// Model to use for the `generate` command.
-    /// Format: "provider:model" (e.g. "openrouter:anthropic/claude-3-5-sonnet-20241022"
-    /// or "ollama:llama3.2"). Provider prefix is optional; unprefixed strings default to openrouter.
-    #[serde(default = "default_generate_model")]
-    pub generate_model: String,
-
     /// Embedding provider: "local" or "openrouter"
     #[serde(default = "default_embed_provider")]
     pub embed_provider: String,
@@ -41,21 +35,6 @@ pub struct Config {
     /// Overlap between consecutive chunks (characters)
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
-
-    /// Maximum number of sub-queries generated via cheap decomposition for fan-out in `generate`.
-    /// Total parallel retrieval angles = 1 (original query) + this value.
-    /// Controls breadth/cost/latency of the parallel retrieval step.
-    #[serde(default = "default_max_fanout_queries")]
-    pub max_fanout_queries: usize,
-
-    /// Maximum number of unique full documents to prefetch in parallel (for high-signal context) during `generate`.
-    #[serde(default = "default_max_parallel_prefetch")]
-    pub max_parallel_prefetch: usize,
-
-    /// Cheap/fast model used for query decomposition into sub-queries (fan-out).
-    /// Accepts "provider:model" format (e.g. "ollama:qwen2.5:7b" or "openrouter:openai/gpt-4o-mini").
-    #[serde(default = "default_decompose_model")]
-    pub decompose_model: String,
 
     /// Enable or disable the session-end lesson capture pass.
     #[serde(default = "default_capture_enabled")]
@@ -174,10 +153,6 @@ pub struct Config {
     pub capture_max_turns: usize,
 }
 
-fn default_generate_model() -> String {
-    "anthropic/claude-3-5-sonnet-20241022".to_string()
-}
-
 fn default_ollama_base_url() -> String {
     "http://localhost:11434".to_string()
 }
@@ -196,18 +171,6 @@ fn default_chunk_size() -> usize {
 
 fn default_chunk_overlap() -> usize {
     120
-}
-
-fn default_max_fanout_queries() -> usize {
-    4
-}
-
-fn default_max_parallel_prefetch() -> usize {
-    6
-}
-
-fn default_decompose_model() -> String {
-    "openai/gpt-4o-mini".to_string()
 }
 
 fn default_capture_enabled() -> bool {
@@ -303,40 +266,6 @@ fn default_inject_min_prompt_words() -> usize {
 
 fn default_capture_max_turns() -> usize {
     16
-}
-
-/// Sanitize fan-out related tunables after deserialization.
-/// Provides sensible validation + fallbacks so bad user edits (0, empty, huge values) never break behavior.
-/// Uses the default_* fns as source of truth.
-fn sanitize_fanout(cfg: Config) -> Config {
-    let mut c = cfg;
-
-    if c.max_fanout_queries == 0 || c.max_fanout_queries > 20 {
-        if c.max_fanout_queries != default_max_fanout_queries() {
-            eprintln!(
-                "proactive-context: adjusting max_fanout_queries={} to sensible default/bound",
-                c.max_fanout_queries
-            );
-        }
-        c.max_fanout_queries = default_max_fanout_queries();
-    }
-
-    if c.max_parallel_prefetch == 0 || c.max_parallel_prefetch > 20 {
-        if c.max_parallel_prefetch != default_max_parallel_prefetch() {
-            eprintln!(
-                "proactive-context: adjusting max_parallel_prefetch={} to sensible default/bound",
-                c.max_parallel_prefetch
-            );
-        }
-        c.max_parallel_prefetch = default_max_parallel_prefetch();
-    }
-
-    if c.decompose_model.trim().is_empty() {
-        eprintln!("proactive-context: empty decompose_model in config, using default");
-        c.decompose_model = default_decompose_model();
-    }
-
-    c
 }
 
 fn sanitize_inject(cfg: Config) -> Config {
@@ -459,14 +388,10 @@ impl Default for Config {
             openrouter_api_key: None,
             ollama_base_url: default_ollama_base_url(),
             ollama_api_key: None,
-            generate_model: default_generate_model(),
             embed_provider: default_embed_provider(),
             embed_model: default_embed_model(),
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
-            max_fanout_queries: default_max_fanout_queries(),
-            max_parallel_prefetch: default_max_parallel_prefetch(),
-            decompose_model: default_decompose_model(),
             capture_enabled: default_capture_enabled(),
             capture_model: default_capture_model(),
             capture_triage_model: default_capture_triage_model(),
@@ -512,7 +437,7 @@ pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
         // Create default config on first run
-        let cfg = sanitize_logging(sanitize_inject(sanitize_fanout(Config::default())));
+        let cfg = sanitize_logging(sanitize_inject(Config::default()));
         save_config(&cfg)?;
         return Ok(cfg);
     }
@@ -521,7 +446,7 @@ pub fn load_config() -> Result<Config> {
         .with_context(|| format!("Failed to read config at {}", path.display()))?;
     let cfg: Config = serde_json::from_str(&data)
         .with_context(|| format!("Failed to parse config at {}", path.display()))?;
-    Ok(sanitize_logging(sanitize_inject(sanitize_fanout(cfg))))
+    Ok(sanitize_logging(sanitize_inject(cfg)))
 }
 
 pub fn save_config(cfg: &Config) -> Result<()> {

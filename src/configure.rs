@@ -48,18 +48,6 @@ struct Role {
 
 const ROLES: &[Role] = &[
     Role {
-        key: "generate_model",
-        label: "pc generate",
-        description: "`pc generate \"question\"` — answers from your notes, can read files",
-        suggestion: "→ Use a capable model  e.g. sonnet, gpt-4o, llama3.3:70b",
-    },
-    Role {
-        key: "decompose_model",
-        label: "pc generate (search)",
-        description: "Splits your question into sub-searches to find more notes (part of generate)",
-        suggestion: "→ Use a fast/cheap model  e.g. haiku, gpt-4o-mini, qwen2.5:7b",
-    },
-    Role {
         key: "inject_select_model",
         label: "Context scan",
         description: "Runs before EVERY prompt — scans your wiki and picks what's relevant",
@@ -87,8 +75,6 @@ const ROLES: &[Role] = &[
 
 fn get_role_value(cfg: &Config, key: &str) -> String {
     match key {
-        "generate_model" => cfg.generate_model.clone(),
-        "decompose_model" => cfg.decompose_model.clone(),
         "inject_select_model" => cfg.inject_select_model.clone(),
         "inject_compile_model" => cfg.inject_compile_model.clone(),
         "capture_model" => cfg.capture_model.clone(),
@@ -99,8 +85,6 @@ fn get_role_value(cfg: &Config, key: &str) -> String {
 
 fn set_role_value(cfg: &mut Config, key: &str, value: String) {
     match key {
-        "generate_model" => cfg.generate_model = value,
-        "decompose_model" => cfg.decompose_model = value,
         "inject_select_model" => cfg.inject_select_model = value,
         "inject_compile_model" => cfg.inject_compile_model = value,
         "capture_model" => cfg.capture_model = value,
