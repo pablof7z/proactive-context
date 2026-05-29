@@ -77,17 +77,20 @@ fn init_schema(conn: &mut Connection, embedder: &dyn Embedder) -> Result<()> {
         .ok();
 
     if let Some(dim) = existing_dim {
-        if dim != current_dim {
-            anyhow::bail!(
-                "Embedding dimension mismatch: DB was created with dim={}, current embedder has dim={}. \
-                 Delete the project index DB and re-run `init` to switch models.",
-                dim,
-                current_dim
+        let schema_changed = existing_version.as_deref() != Some(SCHEMA_VERSION);
+        if dim != current_dim || schema_changed {
+            // Dimension or schema changed — wipe vector data and metadata so the
+            // daemon's next full_index re-embeds everything with the new model.
+            eprintln!(
+                "proactive-context: embed model changed (dim {} → {}), wiping index for re-embedding",
+                dim, current_dim
             );
-        }
-        if existing_version.as_deref() != Some(SCHEMA_VERSION) {
-            // Schema changed (e.g. distance metric). Drop and recreate.
             conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
+            conn.execute_batch("DELETE FROM chunks;")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_dim', ?)",
+                params![current_dim.to_string()],
+            )?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                 params![SCHEMA_VERSION],
