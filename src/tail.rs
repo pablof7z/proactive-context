@@ -284,9 +284,14 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
     match ev.event.as_str() {
         "inject.start" => {
             let chars = p.get("prompt_chars").and_then(|v| v.as_u64()).unwrap_or(0);
-            let ctx = p.get("context_turns").and_then(|v| v.as_u64()).unwrap_or(0);
-            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            trunc(&format!("{} chars · {} turns · {}", chars, ctx, model), budget)
+            let preview = p.get("prompt_preview").and_then(|v| v.as_str()).unwrap_or("");
+            let model = p
+                .get("select_model")
+                .and_then(|v| v.as_str())
+                .or_else(|| p.get("model").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let model_short = model.rsplit('/').next().unwrap_or(model);
+            trunc(&format!("{} chars · {} · \"{}\"", chars, model_short, preview), budget)
         }
         "query.start" => {
             let top_k = p.get("top_k").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -335,16 +340,16 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
                 .map(|ms| format!("{:.2}s", ms as f64 / 1000.0))
                 .unwrap_or_default();
             let reason = p.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            if reason.is_empty() {
-                trunc(
-                    &format!("{}  {} hits · {} chars · {}", lat, hits, out_chars, outcome),
-                    budget,
-                )
+            let preview = p.get("prompt_preview").and_then(|v| v.as_str()).unwrap_or("");
+            let suffix = if reason.is_empty() {
+                format!("{}  {} hits · {} chars · {}", lat, hits, out_chars, outcome)
             } else {
-                trunc(
-                    &format!("{}  {} hits · {} [{}]", lat, hits, outcome, reason),
-                    budget,
-                )
+                format!("{}  {} hits · {} [{}]", lat, hits, outcome, reason)
+            };
+            if preview.is_empty() {
+                trunc(&suffix, budget)
+            } else {
+                trunc(&format!("{}  \"{}\"", suffix, preview), budget)
             }
         }
         "capture.start" => {
@@ -1019,17 +1024,23 @@ mod tests {
 
     #[test]
     fn golden_inject_start_no_color() {
-        // At width=120 body_budget=(120-60).max(30)=60, "75 chars · 6 turns · openai/gpt-4o-mini" is 40 chars, fits.
+        // At width=120 body_budget=(120-60).max(30)=60. Body is
+        // `75 chars · gpt-4o-mini · "how do I add a route?"`, which fits.
         let ev = make_ev(
             "2026-05-28T20:54:06.098Z",
             "Users_pablofernandez_src_proactive-context",
             "c3b5-1780001646098",
             "inject.start",
             None,
-            json!({"context_turns": 6, "model": "openai/gpt-4o-mini", "prompt_chars": 75}),
+            json!({
+                "context_turns": 6,
+                "select_model": "openai/gpt-4o-mini",
+                "prompt_chars": 75,
+                "prompt_preview": "how do I add a route?"
+            }),
         );
         let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
-        assert_eq!(result, "20:54:06  098  proactive…  > inject.start  75 chars · 6 turns · openai/gpt-4o-mini");
+        assert_eq!(result, "20:54:06  098  proactive…  > inject.start  75 chars · gpt-4o-mini · \"how do I add a route?\"");
     }
 
     #[test]

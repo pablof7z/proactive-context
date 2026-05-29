@@ -4,6 +4,10 @@ use std::fs;
 /// Extract plain text from a message `content` value (string or block array).
 pub(crate) fn extract_text(content: &serde_json::Value) -> String {
     match content {
+        // Skip harness-injected XML messages: <task-notification>, <system-reminder>,
+        // raw tool output with <tool-use-id>/<output-file>, etc. Human prose never
+        // starts with '<'; these do.
+        serde_json::Value::String(s) if s.trim_start().starts_with('<') => String::new(),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(blocks) => blocks
             .iter()

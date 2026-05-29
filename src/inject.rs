@@ -279,9 +279,12 @@ pub fn run_inject(verbose: bool) -> Result<()> {
         return Ok(());
     }
 
+    let prompt_preview = crate::events::truncate(&input.prompt, 150);
+
     // Emit inject.start
     log_event("inject.start", None, serde_json::json!({
         "prompt_chars": input.prompt.len(),
+        "prompt_preview": &prompt_preview,
         "context_turns": context_turns_used,
         "select_model": cfg.inject_select_model,
         "compile_model": cfg.inject_compile_model
@@ -310,7 +313,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
                 "outcome": "empty",
                 "hits": 0,
-                "out_chars": 0
+                "out_chars": 0,
+                "prompt_preview": &prompt_preview
             }));
             return Ok(());
         }
@@ -331,7 +335,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
                 "outcome": "empty",
                 "hits": 0,
-                "out_chars": 0
+                "out_chars": 0,
+                "prompt_preview": &prompt_preview
             }));
             emit(verbose, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
                 start.elapsed().as_millis()));
@@ -344,7 +349,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             "outcome": "fallback",
             "reason": "no_api_key",
             "hits": hits.len(),
-            "out_chars": out_chars
+            "out_chars": out_chars,
+            "prompt_preview": &prompt_preview
         }));
         emit(verbose, Some(&fallback_block), &format!(
             "inject [{}ms] | {} hits | fallback (no API key) | injected {}c\n\nHits:\n{}",
@@ -417,7 +423,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "none",
                     "hits": hits.len(),
-                    "out_chars": 0
+                    "out_chars": 0,
+                    "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, None, &format!(
                     "inject [{}ms] | {} hits | guides: {} | briefing: NONE",
@@ -441,7 +448,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 "outcome": "compiled",
                 "hits": hits.len(),
                 "out_chars": out_chars,
-                "out_words": out_words
+                "out_words": out_words,
+                "prompt_preview": &prompt_preview
             });
             if let Some(ref t) = title_opt {
                 done_payload["title"] = serde_json::Value::String(t.clone());
@@ -461,7 +469,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                 "outcome": "none",
                 "hits": hits.len(),
-                "out_chars": 0
+                "out_chars": 0,
+                "prompt_preview": &prompt_preview
             }));
             emit(verbose, None, &format!(
                 "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
@@ -480,7 +489,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "outcome": "fallback",
                     "reason": "compile_error",
                     "hits": hits.len(),
-                    "out_chars": out_chars
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, Some(&fallback_block), &format!(
                     "inject [{}ms] | {} hits | error: {} | fallback {}c\n\nHits:\n{}",
@@ -490,7 +500,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
                     "hits": 0,
-                    "out_chars": 0
+                    "out_chars": 0,
+                    "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, None, &format!(
                     "inject [{}ms] | 0 hits | error: {}",
@@ -506,7 +517,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "outcome": "fallback",
                     "reason": "timeout",
                     "hits": hits.len(),
-                    "out_chars": out_chars
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, Some(&fallback_block), &format!(
                     "inject [{}ms] | {} hits | timeout → fallback {}c\n\nHits:\n{}",
@@ -515,7 +527,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
                     "hits": 0,
-                    "out_chars": 0
+                    "out_chars": 0,
+                    "prompt_preview": &prompt_preview
                 }));
                 emit(verbose, None, &format!(
                     "inject [{}ms] | 0 hits | timeout — nothing injected", elapsed_ms));
@@ -810,16 +823,22 @@ async fn wiki_navigate_and_compile(
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &select_spec.model, &msgs, None, 300, 0).await?.content
+            chat_once(&client, api_key, &select_spec.model, &msgs, None, 300, 1).await?.content
         }
         Provider::Ollama => {
-            build_ollama_client(ollama_base_url, ollama_api_key)?
+            let t0 = std::time::Instant::now();
+            let resp = build_ollama_client(ollama_base_url, ollama_api_key)?
                 .agent(&select_spec.model)
                 .preamble(&preamble)
                 .max_tokens(300u64)
                 .additional_params(serde_json::json!({"max_tokens": 300}))
                 .build()
-                .prompt(current_prompt).await?
+                .prompt(current_prompt).await?;
+            crate::openrouter::record_external_turn(
+                &select_spec.model, 1, &preamble, current_prompt, &resp,
+                t0.elapsed().as_millis() as u64,
+            );
+            resp
         }
     };
 
@@ -941,16 +960,22 @@ async fn compile_briefing(
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &spec.model, &msgs, None, max_tokens as u32, 0).await?.content
+            chat_once(&client, api_key, &spec.model, &msgs, None, max_tokens as u32, 2).await?.content
         }
         Provider::Ollama => {
-            build_ollama_client(ollama_base_url, ollama_api_key)?
+            let t0 = std::time::Instant::now();
+            let resp = build_ollama_client(ollama_base_url, ollama_api_key)?
                 .agent(&spec.model)
                 .preamble(&preamble)
                 .max_tokens(max_tokens as u64)
                 .additional_params(serde_json::json!({"max_tokens": max_tokens}))
                 .build()
-                .prompt(current_prompt).await?
+                .prompt(current_prompt).await?;
+            crate::openrouter::record_external_turn(
+                &spec.model, 2, &preamble, current_prompt, &resp,
+                t0.elapsed().as_millis() as u64,
+            );
+            resp
         }
     };
 

@@ -60,6 +60,8 @@ struct AppState {
     selected: Option<usize>,
     /// Modal: which record index is open
     modal: Option<usize>,
+    /// Modal: vertical scroll offset for the detail pane
+    modal_scroll: u16,
     /// Modal: selected sibling index within the modal trace view
     modal_sibling_sel: usize,
     /// Filter summary string (for status bar)
@@ -76,6 +78,7 @@ impl AppState {
             follow: FollowState::Following,
             selected: None,
             modal: None,
+            modal_scroll: 0,
             modal_sibling_sel: 0,
             filter_summary,
             verbosity,
@@ -148,8 +151,17 @@ impl AppState {
     fn open_modal(&mut self) {
         if let Some(sel) = self.selected {
             self.modal = Some(sel);
+            self.modal_scroll = 0;
             self.modal_sibling_sel = 0;
         }
+    }
+
+    fn modal_scroll_up(&mut self, amount: u16) {
+        self.modal_scroll = self.modal_scroll.saturating_sub(amount);
+    }
+
+    fn modal_scroll_down(&mut self, amount: u16) {
+        self.modal_scroll = self.modal_scroll.saturating_add(amount);
     }
 
     fn close_modal(&mut self) {
@@ -378,8 +390,11 @@ fn record_to_list_item<'a>(rec: &'a Record, selected: bool, state: &AppState) ->
         Style::default()
     };
 
-    // Use a moderate body budget; the TUI widget handles width clipping
-    let body_budget = 60usize;
+    // Larger budget for error messages so they're readable in the list view
+    let body_budget = match ev.event.as_str() {
+        "error" | "llm.error" => 250,
+        _ => 60,
+    };
     let segs = match row_segments(ev, state.verbosity, body_budget, state.ascii) {
         Some(s) => s,
         None => return ListItem::new(Line::default()),
@@ -521,7 +536,7 @@ fn render_modal(frame: &mut Frame, state: &AppState) {
         ])
         .split(inner);
 
-    render_modal_event_detail(frame, chunks[0], ev, &rec.raw, state);
+    render_modal_event_detail(frame, chunks[0], ev, &rec.raw, state, state.modal_scroll);
     render_modal_divider(frame, chunks[1], " Request Trace ");
     render_modal_trace(frame, chunks[2], state);
     render_modal_help(frame, chunks[3]);
@@ -533,6 +548,7 @@ fn render_modal_event_detail(
     ev: &EventLine,
     raw: &str,
     state: &AppState,
+    scroll: u16,
 ) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -569,11 +585,22 @@ fn render_modal_event_detail(
         Style::default().fg(Color::DarkGray),
     )));
     let pretty = serde_json::to_string_pretty(&ev.payload).unwrap_or_else(|_| "{}".to_string());
-    for line in pretty.lines().take(8) {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", line),
-            Style::default().fg(Color::LightBlue),
-        )));
+    let mut line_count = 0;
+    for json_line in pretty.lines() {
+        if line_count >= 25 {
+            break;
+        }
+        // If the line contains \n escape sequences, split them into separate display lines
+        for display_line in json_line.split("\\n") {
+            if line_count >= 25 {
+                break;
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", display_line),
+                Style::default().fg(Color::LightBlue),
+            )));
+            line_count += 1;
+        }
     }
 
     // Event-specific enrichment
@@ -603,6 +630,18 @@ fn render_modal_event_detail(
                     }
                 }
             }
+            // Show full prompt
+            if let Some(prompt_preview) = ev.payload.get("prompt_preview").and_then(|v| v.as_str()) {
+                lines.push(Line::from(Span::styled("prompt:", Style::default().fg(Color::DarkGray))));
+                for chunk in prompt_preview.chars().collect::<Vec<_>>().chunks(area.width as usize - 4) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", chunk.iter().collect::<String>()),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            }
+            // Show conversation sidecars (t1=select, t2=compile)
+            lines.extend(inject_sidecar_lines(&ev.req));
         }
         "retrieve.hit" => {
             // Re-read chunk from disk if possible
@@ -621,8 +660,92 @@ fn render_modal_event_detail(
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
     )));
 
-    let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(para, area);
+}
+
+/// For inject.done: read the select (t1) and compile (t2) sidecars and render them.
+fn inject_sidecar_lines(req: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let (_, log_path) = crate::events::log_cfg_path_and_req();
+    let sidecar_dir = log_path.parent().unwrap_or(log_path.as_path()).join("llm_turns");
+    let safe_req = req.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+
+    for (turn, label) in [(1usize, "select"), (2usize, "compile")] {
+        let path = sidecar_dir.join(format!("{}-t{}.json", safe_req, turn));
+        if !path.exists() { continue; }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue; };
+        let Ok(sc) = serde_json::from_str::<serde_json::Value>(&raw) else { continue; };
+
+        lines.push(Line::from(Span::styled(
+            format!("── {} (turn {}) ──", label, turn),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )));
+
+        // Show usage/cost
+        if let Some(usage) = sc.pointer("/response/usage") {
+            let pt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+            let ct = usage["completion_tokens"].as_u64().unwrap_or(0);
+            let cost_str = usage["cost"].as_f64()
+                .map(|c| format!("  ${:.7}", c))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("  {}pt / {}ct{}", pt, ct, cost_str),
+                Style::default().fg(Color::LightCyan),
+            )));
+        }
+
+        // Show all messages (full, no cap)
+        if let Some(msgs) = sc.pointer("/request/messages").and_then(|v| v.as_array()) {
+            for msg in msgs {
+                let role = msg["role"].as_str().unwrap_or("?");
+                let content = msg["content"].as_str().unwrap_or("");
+                let (label, style) = match role {
+                    "system" => ("  [system] ", Style::default().fg(Color::DarkGray)),
+                    "user"   => ("  [user]   ", Style::default().fg(Color::Yellow)),
+                    _        => ("  [other]  ", Style::default()),
+                };
+                let mut is_first = true;
+                for content_line in content.lines() {
+                    for chunk in content_line.chars().collect::<Vec<_>>().chunks(100) {
+                        let prefix = if is_first { label } else { "           " };
+                        is_first = false;
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(chunk.iter().collect::<String>(), Style::default()),
+                        ]));
+                    }
+                }
+            }
+        }
+
+        // Show response (full, no cap)
+        if let Some(resp) = sc.pointer("/response/content").and_then(|v| v.as_str()) {
+            if !resp.is_empty() {
+                lines.push(Line::from(Span::styled("  response:", Style::default().fg(Color::DarkGray))));
+                for resp_line in resp.lines() {
+                    for chunk in resp_line.chars().collect::<Vec<_>>().chunks(100) {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", chunk.iter().collect::<String>()),
+                            Style::default().fg(Color::LightGreen),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (sidecars not found — will appear after next inject with updated binary)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
 }
 
 /// Read the sidecar JSON for llm.request/llm.response and render the full prompt+completion.
@@ -670,24 +793,20 @@ fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
                     "tool" => Style::default().fg(Color::Green),
                     _ => Style::default(),
                 };
-                for (i, chunk) in content.chars().collect::<Vec<_>>().chunks(120).enumerate() {
-                    let prefix = if i == 0 {
-                        format!("  [{role}] ")
-                    } else {
-                        "         ".to_string()
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, role_style),
-                        Span::styled(chunk.iter().collect::<String>(), Style::default()),
-                    ]));
-                    if i >= 4 { // cap at 5 lines per message
-                        if content.len() > 600 {
-                            lines.push(Line::from(Span::styled(
-                                format!("         … ({} chars total)", content.len()),
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
-                        break;
+                // Respect newlines in content; chunk only if a line is too long
+                let mut is_first_line_of_msg = true;
+                for content_line in content.lines() {
+                    for chunk in content_line.chars().collect::<Vec<_>>().chunks(120) {
+                        let prefix = if is_first_line_of_msg {
+                            is_first_line_of_msg = false;
+                            format!("  [{role}] ")
+                        } else {
+                            "         ".to_string()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, role_style),
+                            Span::styled(chunk.iter().collect::<String>(), Style::default()),
+                        ]));
                     }
                 }
             }
@@ -700,19 +819,12 @@ fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
                     "response:",
                     Style::default().fg(Color::DarkGray),
                 )));
-                for (i, chunk) in resp_content.chars().collect::<Vec<_>>().chunks(120).enumerate() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", chunk.iter().collect::<String>()),
-                        Style::default().fg(Color::LightGreen),
-                    )));
-                    if i >= 8 {
-                        if resp_content.len() > 1080 {
-                            lines.push(Line::from(Span::styled(
-                                format!("  … ({} chars total)", resp_content.len()),
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
-                        break;
+                for content_line in resp_content.lines() {
+                    for chunk in content_line.chars().collect::<Vec<_>>().chunks(120) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", chunk.iter().collect::<String>()),
+                            Style::default().fg(Color::LightGreen),
+                        )));
                     }
                 }
             }
@@ -861,7 +973,7 @@ fn render_modal_trace(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_modal_help(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
-        "  ↑/↓: navigate siblings  Esc/q: close",
+        "  ↑/↓/j/k: scroll  PgDn/Space: page down  ←/→: siblings  Esc/q: close",
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
     )));
     frame.render_widget(para, area);
@@ -978,12 +1090,26 @@ pub fn run_tui(
                         KeyCode::Esc | KeyCode::Char('q') => {
                             app.close_modal();
                         }
+                        // Scroll detail pane
                         KeyCode::Up | KeyCode::Char('k') => {
+                            app.modal_scroll_up(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.modal_scroll_down(1);
+                        }
+                        KeyCode::PageUp => {
+                            app.modal_scroll_up(20);
+                        }
+                        KeyCode::PageDown | KeyCode::Char(' ') => {
+                            app.modal_scroll_down(20);
+                        }
+                        // Navigate siblings in the trace section
+                        KeyCode::Left | KeyCode::Char('h') => {
                             if app.modal_sibling_sel > 0 {
                                 app.modal_sibling_sel -= 1;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        KeyCode::Right | KeyCode::Char('l') => {
                             let siblings_len = app.modal_siblings().len();
                             if app.modal_sibling_sel + 1 < siblings_len {
                                 app.modal_sibling_sel += 1;

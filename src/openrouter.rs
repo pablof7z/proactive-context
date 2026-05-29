@@ -290,6 +290,49 @@ fn sanitize_for_filename(s: &str) -> String {
         .collect()
 }
 
+/// Log llm.request + llm.response events and write a sidecar for a call that was
+/// executed outside this module (e.g. Ollama via rig-core).  Call this immediately
+/// after the rig `.prompt()` returns.
+pub fn record_external_turn(
+    model: &str,
+    turn: usize,
+    system_content: &str,
+    user_content: &str,
+    response_content: &str,
+    lat_ms: u64,
+) {
+    let messages = vec![system_msg(system_content), user_msg(user_content)];
+
+    log_event(
+        "llm.request",
+        None,
+        serde_json::json!({
+            "model": model,
+            "turn": turn,
+            "n_messages": 2,
+            "has_tools": false,
+            "prompt_preview": crate::events::truncate(user_content, 150)
+        }),
+    );
+
+    let sidecar_path = write_sidecar(
+        model, turn, &messages, response_content, &Usage::default(), &None, lat_ms,
+    );
+
+    log_event(
+        "llm.response",
+        Some(lat_ms),
+        serde_json::json!({
+            "model": model,
+            "turn": turn,
+            "finish_reason": "stop",
+            "n_tool_calls": 0,
+            "response_preview": crate::events::truncate(response_content, 150),
+            "sidecar": sidecar_path.map(|p| p.to_string_lossy().to_string())
+        }),
+    );
+}
+
 fn parse_usage(u: &Value) -> Usage {
     let cost_details = {
         let cd = &u["cost_details"];
