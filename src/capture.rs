@@ -1,7 +1,9 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{load_config, normalize_path};
@@ -15,11 +17,27 @@ use crate::wiki::{
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CaptureInput {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    transcript_path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PendingCapture {
     session_id: String,
     cwd: String,
     transcript_path: String,
+    scheduled_at_secs: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct CaptureMarker {
+    captured_at_exchanges: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -88,6 +106,67 @@ struct WikiPlanResponse {
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().expect("cannot determine home directory")
+}
+
+fn captured_sessions_dir() -> PathBuf {
+    home_dir().join(".proactive-context").join("captured-sessions")
+}
+
+fn session_lock_dir() -> PathBuf {
+    home_dir().join(".proactive-context").join("session-locks")
+}
+
+fn pending_captures_dir() -> PathBuf {
+    home_dir().join(".proactive-context").join("pending-captures")
+}
+
+// ─── Capture marker (dedup by transcript extent) ──────────────────────────────
+
+fn is_already_captured(session_id: &str, current_exchanges: usize) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    let path = captured_sessions_dir().join(format!("{}.json", session_id));
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(marker) = serde_json::from_str::<CaptureMarker>(&data) {
+            return current_exchanges <= marker.captured_at_exchanges;
+        }
+    }
+    false
+}
+
+fn mark_captured(session_id: &str, exchanges: usize) -> Result<()> {
+    if session_id.is_empty() {
+        return Ok(());
+    }
+    let dir = captured_sessions_dir();
+    fs::create_dir_all(&dir)?;
+    let marker = CaptureMarker { captured_at_exchanges: exchanges };
+    fs::write(dir.join(format!("{}.json", session_id)), serde_json::to_string(&marker)?)?;
+    Ok(())
+}
+
+// ─── Per-session flock ────────────────────────────────────────────────────────
+
+fn acquire_session_lock(session_id: &str) -> Result<fs::File> {
+    let dir = session_lock_dir();
+    fs::create_dir_all(&dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join(format!("{}.lock", session_id)))?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        anyhow::bail!("another capture is already running for this session (lock held)");
+    }
+    Ok(file)
+}
+
+// ─── Unix timestamp helper ───────────────────────────────────────────────────
+
+fn unix_now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn project_dir_from_cwd(cwd: &str) -> PathBuf {
@@ -199,6 +278,25 @@ fn strip_json_fences(s: &str) -> &str {
     let s = s.strip_prefix("```").unwrap_or(s);
     let s = s.strip_suffix("```").unwrap_or(s);
     s.trim()
+}
+
+// ─── Triage ───────────────────────────────────────────────────────────────────
+
+fn triage_transcript(api_key: &str, model: &str, transcript: &str) -> Result<bool> {
+    let system = "You scan AI coding assistant conversations for durable lessons worth capturing.";
+    let user_msg = format!(
+        "Does this conversation contain at least one of:\n\
+        - A user correction of the assistant's approach, output, or assumption\n\
+        - An error resolved in a non-obvious way\n\
+        - A non-obvious discovery about the codebase, tooling, or domain\n\
+        - A surprising constraint, pitfall, or config detail that will matter again\n\
+        - A user preference explicitly stated\n\n\
+        Reply with ONLY 'YES' or 'NO' on the first line.\n\n\
+        TRANSCRIPT:\n{transcript}"
+    );
+    let raw = call_openrouter(api_key, model, system, &user_msg)?;
+    let answer = raw.trim().lines().next().unwrap_or("").to_uppercase();
+    Ok(answer.starts_with("YES"))
 }
 
 // ─── Distillation ─────────────────────────────────────────────────────────────
@@ -459,27 +557,19 @@ fn apply_wiki_ops(
     Ok(())
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+// ─── Core capture logic ───────────────────────────────────────────────────────
 
-pub fn run_capture() -> Result<()> {
-    let mut raw = String::new();
-    io::stdin().read_to_string(&mut raw)?;
-    let raw = raw.trim();
-    if raw.is_empty() {
+fn run_capture_from_input(input: CaptureInput) -> Result<()> {
+    if input.session_id.is_empty() {
+        eprintln!("capture: no session_id — skipping");
         return Ok(());
     }
-
-    let input: CaptureInput = match serde_json::from_str(raw) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("capture: stdin parse failed: {}", e);
-            return Ok(());
-        }
-    };
 
     // Seed event context
     let project = normalize_path(&PathBuf::from(&input.cwd));
     init_context(&project, &input.session_id);
+
+    let capture_start = std::time::Instant::now();
 
     let cfg = match load_config() {
         Ok(c) => c,
@@ -528,6 +618,13 @@ pub fn run_capture() -> Result<()> {
         .filter(|w| w[0].0 == "user" && w[1].0 == "assistant")
         .count();
 
+    // Fast dedup check: skip if we already processed this transcript extent
+    if is_already_captured(&input.session_id, exchanges) {
+        eprintln!("capture: already captured {} exchanges for session {} — skipping",
+            exchanges, input.session_id);
+        return Ok(());
+    }
+
     let ts = build_transcript_string(&turns);
     let ts = if ts.len() > 200_000 {
         ts[ts.len() - 200_000..].to_string()
@@ -538,6 +635,49 @@ pub fn run_capture() -> Result<()> {
     if ts.len() < 500 || exchanges < 3 {
         eprintln!("capture: too short ({} chars, {} exchanges) — skipping", ts.len(), exchanges);
         return Ok(());
+    }
+
+    // Acquire per-session lock to prevent concurrent captures (Stop debounce + SessionEnd race)
+    let _lock = match acquire_session_lock(&input.session_id) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("capture: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Re-check after acquiring lock (TOCTOU guard)
+    if is_already_captured(&input.session_id, exchanges) {
+        eprintln!("capture: already captured (post-lock check) — skipping");
+        return Ok(());
+    }
+
+    // Fast triage: use cheap model to decide if worth the full distillation
+    if !cfg.capture_triage_model.is_empty() {
+        eprintln!("capture: triaging with {}...", cfg.capture_triage_model);
+        match triage_transcript(&api_key, &cfg.capture_triage_model, &ts) {
+            Ok(worth_it) => {
+                if !worth_it {
+                    eprintln!("capture: triage says nothing worth capturing — skipping");
+                    log_event("capture.triage", None, serde_json::json!({
+                        "result": "skip",
+                        "exchanges": exchanges,
+                        "model": cfg.capture_triage_model
+                    }));
+                    // Do NOT mark as captured — transcript growth should re-trigger
+                    return Ok(());
+                }
+                log_event("capture.triage", None, serde_json::json!({
+                    "result": "proceed",
+                    "exchanges": exchanges,
+                    "model": cfg.capture_triage_model
+                }));
+            }
+            Err(e) => {
+                // Triage failure: proceed with full capture rather than silently dropping
+                eprintln!("capture: triage failed ({}), proceeding anyway", e);
+            }
+        }
     }
 
     // Emit capture.start
@@ -561,7 +701,16 @@ pub fn run_capture() -> Result<()> {
     };
 
     eprintln!("capture: {} lesson(s) extracted", lessons.len());
+
+    // Mark captured now (after distillation, regardless of lesson count).
+    // SessionEnd or the next debounce will skip if exchanges haven't grown.
+    let _ = mark_captured(&input.session_id, exchanges);
+
     if lessons.is_empty() {
+        log_event("capture.done", Some(capture_start.elapsed().as_millis() as u64), serde_json::json!({
+            "lessons": 0,
+            "guides": 0
+        }));
         return Ok(());
     }
 
@@ -581,7 +730,6 @@ pub fn run_capture() -> Result<()> {
         if lesson.slug.is_empty() || lesson.rule.is_empty() {
             continue;
         }
-        // Emit capture.lesson for tracking
         log_event("capture.lesson", None, serde_json::json!({
             "slug": lesson.slug,
             "category": lesson.category,
@@ -621,14 +769,12 @@ pub fn run_capture() -> Result<()> {
     }
 
     if project_count > 0 || wiki_path.exists() {
-        // Enforce bidirectional links
         let link_count = wiki::enforce_bidirectional_links(&wiki_path, &today_str)
             .unwrap_or_else(|e| { eprintln!("capture: bidir links failed: {}", e); 0 });
         if link_count > 0 {
             eprintln!("capture: added {} bidirectional link(s)", link_count);
         }
 
-        // Rebuild _index.md
         match rebuild_index(&wiki_path, &today_str) {
             Ok(rows) => {
                 log_event("wiki.index_read", None, serde_json::json!({
@@ -640,7 +786,6 @@ pub fn run_capture() -> Result<()> {
             Err(e) => eprintln!("capture: index rebuild failed: {}", e),
         }
 
-        // Re-index wiki into index.db
         let db_path = proj_dir.join("index.db");
         match index_files_into_db(&wiki_path, &db_path) {
             Ok(_) => eprintln!("capture: indexed wiki into index.db"),
@@ -648,5 +793,189 @@ pub fn run_capture() -> Result<()> {
         }
     }
 
+    // capture.done — the glyph exists in tail.rs but was never emitted until now.
+    log_event("capture.done", Some(capture_start.elapsed().as_millis() as u64), serde_json::json!({
+        "lessons": lessons.len(),
+        "guides": project_count
+    }));
+
     Ok(())
+}
+
+// ─── SessionEnd entry point ───────────────────────────────────────────────────
+
+pub fn run_capture() -> Result<()> {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let input: CaptureInput = match serde_json::from_str(raw) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("capture: stdin parse failed: {}", e);
+            return Ok(());
+        }
+    };
+    run_capture_from_input(input)
+}
+
+// ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
+//
+// Reads stdin (same JSON as the SessionEnd hook), writes a pending file, kills
+// any existing debounce process for this session, and forks `capture --deferred
+// <session_id>` in the background before returning immediately.
+
+pub fn run_capture_scheduled(delay_secs: u64) -> Result<()> {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+
+    let hook_input: CaptureInput = match serde_json::from_str(raw) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("capture --in: stdin parse failed: {}", e);
+            return Ok(());
+        }
+    };
+
+    if hook_input.session_id.is_empty() {
+        eprintln!("capture --in: no session_id — skipping");
+        return Ok(());
+    }
+
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("capture --in: config error: {}", e);
+            return Ok(());
+        }
+    };
+
+    if !cfg.capture_enabled {
+        return Ok(());
+    }
+
+    let pending = PendingCapture {
+        session_id: hook_input.session_id.clone(),
+        cwd: hook_input.cwd.clone(),
+        transcript_path: hook_input.transcript_path.clone(),
+        scheduled_at_secs: unix_now_secs(),
+    };
+
+    let dir = pending_captures_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("capture --in: can't create pending dir: {}", e);
+        return Ok(());
+    }
+
+    let pid_path = dir.join(format!("{}.pid", &hook_input.session_id));
+    let pending_path = dir.join(format!("{}.json", &hook_input.session_id));
+
+    // Kill previous debounce process (best-effort; correctness comes from
+    // the scheduled_at_secs check inside run_deferred_capture)
+    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+
+    // Overwrite pending file to reset the debounce clock
+    if let Err(e) = fs::write(&pending_path, serde_json::to_string(&pending)?) {
+        eprintln!("capture --in: can't write pending file: {}", e);
+        return Ok(());
+    }
+
+    // Fork `capture --deferred <session_id>` in a new session so it outlives the hook
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("capture --in: can't find binary path: {}", e);
+            return Ok(());
+        }
+    };
+
+    let session_id = hook_input.session_id.clone();
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("capture")
+        .arg("--deferred").arg(&session_id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let _ = fs::write(&pid_path, child.id().to_string());
+            eprintln!(
+                "capture --in: debounce started (pid={}, delay={}s, session={}…)",
+                child.id(), delay_secs, &session_id[..session_id.len().min(8)]
+            );
+        }
+        Err(e) => {
+            eprintln!("capture --in: failed to spawn background process: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Background debounce runner (`capture --deferred <session_id>`) ───────────
+
+pub fn run_deferred_capture(session_id: &str) -> Result<()> {
+    let dir = pending_captures_dir();
+    let pending_path = dir.join(format!("{}.json", session_id));
+    let pid_path = dir.join(format!("{}.pid", session_id));
+
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    let delay_secs = cfg.capture_debounce_secs;
+
+    // Snapshot the scheduled_at we were launched for
+    let launched_at = {
+        let data = match fs::read_to_string(&pending_path) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        match serde_json::from_str::<PendingCapture>(&data) {
+            Ok(p) => p.scheduled_at_secs,
+            Err(_) => return Ok(()),
+        }
+    };
+
+    std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+
+    // Re-read: if scheduled_at changed, a newer turn arrived → exit silently
+    let pending: PendingCapture = match fs::read_to_string(&pending_path).ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+    {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    if pending.scheduled_at_secs != launched_at {
+        return Ok(());
+    }
+
+    // Winning debounce — clean up and run capture
+    let _ = fs::remove_file(&pending_path);
+    let _ = fs::remove_file(&pid_path);
+
+    run_capture_from_input(CaptureInput {
+        session_id: pending.session_id,
+        cwd: pending.cwd,
+        transcript_path: pending.transcript_path,
+    })
 }

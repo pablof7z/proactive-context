@@ -13,6 +13,7 @@ mod events;
 mod generate;
 mod inject;
 mod query;
+mod statusline;
 mod tail;
 mod transcript;
 mod tui;
@@ -99,9 +100,22 @@ enum Commands {
         action: Option<ConfigAction>,
     },
 
-    /// Distill lessons from a completed session transcript (invoked via SessionEnd hook).
+    /// Distill lessons from a completed session transcript.
     /// Reads { session_id, cwd, transcript_path } JSON from stdin.
-    Capture,
+    ///
+    /// SessionEnd hook: `capture` (runs immediately, deduplicates via marker).
+    /// Stop hook:       `capture --in 300` (returns immediately, runs in background
+    ///                  after 300 s of silence; resets the timer on each new turn).
+    Capture {
+        /// Delay N seconds before distilling (Stop hook debounce).
+        /// Returns immediately; background process runs capture after the silence window.
+        #[arg(long, value_name = "SECS")]
+        r#in: Option<u64>,
+
+        // Internal: run the deferred capture for this session_id (spawned by --in).
+        #[arg(long, hide = true)]
+        deferred: Option<String>,
+    },
 
     /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
     /// Reads { prompt, cwd, session_id, transcript_path } JSON from stdin.
@@ -110,6 +124,15 @@ enum Commands {
         /// Show a systemMessage with hits, guides read, and the generated briefing
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+
+    /// Render a one-line Claude Code status bar indicator (invoked via statusLine.command).
+    /// Reads the Claude Code status-line JSON from stdin; prints one styled line to stdout.
+    /// Always exits 0. No LLM, no network, sub-10ms.
+    Statusline {
+        /// Append context-window usage % (green <70, yellow 70-89, red >=90).
+        #[arg(long)]
+        with_context: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -254,12 +277,23 @@ fn main() -> Result<()> {
             handle_config(action)?;
         }
 
-        Commands::Capture => {
-            crate::capture::run_capture()?;
+        Commands::Capture { r#in, deferred } => {
+            if let Some(session_id) = deferred {
+                crate::capture::run_deferred_capture(&session_id)?;
+            } else if let Some(delay) = r#in {
+                crate::capture::run_capture_scheduled(delay)?;
+            } else {
+                crate::capture::run_capture()?;
+            }
         }
 
         Commands::Inject { verbose } => {
             crate::inject::run_inject(verbose)?;
+        }
+
+        Commands::Statusline { with_context } => {
+            crate::statusline::run_statusline(with_context);
+            // run_statusline calls process::exit(0) — never returns
         }
 
         Commands::Tail {

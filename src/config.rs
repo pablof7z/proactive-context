@@ -54,6 +54,18 @@ pub struct Config {
     #[serde(default = "default_capture_model")]
     pub capture_model: String,
 
+    /// Fast/cheap model for transcript triage before expensive distillation.
+    /// If triage says nothing worth capturing, the distillation step is skipped.
+    /// Set to empty string to disable triage (always run full capture).
+    #[serde(default = "default_capture_triage_model")]
+    pub capture_triage_model: String,
+
+    /// Seconds to wait after a turn ends (Stop hook) before running capture.
+    /// Resets on each new turn so back-and-forth sessions debounce naturally.
+    /// Default: 300 (5 minutes). Set to 0 to disable the Stop-hook debounce path.
+    #[serde(default = "default_capture_debounce_secs")]
+    pub capture_debounce_secs: u64,
+
     // ---- Observability log ----
     /// Enable or disable the structured event log.
     #[serde(default = "default_logging_enabled")]
@@ -182,6 +194,14 @@ fn default_capture_enabled() -> bool {
 
 fn default_capture_model() -> String {
     "anthropic/claude-sonnet-4-6".to_string()
+}
+
+fn default_capture_triage_model() -> String {
+    "anthropic/claude-haiku-4-5".to_string()
+}
+
+fn default_capture_debounce_secs() -> u64 {
+    300
 }
 
 fn default_logging_enabled() -> bool {
@@ -413,6 +433,8 @@ impl Default for Config {
             decompose_model: default_decompose_model(),
             capture_enabled: default_capture_enabled(),
             capture_model: default_capture_model(),
+            capture_triage_model: default_capture_triage_model(),
+            capture_debounce_secs: default_capture_debounce_secs(),
             // Observability
             logging_enabled: default_logging_enabled(),
             log_path: String::new(),
