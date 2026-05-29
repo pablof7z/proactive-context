@@ -144,6 +144,24 @@ pub struct Config {
     /// Default: 16
     #[serde(default = "default_capture_max_turns")]
     pub capture_max_turns: usize,
+
+    // ---- Cross-agent awareness (v0.1) ----
+    /// Enable the ambient cross-agent awareness board.
+    #[serde(default = "default_awareness_enabled")]
+    pub awareness_enabled: bool,
+
+    /// Fast, large-context model that distills an agent's current intent from its
+    /// transcript for the peer-awareness board. Full provider-spec string.
+    #[serde(default = "default_awareness_model")]
+    pub awareness_model: String,
+
+    /// Minimum seconds between peer-delta injections for a single agent (anti-spam).
+    #[serde(default = "default_awareness_inject_min_interval_secs")]
+    pub awareness_inject_min_interval_secs: u64,
+
+    /// Seconds of inactivity after which a peer stops being surfaced.
+    #[serde(default = "default_awareness_expiry_secs")]
+    pub awareness_expiry_secs: u64,
 }
 
 fn default_ollama_base_url() -> String {
@@ -180,6 +198,22 @@ fn default_capture_triage_model() -> String {
 
 fn default_capture_debounce_secs() -> u64 {
     300
+}
+
+fn default_awareness_enabled() -> bool {
+    true
+}
+
+fn default_awareness_model() -> String {
+    "openrouter:openai/gpt-4o-mini".to_string()
+}
+
+fn default_awareness_inject_min_interval_secs() -> u64 {
+    30
+}
+
+fn default_awareness_expiry_secs() -> u64 {
+    3600
 }
 
 fn default_logging_enabled() -> bool {
@@ -406,6 +440,11 @@ impl Default for Config {
             inject_min_prompt_words: default_inject_min_prompt_words(),
             // Citation-anchored capture (v0.4)
             capture_max_turns: default_capture_max_turns(), // usize
+            // Cross-agent awareness (v0.1)
+            awareness_enabled: default_awareness_enabled(),
+            awareness_model: default_awareness_model(),
+            awareness_inject_min_interval_secs: default_awareness_inject_min_interval_secs(),
+            awareness_expiry_secs: default_awareness_expiry_secs(),
         }
     }
 }
