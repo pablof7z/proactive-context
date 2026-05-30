@@ -2189,8 +2189,13 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         plain_ts
     };
 
-    if plain_ts.len() < 500 || exchanges < 3 {
-        eprintln!("capture: too short ({} chars, {} exchanges) — skipping", plain_ts.len(), exchanges);
+    // Substance gate. We only veto on CONTENT (char floor) + a minimal "user actually
+    // spoke" floor — NOT on exchange count. A heavily-agentic session (one directive, then
+    // 100+ assistant/tool turns) is substantive but has few user turns; the old `exchanges < 3`
+    // veto wrongly dropped ~half such sessions. Triage (below) is the real "is there a durable
+    // lesson?" filter, so let it decide; here we only skip genuinely empty/non-user sessions.
+    if plain_ts.len() < 500 || exchanges < 1 {
+        eprintln!("capture: too short ({} chars, {} user-turns) — skipping", plain_ts.len(), exchanges);
         return Ok(());
     }
 
