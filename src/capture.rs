@@ -1405,24 +1405,41 @@ of claims.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
 [{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
 ## GUIDE ALTITUDE — this is the most important thing to get right\n\
-A guide is a SUBSYSTEM / CONCERN-level topic that ACCUMULATES many related claims over time — \
-NOT one guide per fact. Think 'chapter', not 'sentence'. A healthy whole-project wiki is roughly \
-25-40 guides total, each holding many claims — never one guide per individual fact.\n\
-- Multiple distinct-but-related facts about the SAME subsystem belong in the SAME guide as separate \
-sections. Example: 'citation ID format', 'citation markers in prose', and 'the citation log file' \
-are ONE topic — the citation system — NOT three guides. Route all three to a single \
-`citation-system` (or similar) slug.\n\
-- Example: 'the compile model acts as a librarian', 'compile JSON output', and 'compile receives \
-verbatim guides' are all the COMPILE step of inject → one `inject-compile` guide, not three.\n\
-- Before minting a new slug, ASK: is there an existing guide whose subsystem/concern already \
-encompasses this claim? If yes, REUSE its exact slug (is_new=false) and add the claim there.\n\n\
+A guide is a SUB-CONCERN: ONE distinct mechanism / responsibility — NOT the whole subsystem, and \
+NOT one guide per fact, feature, option, or sub-step. A healthy whole-project wiki is roughly \
+25-30 guides total. If you are producing far more than that you are SPLITTING TOO FINELY — most \
+claims about a thing belong together as SECTIONS of ONE guide, not as separate guides.\n\
+## THE DISCRIMINATOR — split by MECHANISM, never by feature/option/sub-step\n\
+- A genuinely DISTINCT mechanism/responsibility → its OWN guide. Example: inject's relevance/select \
+GATE (`inject-gate`) and its COMPILE/synthesis step (`inject-compile`) are DIFFERENT mechanisms → \
+DIFFERENT guides. The inject pipeline is rightly ~6 guides (gate, compile, recent-context, no-DB/\
+auto-index, noun-resolution, architecture) because each is a distinct mechanism.\n\
+- But a FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION, NOT a guide. MERGE these. \
+Examples of correct merging:\n\
+  * The archeologist's picker, dry-run, resume/dedup, output-dir, and run-view TUI are all FEATURES \
+of ONE `archeologist` guide — NOT five guides. One subsystem with many features = ONE guide.\n\
+  * Embeddings + vector store + distance metric + similarity threshold = ONE `embeddings-and-vector-db` \
+guide — NOT four. They are facets of one storage mechanism.\n\
+  * 'citation ID format', 'citation markers in prose', 'the citation log file' = ONE `citation-system` \
+guide. Likewise daemon init/stop/ps = ONE daemon-lifecycle guide.\n\
+- The test: would these claims read as SECTIONS of a single coherent guide a person would open? Then \
+they are ONE guide. Only when a claim is a SEPARATE mechanism a reader would look up on its own does \
+it deserve its own slug.\n\
+- So: split a subsystem ONLY at distinct-mechanism boundaries; MERGE features, options, and sub-steps \
+of the same mechanism into one guide as sections.\n\n\
 ## Rules\n\
-- If an EXISTING guide's title/summary covers the claim's subsystem, REUSE its exact slug, \
-is_new=false. Mandatory: never mint a slug that is a synonym or sub-topic of an existing guide \
-(e.g. do NOT create `compile-model-as-librarian` when `librarian-compile-model` exists — same role).\n\
-- Only set is_new=true (fresh kebab-case slug + human title) when NO existing guide's subsystem fits.\n\
-- Sibling claims in THIS batch about the same subsystem MUST converge on ONE shared slug.\n\
-- Prefer adding to a broad existing guide over minting a narrow new sibling. One subsystem → one slug.\n";
+- If an EXISTING guide already covers this claim's specific mechanism, REUSE its exact slug, \
+is_new=false. Never mint a slug that is a synonym of an existing guide for the SAME mechanism \
+(e.g. do NOT create `compile-model-as-librarian` when `librarian-compile-model` exists — same role; \
+do NOT create `embedding-providers` when `embedding-provider` exists — same mechanism).\n\
+- Set is_new=true (fresh kebab-case slug + human title) ONLY when the claim is a DISTINCT mechanism \
+that no existing guide covers — NOT for a feature/option/sub-step of a mechanism an existing guide \
+already covers (add it there as a section instead).\n\
+- DEFAULT TO REUSE: when unsure whether a claim is its own mechanism or a facet of an existing guide's \
+mechanism, REUSE the existing guide. Over-merging a facet is cheap; minting a near-duplicate guide \
+fragments the wiki.\n\
+- Sibling claims in THIS batch about the SAME mechanism (or its features/options) MUST converge on \
+ONE shared slug; only claims about genuinely DIFFERENT mechanisms get DIFFERENT slugs.\n";
 
 const RECONCILE_PREAMBLE: &str = "\
 You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
