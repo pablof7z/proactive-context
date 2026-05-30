@@ -1414,11 +1414,15 @@ different wording fool you into minting a near-duplicate.\n\
 - If any CANDIDATE GUIDE is about the SAME MECHANISM / sub-concern as the claim — judged by what it \
 DOES, not by matching words — REUSE its exact slug, is_new=false. When a surfaced candidate plausibly \
 covers the claim's mechanism, REUSE it. Reuse is the default for a surfaced candidate.\n\
-- Set is_new=true (fresh kebab-case slug + human title) ONLY when NO candidate is the same mechanism \
-— i.e. every candidate is a genuinely DIFFERENT mechanism (merely adjacent in the same subsystem), or \
-the claim lists '(no similar existing guide)'. 'Different mechanism' means a reader would look it up \
-under its own separate heading; mere different phrasing of the same mechanism is NOT a different \
-mechanism.\n\
+- A candidate in the SAME SUBSYSTEM as the claim is almost always the RIGHT HOME, not a reason to \
+split. If the claim is a FEATURE, OPTION, FLAG, SUB-STEP, TIMEOUT/RETRY knob, VERBOSE/LOG/OBSERVABILITY \
+facet, or CONFIG detail OF the mechanism a candidate already covers → REUSE that candidate and add the \
+claim as a SECTION. 'Adjacent in the same subsystem' means MERGE, not NEW.\n\
+- Set is_new=true (fresh kebab-case slug + human title) ONLY when NO candidate covers the claim's \
+mechanism AND the claim is itself a genuinely DISTINCT MECHANISM a reader would look up under its own \
+separate heading (e.g. the relevance GATE vs the COMPILE/synthesis step are distinct mechanisms) — OR \
+the claim lists '(no similar existing guide)'. A feature/option/sub-step/observability facet is NEVER a \
+distinct mechanism; mere different phrasing of the same mechanism is NEVER a distinct mechanism.\n\
 - A superseded detail in a candidate's slug is NOT a reason to mint a new guide. If the claim REVERSES \
 or UPDATES a decision a candidate already covers (e.g. candidate `redis-session-store` and the claim \
 switches sessions to Postgres), REUSE that candidate's slug — the reconcile step replaces the old \
@@ -1438,13 +1442,28 @@ wiki is ~25-30 guides.\n\
 - A FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION of that mechanism's guide, NOT \
 its own guide. E.g. the archeologist's picker, dry-run, resume/dedup, and output-dir are features of \
 ONE `archeologist` guide. The test: would these claims read as SECTIONS of a single coherent guide a \
-person would open under one title? Then they are ONE guide.\n\n\
-## Granularity guidance — split at mechanism seams; do NOT over-merge distinct mechanisms\n\
-Because candidates are pre-retrieved by similarity, a later same-topic claim will be shown the \
-existing guide and route there — so you do NOT need to defensively over-merge to avoid duplicates. \
-When a claim is a genuinely distinct mechanism from every candidate, prefer a NEW guide at the right \
-mechanism altitude rather than cramming it into an adjacent guide. Distinct sub-concerns stay \
-distinct; only true features/options/sub-steps merge into their mechanism's guide.\n\n\
+person would open under one title? Then they are ONE guide.\n\
+## CONCRETE MERGES — do NOT mint these near-duplicate guides; fold them into the parent mechanism\n\
+- INJECT is ~6 guides total: the GATE, the COMPILE/synthesis step, recent-context, no-DB/auto-index, \
+noun-resolution, and the overall pipeline/architecture. Everything else about inject is a SECTION of \
+one of those. Do NOT create separate guides like `inject-timeouts`, `inject-verbose`, \
+`inject-statusline`, `inject-event-log`, `inject-model-selection`, `inject-hook-implementation`, or \
+`inject-catalog`: a timeout/retry knob and a verbose/log flag are OBSERVABILITY/CONFIG facets → fold \
+into recent-context-and-observability or the pipeline guide; model selection → the gate guide; \
+hook/catalog → the pipeline/architecture guide.\n\
+- EMBEDDINGS + the VECTOR STORE are ONE guide (`embeddings-and-vector-db`). Do NOT split into \
+`local-embeddings`, `openrouter-embeddings`, `vector-distance-metrics`, `embedding-dimension-mismatch`, \
+and `onnx-reranker-caching` — provider choice, distance metric, dimension handling, and reranker \
+caching are all facets of the SAME embeddings/vector mechanism → ONE guide with sections.\n\
+- Likewise config/storage-layout details, daemon init/stop/ps, and the citation id/markers/log are \
+each ONE guide, not several.\n\n\
+## Granularity guidance — split ONLY at true mechanism seams\n\
+Because candidates are pre-retrieved by similarity, a later same-subsystem claim WILL be shown the \
+existing guide — route it THERE. The failure mode to avoid is OVER-SPLITTING: minting a new guide for \
+every feature/option/flag/sub-step/observability facet of a mechanism a candidate already covers. When \
+a candidate is in the claim's subsystem, default to REUSE; only mint NEW when the claim is a separate \
+mechanism with its own distinct responsibility (gate vs compile), never for a facet of an existing \
+one.\n\n\
 ## WITHIN-BATCH sibling convergence (still required)\n\
 Two or more claims in THIS batch about the SAME mechanism MUST share ONE slug — especially when the \
 mechanism is NEW (no candidate exists yet, so similarity search cannot converge them; only you, \
