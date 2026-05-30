@@ -2015,7 +2015,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         project_dir_from_cwd(&input.cwd)
     };
     let project_root = resolve_project_root(&PathBuf::from(&input.cwd));
-    let wiki_path = wiki_dir(&project_root);
+    // When an output_dir override is set (archeologist isolated run), redirect ALL wiki
+    // writes under it too — NOT just markers/index.db. Otherwise guides would clobber the
+    // real repo's docs/wiki/. Mirror proj_dir's layout: <output_dir>/projects/<norm>/docs/wiki.
+    let wiki_path = if input.output_dir.is_some() {
+        proj_dir.join("docs").join("wiki")
+    } else {
+        wiki_dir(&project_root)
+    };
     let today_str = input.today_override.clone().unwrap_or_else(today);
 
     // Fast triage (with wiki index for "already specified" check — spec Open Q5)

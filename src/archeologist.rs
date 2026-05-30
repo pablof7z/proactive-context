@@ -659,7 +659,13 @@ fn run_checkpoint(cwd: &str, output_dir: Option<&std::path::PathBuf>) {
     }
     let proj_dir = archeologist_project_dir(cwd, output_dir);
     let project_root = resolve_project_root(&std::path::PathBuf::from(cwd));
-    let wiki_path = wiki_dir(&project_root);
+    // Match run_capture_from_input: when output_dir is set, structural maintenance must
+    // operate on the redirected wiki (proj_dir/docs/wiki), not the real repo's docs/wiki/.
+    let wiki_path = if output_dir.is_some() {
+        proj_dir.join("docs").join("wiki")
+    } else {
+        wiki_dir(&project_root)
+    };
     let today = date_str_today();
     run_structural_maintenance(&wiki_path, &proj_dir, &today);
 }
