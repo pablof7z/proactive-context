@@ -1958,10 +1958,12 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     };
 
-    let exchanges = turns
-        .windows(2)
-        .filter(|w| w[0].0 == "user" && w[1].0 == "assistant")
-        .count();
+    // Count user turns as the "exchange" proxy. The old strict windows(2) user→assistant
+    // adjacency count under-counted tool-heavy sessions: assistant tool-call turns create
+    // long same-role runs, so a 100+-message session could show only 1-2 exact adjacencies
+    // and be wrongly dropped as "too short" (esp. via the archeologist's meta-parse path).
+    // A user turn reliably marks one round of engagement regardless of tool-call density.
+    let exchanges = turns.iter().filter(|t| t.0 == "user").count();
 
     // Resolve output paths (output_dir override for isolated archeologist runs)
     let marker_dir = input.output_dir.as_ref()
