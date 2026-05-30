@@ -2130,7 +2130,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
 
     // Open-question extraction: detect undefined nouns in the transcript for the
     // SessionStart hook to resolve in the next session. Skip in archeologist bulk mode.
-    if !input.skip_structural_maintenance {
+    // Also skip when no triage model is configured: an empty model string parses to the
+    // OpenRouter default, so running it on an Ollama-only setup yields a spurious 401.
+    // (Mirrors the triage gate above.)
+    if !input.skip_structural_maintenance && !cfg.capture_triage_model.is_empty() {
         extract_open_questions(
             &triage_spec,
             &openrouter_api_key,
@@ -2345,9 +2348,16 @@ pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, toda
     }
 
     let db_path = proj_dir.join("index.db");
-    match index_files_into_db(wiki_path, &db_path) {
-        Ok(_) => eprintln!("capture: indexed wiki into index.db"),
-        Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
+    // The project cache dir (~/.proactive-context/projects/<slug>/) may not exist yet —
+    // the wiki lives under the repo (docs/wiki/), so nothing else creates this dir. Without
+    // it, opening index.db fails with ENOENT. Create it before indexing.
+    if let Err(e) = fs::create_dir_all(proj_dir) {
+        eprintln!("capture: could not create project dir {}: {}", proj_dir.display(), e);
+    } else {
+        match index_files_into_db(wiki_path, &db_path) {
+            Ok(_) => eprintln!("capture: indexed wiki into index.db"),
+            Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
+        }
     }
 }
 
