@@ -626,6 +626,49 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
     rows
 }
 
+/// Read index rows by scanning LIVE guide files on disk, not the derived `_index.md`
+/// cache. Use this when freshness matters within a capture loop: in archeologist bulk
+/// mode the `_index.md` cache is only rebuilt at structural-maintenance checkpoints
+/// (every `--synth-every` sessions), so guides created by earlier in-window sessions
+/// exist on disk but are absent from the cache. ROUTE reading the stale cache was blind
+/// to its own recent siblings and minted near-duplicate slugs for the same topic.
+///
+/// Mirrors `WikiListTool::call`'s filter (skips any `_`-prefixed file, e.g. `_index`,
+/// `_citations`) and reuses `rebuild_index`'s row construction, but performs NO write —
+/// it is a pure read so it is safe to call on every ROUTE without churning the cache.
+/// Inject/statusline keep using the cheap `read_index` cache read to stay within budget.
+pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
+    let mut rows: Vec<IndexRow> = Vec::new();
+    let entries = match fs::read_dir(wiki_dir) {
+        Ok(e) => e,
+        Err(_) => return rows,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.starts_with('_') {
+            continue; // skip _index, _citations
+        }
+        if let Some(guide) = load_guide(&path) {
+            let fm = &guide.frontmatter;
+            rows.push(IndexRow {
+                slug: fm.slug.clone(),
+                title: fm.title.clone(),
+                summary: fm.summary.clone(),
+                tags: fm.tags.clone(),
+                volatility: fm.volatility.clone(),
+                verified: fm.verified.clone(),
+                updated: fm.updated.clone(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    rows
+}
+
 // ─── Guide creation helper ───────────────────────────────────────────────────
 
 /// Construct a new Guide from a rule/concept with proper frontmatter.

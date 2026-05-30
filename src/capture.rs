@@ -19,7 +19,7 @@ use crate::events::{init_context, log_event, truncate};
 use crate::transcript::{build_transcript_string, parse_transcript, parse_transcript_meta};
 use crate::wiki::{
     self, add_statement_to_section, guide_path, load_guide,
-    new_guide, read_index, rebuild_index, revise_section, save_guide, slugify, wiki_dir,
+    new_guide, read_index, read_index_live, rebuild_index, revise_section, save_guide, slugify, wiki_dir,
     Guide,
 };
 
@@ -1688,7 +1688,11 @@ async fn run_wiki_agent(
     }
 
     // ── STAGE 3: ROUTE (batched, single call) ────────────────────────────────────
-    let index_rows = read_index(&ctx.wiki_path);
+    // Scan LIVE guide files (not the derived `_index.md` cache). In archeologist bulk
+    // mode the cache is only rebuilt at checkpoints (every `--synth-every` sessions), so
+    // reading the cache here made ROUTE blind to guides created by earlier in-window
+    // sessions → near-duplicate slugs for the same topic (cross-window fragmentation).
+    let index_rows = read_index_live(&ctx.wiki_path);
     let index_text = if index_rows.is_empty() {
         "(the wiki is empty — every claim is a new topic)".to_string()
     } else {
