@@ -61,6 +61,10 @@ struct PendingCapture {
     cwd: String,
     transcript_path: String,
     scheduled_at_secs: u64,
+    /// Debounce window the deferred runner should sleep before capturing.
+    /// Resolved at schedule time from `--in <SECS>` (override) or config (default).
+    #[serde(default = "crate::config::default_capture_debounce_secs")]
+    debounce_secs: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1907,7 +1911,7 @@ pub fn run_capture() -> Result<()> {
 
 // ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
 
-pub fn run_capture_scheduled(delay_secs: u64) -> Result<()> {
+pub fn run_capture_scheduled(delay_override: Option<u64>) -> Result<()> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim();
@@ -1940,11 +1944,15 @@ pub fn run_capture_scheduled(delay_secs: u64) -> Result<()> {
         return Ok(());
     }
 
+    // `--in <SECS>` overrides; bare `--in` (the Stop hook) falls back to config.
+    let delay_secs = delay_override.unwrap_or(cfg.capture_debounce_secs);
+
     let pending = PendingCapture {
         session_id: hook_input.session_id.clone(),
         cwd: hook_input.cwd.clone(),
         transcript_path: hook_input.transcript_path.clone(),
         scheduled_at_secs: unix_now_secs(),
+        debounce_secs: delay_secs,
     };
 
     let dir = pending_captures_dir();
@@ -2013,19 +2021,15 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
     let pending_path = dir.join(format!("{}.json", session_id));
     let pid_path = dir.join(format!("{}.pid", session_id));
 
-    let cfg = match load_config() {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-    let delay_secs = cfg.capture_debounce_secs;
-
-    let launched_at = {
+    // Read the debounce window the scheduler resolved (`--in <SECS>` or config),
+    // along with the timestamp that marks us as the current winner.
+    let (launched_at, delay_secs) = {
         let data = match fs::read_to_string(&pending_path) {
             Ok(d) => d,
             Err(_) => return Ok(()),
         };
         match serde_json::from_str::<PendingCapture>(&data) {
-            Ok(p) => p.scheduled_at_secs,
+            Ok(p) => (p.scheduled_at_secs, p.debounce_secs),
             Err(_) => return Ok(()),
         }
     };

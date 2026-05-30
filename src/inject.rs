@@ -1,4 +1,4 @@
-use crate::config::{load_config, normalize_path, project_db_path, project_context_dir, resolve_project_root};
+use crate::config::{load_config, normalize_path, project_db_path, resolve_project_root};
 use crate::events::{init_context, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
@@ -44,18 +44,24 @@ const COMPILE_PREAMBLE: &str = "\
 You are a context compiler for an AI coding assistant (Claude Code). The text given as the user \
 prompt is a SEARCH QUERY describing what the assistant is about to work on. You are given SOURCE \
 DOCUMENTS, line-numbered, each under a header naming its absolute file path.\n\n\
-Write a TIGHT, synthesized briefing containing ONLY the information relevant to the query, drawn \
-strictly from the provided sources. Be dense and specific. Do NOT answer the query, do NOT write \
-code, do NOT restate the query or pad with filler — surface the relevant facts so the assistant \
-can reason from them.\n\n\
+Your ONLY job is to extract and surface relevant facts from the sources so the assistant can \
+reason from them. You are a librarian, not an analyst.\n\n\
+STRICT PROHIBITIONS — violating any of these is a critical failure:\n\
+- Do NOT answer the query or pre-bake a response\n\
+- Do NOT write hypotheses, inferences, or diagnoses (no \"Why it might...\", no \"The likely cause is...\")\n\
+- Do NOT write summary or conclusion sections (no \"Bottom line:\", no \"In summary:\", no \"Therefore...\")\n\
+- Do NOT reason about what the code does or why something might fail\n\
+- Do NOT write code\n\
+- Do NOT restate the query or pad with filler\n\
+Every sentence must state a fact drawn directly from a cited source — nothing more.\n\n\
 HARD REQUIREMENT — CITATIONS: every factual claim MUST be immediately followed by an inline source \
-citation in the form (path:line) or (path:start-end), using the EXACT absolute path from the \
+citation in the form (path:line) or (path:start-end), using the EXACT path from the \
 source header and the line numbers shown by the `N|` prefix. A claim with no citation is invalid. \
 Never invent paths or line numbers — cite only what is shown. Synthesize in your own words; do not \
 paste whole sections verbatim.\n\n\
 Output EXACTLY this shape:\n\
 TITLE: <2-8 words naming the topic, or the single word none if nothing is relevant>\n\
-<the synthesized briefing, with an inline (path:line) citation after every claim>\n\n\
+<cited facts from the sources, one claim per sentence, each followed by its (path:line) citation>\n\n\
 If NOTHING in the sources is relevant to the query, output exactly:\n\
 TITLE: none";
 
@@ -360,8 +366,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
     let ollama_api_key = cfg.ollama_api_key.clone();
 
     // ── 3. Wiki-based navigation under timeout ─────────────────────────────
-    let proj_dir = project_context_dir(&root);
-    let wiki_path = wiki::wiki_dir(&proj_dir);
+    let wiki_path = wiki::wiki_dir(&root);
 
     // Check if wiki exists and has guides
     let wiki_index_rows = if wiki_path.exists() {
@@ -895,7 +900,7 @@ async fn wiki_navigate_and_compile(
 
 /// Render the selected sources as line-numbered text for the compile model to synthesize from.
 /// Each `(label, content)` is headed by `=== source: <label> ===`, where `label` is the
-/// ABSOLUTE file path the model must cite. Line numbers are 1-based over `content.lines()`,
+/// cwd-relative path the model must cite. Line numbers are 1-based over `content.lines()`,
 /// matching the `N|` prefix the model is told to cite.
 fn render_guides_for_select(sources: &[(String, String)]) -> String {
     let mut out = String::new();
@@ -925,8 +930,7 @@ async fn compile_briefing(
     root: &Path,
     max_tokens: usize,
 ) -> Result<String> {
-    // Label each source by the ABSOLUTE path the model must cite (wiki guides live under
-    // wiki_dir keyed by bare slug; committed project files are keyed by their repo-relative path).
+    // Label each source by a cwd-relative path the model must cite.
     let sources: Vec<(String, String)> = guides
         .iter()
         .map(|(slug, content)| {
@@ -935,7 +939,11 @@ async fn compile_briefing(
             } else {
                 guide_path(wiki_dir, slug)
             };
-            (abs.display().to_string(), content.clone())
+            let label = abs
+                .strip_prefix(root)
+                .map(|rel| format!("./{}", rel.display()))
+                .unwrap_or_else(|_| abs.display().to_string());
+            (label, content.clone())
         })
         .collect();
 

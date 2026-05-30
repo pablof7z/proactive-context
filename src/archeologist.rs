@@ -658,7 +658,8 @@ fn run_checkpoint(cwd: &str, output_dir: Option<&std::path::PathBuf>) {
         return;
     }
     let proj_dir = archeologist_project_dir(cwd, output_dir);
-    let wiki_path = wiki_dir(&proj_dir);
+    let project_root = resolve_project_root(&std::path::PathBuf::from(cwd));
+    let wiki_path = wiki_dir(&project_root);
     let today = date_str_today();
     run_structural_maintenance(&wiki_path, &proj_dir, &today);
 }

@@ -1,6 +1,13 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::path::PathBuf;
+
+pub fn fastembed_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .join("proactive-context/fastembed")
+}
 
 /// Trait for embedding providers (local or remote).
 pub trait Embedder: Send + Sync {
@@ -33,7 +40,9 @@ impl LocalEmbedder {
         };
 
         let model = TextEmbedding::try_new(
-            InitOptions::new(embedding_model.clone()).with_show_download_progress(true),
+            InitOptions::new(embedding_model.clone())
+                .with_show_download_progress(true)
+                .with_cache_dir(fastembed_cache_dir()),
         )
         .context("Failed to initialize fastembed model")?;
 

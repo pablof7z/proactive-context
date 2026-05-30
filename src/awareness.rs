@@ -14,6 +14,7 @@ use crate::config::{load_config, project_context_dir, resolve_project_root, Conf
 use crate::provider::ModelSpec;
 use crate::transcript::parse_transcript;
 use anyhow::Result;
+use colored::Colorize;
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::io::{self, Read};
@@ -436,7 +437,7 @@ pub fn print_board(cwd: &str, show_all: bool) -> Result<()> {
 
     let mut shown = 0;
     let mut hidden_expired = 0;
-    println!("Agent standup board — {}", root.display());
+    println!("{} {}", "Agent standup board —".bold(), root.display().to_string().cyan().bold());
     println!();
     for row in rows {
         let (sid, branch, worktree, intent, initial, last_active, _last_distill, ended, _started) = row?;
@@ -458,24 +459,31 @@ pub fn print_board(cwd: &str, show_all: bool) -> Result<()> {
             .filter(|s| !s.trim().is_empty())
             .or(initial)
             .unwrap_or_else(|| "(intent not yet distilled)".into());
+        let (bullet, status_str) = match status {
+            "active"  => ("●".green().bold(),  "active ".green().bold()),
+            "done"    => ("●".dimmed(),         "done   ".dimmed()),
+            _         => ("●".yellow(),         "expired".yellow()),
+        };
+        let meta = format!("[{}, {}]", branch, fmt_age(age));
         println!(
-            "● {:<8} {:<7} {:<22} {}",
-            &sid[..sid.len().min(8)],
-            status,
-            format!("[{}, {}]", branch, fmt_age(age)),
+            "{} {:<8} {} {:<22} {}",
+            bullet,
+            sid[..sid.len().min(8)].dimmed(),
+            status_str,
+            meta.cyan(),
             body
         );
         // show the worktree on a dim second line when it differs from the room root
         if Path::new(&worktree) != root {
-            println!("    ↳ {}", worktree);
+            println!("    {} {}", "↳".dimmed(), worktree.dimmed());
         }
     }
     if shown == 0 {
-        println!("(no active agents)");
+        println!("{}", "(no active agents)".dimmed());
     }
     if hidden_expired > 0 {
         println!();
-        println!("({} expired agent(s) hidden — pass --all to show)", hidden_expired);
+        println!("{}", format!("({} expired agent(s) hidden — pass --all to show)", hidden_expired).dimmed());
     }
     Ok(())
 }

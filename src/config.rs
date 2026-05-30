@@ -196,7 +196,7 @@ fn default_capture_triage_model() -> String {
     "anthropic/claude-haiku-4-5".to_string()
 }
 
-fn default_capture_debounce_secs() -> u64 {
+pub fn default_capture_debounce_secs() -> u64 {
     300
 }
 

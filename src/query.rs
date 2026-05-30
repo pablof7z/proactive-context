@@ -1,6 +1,6 @@
 use crate::config::load_config;
 use crate::db::{open_db, open_db_at, vector_search, SearchHit};
-use crate::embed::build_embedder;
+use crate::embed::{build_embedder, fastembed_cache_dir};
 use crate::events::{log_event, truncate};
 use anyhow::Result;
 use fastembed::{RerankerModel, RerankResult, TextRerank};
@@ -148,7 +148,8 @@ pub(crate) fn rerank_hits(hits: &[SearchHit], query: &str, top_k: usize) -> Resu
 
     let mut reranker = TextRerank::try_new(
         fastembed::RerankInitOptions::new(RerankerModel::BGERerankerBase)
-            .with_show_download_progress(true),
+            .with_show_download_progress(true)
+            .with_cache_dir(fastembed_cache_dir()),
     )?;
 
     let documents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();

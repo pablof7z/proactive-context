@@ -106,13 +106,14 @@ enum Commands {
     /// Reads { session_id, cwd, transcript_path } JSON from stdin.
     ///
     /// SessionEnd hook: `capture` (runs immediately, deduplicates via marker).
-    /// Stop hook:       `capture --in 300` (returns immediately, runs in background
-    ///                  after 300 s of silence; resets the timer on each new turn).
+    /// Stop hook:       `capture --in` (returns immediately, runs in background after
+    ///                  the configured silence window; resets the timer on each new turn).
     Capture {
-        /// Delay N seconds before distilling (Stop hook debounce).
-        /// Returns immediately; background process runs capture after the silence window.
-        #[arg(long, value_name = "SECS")]
-        r#in: Option<u64>,
+        /// Debounce capture instead of running immediately (Stop hook).
+        /// Bare `--in` uses `capture_debounce_secs` from config; `--in <SECS>`
+        /// overrides it. Returns immediately; the deferred process does the work.
+        #[arg(long, value_name = "SECS", num_args = 0..=1)]
+        r#in: Option<Option<u64>>,
 
         // Internal: run the deferred capture for this session_id (spawned by --in).
         #[arg(long, hide = true)]

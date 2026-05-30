@@ -14,7 +14,7 @@
 ///   no-wiki:   (empty string)
 ///   --with-context appends: · <pct>%  (green/yellow/red)
 
-use crate::config::{load_config, project_context_dir};
+use crate::config::load_config;
 use crate::tail::{parse_ts_to_millis, EventLine};
 use crate::wiki;
 use serde::Deserialize;
@@ -444,8 +444,7 @@ fn run_statusline_inner(with_context: bool) -> String {
 
     // Resolve wiki dir
     let root = std::path::PathBuf::from(&cwd);
-    let proj_dir = project_context_dir(&root);
-    let wiki_dir = wiki::wiki_dir(&proj_dir);
+    let wiki_dir = wiki::wiki_dir(&root);
 
     // Guide count — gates everything
     let guides = count_guides(&wiki_dir);

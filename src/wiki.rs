@@ -1,7 +1,7 @@
 /// wiki.rs — per-project knowledge wiki
 ///
 /// Storage layout:
-///   ~/.proactive-context/projects/<normalized>/wiki/
+///   <project_root>/docs/wiki/
 ///     _index.md          derived cache: table of every guide (title, summary, tags, volatility, verified, slug)
 ///     <slug>.md          one guide per bounded concept
 ///
@@ -237,9 +237,9 @@ pub fn slugify(title: &str) -> String {
 
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
-/// Wiki directory for a project.
-pub fn wiki_dir(proj_dir: &Path) -> PathBuf {
-    proj_dir.join("wiki")
+/// Wiki directory for a project — always lives inside the project source tree.
+pub fn wiki_dir(project_root: &Path) -> PathBuf {
+    project_root.join("docs").join("wiki")
 }
 
 /// Path for a guide by slug.
