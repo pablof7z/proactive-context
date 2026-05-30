@@ -1406,15 +1406,24 @@ most relevant (with a similarity score 0..1, higher = closer). You choose among 
 candidates, or declare NEW.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
 [{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
-## How to choose\n\
-- If one of the claim's CANDIDATE GUIDES covers the SAME mechanism as the claim, REUSE its exact \
-slug, is_new=false. The candidates were retrieved BY similarity — a high-scoring candidate whose \
-title/summary matches the claim's mechanism is almost always the right home. Prefer reuse over a \
-new slug whenever a candidate genuinely fits.\n\
-- If NONE of the candidates is actually the same mechanism (they are merely adjacent, or the claim \
-lists '(no similar existing guide)'), set is_new=true with a fresh kebab-case slug + human title. \
-Do NOT force a claim into a candidate that is only loosely related — a wrong reuse buries a distinct \
-mechanism inside an unrelated guide.\n\
+## How to choose — TRUST THE CANDIDATES\n\
+The candidates were retrieved by SEMANTIC similarity, so they can be the right home EVEN WITH ZERO \
+SHARED VOCABULARY. This is the whole point: 'token-bucket rate limiting' and 'the throttling layer \
+caps requests per client' are the SAME mechanism in different words → SAME guide. Do not let \
+different wording fool you into minting a near-duplicate.\n\
+- If any CANDIDATE GUIDE is about the SAME MECHANISM / sub-concern as the claim — judged by what it \
+DOES, not by matching words — REUSE its exact slug, is_new=false. When a surfaced candidate plausibly \
+covers the claim's mechanism, REUSE it. Reuse is the default for a surfaced candidate.\n\
+- Set is_new=true (fresh kebab-case slug + human title) ONLY when NO candidate is the same mechanism \
+— i.e. every candidate is a genuinely DIFFERENT mechanism (merely adjacent in the same subsystem), or \
+the claim lists '(no similar existing guide)'. 'Different mechanism' means a reader would look it up \
+under its own separate heading; mere different phrasing of the same mechanism is NOT a different \
+mechanism.\n\
+- A superseded detail in a candidate's slug is NOT a reason to mint a new guide. If the claim REVERSES \
+or UPDATES a decision a candidate already covers (e.g. candidate `redis-session-store` and the claim \
+switches sessions to Postgres), REUSE that candidate's slug — the reconcile step replaces the old \
+decision in place. Minting `postgres-session-store` beside `redis-session-store` is a DUPLICATE, not a \
+new mechanism.\n\
 - You may ONLY reuse a slug that appears in that claim's CANDIDATE GUIDES list. Never invent a reuse \
 of some other guide you remember; if it isn't a listed candidate, treat the mechanism as NEW.\n\n\
 ## GUIDE ALTITUDE — a guide is ONE mechanism (one sub-concern)\n\
@@ -1751,9 +1760,12 @@ async fn run_wiki_agent(
     };
 
     let n_with_candidates = recalls.iter().filter(|r| !r.candidates.is_empty()).count();
+    let best_scores: Vec<String> = recalls.iter()
+        .map(|r| r.candidates.first().map(|c| format!("{:.2}", c.score)).unwrap_or_else(|| "-".to_string()))
+        .collect();
     eprintln!(
-        "capture: ROUTE recall → {}/{} claims have ≥1 candidate (top_k={}, tau={:.2})",
-        n_with_candidates, admitted.len(), route_top_k, route_tau
+        "capture: ROUTE recall → {}/{} claims have ≥1 candidate (top_k={}, tau={:.2}); top-cosine per claim: [{}]",
+        n_with_candidates, admitted.len(), route_top_k, route_tau, best_scores.join(", ")
     );
     log_event("capture.route_recall", None, serde_json::json!({
         "claims": admitted.len(), "with_candidates": n_with_candidates,
