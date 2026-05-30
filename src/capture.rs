@@ -61,9 +61,8 @@ struct PendingCapture {
     cwd: String,
     transcript_path: String,
     scheduled_at_secs: u64,
-    /// Debounce window the deferred runner should sleep before capturing.
-    /// Resolved at schedule time from `--in <SECS>` (override) or config (default).
-    #[serde(default = "crate::config::default_capture_debounce_secs")]
+    /// Debounce window (seconds) the deferred runner sleeps before capturing.
+    /// Always set from `--in <SECS>`; no config fallback.
     debounce_secs: u64,
 }
 
@@ -1911,7 +1910,7 @@ pub fn run_capture() -> Result<()> {
 
 // ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
 
-pub fn run_capture_scheduled(delay_override: Option<u64>) -> Result<()> {
+pub fn run_capture_scheduled(delay_secs: u64) -> Result<()> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim();
@@ -1943,9 +1942,6 @@ pub fn run_capture_scheduled(delay_override: Option<u64>) -> Result<()> {
     if !cfg.capture_enabled {
         return Ok(());
     }
-
-    // `--in <SECS>` overrides; bare `--in` (the Stop hook) falls back to config.
-    let delay_secs = delay_override.unwrap_or(cfg.capture_debounce_secs);
 
     let pending = PendingCapture {
         session_id: hook_input.session_id.clone(),

@@ -110,10 +110,9 @@ enum Commands {
     ///                  the configured silence window; resets the timer on each new turn).
     Capture {
         /// Debounce capture instead of running immediately (Stop hook).
-        /// Bare `--in` uses `capture_debounce_secs` from config; `--in <SECS>`
-        /// overrides it. Returns immediately; the deferred process does the work.
-        #[arg(long, value_name = "SECS", num_args = 0..=1)]
-        r#in: Option<Option<u64>>,
+        /// `--in <SECS>` returns immediately; the deferred process sleeps then captures.
+        #[arg(long, value_name = "SECS")]
+        r#in: Option<u64>,
 
         // Internal: run the deferred capture for this session_id (spawned by --in).
         #[arg(long, hide = true)]
@@ -370,8 +369,8 @@ fn main() -> Result<()> {
         Commands::Capture { r#in, deferred } => {
             if let Some(session_id) = deferred {
                 crate::capture::run_deferred_capture(&session_id)?;
-            } else if let Some(delay) = r#in {
-                crate::capture::run_capture_scheduled(delay)?;
+            } else if let Some(secs) = r#in {
+                crate::capture::run_capture_scheduled(secs)?;
             } else {
                 crate::capture::run_capture()?;
             }
