@@ -1428,6 +1428,11 @@ const RECONCILE_PREAMBLE: &str = "\
 You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
 (may be empty for a new guide) and ALL claims routed to this guide. Produce an ordered list of \
 edit operations that make the guide reflect the CURRENT desired state.\n\n\
+## Claim authority tags\n\
+Each routed claim is prefixed with its authority:\n\
+- [explicit] = the USER stated it directly. Load-bearing, permanent product direction.\n\
+- [implicit] = the AGENT proposed/inferred it (the user did not state it). A real candidate \
+direction (often the actual implementation path) but NOT yet blessed by the user — PROVISIONAL.\n\n\
 ## Output: STRICT JSON ARRAY of ops, nothing else\n\
 [{\"op\": \"create\"|\"add\"|\"revise\"|\"remove\", \
 \"section\": \"## Section Heading\", \
@@ -1437,19 +1442,40 @@ edit operations that make the guide reflect the CURRENT desired state.\n\n\
 ## Op semantics\n\
 - create: the FIRST section(s) of a brand-new guide. Use for an empty current body.\n\
 - add: append a genuinely NEW, non-conflicting statement to a section.\n\
-- revise: REPLACE the prose of an existing section (cite the new evidence). Prior citations are \
-carried forward by the system.\n\
-- remove: delete a section that is fully retracted.\n\n\
+- revise: REPLACE the entire prose of an existing section (cite the new evidence). Prior citations \
+are carried forward by the system. To EDIT one statement within a multi-statement section \
+(e.g. promote a provisional one, or delete a provisional one while keeping its siblings), use \
+`revise` and re-emit the section's FULL text minus/plus the changed statement — preserving every \
+sibling statement you are not changing.\n\
+- remove: delete an entire section that is fully retracted (use only when the section's whole \
+content is being dropped; there is NO statement-level delete op — to drop one statement among \
+several, `revise` the section without it).\n\n\
+## Rendering implicit (provisional) claims — round-trips to disk, so be exact\n\
+An [implicit] claim that has NO explicit counterpart in this batch or guide must be written with a \
+verbatim inline prefix so a LATER session can recognize and resolve it:\n\
+    ⟨provisional, agent-inferred⟩ <the statement>\n\
+Keep that exact prefix (the ⟨ ⟩ guillemets and the words 'provisional, agent-inferred'). It marks \
+the statement as a candidate direction, NOT a blessed decision. An [explicit] claim is NEVER given \
+this prefix.\n\n\
+## Implicit-claim lifecycle — resolve against explicit claims (THIS batch AND existing prose)\n\
+- An [explicit] claim CONFIRMS an [implicit] statement (same direction): PROMOTE it — write/keep the \
+statement WITHOUT the provisional prefix (it is now blessed). Do not keep both a provisional and a \
+promoted copy.\n\
+- An [explicit] claim CONTRADICTS an [implicit] statement: DELETE the implicit statement entirely \
+(NO breadcrumb — it was only an inference, never user intent) and codify the explicit correction as \
+a permanent (un-prefixed) statement.\n\
+- An [implicit] claim with no explicit confirmation or contradiction: KEEP it, rendered with the \
+provisional prefix above.\n\n\
 ## THE CORE RULE — never accrete a contradiction\n\
 When a claim CONTRADICTS existing prose, you MUST use `revise` (or `remove`) to REPLACE the old \
 statement. NEVER `add` a statement that sits next to a contradictory one. The new decision must \
 become the live statement; the old one must NOT remain presented as current.\n\n\
 ## Authority-asymmetric history (§6)\n\
-- When a USER decision supersedes an earlier USER decision, the revised section SHOULD keep a \
-terse breadcrumb: state the new decision as current, then one short clause like \
+- When an [explicit] (USER) decision supersedes an earlier [explicit] (USER) decision, the revised \
+section SHOULD keep a terse breadcrumb: state the new decision as current, then one short clause like \
 '(Previously: <old>.)'. Keep it brief.\n\
-- When the superseded statement was a mere assistant proposal/hypothesis, DROP it entirely — no \
-breadcrumb.\n\
+- When the superseded statement was a provisional/implicit (agent) statement, DROP it entirely — no \
+breadcrumb (per the lifecycle above).\n\
 - Every section addressed by `section` must use an exact '## Heading' style heading.\n\
 - Output [] only if the claims require no change to this guide.\n";
 
@@ -1549,16 +1575,24 @@ struct ExtractedClaim {
     assertion: String,
     #[serde(default)]
     evidence: Vec<EvidenceRange>,
+    // Advisory only since §5 tag-don't-drop: EXTRACT still emits it, but it no longer
+    // gates admission (authority is derived mechanically from the evidence turn). Kept
+    // deserializable to avoid churning the EXTRACT contract.
     #[serde(default)]
+    #[allow(dead_code)]
     ratified: bool,
 }
 
-/// A claim after the authority gate, with Rust-derived authorship.
+/// A claim admitted into the pipeline, with Rust-derived authorship and authority tag (§5).
+/// Authority is derived mechanically from authorship: user-turn → `explicit`, agent-turn →
+/// `implicit`. Tag-don't-drop: every evidence-verified claim is admitted; the tag controls
+/// how RECONCILE renders/reconciles it, not whether it survives.
 #[derive(Debug, Clone)]
 struct AdmittedClaim {
     assertion: String,
     evidence: Vec<EvidenceRange>,
-    author: String, // "user" | "assistant"
+    author: String,            // "user" | "assistant"
+    authority: &'static str,   // "explicit" (user) | "implicit" (agent-inferred, provisional)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1617,31 +1651,40 @@ async fn run_wiki_agent(
         return Ok("EXTRACT produced no claims.".to_string());
     }
 
-    // ── STAGE 2: AUTHORITY GATE (mechanical, Rust-owned) ─────────────────────────
-    // Verify evidence in Rust; derive author mechanically; keep all user claims,
-    // drop agent claims unless ratified.
+    // ── STAGE 2: AUTHORITY TAGGING (mechanical, Rust-owned) — §5 tag-don't-drop ───
+    // Verify evidence in Rust; derive author mechanically; TAG (not gate) by authority.
+    // Every evidence-verified claim is admitted: user-turn → `explicit` (load-bearing,
+    // permanent), agent-turn → `implicit` (provisional, agent-inferred). The old gate
+    // that DROPPED unratified agent claims is removed — dropping destroyed coverage of
+    // agentic sessions and discarded the agent's inferred direction (often the real impl
+    // path). The lifecycle (promote-on-confirm / delete-on-contradict) is handled in
+    // RECONCILE. Only unverifiable evidence still drops (§2.4).
     let mut admitted: Vec<AdmittedClaim> = Vec::new();
+    let (mut n_explicit, mut n_implicit) = (0usize, 0usize);
     for c in &extracted {
         if !ctx.evidence_is_valid(&c.evidence) {
             continue; // unverifiable evidence → drop (§2.4)
         }
         let author = ctx.author_for_ranges(&c.evidence);
-        let keep = author == "user" || c.ratified;
-        if !keep {
-            continue; // unratified agent claim → drop (§5 admission gate)
-        }
+        let authority = if author == "user" { "explicit" } else { "implicit" };
+        if authority == "explicit" { n_explicit += 1; } else { n_implicit += 1; }
         admitted.push(AdmittedClaim {
             assertion: c.assertion.trim().to_string(),
             evidence: c.evidence.clone(),
             author,
+            authority,
         });
     }
-    eprintln!("capture: AUTHORITY GATE → {} admitted claim(s)", admitted.len());
-    log_event("capture.authority_gate", None, serde_json::json!({
-        "admitted": admitted.len(), "extracted": extracted.len()
+    eprintln!(
+        "capture: AUTHORITY TAGGING → {} admitted ({} explicit, {} implicit)",
+        admitted.len(), n_explicit, n_implicit
+    );
+    log_event("capture.authority_tagging", None, serde_json::json!({
+        "admitted": admitted.len(), "extracted": extracted.len(),
+        "explicit": n_explicit, "implicit": n_implicit
     }));
     if admitted.is_empty() {
-        return Ok("No claims survived the authority gate.".to_string());
+        return Ok("No evidence-verified claims to capture.".to_string());
     }
 
     // ── STAGE 3: ROUTE (batched, single call) ────────────────────────────────────
@@ -1719,7 +1762,7 @@ async fn run_wiki_agent(
                     .map(|r| format!("{{\"start\":{},\"end\":{}}}", r.start, r.end))
                     .collect::<Vec<_>>()
                     .join(",");
-                format!("- ({}) {} | evidence: [{}]", c.author, c.assertion, ev)
+                format!("- [{}] {} | evidence: [{}]", c.authority, c.assertion, ev)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1775,7 +1818,11 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| safe_slug.replace('-', " "));
     let new_summary = {
-        let s = op.text.trim();
+        // Strip the provisional marker (§5) before it can leak into the frontmatter
+        // summary — the summary feeds the ROUTE index the pipeline reads next session,
+        // and a marker there is noise, not a topic descriptor.
+        let s = op.text.replace("⟨provisional, agent-inferred⟩", "");
+        let s = s.trim();
         let s = s.split(". ").next().unwrap_or(s);
         let s: String = s.chars().take(160).collect();
         s.replace('\n', " ").trim().to_string()

@@ -21,7 +21,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-WORKTREE="/Users/pablofernandez/src/pc-revise-capture"
+WORKTREE="/Users/pablofernandez/src/proactive-context"
 cd "$WORKTREE" || { echo "FATAL: cannot cd to worktree"; exit 1; }
 
 echo "=== BUILD ==="
