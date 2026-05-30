@@ -13,7 +13,7 @@ use rig_core::tool::Tool;
 use tokio::runtime::Runtime;
 
 use crate::config::{load_config, normalize_path, resolve_project_root};
-use crate::provider::{ModelSpec, Provider, build_ollama_client, build_openrouter_client};
+use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
 use crate::transcript::{build_transcript_string, parse_transcript, parse_transcript_meta};
@@ -420,14 +420,62 @@ fn append_global_pending(lesson: &Lesson, session_id: &str) -> Result<()> {
 /// Format: `{:>4}| <line>` — 1-based. The lines vector is the SAME enumeration used
 /// when slicing evidence ranges.
 fn build_line_numbered_transcript(turns: &[(String, String)]) -> (String, Vec<String>) {
+    let (numbered, lines, _roles) = build_line_numbered_transcript_with_roles(turns);
+    (numbered, lines)
+}
+
+/// Like `build_line_numbered_transcript`, but also returns a parallel `Vec<String>`
+/// of the role ("user"/"assistant") that OWNS each 1-based transcript line.
+///
+/// This is built in lockstep with the EXACT same enumeration `build_transcript_string`
+/// produces — turns are joined by "\n\n", so each turn contributes its own text lines
+/// plus one blank separator line between turns. The blank separator inherits the role
+/// of the turn that precedes it. This is the foundation of mechanical authorship (§5):
+/// a claim's author = the role of the turn its evidence lines fall in. Rust OWNS this;
+/// the model's self-reported author is never trusted.
+pub(crate) fn build_line_numbered_transcript_with_roles(
+    turns: &[(String, String)],
+) -> (String, Vec<String>, Vec<String>) {
     let flat = build_transcript_string(turns);
     let lines: Vec<String> = flat.lines().map(|l| l.to_string()).collect();
+
+    // Reconstruct the line→role map using the SAME formatting as build_transcript_string:
+    //   each turn renders as "{Role}: {text}" and turns are joined by "\n\n".
+    // We replay that join here so the role vector aligns 1:1 with `lines`.
+    let mut roles: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, (role, text)) in turns.iter().enumerate() {
+        let normalized = if role == "user" { "user" } else { "assistant" };
+        let rendered = format!(
+            "{}: {}",
+            if role == "user" { "User" } else { "Assistant" },
+            text
+        );
+        // Number of physical lines this turn occupies in the flattened string.
+        let turn_line_count = rendered.split('\n').count();
+        for _ in 0..turn_line_count {
+            roles.push(normalized.to_string());
+        }
+        // The "\n\n" join between turns introduces one blank line BETWEEN turns;
+        // attribute that separator line to the preceding turn's role.
+        if i + 1 < turns.len() {
+            roles.push(normalized.to_string());
+        }
+    }
+    // Defensive: keep roles aligned to lines if any edge case under/over-counts.
+    if roles.len() < lines.len() {
+        let last = roles.last().cloned().unwrap_or_else(|| "assistant".to_string());
+        while roles.len() < lines.len() {
+            roles.push(last.clone());
+        }
+    } else {
+        roles.truncate(lines.len());
+    }
 
     let mut numbered = String::with_capacity(flat.len() + lines.len() * 6);
     for (i, line) in lines.iter().enumerate() {
         numbered.push_str(&format!("{:>4}| {}\n", i + 1, line));
     }
-    (numbered, lines)
+    (numbered, lines, roles)
 }
 
 /// Slice verbatim text from transcript lines given a list of {start, end} ranges.
@@ -518,6 +566,9 @@ struct WikiAgentCtx {
     prefix: String,
     /// All transcript lines (0-based for slice; 1-based line numbers in the numbered string)
     transcript_lines: Vec<String>,
+    /// Parallel to `transcript_lines`: the role ("user"/"assistant") owning each line.
+    /// Used for mechanical authorship attribution (§5) — Rust-owned, never model-claimed.
+    transcript_roles: Vec<String>,
     /// Per-session citation counter (monotonic, seeded from log at startup)
     counter: Mutex<usize>,
     /// date string "YYYY-MM-DD" for guide frontmatter
@@ -530,6 +581,7 @@ impl WikiAgentCtx {
         project_key: String,
         session_id: String,
         transcript_lines: Vec<String>,
+        transcript_roles: Vec<String>,
         today: String,
     ) -> Self {
         let prefix: String = session_id.chars().take(5).collect();
@@ -540,9 +592,38 @@ impl WikiAgentCtx {
             session_id,
             prefix,
             transcript_lines,
+            transcript_roles,
             counter: Mutex::new(counter_start),
             today,
         }
+    }
+
+    /// Mechanical authorship (§5): the author of a claim is the role of the turn that
+    /// owns its FIRST evidence line. Rust-checkable; the model's self-reported author
+    /// is ignored. Returns "user" or "assistant". Defaults to "assistant" if no valid
+    /// evidence line resolves (conservative — agent claims need ratification).
+    fn author_for_ranges(&self, ranges: &[EvidenceRange]) -> String {
+        for r in ranges {
+            // 1-based inclusive line numbers → 0-based index into transcript_roles.
+            if r.start == 0 {
+                continue;
+            }
+            let idx = r.start - 1;
+            if idx < self.transcript_roles.len() {
+                return self.transcript_roles[idx].clone();
+            }
+        }
+        "assistant".to_string()
+    }
+
+    /// True if every range resolves to at least one in-bounds, non-empty transcript slice.
+    /// Used to drop claims whose evidence Rust cannot verify (§2.4 — citations are
+    /// Rust-verified, not model-promised).
+    fn evidence_is_valid(&self, ranges: &[EvidenceRange]) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        !slice_transcript_ranges(&self.transcript_lines, ranges).trim().is_empty()
     }
 
     /// Mint a new citation ID and increment the counter.
@@ -1279,84 +1360,517 @@ impl Tool for WikiLinkTool {
 
 // ─── Wiki agent loop (replaces distill→plan→apply) ────────────────────────────
 
-const WIKI_AGENT_PREAMBLE: &str = "\
-You are the SPEC HISTORIAN for this project. Your job is to maintain the project wiki as a \
-LIVING, REGENERABLE PRODUCT SPECIFICATION — not a changelog or collection of assistant tips.\n\n\
-## Your role\n\
-Reverse-engineer the COMPLETE product spec from the conversation. The wiki is a positive, \
-desired-state spec: every statement describes how the product SHOULD work.\n\n\
-## Positive specification — the key reframe\n\
-- WRONG (event): 'avatar was broken'\n\
-- RIGHT (spec): 'On the feed, tapping an avatar opens a hovercard with the user details'\n\
-- WRONG (assistant-centric): 'remember to use optimistic locking'\n\
-- RIGHT (spec): 'Profile updates use optimistic locking to prevent race conditions'\n\n\
-## Recall bias: WHEN IN DOUBT, CAPTURE\n\
-Human time is irreplaceable; tokens are cheap. If the conversation passed triage, capture it.\n\n\
-## Evidence requirement\n\
-Every mutating call requires `evidence`: transcript line ranges from the numbered transcript \
-shown below. Format: [{\"start\": N, \"end\": M}, ...]. You NEVER write [^id] — Rust mints them.\n\
-Evidence must be self-justifying: when citing an approval, include the proposal it approved.\n\n\
-## Workflow\n\
-1. Call wiki_list to see existing guides.\n\
-2. Call wiki_read on relevant guides.\n\
-3. Make all necessary mutations (create, add, revise, remove, link).\n\
-4. Return a summary of what you captured.\n\n\
-## Section addressing\n\
-Mutating tools address by section heading (exact heading text, e.g. '## Avatar Behavior').\n\
-For wiki_revise_statement: provide new prose WITHOUT any [^id] — Rust carries them forward.\n\n\
-## Scope: PROJECT ONLY\n\
-Do NOT create global/user-preference entries. Project-scoped spec facts only.\n\
-Do NOT capture purely transient facts (one-off debugging steps that resolved).\n";
+// ════════════════════════════════════════════════════════════════════════════
+//  Staged capture pipeline: EXTRACT → AUTHORITY GATE → ROUTE → RECONCILE → INDEX
+//
+//  Replaces the single free-edit agent loop (which accreted, per spec §3) with a
+//  reconciliation of a claim-set against the existing spec (§4). Each stage is a
+//  single-shot model call whose JSON output Rust parses, verifies, and applies via
+//  the existing wiki primitives. No model is trusted to write [^id], to pick the
+//  author, or to free-edit prose.
+// ════════════════════════════════════════════════════════════════════════════
 
+const EXTRACT_PREAMBLE: &str = "\
+You are the EXTRACT stage of a knowledge-capture pipeline. Read the line-numbered \
+conversation transcript and emit ATOMIC, CITED claims — one fact each — as a positive, \
+desired-state product spec.\n\n\
+## Positive specification (not an event log)\n\
+- WRONG (event): 'avatar was broken'\n\
+- RIGHT (spec):  'Tapping an avatar opens a hovercard with the user details'\n\
+- WRONG (assistant-centric): 'remember to use optimistic locking'\n\
+- RIGHT (spec):  'Profile updates use optimistic locking to prevent race conditions'\n\n\
+## Output: STRICT JSON ARRAY, nothing else\n\
+[{\"assertion\": \"<one atomic spec fact>\", \
+\"evidence\": [{\"start\": N, \"end\": M}], \
+\"ratified\": true|false}]\n\n\
+- `assertion`: one self-contained statement of how the product SHOULD work.\n\
+- `evidence`: 1+ transcript line ranges (1-based, inclusive) that SUPPORT the assertion. \
+The cited lines must literally contain the basis for the claim.\n\
+- `ratified`: set TRUE only when a claim originates from the ASSISTANT proposing something \
+AND a LATER USER turn explicitly endorses/accepts/approves it (e.g. 'yes do that', 'go ahead'). \
+For claims the USER stated directly, `ratified` is irrelevant — set false. \
+Do NOT report an `author` field; authorship is determined mechanically downstream.\n\n\
+## Rules\n\
+- Decisions, requirements, behaviors, constraints, gotchas — capture them.\n\
+- When the user REVERSES or CHANGES an earlier decision, emit the NEW decision as a claim \
+(cite the lines where they changed their mind). Do not also re-assert the old one.\n\
+- Skip transient one-off debugging steps that resolved with no lasting spec implication.\n\
+- Project-scoped facts only; no global/user-preference entries.\n\
+- Emit [] if there is genuinely nothing worth capturing.\n";
+
+const ROUTE_PREAMBLE: &str = "\
+You are the ROUTE stage. Each claim must be assigned to the ONE wiki guide whose topic it \
+belongs to. You are given the EXISTING wiki index (slug | title | summary) and a numbered list \
+of claims.\n\n\
+## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
+[{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
+## Rules — routing is the highest-leverage stage; do it carefully\n\
+- If an EXISTING guide already covers the claim's topic, REUSE its exact slug and set is_new=false. \
+This is mandatory: never mint a near-duplicate slug for a topic an existing guide covers.\n\
+- Only set is_new=true (with a fresh kebab-case slug + human title) when NO existing guide fits.\n\
+- Claims about the SAME topic MUST get the SAME slug, even if worded differently.\n\
+- Keep slugs canonical and stable: one topic → one slug.\n";
+
+const RECONCILE_PREAMBLE: &str = "\
+You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
+(may be empty for a new guide) and ALL claims routed to this guide. Produce an ordered list of \
+edit operations that make the guide reflect the CURRENT desired state.\n\n\
+## Output: STRICT JSON ARRAY of ops, nothing else\n\
+[{\"op\": \"create\"|\"add\"|\"revise\"|\"remove\", \
+\"section\": \"## Section Heading\", \
+\"text\": \"prose WITHOUT any [^id] markers\", \
+\"evidence\": [{\"start\": N, \"end\": M}], \
+\"supersedes\": \"<short quote of the old text being replaced, or empty>\"}]\n\n\
+## Op semantics\n\
+- create: the FIRST section(s) of a brand-new guide. Use for an empty current body.\n\
+- add: append a genuinely NEW, non-conflicting statement to a section.\n\
+- revise: REPLACE the prose of an existing section (cite the new evidence). Prior citations are \
+carried forward by the system.\n\
+- remove: delete a section that is fully retracted.\n\n\
+## THE CORE RULE — never accrete a contradiction\n\
+When a claim CONTRADICTS existing prose, you MUST use `revise` (or `remove`) to REPLACE the old \
+statement. NEVER `add` a statement that sits next to a contradictory one. The new decision must \
+become the live statement; the old one must NOT remain presented as current.\n\n\
+## Authority-asymmetric history (§6)\n\
+- When a USER decision supersedes an earlier USER decision, the revised section SHOULD keep a \
+terse breadcrumb: state the new decision as current, then one short clause like \
+'(Previously: <old>.)'. Keep it brief.\n\
+- When the superseded statement was a mere assistant proposal/hypothesis, DROP it entirely — no \
+breadcrumb.\n\
+- Every section addressed by `section` must use an exact '## Heading' style heading.\n\
+- Output [] only if the claims require no change to this guide.\n";
+
+/// One staged single-shot model call. Mirrors inject.rs's provider dispatch: OpenRouter via
+/// `chat_once`, Ollama via the rig agent `.preamble().prompt()` pattern. Returns raw content.
+async fn run_stage(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<String> {
+    match spec.provider {
+        Provider::OpenRouter => {
+            let client = crate::openrouter::make_client();
+            let msgs = vec![
+                crate::openrouter::system_msg(system),
+                crate::openrouter::user_msg(user),
+            ];
+            Ok(crate::openrouter::chat_once(&client, openrouter_api_key, &spec.model, &msgs, None, max_tokens, 1)
+                .await?
+                .content)
+        }
+        Provider::Ollama => {
+            let t0 = std::time::Instant::now();
+            let resp = build_ollama_client(ollama_base_url, ollama_api_key)?
+                .agent(&spec.model)
+                .preamble(system)
+                .max_tokens(max_tokens as u64)
+                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
+                .build()
+                .prompt(user)
+                .await?;
+            crate::openrouter::record_external_turn(
+                &spec.model, 1, system, user, &resp, t0.elapsed().as_millis() as u64,
+            );
+            Ok(resp)
+        }
+    }
+}
+
+/// Extract the first balanced JSON array/object from a model response, tolerating
+/// ```json fences and surrounding prose. Returns the raw JSON substring.
+fn extract_json_blob(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    // Strip code fences if present.
+    let s = if let Some(rest) = s.strip_prefix("```json") {
+        rest.trim_start()
+    } else if let Some(rest) = s.strip_prefix("```") {
+        rest.trim_start()
+    } else {
+        s
+    };
+    let s = s.trim_end_matches("```").trim();
+
+    // Find the first array or object opener and scan for its balanced close.
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'[' || b == b'{')?;
+    let open = bytes[start];
+    let close = if open == b'[' { b']' } else { b'}' };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ─── Stage data shapes ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ExtractedClaim {
+    assertion: String,
+    #[serde(default)]
+    evidence: Vec<EvidenceRange>,
+    #[serde(default)]
+    ratified: bool,
+}
+
+/// A claim after the authority gate, with Rust-derived authorship.
+#[derive(Debug, Clone)]
+struct AdmittedClaim {
+    assertion: String,
+    evidence: Vec<EvidenceRange>,
+    author: String, // "user" | "assistant"
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDecision {
+    claim_index: usize,
+    slug: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_new: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconcileOp {
+    op: String,
+    #[serde(default)]
+    section: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    evidence: Vec<EvidenceRange>,
+}
+
+/// The staged capture pipeline. Replaces the old free-edit agent loop. Keeps the same
+/// fn signature + call site so `run_capture_from_input` is unchanged. `max_turns` and
+/// `openrouter_api_key` are retained for signature compatibility (max_turns is unused —
+/// the pipeline is a fixed number of single-shot calls, not an agentic loop).
 async fn run_wiki_agent(
     spec: &ModelSpec,
     openrouter_api_key: &str,
     ollama_base_url: &str,
     ollama_api_key: Option<&str>,
-    max_turns: usize,
+    _max_turns: usize,
     ctx: Arc<WikiAgentCtx>,
     numbered_transcript: &str,
 ) -> Result<String> {
-    let preamble = format!(
-        "{}\n\n## LINE-NUMBERED TRANSCRIPT\n\n{}",
-        WIKI_AGENT_PREAMBLE, numbered_transcript
+    // ── STAGE 1: EXTRACT ────────────────────────────────────────────────────────
+    let extract_user = format!(
+        "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
+        numbered_transcript
     );
+    let extract_raw = run_stage(
+        spec, openrouter_api_key, ollama_base_url, ollama_api_key,
+        EXTRACT_PREAMBLE, &extract_user, 6000,
+    ).await?;
 
-    macro_rules! build_agent {
-        ($client:expr) => {
-            $client
-                .agent(&spec.model)
-                .preamble(&preamble)
-                .max_tokens(2000u64)
-                .additional_params(serde_json::json!({"max_tokens": 2000}))
-                .tool(WikiListTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiReadTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiCreateTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiAddStatementTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiReviseStatementTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiRemoveStatementTool { ctx: Arc::clone(&ctx) })
-                .tool(WikiLinkTool { ctx: Arc::clone(&ctx) })
-                .default_max_turns(max_turns)
-                .build()
-        };
+    let extracted: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
+        Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    eprintln!("capture: EXTRACT → {} raw claim(s)", extracted.len());
+    log_event("capture.extract", None, serde_json::json!({ "claims": extracted.len() }));
+
+    if extracted.is_empty() {
+        return Ok("EXTRACT produced no claims.".to_string());
     }
 
-    let agent_result: String = match spec.provider {
-        Provider::OpenRouter => {
-            let client = build_openrouter_client(openrouter_api_key)?;
-            build_agent!(client)
-                .prompt("Analyze this conversation and update the wiki to capture all product spec facts, decisions, and requirements. Be thorough.")
-                .await?
+    // ── STAGE 2: AUTHORITY GATE (mechanical, Rust-owned) ─────────────────────────
+    // Verify evidence in Rust; derive author mechanically; keep all user claims,
+    // drop agent claims unless ratified.
+    let mut admitted: Vec<AdmittedClaim> = Vec::new();
+    for c in &extracted {
+        if !ctx.evidence_is_valid(&c.evidence) {
+            continue; // unverifiable evidence → drop (§2.4)
         }
-        Provider::Ollama => {
-            let client = build_ollama_client(ollama_base_url, ollama_api_key)?;
-            build_agent!(client)
-                .prompt("Analyze this conversation and update the wiki to capture all product spec facts, decisions, and requirements. Be thorough.")
-                .await?
+        let author = ctx.author_for_ranges(&c.evidence);
+        let keep = author == "user" || c.ratified;
+        if !keep {
+            continue; // unratified agent claim → drop (§5 admission gate)
         }
+        admitted.push(AdmittedClaim {
+            assertion: c.assertion.trim().to_string(),
+            evidence: c.evidence.clone(),
+            author,
+        });
+    }
+    eprintln!("capture: AUTHORITY GATE → {} admitted claim(s)", admitted.len());
+    log_event("capture.authority_gate", None, serde_json::json!({
+        "admitted": admitted.len(), "extracted": extracted.len()
+    }));
+    if admitted.is_empty() {
+        return Ok("No claims survived the authority gate.".to_string());
+    }
+
+    // ── STAGE 3: ROUTE (batched, single call) ────────────────────────────────────
+    let index_rows = read_index(&ctx.wiki_path);
+    let index_text = if index_rows.is_empty() {
+        "(the wiki is empty — every claim is a new topic)".to_string()
+    } else {
+        index_rows.iter()
+            .map(|r| format!("{} | {} | {}", r.slug, r.title, r.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let claims_text = admitted.iter().enumerate()
+        .map(|(i, c)| format!("[{}] ({}) {}", i, c.author, c.assertion))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let route_user = format!(
+        "## EXISTING WIKI INDEX (slug | title | summary)\n{}\n\n## CLAIMS\n{}\n\n\
+         Emit the JSON routing array now (one entry per claim, same order).",
+        index_text, claims_text
+    );
+    let route_raw = run_stage(
+        spec, openrouter_api_key, ollama_base_url, ollama_api_key,
+        ROUTE_PREAMBLE, &route_user, 4000,
+    ).await?;
+    let routes: Vec<RouteDecision> = match extract_json_blob(&route_raw) {
+        Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+        None => Vec::new(),
     };
 
-    Ok(agent_result)
+    // Group admitted claim indices by canonical slug. Unrouted claims fall back to a
+    // slug derived from their own assertion (recall bias: never silently drop a fact).
+    use std::collections::BTreeMap;
+    let mut by_slug: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut routed_claims: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for r in &routes {
+        if r.claim_index >= admitted.len() {
+            continue;
+        }
+        let slug = slugify(&r.slug);
+        if slug.is_empty() {
+            continue;
+        }
+        by_slug.entry(slug).or_default().push(r.claim_index);
+        routed_claims.insert(r.claim_index);
+    }
+    for (i, c) in admitted.iter().enumerate() {
+        if !routed_claims.contains(&i) {
+            let slug = slugify(&c.assertion.split_whitespace().take(6).collect::<Vec<_>>().join(" "));
+            let slug = if slug.is_empty() { format!("claim-{}", i) } else { slug };
+            by_slug.entry(slug).or_default().push(i);
+        }
+    }
+    eprintln!("capture: ROUTE → {} target guide(s)", by_slug.len());
+    log_event("capture.route", None, serde_json::json!({ "guides": by_slug.len() }));
+
+    // ── STAGE 4: RECONCILE per slug (sequential — §9 forbids parallel) ───────────
+    let mut applied = 0usize;
+    for (slug, claim_indices) in &by_slug {
+        let path = guide_path(&ctx.wiki_path, slug);
+        let current_body = load_guide(&path).map(|g| g.body).unwrap_or_default();
+
+        let claims_for_guide = claim_indices.iter()
+            .map(|&i| {
+                let c = &admitted[i];
+                let ev = c.evidence.iter()
+                    .map(|r| format!("{{\"start\":{},\"end\":{}}}", r.start, r.end))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("- ({}) {} | evidence: [{}]", c.author, c.assertion, ev)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reconcile_user = format!(
+            "## TARGET GUIDE SLUG\n{}\n\n## CURRENT GUIDE BODY\n{}\n\n## CLAIMS ROUTED TO THIS GUIDE\n{}\n\n\
+             Emit the ordered JSON op array now.",
+            slug,
+            if current_body.trim().is_empty() { "(empty — this is a NEW guide)" } else { &current_body },
+            claims_for_guide
+        );
+        let reconcile_raw = run_stage(
+            spec, openrouter_api_key, ollama_base_url, ollama_api_key,
+            RECONCILE_PREAMBLE, &reconcile_user, 6000,
+        ).await?;
+        let ops: Vec<ReconcileOp> = match extract_json_blob(&reconcile_raw) {
+            Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        eprintln!("capture: RECONCILE {} → {} op(s)", slug, ops.len());
+
+        for op in &ops {
+            // Evidence must verify in Rust; otherwise the op is rejected (§2.4).
+            if !ctx.evidence_is_valid(&op.evidence) {
+                // For create/add/revise, evidence is required. Skip un-cited ops.
+                if op.op != "remove" {
+                    continue;
+                }
+            }
+            let applied_op = apply_reconcile_op(&ctx, slug, op);
+            if applied_op {
+                applied += 1;
+            }
+        }
+    }
+
+    Ok(format!(
+        "Staged capture complete: {} claim(s) admitted across {} guide(s), {} op(s) applied.",
+        admitted.len(), by_slug.len(), applied
+    ))
+}
+
+/// Apply a single RECONCILE op via the existing wiki primitives, mirroring the tool bodies:
+/// verify evidence → cite → mint marker → apply primitive → append_citation_log. Returns
+/// true if a mutation was applied.
+fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, op: &ReconcileOp) -> bool {
+    let safe_slug = slugify(slug);
+    let section = if op.section.trim().is_empty() {
+        "## Notes".to_string()
+    } else {
+        op.section.trim().to_string()
+    };
+    let today = ctx.today.clone();
+    let session_id = ctx.session_id.clone();
+    let wiki_path = ctx.wiki_path.clone();
+
+    let lock_slug = safe_slug.clone();
+    match op.op.as_str() {
+        "create" | "add" => {
+            let (marker, sliced) = ctx.cite(&op.evidence);
+            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let marker_clone = marker.clone();
+            let text = op.text.clone();
+            let section_c = section.clone();
+            let result = ctx.with_guide_locked(&lock_slug, move |existing| {
+                let mut guide = match existing {
+                    Some(g) => g,
+                    None => {
+                        let body = format!(
+                            "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
+                            safe_slug.replace('-', " "), section_c, text.trim(), marker_clone
+                        );
+                        return Ok((
+                            new_guide(&safe_slug, &safe_slug.replace('-', " "), "", &["capture".to_string()], "warm", &body, &session_id, &today),
+                            format!("Created guide '{}'.", safe_slug),
+                        ));
+                    }
+                };
+                guide.body = add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
+                guide.frontmatter.updated = today.clone();
+                let source_key = format!("session:{}", session_id);
+                if !guide.frontmatter.sources.contains(&source_key) {
+                    guide.frontmatter.sources.push(source_key);
+                }
+                Ok((guide, format!("Added to '{}' / '{}'.", safe_slug, section_c)))
+            });
+            if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                eprintln!("capture: citation log write failed: {}", e);
+            }
+            eprintln!("capture: op {} → {}", op.op, result);
+            true
+        }
+        "revise" => {
+            let (marker, sliced) = ctx.cite(&op.evidence);
+            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let marker_clone = marker.clone();
+            let text = op.text.clone();
+            let section_c = section.clone();
+            let result = ctx.with_guide_locked(&lock_slug, move |existing| {
+                let mut guide = match existing {
+                    Some(g) => g,
+                    None => {
+                        let body = format!(
+                            "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
+                            safe_slug.replace('-', " "), section_c, text.trim(), marker_clone
+                        );
+                        return Ok((
+                            new_guide(&safe_slug, &safe_slug.replace('-', " "), "", &["capture".to_string()], "warm", &body, &session_id, &today),
+                            format!("Created guide '{}' (revise had no target).", safe_slug),
+                        ));
+                    }
+                };
+                match revise_section(&guide.body, &section_c, &text, &marker_clone) {
+                    Ok(new_body) => {
+                        guide.body = new_body;
+                        guide.frontmatter.updated = today.clone();
+                        let source_key = format!("session:{}", session_id);
+                        if !guide.frontmatter.sources.contains(&source_key) {
+                            guide.frontmatter.sources.push(source_key);
+                        }
+                        Ok((guide, format!("Revised '{}' / '{}'.", safe_slug, section_c)))
+                    }
+                    Err(_) => {
+                        // Section didn't exist → fall back to add so the fact is not lost.
+                        guide.body = add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
+                        guide.frontmatter.updated = today.clone();
+                        Ok((guide, format!("Revise target missing in '{}'; added instead.", safe_slug)))
+                    }
+                }
+            });
+            if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                eprintln!("capture: citation log write failed: {}", e);
+            }
+            eprintln!("capture: op revise → {}", result);
+            true
+        }
+        "remove" => {
+            let (marker, sliced) = if op.evidence.is_empty() {
+                (String::new(), String::new())
+            } else {
+                ctx.cite(&op.evidence)
+            };
+            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let section_c = section.clone();
+            let result = ctx.with_guide_locked(&lock_slug, move |existing| {
+                let mut guide = match existing {
+                    Some(g) => g,
+                    None => return Err(anyhow::anyhow!("guide '{}' not found", safe_slug)),
+                };
+                match wiki::find_full_section_range(&guide.body, &section_c) {
+                    Some((start, end)) => {
+                        guide.body.replace_range(start..end, "");
+                        guide.frontmatter.updated = today.clone();
+                        Ok((guide, format!("Removed '{}' / '{}'.", safe_slug, section_c)))
+                    }
+                    None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
+                }
+            });
+            if !id.is_empty() {
+                if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                    eprintln!("capture: citation log write failed: {}", e);
+                }
+            }
+            eprintln!("capture: op remove → {}", result);
+            true
+        }
+        other => {
+            eprintln!("capture: unknown reconcile op '{}' — skipped", other);
+            false
+        }
+    }
 }
 
 // ─── Core capture logic ───────────────────────────────────────────────────────
@@ -1461,8 +1975,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         return Ok(());
     }
 
-    // Build line-numbered transcript for evidence-range addressing
-    let (numbered_transcript, transcript_lines) = build_line_numbered_transcript(&turns);
+    // Build line-numbered transcript for evidence-range addressing, plus the
+    // line→role map used for mechanical authorship attribution (§5).
+    let (numbered_transcript, transcript_lines, transcript_roles) =
+        build_line_numbered_transcript_with_roles(&turns);
 
     // Build plain transcript for triage
     let plain_ts = build_transcript_string(&turns);
@@ -1558,6 +2074,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         project_key,
         input.session_id.clone(),
         transcript_lines,
+        transcript_roles,
         today_str.clone(),
     ));
 
@@ -1612,7 +2129,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
 
     // Open-question extraction: detect undefined nouns in the transcript for the
     // SessionStart hook to resolve in the next session. Skip in archeologist bulk mode.
-    if !input.skip_structural_maintenance {
+    // Also skip when no triage model is configured: an empty model string parses to the
+    // OpenRouter default, so running it on an Ollama-only setup yields a spurious 401.
+    // (Mirrors the triage gate above.)
+    if !input.skip_structural_maintenance && !cfg.capture_triage_model.is_empty() {
         extract_open_questions(
             &triage_spec,
             &openrouter_api_key,
@@ -1827,9 +2347,16 @@ pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, toda
     }
 
     let db_path = proj_dir.join("index.db");
-    match index_files_into_db(wiki_path, &db_path) {
-        Ok(_) => eprintln!("capture: indexed wiki into index.db"),
-        Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
+    // The project cache dir (~/.proactive-context/projects/<slug>/) may not exist yet —
+    // the wiki lives under the repo (docs/wiki/), so nothing else creates this dir. Without
+    // it, opening index.db fails with ENOENT. Create it before indexing.
+    if let Err(e) = fs::create_dir_all(proj_dir) {
+        eprintln!("capture: could not create project dir {}: {}", proj_dir.display(), e);
+    } else {
+        match index_files_into_db(wiki_path, &db_path) {
+            Ok(_) => eprintln!("capture: indexed wiki into index.db"),
+            Err(e) => eprintln!("capture: wiki indexing failed: {}", e),
+        }
     }
 }
 
