@@ -96,33 +96,35 @@ This is the existing `docs/wiki/_citations.log` **upgraded with schema** — not
 No prior alternative (embedding routing, capture-as-diff) had this axis. It reframes the wiki from *"facts the model believed"* to *"product direction, distinguishing what the principal stated from what the agent inferred."*
 
 - **Mechanical, not classified.** Authorship is derived from **which transcript turn the evidence range falls in** — user turn → **explicit** direction; agent turn → **implicit** direction. Rust-checkable; no brittle LLM classifier.
-- **Tag, don't drop (admission).** *Every* claim is admitted and captured. It is **tagged by authority**, not gated out:
-  - **Explicit direction** (user-stated): load-bearing, permanent.
-  - **Implicit direction** (agent-stated/inferred): captured but marked **provisional** — a real candidate product direction (often the actual implementation path), not yet blessed.
-- **Lifecycle of an implicit claim:**
-  - *default* — lives in the guide, clearly marked agent-inferred/provisional.
-  - *user explicitly acknowledges it* → **promote** to explicit (permanent).
-  - *user explicitly contradicts it* → **delete** the implicit claim (NO breadcrumb — it was never user intent, only an inference) and codify the explicit correction as permanent.
-- **Worked example:** user "add oauth integration" (explicit) → agent "I'll add Google OAuth too" (implicit/provisional) → later user "only support github oauth" → the *google-oauth* implicit claim is **deleted**, "github-only oauth" codified explicit.
+- **Tag, don't drop (admission).** *Every* claim is admitted and captured (user and agent alike). Each carries an authorship tag — `explicit` (user turn) / `implicit` (agent turn) — but the tag is **internal metadata only**.
+- **The tag is NEVER rendered in guide prose.** Guides read as clean desired-state spec. No `⟨provisional⟩`/`explicit`/`implicit` labels in the body.
+- **Nothing is deleted — ever.** Capture all, keep all. When a claim is superseded or even *explicitly contradicted by the user*, the old claim is retained in the source of truth (the claim log), marked superseded + by origin. The wiki only supersedes-and-keeps; it never erases.
+- **No promotion lifecycle.** Because nothing renders the tag, there is nothing to "un-mark." The tag stays put as provenance for the life of the claim.
+- **The tag's sole job is a review filter.** A `wiki doctor` / audit pass uses it to surface agent-derived claims — especially agent-originated claims never user-confirmed — for human review. It does not gate admission, does not render, and does not trigger deletion.
 
-> **Design correction (2026-05-30).** This **replaces** the earlier "ratification gate" that *dropped* unratified agent claims at admission. Dropping was wrong on two counts: (1) it discarded the agent's inferred direction, which is usually the real implementation path and worth recording as provisional; (2) it destroyed coverage of *agentic* sessions (the archeologist test measured ~8 of 9 claims dropped from a delegated session — §8.3). Tagging-not-dropping captures everything *and* adds signal: a reader (or Claude) can see at a glance what is load-bearing user intent vs softer agent-taken direction.
+> **Design evolution (2026-05-30, two corrections).**
+> 1. The original "ratification gate" *dropped* unratified agent claims at admission — wrong: it discarded the agent's inferred direction (usually the real implementation path) and destroyed coverage of agentic sessions (~8 of 9 claims dropped from a delegated session — §8.3). Replaced by tag-don't-drop.
+> 2. The interim tag-don't-drop *rendered* a `⟨provisional⟩` marker and *deleted* contradicted agent claims. The archeologist run (§8.5) showed why both were wrong: **81% of claims came out `implicit`** (in coding sessions the assistant narrates most settled facts), so the rendered marker stamped *core facts* as provisional and meant nothing; and deleting "agent-derived" claims on contradiction would erase real evolving facts whose history has archaeological value. **Final model:** tag is metadata-only (never rendered), nothing is ever deleted (capture-all/keep-all), and the tag drives only a review filter. This sidesteps the unsolved fact-vs-proposal classification entirely — we don't need to know which agent claims are "soft," because we neither render nor delete based on the tag.
 
 ---
 
-## 6. Authority-asymmetric supersession retention (the archaeology rule)
+## 6. Supersession retention: keep everything (the archaeology rule)
 
-When a claim is superseded/contradicted, retention depends on authority — the same explicit/implicit axis as §5:
+When a claim is superseded/contradicted, **nothing is deleted** — the new claim becomes the live tip; the old claim is retained in the source of truth (claim log), marked superseded and by origin. Retention is **symmetric** across authorship; the origin tag is preserved as metadata (for the §5 review filter), not used to decide deletion.
 
-- **Implicit (agent) claim contradicted by the user → DELETE** (no breadcrumb). It was an inferred direction, never blessed; once the user contradicts it there is nothing to memorialize. ("An agent inference being corrected is not relevant history.") Implicit claims are the *bulk* of all claims, so this keeps the corpus bounded.
-- **Explicit (user) claim changed by the user → KEEP as a provenance breadcrumb**: *"Currently B (since session N). Was A until then — changed because X."* A user *mind-change* is genuine product history — the archaeology that explains why present-day code looks the way it does. User mind-changes are rare, so retained history grows slowly.
+What *renders* in the guide body is separate from what's *retained*:
+- **Live tip:** the current claim, as clean prose.
+- **Breadcrumb (rendered):** for a genuine **user mind-change**, a terse inline note — *"Currently B. Was A until session N — changed because X."* This is real product history (a thing was built as A, then changed to B), the archaeology that explains why present-day code looks the way it does.
+- **Superseded agent claims (retained, not auto-rendered):** kept in the claim log and surfaced by the review filter — but *not* auto-rendered as "Previously: …" breadcrumbs, because an agent claim may have been wrong/never-true (a hallucination the user corrected), and rendering "previously X" would falsely imply the system once *was* X. They're preserved for audit, not presented as live history. *(This rendering nuance is the author's interpretation — see note below; confirm if you want superseded agent claims rendered too.)*
+
+> **Design evolution (2026-05-30).** This **replaces** the earlier asymmetric rule ("delete contradicted agent claims; keep user-superseded as breadcrumbs"). Decision: **keep everything, including when the user explicitly corrects the model** — because the archeologist run (§8.5) showed most "agent" claims are real facts, so deleting on contradiction would erase genuine evolving history. The tag no longer gates deletion at all; it only feeds the review filter (§5).
 
 **Why:** this is the mission (§1). Current-tip-only projection discards the archaeology that explains present-day code. This **refines invariant 2.1**: the guide is desired-state **plus** curated provenance of *user-decision* evolution (not a raw event log — curated, terse, load-bearing).
 
-**Bonus:** this gives pruning a *semantic* basis instead of a crude token-count heuristic — corrected agent inferences are disposable, user intent (and its evolution) is archival — which keeps projection input bounded (critical for the destination's cost; see §8).
+**Cost:** keep-everything means the claim log grows monotonically, but (a) the *rendered guide* only ever shows the live tip + terse user-mind-change breadcrumbs, so the reader/inject surface stays clean; (b) supersessions are rare relative to total claims; (c) the retained-but-superseded claims are what the review filter and any future archaeology depend on. If log size ever bites, the `wiki doctor` can archive cold superseded claims out of the hot path — but never silently, and never by authorship.
 
-**Open nuances:**
-- *Granularity:* keep only evolutions with explanatory value; terse; not every trivial revision.
-- *Agent facts vs agent proposals:* a contradicted agent *proposal/direction* is disposable, but a superseded agent *fact* (e.g. "the DB used sqlite-vec" before a swap) may be archaeology worth keeping. Default = delete contradicted implicit claims; revisit if a class of agent *facts* proves explanatory.
+**Open nuance:**
+- *Granularity:* render breadcrumbs only for user mind-changes with explanatory value; terse; not every trivial revision. (The *"agent facts vs agent proposals"* nuance is now moot — we no longer delete or classify by it; everything is kept and the tag only feeds the review filter.)
 
 ---
 
