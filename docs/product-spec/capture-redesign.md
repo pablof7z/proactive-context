@@ -189,6 +189,17 @@ The v0.5 staged pipeline was run via `archeologist` over this project's own 47 s
 - **Content quality where captured: good** (desired-state prose, correct citations, working `(Previously: …)` breadcrumbs). The weak layer was structure (routing), exactly as predicted.
 - **Structural gaps no pipeline can mine** (confirmed vs gold): entity/definition guides, meta-rules (authority/supersession itself), positioning/philosophy, "rejected design" framing. These must be **authored directly** (Layer 2, §2.6).
 
+### 8.5 Tag-don't-drop measured — and the fact-vs-proposal crux (2026-05-30, iter3)
+
+Implemented §5 tag-don't-drop (commit `5d018fa`) and re-ran on this project. Result: deletion-on-contradiction fires cleanly (e2e: SMS + Kafka deleted); claim density recovered (+37% session-refs, 211 implicit claims admitted that the old gate dropped). **But it exposed a flaw in the mechanical model:**
+
+- **Signal dilution (the headline):** **81% of admitted claims came out `implicit`** (211 implicit vs 50 explicit), because *in coding sessions the assistant narrates most settled architectural facts*. So `⟨provisional, agent-inferred⟩` landed on **208 statements across all 35 guides** — including core facts and product philosophy. The marker stopped discriminating.
+- **Root cause:** "implicit = any agent turn" ≠ "implicit = unblessed *proposal*." The distinction actually wanted is **agent FACT** (*"the DB uses sqlite-vec"* — true, load-bearing) **vs agent PROPOSAL/INTENTION** (*"I'll add Google OAuth too"* — provisional). Mechanical turn-attribution can't separate them; both are assistant turns. This is the §6 *"agent facts vs agent proposals"* nuance, now confirmed load-bearing.
+- **Promotion unreliable:** glm left an implicit claim provisional even after explicit user confirmation ("yes, do that").
+- **Lifecycle under-exercised:** promote/delete only fires when an explicit and implicit claim co-route into the *same* reconcile batch — the §8.1 cross-slug limit again.
+
+**Open fork (undecided):** make `implicit/provisional` mean *proposal*, not *agent-authored*. Most promising: have **EXTRACT classify claim TYPE (settled-fact vs proposal/intention)** — a narrower, phrasing-based classification ("I'll…/we should…/let me also…" vs declarative facts) that is far more tractable than the brittle *authority* classifier §3.2 rejected. Then only proposals carry the provisional marker; agent-narrated facts are plain content. The mechanical user/agent tag still drives the lifecycle internally; it just stops being the *rendering* signal.
+
 ---
 
 ## 9. Rejected alternatives (and why — preserve this nuance)
