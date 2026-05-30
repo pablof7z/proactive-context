@@ -18,6 +18,7 @@ mod inject;
 mod openrouter;
 mod provider;
 mod query;
+mod route_recall;
 mod statusline;
 mod tail;
 mod transcript;

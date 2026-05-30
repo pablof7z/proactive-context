@@ -1399,47 +1399,49 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
 const ROUTE_PREAMBLE: &str = "\
-You are the ROUTE stage. Each claim must be assigned to the ONE wiki guide whose topic it \
-belongs to. You are given the EXISTING wiki index (slug | title | summary) and a numbered list \
-of claims.\n\n\
+You are the RERANK half of the ROUTE stage. Each claim must be assigned to the ONE wiki guide \
+whose topic it belongs to, OR to a NEW guide. To save you from scanning the whole wiki, each \
+claim already lists its CANDIDATE GUIDES — the existing guides a semantic-similarity search found \
+most relevant (with a similarity score 0..1, higher = closer). You choose among ONLY those \
+candidates, or declare NEW.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
 [{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
-## GUIDE ALTITUDE — this is the most important thing to get right\n\
-A guide is a SUB-CONCERN: ONE distinct mechanism / responsibility — NOT the whole subsystem, and \
-NOT one guide per fact, feature, option, or sub-step. A healthy whole-project wiki is roughly \
-25-30 guides total. If you are producing far more than that you are SPLITTING TOO FINELY — most \
-claims about a thing belong together as SECTIONS of ONE guide, not as separate guides.\n\
-## THE DISCRIMINATOR — split by MECHANISM, never by feature/option/sub-step\n\
-- A genuinely DISTINCT mechanism/responsibility → its OWN guide. Example: inject's relevance/select \
-GATE (`inject-gate`) and its COMPILE/synthesis step (`inject-compile`) are DIFFERENT mechanisms → \
-DIFFERENT guides. The inject pipeline is rightly ~6 guides (gate, compile, recent-context, no-DB/\
-auto-index, noun-resolution, architecture) because each is a distinct mechanism.\n\
-- But a FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION, NOT a guide. MERGE these. \
-Examples of correct merging:\n\
-  * The archeologist's picker, dry-run, resume/dedup, output-dir, and run-view TUI are all FEATURES \
-of ONE `archeologist` guide — NOT five guides. One subsystem with many features = ONE guide.\n\
-  * Embeddings + vector store + distance metric + similarity threshold = ONE `embeddings-and-vector-db` \
-guide — NOT four. They are facets of one storage mechanism.\n\
-  * 'citation ID format', 'citation markers in prose', 'the citation log file' = ONE `citation-system` \
-guide. Likewise daemon init/stop/ps = ONE daemon-lifecycle guide.\n\
-- The test: would these claims read as SECTIONS of a single coherent guide a person would open? Then \
-they are ONE guide. Only when a claim is a SEPARATE mechanism a reader would look up on its own does \
-it deserve its own slug.\n\
-- So: split a subsystem ONLY at distinct-mechanism boundaries; MERGE features, options, and sub-steps \
-of the same mechanism into one guide as sections.\n\n\
-## Rules\n\
-- If an EXISTING guide already covers this claim's specific mechanism, REUSE its exact slug, \
-is_new=false. Never mint a slug that is a synonym of an existing guide for the SAME mechanism \
-(e.g. do NOT create `compile-model-as-librarian` when `librarian-compile-model` exists — same role; \
-do NOT create `embedding-providers` when `embedding-provider` exists — same mechanism).\n\
-- Set is_new=true (fresh kebab-case slug + human title) ONLY when the claim is a DISTINCT mechanism \
-that no existing guide covers — NOT for a feature/option/sub-step of a mechanism an existing guide \
-already covers (add it there as a section instead).\n\
-- DEFAULT TO REUSE: when unsure whether a claim is its own mechanism or a facet of an existing guide's \
-mechanism, REUSE the existing guide. Over-merging a facet is cheap; minting a near-duplicate guide \
-fragments the wiki.\n\
-- Sibling claims in THIS batch about the SAME mechanism (or its features/options) MUST converge on \
-ONE shared slug; only claims about genuinely DIFFERENT mechanisms get DIFFERENT slugs.\n";
+## How to choose\n\
+- If one of the claim's CANDIDATE GUIDES covers the SAME mechanism as the claim, REUSE its exact \
+slug, is_new=false. The candidates were retrieved BY similarity — a high-scoring candidate whose \
+title/summary matches the claim's mechanism is almost always the right home. Prefer reuse over a \
+new slug whenever a candidate genuinely fits.\n\
+- If NONE of the candidates is actually the same mechanism (they are merely adjacent, or the claim \
+lists '(no similar existing guide)'), set is_new=true with a fresh kebab-case slug + human title. \
+Do NOT force a claim into a candidate that is only loosely related — a wrong reuse buries a distinct \
+mechanism inside an unrelated guide.\n\
+- You may ONLY reuse a slug that appears in that claim's CANDIDATE GUIDES list. Never invent a reuse \
+of some other guide you remember; if it isn't a listed candidate, treat the mechanism as NEW.\n\n\
+## GUIDE ALTITUDE — a guide is ONE mechanism (one sub-concern)\n\
+A guide is a SUB-CONCERN: ONE distinct mechanism / responsibility a reader would look up on its own \
+— NOT the whole subsystem, and NOT one guide per fact. Split a subsystem at its DISTINCT-MECHANISM \
+boundaries.\n\
+- DISTINCT mechanisms → SEPARATE guides. Example: inject's relevance/select GATE (`inject-gate`) and \
+its COMPILE/synthesis step (`inject-compile`) are different mechanisms → different guides. The inject \
+pipeline is rightly ~6 guides (gate, compile, recent-context, no-DB/auto-index, noun-resolution, \
+architecture). Splitting at real mechanism seams is CORRECT and expected — a healthy whole-project \
+wiki is ~25-30 guides.\n\
+- A FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION of that mechanism's guide, NOT \
+its own guide. E.g. the archeologist's picker, dry-run, resume/dedup, and output-dir are features of \
+ONE `archeologist` guide. The test: would these claims read as SECTIONS of a single coherent guide a \
+person would open under one title? Then they are ONE guide.\n\n\
+## Granularity guidance — split at mechanism seams; do NOT over-merge distinct mechanisms\n\
+Because candidates are pre-retrieved by similarity, a later same-topic claim will be shown the \
+existing guide and route there — so you do NOT need to defensively over-merge to avoid duplicates. \
+When a claim is a genuinely distinct mechanism from every candidate, prefer a NEW guide at the right \
+mechanism altitude rather than cramming it into an adjacent guide. Distinct sub-concerns stay \
+distinct; only true features/options/sub-steps merge into their mechanism's guide.\n\n\
+## WITHIN-BATCH sibling convergence (still required)\n\
+Two or more claims in THIS batch about the SAME mechanism MUST share ONE slug — especially when the \
+mechanism is NEW (no candidate exists yet, so similarity search cannot converge them; only you, \
+seeing both claims here, can). Give such siblings the SAME new slug + title. Claims about genuinely \
+DIFFERENT mechanisms get DIFFERENT slugs. Never emit two different new slugs that are synonyms for \
+the same mechanism within this batch.\n";
 
 const RECONCILE_PREAMBLE: &str = "\
 You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
@@ -1698,28 +1700,93 @@ async fn run_wiki_agent(
         return Ok("No evidence-verified claims to capture.".to_string());
     }
 
-    // ── STAGE 3: ROUTE (batched, single call) ────────────────────────────────────
-    // Scan LIVE guide files (not the derived `_index.md` cache). In archeologist bulk
-    // mode the cache is only rebuilt at checkpoints (every `--synth-every` sessions), so
-    // reading the cache here made ROUTE blind to guides created by earlier in-window
-    // sessions → near-duplicate slugs for the same topic (cross-window fragmentation).
+    // ── STAGE 3: ROUTE — retrieve-then-rerank ─────────────────────────────────────
+    // RECALL (embeddings, mechanical): for each claim, retrieve the top-K most
+    // semantically-similar EXISTING guides by cosine. RERANK (LLM, constrained): hand the
+    // LLM ONLY those K candidates per claim and have it pick a home slug or NEW. This gives
+    // the LLM a real similarity signal it lacked when scanning a flat all-guides list, and
+    // surfaces an existing same-topic guide to a LATER same-topic claim → the near-dup
+    // can't form. So fine granularity AND zero dups co-exist.
+    //
+    // FRESHNESS: we embed the LIVE on-disk guides (read_index_live) IN MEMORY here — NOT
+    // the on-disk index.db vector store, which is only rebuilt at checkpoints and would be
+    // stale within a bulk archeologist window (the bug we fixed for the text index). Guide
+    // counts are tens, so per-session in-memory embedding is cheap.
     let index_rows = read_index_live(&ctx.wiki_path);
-    let index_text = if index_rows.is_empty() {
-        "(the wiki is empty — every claim is a new topic)".to_string()
-    } else {
-        index_rows.iter()
-            .map(|r| format!("{} | {} | {}", r.slug, r.title, r.summary))
-            .collect::<Vec<_>>()
-            .join("\n")
+
+    // RECALL tuning knobs. ROUTE_TOP_K = candidate set size per claim; ROUTE_TAU = minimum
+    // cosine similarity to surface a guide at all (best-guide-below-tau ⇒ empty set ⇒ the
+    // reranker leans NEW). TAU is the split-vs-merge knob: higher ⇒ finer split (more NEW),
+    // lower ⇒ coarser reuse. Overridable via env for tuning sweeps without recompiling.
+    let route_top_k: usize = std::env::var("PC_ROUTE_TOP_K").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(8);
+    let route_tau: f32 = std::env::var("PC_ROUTE_TAU").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(0.30);
+
+    let claim_assertions: Vec<String> = admitted.iter().map(|c| c.assertion.clone()).collect();
+
+    // Build the embedder from config (matches the load_config pattern used elsewhere in
+    // this module; avoids threading Config through the call chain). If the embedder cannot
+    // be built we fall back to recall=none → the reranker sees an empty candidate set for
+    // every claim and routes everything as NEW within-batch convergence still applies.
+    let recalls: Vec<crate::route_recall::ClaimRecall> = match load_config()
+        .ok()
+        .and_then(|cfg| crate::embed::build_embedder(&cfg).ok())
+    {
+        Some(mut embedder) => {
+            match crate::route_recall::recall_candidates(
+                embedder.as_mut(), &index_rows, &claim_assertions, route_top_k, route_tau,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("capture: ROUTE recall failed ({e}); falling back to NEW-only candidates");
+                    vec![crate::route_recall::ClaimRecall::default(); admitted.len()]
+                }
+            }
+        }
+        None => {
+            eprintln!("capture: ROUTE could not build embedder; falling back to NEW-only candidates");
+            vec![crate::route_recall::ClaimRecall::default(); admitted.len()]
+        }
     };
+
+    let n_with_candidates = recalls.iter().filter(|r| !r.candidates.is_empty()).count();
+    eprintln!(
+        "capture: ROUTE recall → {}/{} claims have ≥1 candidate (top_k={}, tau={:.2})",
+        n_with_candidates, admitted.len(), route_top_k, route_tau
+    );
+    log_event("capture.route_recall", None, serde_json::json!({
+        "claims": admitted.len(), "with_candidates": n_with_candidates,
+        "top_k": route_top_k, "tau": route_tau, "live_guides": index_rows.len()
+    }));
+
+    // RERANK prompt: each claim carries ONLY its own recalled candidates inline. A claim
+    // with no candidates is told the wiki has nothing close (lean NEW). Batched in one call
+    // so the LLM can still converge sibling claims about a brand-NEW topic onto one shared
+    // slug (recall can't surface a guide that doesn't exist yet — only co-seeing the
+    // siblings can converge them).
     let claims_text = admitted.iter().enumerate()
-        .map(|(i, c)| format!("[{}] ({}) {}", i, c.author, c.assertion))
+        .map(|(i, c)| {
+            let cands = &recalls[i].candidates;
+            let cand_block = if cands.is_empty() {
+                "    (no similar existing guide — this is likely a NEW topic)".to_string()
+            } else {
+                cands.iter()
+                    .map(|cand| format!(
+                        "    - {} | {} | {} (similarity {:.2})",
+                        cand.slug, cand.title, cand.summary, cand.score
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!("[{}] ({}) {}\n  CANDIDATE GUIDES:\n{}", i, c.author, c.assertion, cand_block)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let route_user = format!(
-        "## EXISTING WIKI INDEX (slug | title | summary)\n{}\n\n## CLAIMS\n{}\n\n\
+        "## CLAIMS (each with its pre-retrieved candidate guides)\n{}\n\n\
          Emit the JSON routing array now (one entry per claim, same order).",
-        index_text, claims_text
+        claims_text
     );
     let route_raw = run_stage(
         spec, openrouter_api_key, ollama_base_url, ollama_api_key,
