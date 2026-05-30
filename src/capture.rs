@@ -1404,12 +1404,25 @@ belongs to. You are given the EXISTING wiki index (slug | title | summary) and a
 of claims.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
 [{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
-## Rules — routing is the highest-leverage stage; do it carefully\n\
-- If an EXISTING guide already covers the claim's topic, REUSE its exact slug and set is_new=false. \
-This is mandatory: never mint a near-duplicate slug for a topic an existing guide covers.\n\
-- Only set is_new=true (with a fresh kebab-case slug + human title) when NO existing guide fits.\n\
-- Claims about the SAME topic MUST get the SAME slug, even if worded differently.\n\
-- Keep slugs canonical and stable: one topic → one slug.\n";
+## GUIDE ALTITUDE — this is the most important thing to get right\n\
+A guide is a SUBSYSTEM / CONCERN-level topic that ACCUMULATES many related claims over time — \
+NOT one guide per fact. Think 'chapter', not 'sentence'. A healthy whole-project wiki is roughly \
+25-40 guides total, each holding many claims — never one guide per individual fact.\n\
+- Multiple distinct-but-related facts about the SAME subsystem belong in the SAME guide as separate \
+sections. Example: 'citation ID format', 'citation markers in prose', and 'the citation log file' \
+are ONE topic — the citation system — NOT three guides. Route all three to a single \
+`citation-system` (or similar) slug.\n\
+- Example: 'the compile model acts as a librarian', 'compile JSON output', and 'compile receives \
+verbatim guides' are all the COMPILE step of inject → one `inject-compile` guide, not three.\n\
+- Before minting a new slug, ASK: is there an existing guide whose subsystem/concern already \
+encompasses this claim? If yes, REUSE its exact slug (is_new=false) and add the claim there.\n\n\
+## Rules\n\
+- If an EXISTING guide's title/summary covers the claim's subsystem, REUSE its exact slug, \
+is_new=false. Mandatory: never mint a slug that is a synonym or sub-topic of an existing guide \
+(e.g. do NOT create `compile-model-as-librarian` when `librarian-compile-model` exists — same role).\n\
+- Only set is_new=true (fresh kebab-case slug + human title) when NO existing guide's subsystem fits.\n\
+- Sibling claims in THIS batch about the same subsystem MUST converge on ONE shared slug.\n\
+- Prefer adding to a broad existing guide over minting a narrow new sibling. One subsystem → one slug.\n";
 
 const RECONCILE_PREAMBLE: &str = "\
 You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
@@ -1553,7 +1566,6 @@ struct RouteDecision {
     claim_index: usize,
     slug: String,
     #[serde(default)]
-    #[allow(dead_code)]
     title: String,
     #[serde(default)]
     #[allow(dead_code)]
@@ -1664,6 +1676,10 @@ async fn run_wiki_agent(
     // slug derived from their own assertion (recall bias: never silently drop a fact).
     use std::collections::BTreeMap;
     let mut by_slug: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    // Human title proposed by ROUTE per slug — populates frontmatter title/summary on
+    // NEW guides so the NEXT session's ROUTE call sees a real description (not an empty
+    // summary) and can reuse the slug instead of minting a near-duplicate.
+    let mut slug_titles: BTreeMap<String, String> = BTreeMap::new();
     let mut routed_claims: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for r in &routes {
         if r.claim_index >= admitted.len() {
@@ -1672,6 +1688,10 @@ async fn run_wiki_agent(
         let slug = slugify(&r.slug);
         if slug.is_empty() {
             continue;
+        }
+        let title = r.title.trim();
+        if !title.is_empty() {
+            slug_titles.entry(slug.clone()).or_insert_with(|| title.to_string());
         }
         by_slug.entry(slug).or_default().push(r.claim_index);
         routed_claims.insert(r.claim_index);
@@ -1729,7 +1749,7 @@ async fn run_wiki_agent(
                     continue;
                 }
             }
-            let applied_op = apply_reconcile_op(&ctx, slug, op);
+            let applied_op = apply_reconcile_op(&ctx, slug, slug_titles.get(slug).map(|s| s.as_str()), op);
             if applied_op {
                 applied += 1;
             }
@@ -1745,8 +1765,21 @@ async fn run_wiki_agent(
 /// Apply a single RECONCILE op via the existing wiki primitives, mirroring the tool bodies:
 /// verify evidence → cite → mint marker → apply primitive → append_citation_log. Returns
 /// true if a mutation was applied.
-fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, op: &ReconcileOp) -> bool {
+fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&str>, op: &ReconcileOp) -> bool {
     let safe_slug = slugify(slug);
+    // Title/summary for any NEW guide created here. Prefer ROUTE's human title; fall back to
+    // the de-slugified form. Summary = the first statement's text (truncated) so the next
+    // session's ROUTE call sees what this guide actually covers.
+    let new_title = route_title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| safe_slug.replace('-', " "));
+    let new_summary = {
+        let s = op.text.trim();
+        let s = s.split(". ").next().unwrap_or(s);
+        let s: String = s.chars().take(160).collect();
+        s.replace('\n', " ").trim().to_string()
+    };
     let section = if op.section.trim().is_empty() {
         "## Notes".to_string()
     } else {
@@ -1764,16 +1797,18 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, op: &ReconcileOp) -> 
             let marker_clone = marker.clone();
             let text = op.text.clone();
             let section_c = section.clone();
+            let new_title_c = new_title.clone();
+            let new_summary_c = new_summary.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
                     None => {
                         let body = format!(
                             "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                            safe_slug.replace('-', " "), section_c, text.trim(), marker_clone
+                            new_title_c, section_c, text.trim(), marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &safe_slug.replace('-', " "), "", &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
                             format!("Created guide '{}'.", safe_slug),
                         ));
                     }
@@ -1798,16 +1833,18 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, op: &ReconcileOp) -> 
             let marker_clone = marker.clone();
             let text = op.text.clone();
             let section_c = section.clone();
+            let new_title_c = new_title.clone();
+            let new_summary_c = new_summary.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
                     None => {
                         let body = format!(
                             "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                            safe_slug.replace('-', " "), section_c, text.trim(), marker_clone
+                            new_title_c, section_c, text.trim(), marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &safe_slug.replace('-', " "), "", &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
                             format!("Created guide '{}' (revise had no target).", safe_slug),
                         ));
                     }
