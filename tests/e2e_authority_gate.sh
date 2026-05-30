@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUND-2 e2e: §5 EXPLICIT/IMPLICIT DIRECTION TAGGING (tag-don't-drop).
-# Single session, mixed authorship. Under the NEW model, agent claims are NOT dropped —
-# they are admitted as `implicit` (provisional) and resolved against explicit user claims:
-#   - USER decision (email via SendGrid)                 → explicit → MUST be present
-#   - AGENT proposal the user REJECTS (SMS via Twilio)   → implicit, user CONTRADICTS it →
-#       DELETED (no breadcrumb) → MUST be absent as a current decision
-#   - AGENT proposal the user CONFIRMS (rate-limit 100/min) → implicit, user CONFIRMS →
-#       PROMOTED to explicit → MUST be present (and not marked provisional)
-#   - AGENT hallucination the user CORRECTS (Kafka)      → implicit, user CONTRADICTS →
-#       DELETED → MUST be absent; correction (Postgres LISTEN/NOTIFY, explicit) MUST be present
+# e2e: §5 SETTLED AUTHORITY MODEL (d70bf48) — tag is metadata-only, no marker is ever rendered.
+# Single session, mixed authorship. Capture admits ALL claims, tags each explicit(user)/
+# implicit(agent) as INTERNAL METADATA ONLY. The tag is NEVER rendered: guides read as clean,
+# confident desired-state spec. There is no promote/delete lifecycle; supersession renders only
+# the live tip (+ a terse `(Previously: …)` breadcrumb for genuine USER mind-changes).
+#   - USER decision (email via SendGrid)                  → explicit → MUST be present as current
+#   - AGENT proposal the user CONTRADICTS (SMS via Twilio)→ superseded by the user "no" →
+#       NOT rendered as a current decision (live tip only; no breadcrumb for non-user-evolution)
+#   - AGENT proposal the user CONFIRMS (rate-limit 100/min) → present as current spec
+#   - AGENT hallucination the user CORRECTS (Kafka)       → superseded by the correction →
+#       NOT rendered as current; correction (Postgres LISTEN/NOTIFY) MUST be present
 #   - AGENT proposal the user NEITHER accepts NOR rejects (exponential-backoff retries) →
-#       implicit, UNCONTRADICTED → MUST be present BUT marked provisional/agent-inferred
-#       (this is the case that actually distinguishes tag-don't-drop from the old drop gate;
-#        under the old gate this proposal would have been dropped entirely)
+#       admitted as PLAIN spec prose, present and UNMARKED (no provisional/agent-inferred marker)
+# KEY REGRESSION CHECK (d70bf48): the rendered guides contain ZERO `⟨provisional⟩`/`agent-inferred`
+# markers anywhere — the metadata tag must never leak into prose. This is a HARD assertion below.
 # Semantic assertions judged by glm (currency, not substring — user negations contain the term).
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
@@ -90,45 +91,44 @@ chk() { echo "$1 -> $2 (expected $3)"; [ "$2" = "$3" ] || { echo "    FAIL: $4";
 A=$(judge "Is email via SendGrid the current notification delivery channel?")
 chk "(1) user decision SendGrid present" "$A" "YES" "explicit user decision must be kept"
 
-# (2) implicit agent proposal the USER EXPLICITLY CONTRADICTED ("we are not adding SMS") →
-#     under tag-don't-drop this is a user-contradiction of an implicit claim → DELETE (no
-#     breadcrumb). So it must NOT be a current decision. (Same observable outcome as the old
-#     drop-gate, but the MECHANISM is now contradiction-driven deletion, not admission gating.)
+# (2) agent proposal the USER EXPLICITLY CONTRADICTED ("we are not adding SMS"). Under the
+#     SETTLED model nothing is deleted: the claim is superseded by the user's "no", so only the
+#     live tip is rendered and SMS/Twilio is NOT presented as a current decision (no breadcrumb —
+#     this isn't user-decision evolution). Observable outcome is the same (absent from current
+#     spec); the MECHANISM is now supersession-not-rendered, not deletion.
 B=$(judge "Does the spec currently include SMS or Twilio as a notification channel?")
-chk "(2) contradicted agent SMS/Twilio absent" "$B" "NO" "implicit claim contradicted by user must be deleted, not presented as current"
+chk "(2) contradicted agent SMS/Twilio absent" "$B" "NO" "superseded claim must not be presented as current"
 
-# (3) implicit agent proposal the USER CONFIRMED ("Yes, do that ... part of the spec") →
-#     promote to explicit → present (as a blessed, current decision).
+# (3) agent proposal the USER CONFIRMED ("Yes, do that ... part of the spec") → present as
+#     current spec (admitted like any other claim; no promotion lifecycle — just kept).
 C=$(judge "Does the spec currently impose a rate limit (such as 100 messages per minute per user)?")
-chk "(3) confirmed agent rate-limit present" "$C" "YES" "implicit claim confirmed by user must be promoted to explicit and kept"
+chk "(3) confirmed agent rate-limit present" "$C" "YES" "user-confirmed claim must be present as current spec"
 
-# (4) implicit agent hallucination the USER CORRECTED → contradiction → DELETE → absent.
+# (4) agent hallucination the USER CORRECTED → superseded by the correction → not rendered as
+#     current (live tip only).
 D=$(judge "Is Kafka the current event-delivery mechanism for notifications?")
-chk "(4) corrected agent Kafka absent" "$D" "NO" "implicit claim contradicted by user (Kafka) must be deleted"
+chk "(4) corrected agent Kafka absent" "$D" "NO" "superseded claim (Kafka) must not be presented as current"
 
 # (5) explicit user correction — present.
 E=$(judge "Are notification events currently delivered via Postgres LISTEN/NOTIFY?")
 chk "(5) user correction Postgres present" "$E" "YES" "explicit user correction must be kept"
 
-# (6) THE NEW-MODEL DISCRIMINATOR: an implicit agent proposal the user NEITHER confirmed NOR
-#     contradicted (exponential-backoff retries). Under the OLD drop-gate this was discarded.
-#     Under tag-don't-drop it must be PRESENT (coverage of agent-inferred direction is the point).
-F=$(judge "Does the wiki mention exponential-backoff retries for failed notification sends (in any form, including as a provisional or agent-inferred idea)?")
-chk "(6) uncontradicted agent proposal PRESENT" "$F" "YES" "tag-don't-drop: an uncontradicted agent proposal must be captured, not dropped"
+# (6) The uncontradicted agent proposal (exponential-backoff retries). The user neither confirmed
+#     nor contradicted it — under the settled model it is admitted as PLAIN spec prose and must be
+#     PRESENT (coverage of agent-inferred direction is the point).
+F=$(judge "Does the wiki mention exponential-backoff retries for failed notification sends?")
+chk "(6) uncontradicted agent proposal PRESENT" "$F" "YES" "an admitted agent proposal must be captured as plain spec prose"
 
-# (6b) ...but it must NOT masquerade as a blessed/explicit user decision. It should be marked
-#      provisional/agent-inferred (rendered with the ⟨provisional, agent-inferred⟩ marker, OR
-#      the model treated the user's mild 'sounds reasonable' as a confirmation → promoted).
-#      We assert the SOFTER of the two: it is present and either marked provisional or promoted —
-#      i.e. it must not be ABSENT. The provisional-marker spot-check below verifies rendering.
-if grep -q "provisional, agent-inferred" "${NONINDEX[@]}" 2>/dev/null; then
-  echo "(6b) provisional marker found in rendered guides -> PASS (implicit claims render as provisional)"
-  grep -n "provisional, agent-inferred" "${NONINDEX[@]}" 2>/dev/null | sed 's/^/      /'
+# (6b) HARD REGRESSION CHECK for d70bf48: the authority tag is metadata-only and must NEVER leak
+#      into rendered prose. NO ⟨provisional⟩ / agent-inferred / ⟨…⟩ marker may appear in ANY guide.
+#      Nothing in this fixture (SendGrid/SMS/rate-limit/Kafka/Postgres/backoff) legitimately uses
+#      the word "provisional", so this cannot false-fail. The exponential-backoff proposal above is
+#      the case that would have carried a marker under the old interim model — it must now be clean.
+if grep -niE 'provisional|agent-inferred|⟨|⟩' "${NONINDEX[@]}" 2>/dev/null; then
+  echo "(6b) FAIL: a metadata marker leaked into rendered prose (d70bf48 regression). Lines above."
+  FAIL=1
 else
-  echo "(6b) NOTE: no ⟨provisional, agent-inferred⟩ marker present. This is acceptable ONLY if every"
-  echo "      implicit claim was promoted (user-confirmed) or deleted (user-contradicted). Given the"
-  echo "      exponential-backoff proposal was uncontradicted, a marker is the expected rendering;"
-  echo "      its absence may mean glm promoted it on the mild 'sounds reasonable'. Inspect guides above."
+  echo "(6b) PASS: zero ⟨provisional⟩/agent-inferred markers in rendered prose (tag is metadata-only)."
 fi
 
 echo "=================================="
