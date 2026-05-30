@@ -1428,11 +1428,13 @@ const RECONCILE_PREAMBLE: &str = "\
 You are the RECONCILE stage for a SINGLE wiki guide. You see the FULL current guide body \
 (may be empty for a new guide) and ALL claims routed to this guide. Produce an ordered list of \
 edit operations that make the guide reflect the CURRENT desired state.\n\n\
-## Claim authority tags\n\
-Each routed claim is prefixed with its authority:\n\
-- [explicit] = the USER stated it directly. Load-bearing, permanent product direction.\n\
-- [implicit] = the AGENT proposed/inferred it (the user did not state it). A real candidate \
-direction (often the actual implementation path) but NOT yet blessed by the user — PROVISIONAL.\n\n\
+## Claim authority tags (INTERNAL METADATA — never rendered)\n\
+Each routed claim is prefixed with its authority. These tags are for YOUR reasoning ONLY — \
+NEVER write them, the word 'provisional', 'agent-inferred', or any ⟨…⟩ marker into the guide prose. \
+Guides read as clean, confident desired-state spec regardless of a claim's origin:\n\
+- [explicit] = the USER stated it directly. Load-bearing product direction.\n\
+- [implicit] = the AGENT proposed/inferred it (the user did not state it) — often the actual \
+implementation path. Captured all the same; origin matters ONLY for the breadcrumb rule below.\n\n\
 ## Output: STRICT JSON ARRAY of ops, nothing else\n\
 [{\"op\": \"create\"|\"add\"|\"revise\"|\"remove\", \
 \"section\": \"## Section Heading\", \
@@ -1444,38 +1446,30 @@ direction (often the actual implementation path) but NOT yet blessed by the user
 - add: append a genuinely NEW, non-conflicting statement to a section.\n\
 - revise: REPLACE the entire prose of an existing section (cite the new evidence). Prior citations \
 are carried forward by the system. To EDIT one statement within a multi-statement section \
-(e.g. promote a provisional one, or delete a provisional one while keeping its siblings), use \
+(replace or drop one statement while keeping its siblings), use \
 `revise` and re-emit the section's FULL text minus/plus the changed statement — preserving every \
 sibling statement you are not changing.\n\
 - remove: delete an entire section that is fully retracted (use only when the section's whole \
 content is being dropped; there is NO statement-level delete op — to drop one statement among \
 several, `revise` the section without it).\n\n\
-## Rendering implicit (provisional) claims — round-trips to disk, so be exact\n\
-An [implicit] claim that has NO explicit counterpart in this batch or guide must be written with a \
-verbatim inline prefix so a LATER session can recognize and resolve it:\n\
-    ⟨provisional, agent-inferred⟩ <the statement>\n\
-Keep that exact prefix (the ⟨ ⟩ guillemets and the words 'provisional, agent-inferred'). It marks \
-the statement as a candidate direction, NOT a blessed decision. An [explicit] claim is NEVER given \
-this prefix.\n\n\
-## Implicit-claim lifecycle — resolve against explicit claims (THIS batch AND existing prose)\n\
-- An [explicit] claim CONFIRMS an [implicit] statement (same direction): PROMOTE it — write/keep the \
-statement WITHOUT the provisional prefix (it is now blessed). Do not keep both a provisional and a \
-promoted copy.\n\
-- An [explicit] claim CONTRADICTS an [implicit] statement: DELETE the implicit statement entirely \
-(NO breadcrumb — it was only an inference, never user intent) and codify the explicit correction as \
-a permanent (un-prefixed) statement.\n\
-- An [implicit] claim with no explicit confirmation or contradiction: KEEP it, rendered with the \
-provisional prefix above.\n\n\
+## NO markers, NO promotion/deletion lifecycle\n\
+Write every admitted claim as clean desired-state prose. Do NOT add a 'provisional' prefix, do NOT \
+label statements by origin, and do NOT delete or 'promote' a statement because of its [explicit]/\
+[implicit] tag. Both authorities are captured as plain spec; the distinction is recorded as metadata \
+elsewhere, not in the guide text.\n\n\
 ## THE CORE RULE — never accrete a contradiction\n\
 When a claim CONTRADICTS existing prose, you MUST use `revise` (or `remove`) to REPLACE the old \
-statement. NEVER `add` a statement that sits next to a contradictory one. The new decision must \
-become the live statement; the old one must NOT remain presented as current.\n\n\
-## Authority-asymmetric history (§6)\n\
-- When an [explicit] (USER) decision supersedes an earlier [explicit] (USER) decision, the revised \
-section SHOULD keep a terse breadcrumb: state the new decision as current, then one short clause like \
-'(Previously: <old>.)'. Keep it brief.\n\
-- When the superseded statement was a provisional/implicit (agent) statement, DROP it entirely — no \
-breadcrumb (per the lifecycle above).\n\
+statement — never `add` a statement next to a contradictory one. The new decision becomes the live \
+statement; the old one must NOT remain presented as current. This holds regardless of either claim's \
+authority. The guide renders only the CURRENT (live) desired state — superseded statements are \
+replaced, not stacked.\n\n\
+## Supersession history (§6) — render only the live tip, plus user-evolution breadcrumbs\n\
+- When an [explicit] (USER) decision supersedes an earlier [explicit] (USER) decision, keep a terse \
+breadcrumb in the revised text: state the new decision as current, then one short clause like \
+'(Previously: <old>.)'. This user-decision evolution is load-bearing archaeology — why the product \
+became what it is.\n\
+- Any other supersession (an agent-inferred statement replaced, or a routine correction) is just \
+replaced — no breadcrumb. It isn't user-decision history.\n\
 - Every section addressed by `section` must use an exact '## Heading' style heading.\n\
 - Output [] only if the claims require no change to this guide.\n";
 
