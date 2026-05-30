@@ -486,7 +486,9 @@ fn slice_transcript_ranges(lines: &[String], ranges: &[EvidenceRange]) -> String
     for range in ranges {
         let start = range.start.saturating_sub(1); // convert to 0-based
         let end = range.end.min(lines.len()); // 1-based inclusive → 0-based exclusive
-        if start >= lines.len() {
+        // Skip out-of-bounds, empty, or INVERTED ranges. The model can emit start > end
+        // (e.g. {start:1296,end:1197}); without this guard `lines[start..end]` panics.
+        if start >= lines.len() || start >= end {
             continue;
         }
         let segment = lines[start..end].join("\n");
