@@ -12,6 +12,7 @@ mod config;
 mod configure;
 mod daemon;
 mod db;
+mod doctor;
 mod embed;
 mod events;
 mod inject;
@@ -263,6 +264,37 @@ enum Commands {
     /// them naturally during the session. Reads { session_id, cwd, source } JSON from stdin.
     /// Always exits 0.
     SessionStart,
+
+    /// Wiki maintenance commands (off-hot-path).
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiAction {
+    /// Periodic consolidation/compaction: detect near-duplicate guide clusters, LLM-confirm,
+    /// and merge each into one canonical guide. Default = dry-run: reads the live wiki
+    /// read-only and writes the proposed consolidated wiki to --output-dir.
+    Doctor {
+        /// Write the consolidated wiki here (dry-run). Defaults to a temp dir. NEVER touches
+        /// the real docs/wiki/ unless --apply.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+
+        /// Write the consolidation in-place to the real wiki. Use with care.
+        #[arg(long)]
+        apply: bool,
+
+        /// Only detect + print candidate clusters; skip the LLM confirm/merge (tau tuning).
+        #[arg(long)]
+        detect_only: bool,
+
+        /// Override the clustering cosine threshold (else PC_DOCTOR_TAU env, else 0.6).
+        #[arg(long, value_name = "TAU")]
+        tau: Option<f32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -465,6 +497,25 @@ fn main() -> Result<()> {
         Commands::SessionStart => {
             crate::session_start::run_session_start()?;
         }
+
+        Commands::Wiki { action } => match action {
+            WikiAction::Doctor {
+                output_dir,
+                apply,
+                detect_only,
+                tau,
+            } => {
+                crate::doctor::run_doctor(
+                    &root,
+                    crate::doctor::DoctorArgs {
+                        output_dir,
+                        apply,
+                        detect_only,
+                        tau,
+                    },
+                )?;
+            }
+        },
     }
 
     Ok(())
