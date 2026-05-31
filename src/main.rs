@@ -295,6 +295,18 @@ enum WikiAction {
         #[arg(long, value_name = "TAU")]
         tau: Option<f32>,
     },
+
+    /// Tidy a wiki directory into its published, human-readable form: hide inline
+    /// citation markers (audit-preserved) and drop empty `## See Also` scaffolds.
+    /// Idempotent; only touches parseable pc guides (a coexisting topic KB is skipped).
+    Tidy {
+        /// Wiki directory of *.md guides (e.g. <repo>/docs/wiki)
+        #[arg(long)]
+        dir: PathBuf,
+        /// Apply changes in place (default is a dry-run summary only)
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -514,6 +526,56 @@ fn main() -> Result<()> {
                         tau,
                     },
                 )?;
+            }
+            WikiAction::Tidy { dir, write } => {
+                let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+                    .collect();
+                entries.sort();
+                let mut scanned = 0usize;
+                let mut changed = 0usize;
+                for path in entries {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    let raw = match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let guide = match crate::wiki::parse_guide(&raw) {
+                        Some(g) => g,
+                        None => continue,
+                    };
+                    scanned += 1;
+                    let normalized = crate::wiki::normalize_for_publish(&guide.body);
+                    if normalized != guide.body {
+                        changed += 1;
+                        if write {
+                            let mut g = guide;
+                            g.body = normalized;
+                            crate::wiki::save_guide(&path, &g)?;
+                        } else {
+                            println!("would tidy: {}", name);
+                        }
+                    }
+                }
+                if write {
+                    println!(
+                        "wiki tidy: {} guide(s) scanned, {} rewritten in {}",
+                        scanned, changed, dir.display()
+                    );
+                } else {
+                    println!(
+                        "wiki tidy (dry-run): {} guide(s) scanned, {} would change. Re-run with --write.",
+                        scanned, changed
+                    );
+                }
             }
         },
     }
