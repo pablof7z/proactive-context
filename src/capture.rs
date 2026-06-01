@@ -1432,40 +1432,30 @@ decision in place. Minting `postgres-session-store` beside `redis-session-store`
 new mechanism.\n\
 - You may ONLY reuse a slug that appears in that claim's CANDIDATE GUIDES list. Never invent a reuse \
 of some other guide you remember; if it isn't a listed candidate, treat the mechanism as NEW.\n\n\
-## GUIDE ALTITUDE — a guide is ONE mechanism (one sub-concern)\n\
-A guide is a SUB-CONCERN: ONE distinct mechanism / responsibility a reader would look up on its own \
-— NOT the whole subsystem, and NOT one guide per fact. Split a subsystem at its DISTINCT-MECHANISM \
-boundaries.\n\
-- DISTINCT mechanisms → SEPARATE guides. Example: inject's relevance/select GATE (`inject-gate`) and \
-its COMPILE/synthesis step (`inject-compile`) are different mechanisms → different guides. The inject \
-pipeline is rightly ~6 guides (gate, compile, recent-context, no-DB/auto-index, noun-resolution, \
-architecture). Splitting at real mechanism seams is CORRECT and expected — a healthy whole-project \
-wiki is ~25-30 guides.\n\
-- A FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION of that mechanism's guide, NOT \
-its own guide. E.g. the archeologist's picker, dry-run, resume/dedup, and output-dir are features of \
-ONE `archeologist` guide. The test: would these claims read as SECTIONS of a single coherent guide a \
-person would open under one title? Then they are ONE guide.\n\
-## CONCRETE MERGES — do NOT mint these near-duplicate guides; fold them into the parent mechanism\n\
-- INJECT is ~6 guides total: the GATE, the COMPILE/synthesis step, recent-context, no-DB/auto-index, \
-noun-resolution, and the overall pipeline/architecture. Everything else about inject is a SECTION of \
-one of those. Do NOT create separate guides like `inject-timeouts`, `inject-verbose`, \
-`inject-statusline`, `inject-event-log`, `inject-model-selection`, `inject-hook-implementation`, or \
-`inject-catalog`: a timeout/retry knob and a verbose/log flag are OBSERVABILITY/CONFIG facets → fold \
-into recent-context-and-observability or the pipeline guide; model selection → the gate guide; \
-hook/catalog → the pipeline/architecture guide.\n\
-- EMBEDDINGS + the VECTOR STORE are ONE guide (`embeddings-and-vector-db`). Do NOT split into \
-`local-embeddings`, `openrouter-embeddings`, `vector-distance-metrics`, `embedding-dimension-mismatch`, \
-and `onnx-reranker-caching` — provider choice, distance metric, dimension handling, and reranker \
-caching are all facets of the SAME embeddings/vector mechanism → ONE guide with sections.\n\
-- Likewise config/storage-layout details, daemon init/stop/ps, and the citation id/markers/log are \
-each ONE guide, not several.\n\n\
-## Granularity guidance — split ONLY at true mechanism seams\n\
-Because candidates are pre-retrieved by similarity, a later same-subsystem claim WILL be shown the \
-existing guide — route it THERE. The failure mode to avoid is OVER-SPLITTING: minting a new guide for \
-every feature/option/flag/sub-step/observability facet of a mechanism a candidate already covers. When \
-a candidate is in the claim's subsystem, default to REUSE; only mint NEW when the claim is a separate \
-mechanism with its own distinct responsibility (gate vs compile), never for a facet of an existing \
-one.\n\n\
+## GUIDE ALTITUDE — a guide is ONE coherent TOPIC a reader opens under one title\n\
+A guide is a TOPIC someone would deliberately open and read top-to-bottom under a single title — a \
+subsystem-level chapter that holds several related mechanisms as SECTIONS, NOT one guide per \
+mechanism and NEVER one guide per fact. Split ONLY at real topic seams: two guides are justified \
+only when a reader would look for the two things in genuinely SEPARATE places. Do NOT target any \
+guide count — the right number of guides is whatever the project's actual surface area demands; a \
+large multi-platform project legitimately has many topics, a tiny tool has few. Never split to hit \
+a number, and never merge unrelated things to hit one.\n\
+- The DEFAULT is to fold a claim into an existing topic as a SECTION. Mint a new guide only when the \
+claim opens a genuinely new topic with no existing home — not merely a new mechanism, option, flag, \
+sub-step, timeout/retry knob, or observability facet of a topic that already exists.\n\
+- Example of right altitude: the whole inject pipeline is ONE topic (gate, compile, recent-context, \
+noun-resolution, hooks are SECTIONS of it) unless a sub-area is genuinely large enough to warrant its \
+own chapter. The archeologist's picker, dry-run, resume/dedup, and output-dir are SECTIONS of ONE \
+`archeologist` guide, not separate guides. The test: would these claims read as SECTIONS of a single \
+coherent guide a person would open under one title? Then they are ONE guide.\n\
+## THE OVER-SPLIT FAILURE MODE — what to fold instead of minting\n\
+The dominant failure is OVER-SPLITTING: minting a fresh guide for a feature, option, flag, sub-step, \
+timeout/retry knob, config detail, or observability facet of a topic that already has a home. These \
+are SECTIONS, never guides. Concretely: a 'verbose flag' or 'timeout knob' for subsystem X folds into \
+X's guide; provider/dimension/caching variations of one mechanism are sections of that mechanism's \
+guide, not a guide each; init/stop/status variants of one tool are sections of that tool's guide. \
+When an existing guide plausibly owns the topic, ROUTE the claim THERE and let RECONCILE add it as a \
+section — reuse is the default, minting is the exception.\n\n\
 ## WITHIN-BATCH sibling convergence (still required)\n\
 Two or more claims in THIS batch about the SAME mechanism MUST share ONE slug — especially when the \
 mechanism is NEW (no candidate exists yet, so similarity search cannot converge them; only you, \
