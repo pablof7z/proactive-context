@@ -4,6 +4,7 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod archeologist;
+mod tenex;
 mod awareness;
 mod capture;
 mod session_start;
@@ -216,6 +217,12 @@ enum Commands {
         /// Safe to delete afterwards.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<std::path::PathBuf>,
+
+        /// Also scan TENEX conversation databases (~/.tenex/projects/) as a source.
+        /// Only conversations where the user participated are included.
+        /// Requires a valid ~/.tenex/config.json.
+        #[arg(long)]
+        tenex: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -419,6 +426,7 @@ fn main() -> Result<()> {
             yes,
             include_sidechains,
             output_dir,
+            tenex,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
                 project,
@@ -429,6 +437,7 @@ fn main() -> Result<()> {
                 yes,
                 include_sidechains,
                 output_dir,
+                include_tenex: tenex,
             })?;
         }
 

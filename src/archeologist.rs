@@ -18,7 +18,7 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::capture::{
     archeologist_is_already_captured, archeologist_project_dir,
@@ -49,6 +49,8 @@ pub struct ArcheologistArgs {
     /// Redirect all wiki output and capture markers to this directory instead of the
     /// default ~/.proactive-context tree. Useful for isolated test runs.
     pub output_dir: Option<std::path::PathBuf>,
+    /// Also scan TENEX conversation databases (~/.tenex/projects/) as a source.
+    pub include_tenex: bool,
 }
 
 pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
@@ -58,7 +60,44 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
     }
 
     // Collect all project metadata from ~/.claude/projects/
-    let projects = scan_claude_projects(&args.since)?;
+    let mut projects = scan_claude_projects(&args.since)?;
+
+    // Optionally merge TENEX conversation sources.
+    // We keep the TempDir alive here so synthesized JSONL files persist through the run.
+    let _tenex_tmp = if args.include_tenex {
+        match crate::tenex::load_config() {
+            Some(cfg) => {
+                let tmp = tempfile::Builder::new()
+                    .prefix("pc-tenex-")
+                    .tempdir()
+                    .context("failed to create temp dir for TENEX synthesis")?;
+                match crate::tenex::scan_tenex_projects(&cfg, &args.since, tmp.path(), args.output_dir.as_ref()) {
+                    Ok(tenex_projects) => {
+                        if tenex_projects.is_empty() {
+                            println!("archeologist: --tenex: no user-participated conversations found");
+                        } else {
+                            println!(
+                                "archeologist: --tenex: found {} project(s) with TENEX conversations",
+                                tenex_projects.len()
+                            );
+                            projects.extend(tenex_projects);
+                        }
+                        Some(tmp)
+                    }
+                    Err(e) => {
+                        eprintln!("archeologist: --tenex scan failed: {}", e);
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!("archeologist: --tenex: ~/.tenex/config.json not found or missing required fields");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if projects.is_empty() {
         println!("archeologist: no projects found in ~/.claude/projects/");

@@ -2657,6 +2657,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite-vec",
+ "tempfile",
  "tokio",
  "walkdir",
 ]
