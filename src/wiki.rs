@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 pub struct GuideFrontmatter {
     pub title: String,
     pub slug: String,
+    pub topic: String,         // kebab-case domain grouping, e.g. "playback", "nostr-protocol"
     pub summary: String,
     pub tags: Vec<String>,
     pub volatility: String,    // hot|warm|cold
@@ -150,6 +151,7 @@ fn assign_scalar_field(fm: &mut GuideFrontmatter, key: &str, val: String) {
     match key {
         "title"         => fm.title = val,
         "slug"          => fm.slug = val,
+        "topic"         => fm.topic = val,
         "summary"       => fm.summary = val,
         "volatility"    => fm.volatility = val,
         "confidence"    => fm.confidence = val,
@@ -178,6 +180,9 @@ pub fn serialize_guide(guide: &Guide) -> String {
     out.push_str("---\n");
     write_scalar(&mut out, "title", &fm.title);
     write_scalar(&mut out, "slug", &fm.slug);
+    if !fm.topic.is_empty() {
+        write_scalar(&mut out, "topic", &fm.topic);
+    }
     write_scalar(&mut out, "summary", &fm.summary);
     write_list(&mut out, "tags", &fm.tags);
     write_scalar(&mut out, "volatility", &fm.volatility);
@@ -483,6 +488,7 @@ fn find_see_also_insertion_point(body: &str) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct IndexRow {
     pub slug: String,
+    pub topic: String,
     pub title: String,
     pub summary: String,
     pub tags: Vec<String>,
@@ -519,6 +525,7 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
                 slug: fm.slug.clone(),
+                topic: fm.topic.clone(),
                 title: fm.title.clone(),
                 summary: fm.summary.clone(),
                 tags: fm.tags.clone(),
@@ -529,8 +536,8 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
         }
     }
 
-    // Sort deterministically by slug
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    // Sort deterministically by topic then slug
+    rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
 
     write_index_file(wiki_dir, today, &rows)?;
     Ok(rows)
@@ -544,23 +551,36 @@ fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<(
     out.push_str("# Wiki Index\n\n");
     out.push_str("> Derived cache — do not hand-edit. Rebuilt by proactive-context after each capture.\n\n");
     out.push_str(&format!("Last updated: {}\n\n", today));
-    out.push_str("## Guides\n\n");
 
     if rows.is_empty() {
         out.push_str("*(no guides yet)*\n");
-    } else {
-        out.push_str("| Slug | Title | Summary | Tags | Volatility | Verified |\n");
-        out.push_str("|------|-------|---------|------|------------|----------|\n");
-        for row in rows {
+        fs::write(&path, out)?;
+        return Ok(());
+    }
+
+    // Group rows by topic (empty topic = "general")
+    let mut by_topic: std::collections::BTreeMap<String, Vec<&IndexRow>> = std::collections::BTreeMap::new();
+    for row in rows {
+        let topic = if row.topic.is_empty() { "general".to_string() } else { row.topic.clone() };
+        by_topic.entry(topic).or_default().push(row);
+    }
+
+    // Render one table section per topic
+    for (topic, topic_rows) in &by_topic {
+        out.push_str(&format!("## {} ({} guide{})\n\n", topic, topic_rows.len(),
+            if topic_rows.len() == 1 { "" } else { "s" }));
+        out.push_str("| Slug | Title | Summary | Tags | Volatility | Verified | Topic |\n");
+        out.push_str("|------|-------|---------|------|------------|----------|-------|\n");
+        for row in topic_rows.iter() {
             let tags_str = row.tags.join(", ");
-            // Escape pipe chars in summary
             let summary = row.summary.replace('|', "\\|");
             let title = row.title.replace('|', "\\|");
             out.push_str(&format!(
-                "| [{}]({}.md) | {} | {} | {} | {} | {} |\n",
-                row.slug, row.slug, title, summary, tags_str, row.volatility, row.verified
+                "| [{}]({}.md) | {} | {} | {} | {} | {} | {} |\n",
+                row.slug, row.slug, title, summary, tags_str, row.volatility, row.verified, topic
             ));
         }
+        out.push('\n');
     }
 
     fs::write(&path, out)?;
@@ -614,9 +634,11 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
                     .collect();
                 let volatility = cols[4].to_string();
                 let verified = cols.get(5).unwrap_or(&"").to_string();
+                let topic = cols.get(6).unwrap_or(&"").to_string();
 
                 rows.push(IndexRow {
                     slug,
+                    topic,
                     title,
                     summary,
                     tags,
@@ -665,6 +687,7 @@ pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
                 slug: fm.slug.clone(),
+                topic: fm.topic.clone(),
                 title: fm.title.clone(),
                 summary: fm.summary.clone(),
                 tags: fm.tags.clone(),
@@ -674,7 +697,7 @@ pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
             });
         }
     }
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
     rows
 }
 
@@ -690,11 +713,13 @@ pub fn new_guide(
     body: &str,
     session_id: &str,
     today: &str,
+    topic: &str,
 ) -> Guide {
     Guide {
         frontmatter: GuideFrontmatter {
             title: title.to_string(),
             slug: slug.to_string(),
+            topic: topic.to_string(),
             summary: summary.to_string(),
             tags: tags.to_vec(),
             volatility: volatility.to_string(),

@@ -770,6 +770,7 @@ mod tests {
     fn row(slug: &str, title: &str, summary: &str) -> IndexRow {
         IndexRow {
             slug: slug.into(),
+            topic: String::new(),
             title: title.into(),
             summary: summary.into(),
             tags: vec![],
