@@ -302,6 +302,17 @@ enum WikiAction {
         /// Override the clustering cosine threshold (else PC_DOCTOR_TAU env, else 0.6).
         #[arg(long, value_name = "TAU")]
         tau: Option<f32>,
+
+        /// Topic-taxonomy mode: one LLM pass assigns every guide a coherent `topic`
+        /// (GROUP, not merge — bodies/citations untouched). Dry-run prints the proposed
+        /// taxonomy; with --apply it stamps the `topic` frontmatter field in place.
+        #[arg(long)]
+        retopic: bool,
+
+        /// Override the model for the --retopic taxonomy call (e.g. `ollama:glm-5.1:cloud`).
+        /// Defaults to capture_model. Useful when capture_model is a slow local model.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
 
     /// Tidy a wiki directory into its published, human-readable form: hide inline
@@ -526,6 +537,8 @@ fn main() -> Result<()> {
                 apply,
                 detect_only,
                 tau,
+                retopic,
+                model,
             } => {
                 crate::doctor::run_doctor(
                     &root,
@@ -534,6 +547,8 @@ fn main() -> Result<()> {
                         apply,
                         detect_only,
                         tau,
+                        retopic,
+                        model,
                     },
                 )?;
             }

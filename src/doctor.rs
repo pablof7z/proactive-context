@@ -68,6 +68,15 @@ pub struct DoctorArgs {
     pub detect_only: bool,
     /// Override clustering threshold (else PC_DOCTOR_TAU env, else DEFAULT_TAU).
     pub tau: Option<f32>,
+    /// Topic-taxonomy mode: instead of merging near-dups, assign every guide a coherent
+    /// `topic` (one LLM pass over the whole catalog) and stamp it into frontmatter. This
+    /// GROUPS the flat wiki without merging (lossless — bodies/citations untouched).
+    /// Dry-run prints the proposed taxonomy; with --apply it rewrites the `topic` field.
+    pub retopic: bool,
+    /// Override the model for the (one-shot) retopic taxonomy call, e.g.
+    /// `ollama:glm-5.1:cloud`. Defaults to `capture_model`. Useful when the configured
+    /// capture model is a slow local model unfit for a large single-call taxonomy.
+    pub model: Option<String>,
 }
 
 // ─── Detection (deterministic, unit-testable) ──────────────────────────────────
@@ -298,13 +307,17 @@ pub struct LlmClient {
 
 impl LlmClient {
     fn call(&self, system: &str, user: &str) -> Result<String> {
-        crate::capture::call_model_blocking(
+        // Doctor calls are off-hot-path batch jobs (whole-catalog taxonomy / cluster merge)
+        // with large prompts + large structured outputs; a slow local model can take minutes.
+        // Use a generous timeout rather than the 120s hot-path default.
+        crate::capture::call_model_blocking_with_timeout(
             &self.spec,
             &self.openrouter_api_key,
             &self.ollama_base_url,
             self.ollama_api_key.as_deref(),
             system,
             user,
+            600,
         )
     }
 }
@@ -468,6 +481,11 @@ pub fn run_doctor(root: &Path, args: DoctorArgs) -> Result<()> {
 
     let rows = read_index_live(&live_wiki);
     println!("  {} guides found; tau = {:.3}", rows.len(), tau);
+
+    // Topic-taxonomy mode is independent of cosine clustering — handle it before DETECT.
+    if args.retopic {
+        return run_retopic(root, &live_wiki, &rows, &cfg, args.apply, args.model.as_deref());
+    }
 
     // DETECT
     let mut embedder = build_embedder(&cfg).context("build embedder")?;
@@ -637,6 +655,151 @@ pub fn run_doctor(root: &Path, args: DoctorArgs) -> Result<()> {
             live_wiki.display()
         );
     }
+    Ok(())
+}
+
+/// Topic-taxonomy pass: one LLM call over the whole catalog proposes a flat set of
+/// coherent topics and assigns every guide to exactly one. We then stamp each guide's
+/// `topic` frontmatter field in place. This GROUPS the wiki (navigability) WITHOUT merging
+/// — bodies, citations, and slugs are untouched (lossless; honors keep-everything).
+///
+/// Rationale (empirical, 2026-06-04): embedding cosine clustering finds near-DUPLICATES,
+/// not topics. A real topic like `nostr-protocol` spans nip01..nip66, which are
+/// cosine-distant, so flat pairwise clustering either over-chains (one 25-guide nmp blob
+/// at tau 0.55) or under-groups (singletons at 0.62+). Topic assignment needs the global
+/// semantic view only an LLM reading all titles+summaries at once provides.
+fn run_retopic(
+    root: &Path,
+    live_wiki: &Path,
+    rows: &[IndexRow],
+    cfg: &Config,
+    apply: bool,
+    model_override: Option<&str>,
+) -> Result<()> {
+    if rows.is_empty() {
+        println!("retopic: no guides to organize.");
+        return Ok(());
+    }
+
+    // Build the catalog the model sees: one line per guide (index | slug | title | summary),
+    // plus the current topic so the model can reuse a sane existing one.
+    let mut catalog = String::new();
+    for (i, r) in rows.iter().enumerate() {
+        let cur = if r.topic.is_empty() { "-" } else { r.topic.as_str() };
+        catalog.push_str(&format!(
+            "{} | {} | {} | {} | (current topic: {})\n",
+            i, r.slug, r.title, r.summary, cur
+        ));
+    }
+
+    let system = "You are a senior technical writer organizing an engineering wiki into a \
+                  clean topic taxonomy. You group guides by SUBSYSTEM / DOMAIN a reader would \
+                  browse together — not by surface word overlap. You never invent guides and \
+                  never drop one.";
+    let user = format!(
+        "Below is the full list of wiki guides: `index | slug | title | summary | current topic`.\n\n\
+         Propose a FLAT set of coherent topics (aim for roughly one topic per ~5-15 guides; a \
+         large project may have 8-20 topics, a small one 3-6). Each topic is a 1-3 word \
+         kebab-case label (e.g. `nostr-protocol`, `chirp-ui`, `relay-management`, \
+         `build-and-release`). Then assign EVERY guide to EXACTLY ONE topic. Reuse a guide's \
+         current topic when it is already sane; otherwise pick the best-fitting topic. Group \
+         related-but-distinct guides together (e.g. all NIP guides → `nostr-protocol`; all \
+         relay selection/admission/settings → `relay-management`) — do NOT give each guide its \
+         own topic.\n\n\
+         Output STRICT JSON, nothing else:\n\
+         {{\"topics\": [\"topic-a\", \"topic-b\", ...], \"assignments\": {{\"<slug>\": \"topic-a\", ...}}}}\n\
+         Every slug below MUST appear exactly once in assignments, mapped to a topic present \
+         in the topics array.\n\n\
+         GUIDES:\n{}",
+        catalog
+    );
+
+    let model = model_override.unwrap_or(&cfg.capture_model);
+    let llm = LlmClient {
+        spec: ModelSpec::parse(model),
+        openrouter_api_key: cfg.openrouter_api_key.clone().unwrap_or_default(),
+        ollama_base_url: cfg.ollama_base_url.clone(),
+        ollama_api_key: cfg.ollama_api_key.clone(),
+    };
+
+    println!("\nretopic: asking {} to propose a taxonomy for {} guides...", model, rows.len());
+    let raw = llm.call(system, &user)?;
+    let json = strip_code_fence(&raw);
+
+    #[derive(serde::Deserialize)]
+    struct Taxonomy {
+        #[serde(default)]
+        topics: Vec<String>,
+        assignments: HashMap<String, String>,
+    }
+    let tax: Taxonomy = serde_json::from_str(&json)
+        .with_context(|| format!("retopic: model did not return valid JSON. Raw:\n{}", raw))?;
+
+    // Validate coverage: every guide assigned, no guide dropped.
+    let known: HashSet<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
+    let assigned: HashSet<&str> = tax.assignments.keys().map(|s| s.as_str()).collect();
+    let missing: Vec<&str> = known.difference(&assigned).copied().collect();
+    if !missing.is_empty() {
+        println!(
+            "retopic: WARNING — {} guide(s) unassigned by the model; they keep their current topic: {}",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
+    // Tally the proposed taxonomy.
+    let mut by_topic: std::collections::BTreeMap<String, Vec<&str>> = std::collections::BTreeMap::new();
+    for r in rows {
+        let topic = tax
+            .assignments
+            .get(&r.slug)
+            .cloned()
+            .unwrap_or_else(|| if r.topic.is_empty() { "general".to_string() } else { r.topic.clone() });
+        by_topic.entry(topic).or_default().push(r.slug.as_str());
+    }
+
+    println!(
+        "\n=== PROPOSED TAXONOMY: {} topics for {} guides (ratio {:.2} guides/topic) ===",
+        by_topic.len(),
+        rows.len(),
+        rows.len() as f32 / by_topic.len().max(1) as f32
+    );
+    for (topic, slugs) in &by_topic {
+        println!("  {} ({})", topic, slugs.len());
+        for s in slugs {
+            println!("      - {}", s);
+        }
+    }
+
+    if !apply {
+        println!("\nretopic (dry-run): no files changed. Re-run with --apply to stamp the `topic` field.");
+        return Ok(());
+    }
+
+    // APPLY: rewrite only the `topic` frontmatter field. Body/citations untouched.
+    let _ = root; // wiki writes target live_wiki (the real docs/wiki)
+    let mut changed = 0usize;
+    for (topic, slugs) in &by_topic {
+        for slug in slugs {
+            let path = wiki::guide_path(live_wiki, slug);
+            if let Some(mut g) = wiki::load_guide(&path) {
+                if &g.frontmatter.topic != topic {
+                    g.frontmatter.topic = topic.to_string();
+                    wiki::save_guide(&path, &g)?;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    // Rebuild the index so the topic-grouped catalog reflects the new assignments.
+    let _ = enforce_bidirectional_links(live_wiki, &today_str());
+    let _ = wiki::rebuild_index(live_wiki, &today_str());
+    println!(
+        "\nretopic: applied — {} guide(s) re-topiced into {} topics in {}",
+        changed,
+        by_topic.len(),
+        live_wiki.display()
+    );
     Ok(())
 }
 

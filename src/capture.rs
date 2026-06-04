@@ -262,6 +262,24 @@ pub(crate) fn call_model_blocking(
     system: &str,
     user_msg: &str,
 ) -> Result<String> {
+    call_model_blocking_with_timeout(
+        spec, openrouter_api_key, ollama_base_url, ollama_api_key, system, user_msg, 120,
+    )
+}
+
+/// Like [`call_model_blocking`] but with a caller-specified HTTP timeout. Batch / off-hot-path
+/// jobs (e.g. the doctor's whole-catalog taxonomy or merge calls) need far more than the
+/// 120s hot-path default — a single large structured-output call on a slow local model can
+/// take several minutes.
+pub(crate) fn call_model_blocking_with_timeout(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    system: &str,
+    user_msg: &str,
+    timeout_secs: u64,
+) -> Result<String> {
     // Ollama uses its native /api/chat endpoint (works for both local and cloud);
     // /v1/chat/completions returns 401 on api.ollama.com.
     let (url, auth_header, is_ollama) = match spec.provider {
@@ -281,7 +299,7 @@ pub(crate) fn call_model_blocking(
     };
 
     let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
 
     let body = if is_ollama {
