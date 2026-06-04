@@ -928,6 +928,7 @@ impl Tool for WikiCreateTool {
                 &body,
                 &ctx.session_id,
                 &ctx.today,
+                "",
             );
             Ok((guide, format!("Created guide '{}' with {} section(s).", safe_slug, sections_count)))
         });
@@ -1020,7 +1021,7 @@ impl Tool for WikiAddStatementTool {
                         safe_slug, section, text.trim(), marker_clone
                     );
                     return Ok((
-                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today),
+                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today, ""),
                         format!("Note: guide '{}' did not exist — created with statement.", safe_slug)
                     ));
                 }
@@ -1128,7 +1129,7 @@ impl Tool for WikiReviseStatementTool {
                         safe_slug, section, text.trim(), marker_clone
                     );
                     return Ok((
-                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today),
+                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today, ""),
                         format!("Note: guide '{}' did not exist — created with section.", safe_slug)
                     ));
                 }
@@ -1235,7 +1236,7 @@ impl Tool for WikiRemoveStatementTool {
                     return Ok((
                         new_guide(&safe_slug, &safe_slug, "", &[], "warm",
                             &format!("# {}\n\n## See Also\n\n", safe_slug),
-                            &session_id, &today),
+                            &session_id, &today, ""),
                         format!("Error: guide '{}' not found — nothing removed.", safe_slug)
                     ));
                 }
@@ -1402,12 +1403,20 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 
 const ROUTE_PREAMBLE: &str = "\
 You are the RERANK half of the ROUTE stage. Each claim must be assigned to the ONE wiki guide \
-whose topic it belongs to, OR to a NEW guide. To save you from scanning the whole wiki, each \
-claim already lists its CANDIDATE GUIDES — the existing guides a semantic-similarity search found \
-most relevant (with a similarity score 0..1, higher = closer). You choose among ONLY those \
-candidates, or declare NEW.\n\n\
+whose topic it belongs to, OR to a NEW guide. You are given TWO inputs: (1) a FULL CATALOG of \
+every existing guide organized by topic — use this to understand the topic landscape and reuse \
+existing topics; (2) per-claim CANDIDATE GUIDES from semantic-similarity search (score 0..1). \
+You choose among only a claim's CANDIDATE GUIDES or declare NEW.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
-[{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
+[{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \
+\"topic\": \"kebab-case-topic\", \"is_new\": true|false}]\n\n\
+## Topic field — required on every entry\n\
+- For an EXISTING guide (is_new=false): copy its topic from the catalog exactly.\n\
+- For a NEW guide (is_new=true): pick a topic from the catalog's existing topic vocabulary \
+if one fits. Only mint a new topic name when the claim is in a domain area genuinely absent \
+from the catalog. Topics are 1-3 word kebab-case groupings (e.g. 'playback', 'nostr-protocol', \
+'ui-components', 'data-persistence', 'agent-system'). Prefer reuse over invention.\n\
+- Within-batch NEW guides about the same area share ONE topic name.\n\n\
 ## How to choose — TRUST THE CANDIDATES\n\
 The candidates were retrieved by SEMANTIC similarity, so they can be the right home EVEN WITH ZERO \
 SHARED VOCABULARY. This is the whole point: 'token-bucket rate limiting' and 'the throttling layer \
@@ -1635,6 +1644,8 @@ struct RouteDecision {
     #[serde(default)]
     title: String,
     #[serde(default)]
+    topic: String,
+    #[serde(default)]
     #[allow(dead_code)]
     is_new: bool,
 }
@@ -1806,10 +1817,35 @@ async fn run_wiki_agent(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Build full-catalog block grouped by topic for global context
+    let full_catalog = {
+        use std::collections::BTreeMap;
+        let mut by_topic: BTreeMap<String, Vec<&wiki::IndexRow>> = BTreeMap::new();
+        for row in &index_rows {
+            let t = if row.topic.is_empty() { "general" } else { row.topic.as_str() };
+            by_topic.entry(t.to_string()).or_default().push(row);
+        }
+        if by_topic.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("## FULL WIKI CATALOG (organized by topic)\n");
+            for (topic, rows) in &by_topic {
+                s.push_str(&format!("### {} ({} guide{})\n", topic, rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }));
+                for row in rows {
+                    s.push_str(&format!("  - {} | {} | {}\n", row.slug, row.title, row.summary));
+                }
+            }
+            s.push('\n');
+            s
+        }
+    };
+
     let route_user = format!(
-        "## CLAIMS (each with its pre-retrieved candidate guides)\n{}\n\n\
+        "{}\
+         ## CLAIMS (each with its pre-retrieved candidate guides)\n{}\n\n\
          Emit the JSON routing array now (one entry per claim, same order).",
-        claims_text
+        full_catalog, claims_text
     );
     let route_raw = run_stage(
         spec, openrouter_api_key, ollama_base_url, ollama_api_key,
@@ -1828,6 +1864,8 @@ async fn run_wiki_agent(
     // NEW guides so the NEXT session's ROUTE call sees a real description (not an empty
     // summary) and can reuse the slug instead of minting a near-duplicate.
     let mut slug_titles: BTreeMap<String, String> = BTreeMap::new();
+    // Topic assigned by ROUTE per slug — written to guide frontmatter.
+    let mut slug_topics: BTreeMap<String, String> = BTreeMap::new();
     let mut routed_claims: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for r in &routes {
         if r.claim_index >= admitted.len() {
@@ -1840,6 +1878,10 @@ async fn run_wiki_agent(
         let title = r.title.trim();
         if !title.is_empty() {
             slug_titles.entry(slug.clone()).or_insert_with(|| title.to_string());
+        }
+        let topic = r.topic.trim();
+        if !topic.is_empty() {
+            slug_topics.entry(slug.clone()).or_insert_with(|| topic.to_string());
         }
         by_slug.entry(slug).or_default().push(r.claim_index);
         routed_claims.insert(r.claim_index);
@@ -1897,7 +1939,7 @@ async fn run_wiki_agent(
                     continue;
                 }
             }
-            let applied_op = apply_reconcile_op(&ctx, slug, slug_titles.get(slug).map(|s| s.as_str()), op);
+            let applied_op = apply_reconcile_op(&ctx, slug, slug_titles.get(slug).map(|s| s.as_str()), slug_topics.get(slug).map(|s| s.as_str()), op);
             if applied_op {
                 applied += 1;
             }
@@ -1913,7 +1955,7 @@ async fn run_wiki_agent(
 /// Apply a single RECONCILE op via the existing wiki primitives, mirroring the tool bodies:
 /// verify evidence → cite → mint marker → apply primitive → append_citation_log. Returns
 /// true if a mutation was applied.
-fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&str>, op: &ReconcileOp) -> bool {
+fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&str>, route_topic: Option<&str>, op: &ReconcileOp) -> bool {
     let safe_slug = slugify(slug);
     // Title/summary for any NEW guide created here. Prefer ROUTE's human title; fall back to
     // the de-slugified form. Summary = the first statement's text (truncated) so the next
@@ -1940,6 +1982,7 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
     let today = ctx.today.clone();
     let session_id = ctx.session_id.clone();
     let wiki_path = ctx.wiki_path.clone();
+    let new_topic = route_topic.unwrap_or("").to_string();
 
     let lock_slug = safe_slug.clone();
     match op.op.as_str() {
@@ -1951,6 +1994,7 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
             let section_c = section.clone();
             let new_title_c = new_title.clone();
             let new_summary_c = new_summary.clone();
+            let new_topic_c = new_topic.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
@@ -1960,13 +2004,17 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                             new_title_c, section_c, text.trim(), marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today, &new_topic_c),
                             format!("Created guide '{}'.", safe_slug),
                         ));
                     }
                 };
                 guide.body = add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
                 guide.frontmatter.updated = today.clone();
+                // Back-fill topic on existing guides that predate topic support
+                if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
+                    guide.frontmatter.topic = new_topic_c;
+                }
                 let source_key = format!("session:{}", session_id);
                 if !guide.frontmatter.sources.contains(&source_key) {
                     guide.frontmatter.sources.push(source_key);
@@ -1987,6 +2035,7 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
             let section_c = section.clone();
             let new_title_c = new_title.clone();
             let new_summary_c = new_summary.clone();
+            let new_topic_c = new_topic.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
@@ -1996,7 +2045,7 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                             new_title_c, section_c, text.trim(), marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today, &new_topic_c),
                             format!("Created guide '{}' (revise had no target).", safe_slug),
                         ));
                     }
@@ -2005,6 +2054,9 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                     Ok(new_body) => {
                         guide.body = new_body;
                         guide.frontmatter.updated = today.clone();
+                        if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
+                            guide.frontmatter.topic = new_topic_c;
+                        }
                         let source_key = format!("session:{}", session_id);
                         if !guide.frontmatter.sources.contains(&source_key) {
                             guide.frontmatter.sources.push(source_key);
