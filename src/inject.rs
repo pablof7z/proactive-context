@@ -1023,15 +1023,26 @@ async fn compile_briefing(
     if !already_injected.is_empty() {
         context.push_str(
             "ALREADY IN THE ASSISTANT'S CONTEXT — the facts below were injected on earlier turns \
-this session and are STILL VISIBLE to the assistant. Do NOT repeat them. Surface ONLY facts from \
-the sources that ADD new information for the current question. If the sources contain nothing \
-beyond what is listed here, output exactly: TITLE: none\n\n",
+this session and are STILL VISIBLE to the assistant right now. Treat them as already-known. Your \
+job is to surface ONLY genuinely NEW facts the assistant does not yet have.\n\
+- A fact counts as already-known even if the user now asks about it directly — do NOT restate it \
+just because the question foregrounds it.\n\
+- Example: if \"the manifest lives at .lumen/manifest.json\" is already known and the user asks \
+\"where is the manifest?\", that fact is NOT new — do not emit it.\n\
+- If the sources contain NOTHING beyond what is already known, output exactly: TITLE: none\n\n\
+ALREADY-KNOWN FACTS:\n",
         );
         context.push_str(already_injected);
         context.push_str("\n\n");
     }
     context.push_str("SOURCE DOCUMENTS (line-numbered; synthesize only what is relevant):\n\n");
     context.push_str(&render_guides_for_select(&sources));
+    if !already_injected.is_empty() {
+        context.push_str(
+            "\nBEFORE YOU ANSWER: re-read ALREADY-KNOWN FACTS above. Drop every claim already \
+covered there. Emit only what remains. If nothing remains, output exactly: TITLE: none\n",
+        );
+    }
 
     let preamble = format!("{}\n\n{}", COMPILE_PREAMBLE, context);
     let response: String = match spec.provider {
