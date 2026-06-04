@@ -84,6 +84,25 @@ fn strip_title_line(text: &str) -> (Option<String>, &str) {
     (None, text)
 }
 
+/// Parse a single gate-output line into a resolved standalone query, tolerating
+/// the formatting models tend to add: a leading list bullet (`- `, `* `, `• `),
+/// surrounding `**` bold, and any case. Returns the question text after `QUERY:`,
+/// or None if this line isn't a (non-empty) QUERY line.
+fn parse_query_line(line: &str) -> Option<String> {
+    let t = line
+        .trim()
+        .trim_start_matches(['-', '*', '•', ' '])
+        .trim_start_matches("**")
+        .trim();
+    if t.len() >= 6 && t[..6].eq_ignore_ascii_case("QUERY:") {
+        // Payload may carry the closing `**` of a bolded label, e.g. `**QUERY:** q`.
+        let q = t[6..].trim_matches(|c: char| c == '*' || c.is_whitespace());
+        (!q.is_empty()).then(|| q.to_string())
+    } else {
+        None
+    }
+}
+
 // ─── Output helper ───────────────────────────────────────────────────────────
 
 /// Non-verbose: prints `context_block` as plain text (→ context injection).
@@ -390,6 +409,15 @@ pub fn run_inject(verbose: bool) -> Result<()> {
         }
     };
 
+    // Prior briefings injected this session — fed to the compiler so it surfaces
+    // only NEW facts (the assistant already has these in its transcript).
+    let already_injected = crate::ledger::read_recent(
+        &root,
+        &input.session_id,
+        cfg.inject_ledger_entries,
+        cfg.inject_ledger_char_cap,
+    );
+
     let browse_result = rt.block_on(async {
         let timeout = std::time::Duration::from_millis(cfg.inject_browse_timeout_ms);
         tokio::time::timeout(
@@ -408,6 +436,8 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 &root,
                 cfg.inject_max_guides,
                 cfg.inject_max_tokens,
+                cfg.inject_resolve_query,
+                &already_injected,
             )
         ).await
     });
@@ -439,6 +469,9 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
                 project_basename, body
             );
+
+            // Record what we just injected so later turns this session dedup against it.
+            crate::ledger::append(&root, &input.session_id, title_opt.as_deref(), body);
 
             log_event("generate.briefing", None, serde_json::json!({
                 "briefing_chars": body.len(),
@@ -769,16 +802,29 @@ fn render_catalog(items: &[CatalogItem]) -> String {
 const SELECT_PREAMBLE: &str = "\
 You are a relevance gate for a coding assistant's context injector. You are given a CATALOG of \
 available context sources (committed project docs and distilled wiki guides), each as \
-`key — title — summary`. The user message is a SEARCH QUERY describing what the assistant is about \
-to work on — do NOT answer it.\n\n\
-Decide which sources (if any) contain context DIRECTLY relevant to the query. You may decide from \
-the titles and summaries alone — you have no tools and read nothing here.\n\n\
+`key — title — summary`. The user message is the user's CURRENT prompt; any RECENT CONVERSATION \
+below is background to interpret it — do NOT answer anything.\n\n\
+Decide which sources (if any) contain context DIRECTLY relevant to what the user now needs. You \
+may decide from the titles and summaries alone — you have no tools and read nothing here.\n\n\
 Output rules:\n\
-- If one or more sources are directly relevant, output their keys, ONE PER LINE, exactly as shown \
-in the catalog (the part before the first ' — '). Output nothing else.\n\
+- Output the keys of directly-relevant sources, ONE PER LINE, exactly as shown in the catalog (the \
+part before the first ' — '), and nothing else on those lines.\n\
 - If NOTHING is directly relevant, output exactly: NOTHING_RELEVANT\n\
 - Do not include marginally-related sources — when in doubt, leave it out. Injecting irrelevant \
 context is worse than injecting nothing.";
+
+/// Prepended to the gate preamble when `inject_resolve_query` is on. Makes the
+/// (already history-aware) gate first decontextualize the current prompt into a
+/// standalone question — the focal message the compile step then synthesizes for.
+const SELECT_RESOLVE_PREFIX: &str = "\
+Before gating, FIRST resolve the user's CURRENT prompt into a single standalone question:\n\
+- Rewrite it to stand on its own, expanding pronouns and ellipsis using the RECENT CONVERSATION \
+(e.g. after an OAuth discussion, \"and does it support google?\" → \"Does the OAuth support include \
+Google as a provider?\").\n\
+- If the current prompt CHANGES TOPIC from the recent conversation, resolve it on its OWN terms — \
+do NOT drag the previous topic in.\n\
+Emit that standalone question as the VERY FIRST line, exactly: QUERY: <standalone question>\n\
+Then gate as instructed below, judging relevance against that standalone question.\n\n";
 
 // ─── Two-model navigate + compile ─────────────────────────────────────────────
 
@@ -796,6 +842,8 @@ async fn wiki_navigate_and_compile(
     root: &Path,
     max_guides: usize,
     max_tokens: usize,
+    resolve_query: bool,
+    already_injected: &str,
 ) -> Result<NavigateResult> {
     // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
     let catalog = build_catalog(root, wiki_dir, index_rows, hits, CATALOG_MAX);
@@ -812,8 +860,12 @@ async fn wiki_navigate_and_compile(
         });
     }
 
-    // ── TURN 1 (fast model, NO TOOLS): select relevant source keys, or bail ────
-    let mut preamble = String::from(SELECT_PREAMBLE);
+    // ── TURN 1 (fast model, NO TOOLS): resolve the query + select keys, or bail ─
+    let mut preamble = String::new();
+    if resolve_query {
+        preamble.push_str(SELECT_RESOLVE_PREFIX);
+    }
+    preamble.push_str(SELECT_PREAMBLE);
     preamble.push_str("\n\nCATALOG:\n");
     preamble.push_str(&render_catalog(&catalog));
     if !recent.is_empty() {
@@ -846,6 +898,19 @@ async fn wiki_navigate_and_compile(
     };
 
     let sel = selection.trim();
+
+    // Extract the resolved standalone question (if the gate emitted a `QUERY:` line).
+    // This becomes the compile focal message; falls back to the raw prompt.
+    let resolved_query: Option<String> =
+        if resolve_query { sel.lines().find_map(parse_query_line) } else { None };
+    if let Some(ref q) = resolved_query {
+        log_event("inject.resolve", None, serde_json::json!({
+            "raw": truncate(current_prompt, 200),
+            "resolved": truncate(q, 200)
+        }));
+    }
+    let focal: &str = resolved_query.as_deref().unwrap_or(current_prompt);
+
     if sel.is_empty() || sel.to_uppercase().contains("NOTHING_RELEVANT") {
         return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
     }
@@ -885,8 +950,9 @@ async fn wiki_navigate_and_compile(
         ollama_api_key,
         ollama_base_url,
         compile_spec,
-        current_prompt,
+        focal,
         recent,
+        already_injected,
         &guides,
         wiki_dir,
         root,
@@ -925,6 +991,7 @@ async fn compile_briefing(
     spec: &ModelSpec,
     current_prompt: &str,
     recent: &str,
+    already_injected: &str,
     guides: &[(String, String)],
     wiki_dir: &Path,
     root: &Path,
@@ -951,6 +1018,16 @@ async fn compile_briefing(
     if !recent.is_empty() {
         context.push_str("RECENT CONVERSATION (background only):\n\n");
         context.push_str(recent);
+        context.push_str("\n\n");
+    }
+    if !already_injected.is_empty() {
+        context.push_str(
+            "ALREADY IN THE ASSISTANT'S CONTEXT — the facts below were injected on earlier turns \
+this session and are STILL VISIBLE to the assistant. Do NOT repeat them. Surface ONLY facts from \
+the sources that ADD new information for the current question. If the sources contain nothing \
+beyond what is listed here, output exactly: TITLE: none\n\n",
+        );
+        context.push_str(already_injected);
         context.push_str("\n\n");
     }
     context.push_str("SOURCE DOCUMENTS (line-numbered; synthesize only what is relevant):\n\n");
@@ -1084,5 +1161,28 @@ fn format_guides(guides: &[String]) -> String {
         "(none)".to_string()
     } else {
         guides.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_query_line;
+
+    #[test]
+    fn parse_query_line_handles_model_formatting() {
+        // Plain, the happy path.
+        assert_eq!(
+            parse_query_line("QUERY: Does the OAuth support include Google?").as_deref(),
+            Some("Does the OAuth support include Google?")
+        );
+        // Case-insensitive, extra whitespace.
+        assert_eq!(parse_query_line("query:   trimmed  ").as_deref(), Some("trimmed"));
+        // Markdown bullet + bold wrappers (common model embellishments).
+        assert_eq!(parse_query_line("- **QUERY:** how does billing work?").as_deref(), Some("how does billing work?"));
+        assert_eq!(parse_query_line("• QUERY: foo").as_deref(), Some("foo"));
+        // Not a query line / empty payload → None (falls back to raw prompt).
+        assert_eq!(parse_query_line("inject-subcommand"), None);
+        assert_eq!(parse_query_line("QUERY:"), None);
+        assert_eq!(parse_query_line("NOTHING_RELEVANT"), None);
     }
 }

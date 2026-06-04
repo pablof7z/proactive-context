@@ -17,6 +17,7 @@ mod doctor;
 mod embed;
 mod events;
 mod inject;
+mod ledger;
 mod openrouter;
 mod provider;
 mod query;
