@@ -217,7 +217,8 @@ Implemented §5 tag-don't-drop (commit `5d018fa`) and re-ran on this project. Re
 
 ## 10. Open questions
 
-1. **Routing (the priority).** Canonical topic→slug so an update lands where the original claim lives? Cross-slug supersession (a claim can retire a claim in a *different* slug)? This is the next experiment.
+1. **Routing (the priority).** Canonical topic→slug so an update lands where the original claim lives? Cross-slug supersession (a claim can retire a claim in a *different* slug)? Topic-organized full-catalog routing — see §11.5(2). This is the next experiment.
+1b. **Staleness retirement (NEW, §11.5(3)).** How to retire content that goes stale by *absence of signal* (no contradicting claim ever arrives — e.g. nmp 0.1.0 → 0.2.0), under the keep-everything rule (demote+breadcrumb, never delete). Code-grounding is the strongest detector.
 2. **The cascade gap.** When a rule is superseded, how do dependent claims that only existed because of it get retired? (Spin 1's main real failure.)
 3. **Projection: deterministic vs LLM-assisted** — and if LLM, how to guarantee it covers exactly the live set (no silent drops, the Spin 3 failure mode).
 4. **History granularity** — which user-superseded claims are worth keeping as archaeology vs which are clutter (§6).
@@ -234,6 +235,41 @@ Implemented §5 tag-don't-drop (commit `5d018fa`) and re-ran on this project. Re
 - **`pc wiki doctor` (deferred compaction)** — cheap insurance *regardless* of which prevention mechanism ships, because it is the **only** option that also **repairs duplicates already in the wiki**. Prunes contradicted implicit claims (per §6) and flags unlinked contradictions; periodic, claim-scoped — never continuous prose regeneration.
 
 **Gating order:** ~~fix routing~~ ✅ → **explicit/implicit tagging + coverage re-measure** (active) → optionally evolve to the **destination** when multi-session scale forces it.
+
+---
+
+## 11.5 Topic-organized routing + staleness retirement (design — 2026-06-01)
+
+Three related decisions from the "172 flat guides" review. #1 has shipped; #2 and #3 are designed here for buy-in before implementation.
+
+### (1) Altitude: no guide-count target — SHIPPED (`21617b2`)
+The RERANK prompt asserted "a healthy whole-project wiki is ~25-30 guides." That is nonsense across project sizes (a 5-file tool vs. a multi-platform app cannot share a count) and unsatisfiable locally, so the model minted noise. **Fix:** altitude is now "one coherent TOPIC a reader opens under one title; split only at real topic seams," with an explicit instruction *not to target any guide count* — the right number falls out of the project's surface area. Project-specific "CONCRETE MERGES" examples (inject/embeddings/daemon, from pc's own wiki) were replaced with a generic over-split-failure-mode rule.
+
+### (2) Topic-organized routing: full-catalog view + `topic` field
+**Problem.** RERANK today sees only the ~8 embedding-recalled candidates *per claim* — no global view — so it mints parallel guides for topics it can't see. And output is flat `wiki_dir/<slug>.md`; there is no `topics/` organization, which the project's own thesis (llm-wiki-style interlinked topic guides) calls for.
+
+**Design.**
+- **RECALL keeps its job (ranking), RERANK gains the global view.** `read_index_live()` already returns the full wiki (slug+title+summary) and is already in scope at ROUTE — it currently only feeds RECALL. Additionally present RERANK the **full catalog organized by topic** (topic → its guides' slug/title/summary), with the per-claim cosine-recalled candidates highlighted as the strongest suggestions. Hierarchy (pick topic among ~10, then guide among ~15) is what makes a global-view decision tractable instead of "choose among 172 flat slugs" — this is *why* full-view routing can work now where unconstrained freedom over-split before (Spin 3: 11 guides for a 6-guide scenario).
+- **ROUTE emits a `topic` per decision, constrained exactly like slugs.** Show ROUTE the existing topic list and bias topic REUSE; otherwise session A's "relay" and session B's "networking" sprawl one level up (the same accretion bug, promoted). New topic only when no existing topic fits.
+- **Physical layout: `topics/<topic>/<slug>.md`.** `topic` added to guide frontmatter.
+
+**Blast radius (enumerated — all assume flat `wiki_dir/<slug>.md`).** `guide_path` (wiki.rs:246); `rebuild_index` (wiki.rs:497) and `read_index_live` (wiki.rs:649) use single-level `read_dir` — must walk one level deeper; inject's catalog builder + `read_catalog_content` (inject.rs:663); doctor's guide addressing; archeologist; **migration of the 4 existing flat wikis**; and a **hard collision** with podcast-player's hand-built `docs/wiki/topics/` KB — pc's topics/ must not clobber it (different frontmatter shape; gate on `compiled-from: conversation`, and/or namespace pc's tree).
+
+**Validation gate (do NOT trust on assertion — this is the lever's track record of failing).** Fresh `--output-dir` rebuild on one real project (nostr), measure: guide count vs. 172, topic distribution, reuse rate, whether over-split reproduces, and **RERANK latency on a ~170-guide full catalog** (the new context cost). Compare against the same project's current flat build.
+
+### (3) Staleness retirement: the absence-of-signal gap (NEW PROBLEM)
+**Why supersession doesn't cover it.** The pipeline only touches a guide when a new capture *routes a claim to it*. A guide goes stale precisely because nobody discusses that topic anymore (e.g. `nmp 0.1.0` after migrating to `0.2.0`) — so no claim routes there, supersession never fires, and the stale guide sits looking authoritative forever. **Supersession is push-based (a new fact contradicts an old one); staleness is the absence of any signal.** A contradicting claim never arrives — that's the whole problem.
+
+**Constraint: demote, never delete.** This must honor the settled **keep-everything / archaeology** rule (§6). Retirement = mark/demote/breadcrumb, NOT removal: render the live tip plus *"Under nmp 0.1.0, X; as of 0.2.0, Y."* Satisfies both "don't present stale as current" and "don't lose history." An auto-deleting pruner would violate the model — explicitly out of scope.
+
+**Where it lives: the periodic `wiki doctor`, not capture.** Same rationale as consolidation — it needs the global, off-hot-path view; capture is per-session and structurally blind to absence.
+
+**Detection signals, by reliability (strongest first):**
+1. **Code-grounding (strongest — grounded in truth, not absence).** A guide cites a symbol / file / version (via its `[^id]` evidence or inline refs) that no longer exists in the repo → strong staleness signal. Deterministic, checkable.
+2. **Topic-version conflict (rides on #2's topic routing).** Two guides in the same `topics/<topic>/` where one names an older version than another / than the code → flag the older as superseded-in-place.
+3. **Age since `verified` (weakest — flag-only, never auto-act).** A `hot`/`warm` guide untouched for a long window → surface for human review, nothing automatic.
+
+**Status:** proposal — needs buy-in before building. Posed by the user as "something we haven't thought about"; this is the spec answer.
 
 ---
 

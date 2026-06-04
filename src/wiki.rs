@@ -255,12 +255,21 @@ pub fn load_guide(path: &Path) -> Option<Guide> {
     parse_guide(&content)
 }
 
-/// Write a guide to disk, creating parent dirs as needed.
+/// Write a guide to disk, creating parent dirs as needed. The body is normalized
+/// into its published (human-readable) form on the way out — see [`normalize_for_publish`].
 pub fn save_guide(path: &Path, guide: &Guide) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serialize_guide(guide))?;
+    let normalized = normalize_for_publish(&guide.body);
+    let content = if normalized == guide.body {
+        serialize_guide(guide)
+    } else {
+        let mut g = guide.clone();
+        g.body = normalized;
+        serialize_guide(&g)
+    };
+    fs::write(path, content)?;
     Ok(())
 }
 
@@ -761,6 +770,112 @@ pub fn collect_citation_markers(text: &str) -> Vec<String> {
     markers
 }
 
+/// Number of bytes in the UTF-8 sequence whose leading byte is `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 { 1 }
+    else if b >> 5 == 0b110 { 2 }
+    else if b >> 4 == 0b1110 { 3 }
+    else if b >> 3 == 0b11110 { 4 }
+    else { 1 }
+}
+
+/// Normalize a guide body into its *published* (committed, human-readable) form.
+/// Idempotent — running it repeatedly yields the same output.
+///
+/// The capture pipeline writes guides with inline `[^id]` citation markers and a
+/// `## See Also` scaffold, both of which are meaningful to the pipeline but render
+/// as broken noise on GitHub/markdown viewers. This collapses the two consumers
+/// (pipeline audit vs. human reader) at the disk-write choke point:
+///
+/// 1. Bare inline `[^id]` markers are wrapped in HTML comments so they render
+///    invisibly, while remaining discoverable by [`collect_citation_markers`]
+///    (the pipeline's carry-forward logic) and preserved for audit.
+/// 2. A trailing `## See Also` section containing no links is dropped (the
+///    bidirectional-link enforcer re-creates it when an actual link is added).
+pub fn normalize_for_publish(body: &str) -> String {
+    strip_empty_see_also(&hide_bare_citation_markers(body))
+}
+
+/// Wrap bare `[^id]` markers — those not already inside an HTML comment — in
+/// `<!-- ... -->`. Markers already inside a comment (e.g. a `<!-- citations: -->`
+/// trailer written by [`revise_section`]) are left untouched, so this is idempotent.
+fn hide_bare_citation_markers(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut i = 0;
+    let mut in_comment = false;
+    while i < bytes.len() {
+        if !in_comment && body[i..].starts_with("<!--") {
+            in_comment = true;
+            out.push_str("<!--");
+            i += 4;
+            continue;
+        }
+        if in_comment && body[i..].starts_with("-->") {
+            in_comment = false;
+            out.push_str("-->");
+            i += 3;
+            continue;
+        }
+        if !in_comment && bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+            if let Some(close_rel) = body[i..].find(']') {
+                let marker = &body[i..i + close_rel + 1];
+                let id = &marker[2..marker.len() - 1];
+                if !id.is_empty() && !id.contains(' ') {
+                    out.push_str("<!-- ");
+                    out.push_str(marker);
+                    out.push_str(" -->");
+                    i += close_rel + 1;
+                    continue;
+                }
+            }
+        }
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Drop a `## See Also` section that contains no links (`[[wikilink]]` or
+/// `[text](url)`). Preserves any content after the section. Idempotent.
+fn strip_empty_see_also(body: &str) -> String {
+    let pos = match find_see_also_pos(body) {
+        Some(p) => p,
+        None => return body.to_string(),
+    };
+    // Span of the See Also section: from its heading to the next heading, or EOF.
+    let after_heading = body[pos..]
+        .find('\n')
+        .map(|n| pos + n + 1)
+        .unwrap_or(body.len());
+    let mut sec_end = body.len();
+    let mut off = after_heading;
+    for line in body[after_heading..].lines() {
+        if line.trim_start().starts_with('#') {
+            sec_end = off;
+            break;
+        }
+        off += line.len() + 1;
+    }
+    let section = &body[pos..sec_end];
+    if section.contains("[[") || section.contains("](") {
+        return body.to_string(); // has real links — keep it
+    }
+    let mut result = String::with_capacity(body.len());
+    result.push_str(body[..pos].trim_end());
+    result.push('\n');
+    let tail = &body[sec_end..];
+    if !tail.trim().is_empty() {
+        result.push('\n');
+        result.push_str(tail);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 /// Find the byte range [start, end) of the section body with the given heading.
 ///
 /// There are two modes:
@@ -975,6 +1090,61 @@ pub fn render_index_for_inject(rows: &[IndexRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hide_bare_citation_markers() {
+        let body = "# G\n\n## Behavior\n\nAvatars fade in over 0.2s. [^19e07-2]\n\n## See Also\n";
+        let out = hide_bare_citation_markers(body);
+        assert!(out.contains("0.2s. <!-- [^19e07-2] -->"), "got: {out}");
+        assert!(!out.contains("0.2s. [^19e07-2]"));
+    }
+
+    #[test]
+    fn test_hide_markers_idempotent_and_skips_comments() {
+        let body = "Text [^a-1] more.\n<!-- citations: [^b-2] [^c-3] -->\n";
+        let once = hide_bare_citation_markers(body);
+        let twice = hide_bare_citation_markers(&once);
+        assert_eq!(once, twice, "not idempotent");
+        // the citations-trailer markers stay inside their original comment, un-rewrapped
+        assert!(once.contains("<!-- citations: [^b-2] [^c-3] -->"));
+        assert!(once.contains("Text <!-- [^a-1] --> more."));
+        // markers still discoverable by the pipeline
+        assert_eq!(collect_citation_markers(&once).len(), 3);
+    }
+
+    #[test]
+    fn test_strip_empty_see_also() {
+        let body = "# G\n\n## Behavior\n\nFoo. [^a]\n\n## See Also\n\n";
+        let out = strip_empty_see_also(body);
+        assert!(!out.contains("See Also"), "empty See Also not stripped: {out}");
+        assert!(out.contains("Foo. [^a]"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_keep_see_also_with_links() {
+        let body = "# G\n\n## Behavior\n\nFoo.\n\n## See Also\n\n- [[other-guide|Other]]\n";
+        let out = strip_empty_see_also(body);
+        assert!(out.contains("## See Also"), "See Also with links wrongly stripped");
+        assert!(out.contains("[[other-guide|Other]]"));
+    }
+
+    #[test]
+    fn test_normalize_for_publish_idempotent() {
+        let body = "# G\n\n## Behavior\n\nAvatars fade in. [^19e07-2]\n\n## See Also\n\n";
+        let once = normalize_for_publish(body);
+        let twice = normalize_for_publish(&once);
+        assert_eq!(once, twice);
+        assert!(once.contains("<!-- [^19e07-2] -->"));
+        assert!(!once.contains("## See Also"));
+    }
+
+    #[test]
+    fn test_normalize_preserves_unicode_body() {
+        let body = "# Guía\n\n## Comportamiento\n\nLos íconos se desvanecen → suave. [^x-1]\n\n## See Also\n";
+        let out = normalize_for_publish(body);
+        assert!(out.contains("íconos se desvanecen → suave. <!-- [^x-1] -->"), "got: {out}");
+    }
 
     #[test]
     fn test_parse_serialize_roundtrip() {
