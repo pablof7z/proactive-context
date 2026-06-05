@@ -862,8 +862,11 @@ fn hide_bare_citation_markers(body: &str) -> String {
     out
 }
 
-/// Drop a `## See Also` section that contains no links (`[[wikilink]]` or
-/// `[text](url)`). Preserves any content after the section. Idempotent.
+/// Drop a `## See Also` section ONLY when it is genuinely empty — i.e. it has no visible
+/// content at all, just blank lines and HTML/citation comments (`<!-- ... -->`). A section
+/// holding ANY visible text — link entries (`[[wikilink]]`/`[text](url)`) OR authored prose
+/// — is KEPT verbatim. We never delete links or content (keep-everything). Preserves any
+/// content after the section. Idempotent.
 fn strip_empty_see_also(body: &str) -> String {
     let pos = match find_see_also_pos(body) {
         Some(p) => p,
@@ -883,9 +886,50 @@ fn strip_empty_see_also(body: &str) -> String {
         }
         off += line.len() + 1;
     }
-    let section = &body[pos..sec_end];
-    if section.contains("[[") || section.contains("](") {
-        return body.to_string(); // has real links — keep it
+    // Inspect the section body (after the heading line). It is safe to drop ONLY if every
+    // non-blank line is a link entry or a citation/HTML comment. Any other text → KEEP.
+    let mut has_real_content = false;
+    let mut in_comment = false;
+    for raw in body[after_heading..sec_end].lines() {
+        // Remove any HTML/citation comment spans from this line (handles multi-line comments
+        // via the `in_comment` carry). Whatever text remains is "visible" content.
+        let mut visible = String::new();
+        let mut rest = raw;
+        loop {
+            if in_comment {
+                match rest.find("-->") {
+                    Some(end) => {
+                        rest = &rest[end + 3..];
+                        in_comment = false;
+                    }
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            match rest.find("<!--") {
+                Some(start) => {
+                    visible.push_str(&rest[..start]);
+                    rest = &rest[start..];
+                    in_comment = true;
+                }
+                None => {
+                    visible.push_str(rest);
+                    break;
+                }
+            }
+        }
+        // Any visible non-blank text — a link entry OR authored prose — counts as content.
+        // Only a section whose visible content is entirely blank (just whitespace + HTML/
+        // citation comments) is considered empty and safe to drop.
+        if !visible.trim().is_empty() {
+            has_real_content = true;
+            break;
+        }
+    }
+    if has_real_content {
+        return body.to_string(); // section holds links or authored content — never delete it
     }
     let mut result = String::with_capacity(body.len());
     result.push_str(body[..pos].trim_end());
@@ -1152,6 +1196,31 @@ mod tests {
         let out = strip_empty_see_also(body);
         assert!(out.contains("## See Also"), "See Also with links wrongly stripped");
         assert!(out.contains("[[other-guide|Other]]"));
+    }
+
+    #[test]
+    fn test_keep_see_also_with_prose_content() {
+        // Regression: a See Also section holding authored prose + a citation comment (a
+        // capture quirk that misfiles content under the heading) must NOT be deleted —
+        // that destroyed cited content in a real --retopic --apply run (keep-everything).
+        let body = "# G\n\n## Behavior\n\nFoo.\n\n## See Also\n\n\
+                    If X allows swipe-to-dismiss, the handler would trigger auto-send.\n\n\
+                    <!-- citations: [^5b223-2] -->\n";
+        let out = normalize_for_publish(body);
+        assert!(out.contains("swipe-to-dismiss"), "deleted authored See-Also content: {out}");
+        assert!(out.contains("[^5b223-2]"), "lost citation under See Also");
+        assert!(out.contains("## See Also"), "wrongly dropped a non-empty See Also");
+        // still idempotent
+        assert_eq!(out, normalize_for_publish(&out));
+    }
+
+    #[test]
+    fn test_strip_see_also_with_only_comment_and_links() {
+        // A See Also whose only non-blank content is links + a citation comment IS empty
+        // enough to drop (the comment is a stray trailer, not authored prose).
+        let body = "# G\n\n## Behavior\n\nFoo. [^a-1]\n\n## See Also\n\n<!-- citations: [^a-1] -->\n";
+        let out = strip_empty_see_also(body);
+        assert!(!out.contains("## See Also"), "comment-only See Also should be dropped: {out}");
     }
 
     #[test]
