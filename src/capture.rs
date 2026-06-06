@@ -594,9 +594,10 @@ desired-state product spec.\n\n\
 - `assertion`: one self-contained statement of how the product SHOULD work.\n\
 - `evidence`: 1+ transcript line ranges (1-based, inclusive) that SUPPORT the assertion. \
 The cited lines must literally contain the basis for the claim.\n\
-- `ratified`: set TRUE only when a claim originates from the ASSISTANT proposing something \
-AND a LATER USER turn explicitly endorses/accepts/approves it (e.g. 'yes do that', 'go ahead'). \
-For claims the USER stated directly, `ratified` is irrelevant — set false. \
+- `ratified`: set TRUE when the user is the authority behind the claim — either (a) the \
+USER stated it directly, or (b) the ASSISTANT proposed it and a LATER USER turn explicitly \
+endorses/accepts/approves it (e.g. 'yes do that', 'go ahead'). Set FALSE for assistant \
+proposals the user never explicitly endorsed. \
 Do NOT report an `author` field; authorship is determined mechanically downstream.\n\n\
 ## Rules\n\
 - Decisions, requirements, behaviors, constraints, gotchas — capture them.\n\
