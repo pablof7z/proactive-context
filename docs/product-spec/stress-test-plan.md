@@ -79,7 +79,7 @@ Edit `~/.proactive-context/config.json` (back it up first; restore after). Usefu
 - `capture_triage_model` → set `""` to disable triage (always proceed).
 - `capture_debounce_secs` → set 1 to make the Stop-hook path testable quickly.
 - `openrouter_api_key` → temporarily blank to force no-API-key paths (restore after!).
-- `capture_max_turns` → set 1 to constrain the agent loop.
+- `capture_max_turns` → legacy knob; kept for config compatibility but the staged pipeline currently ignores it.
 
 ---
 
@@ -169,17 +169,17 @@ Verify: run once with a valid transcript_path and once with a bogus path — bot
 ### CAP-01 — Triage NO (transient/already-specified) → no wiki change — CRITICAL
 Setup: fresh wiki. Transcript that is purely transient (e.g. "git pull", "moved a file", small talk) but ≥500 chars & ≥3 exchanges. Unique SID.
 Action: `$BIN capture` via stdin.
-Expected: triage returns NO → `capture.triage(result:"skip")`, return before agent loop. **No guide files created, no `_citations.log`, no `capture.start`.**
+Expected: triage returns NO → `capture.triage(result:"skip")`, return before staged capture. **No guide files created, no `_citations.log`, no `capture.start`.**
 Verify: `wiki/` absent or unchanged; event `capture.triage` with `result=skip`; no `capture.start`/`wiki.create`. Then re-run capture on a transcript whose content is **already fully in the wiki** → also expect skip (triage gets the wiki index for the "already specified" check).
 
-### CAP-02 — Triage YES → agent loop runs — CRITICAL
+### CAP-02 — Triage YES → staged capture pipeline runs — CRITICAL
 Setup: fresh wiki; the sentinel transcript (0.4). Unique SID.
 Action: `$BIN capture`.
-Expected: `capture.triage(result:"proceed")` → `capture.start` → wiki_* tool events (`wiki.list`, `wiki.create`/`wiki.add_statement`/...) → `capture.agent_done` → structural maintenance (`wiki.index_read action:rebuilt`) → `capture.done`.
+Expected: `capture.triage(result:"proceed")` → `capture.start` → staged events (`capture.extract`, `capture.route_recall`, `capture.route`) plus wiki mutation events (`wiki.create`/`wiki.add_statement`/`wiki.revise_statement`/...) → `capture.agent_done` → structural maintenance (`wiki.index_read action:rebuilt`) → `capture.done`.
 Verify: at least one guide file created; run the **UNIVERSAL INTEGRITY AUDIT (0.6)**.
 
 ### CAP-03 — create / add / revise / remove in one driven session — CRITICAL
-This needs the agent to perform multiple mutation types. Since the agent is autonomous, drive it via transcript content that *demands* each op, OR run a sequence of captures across crafted transcripts:
+This needs the staged pipeline to perform multiple mutation types. Since routing/reconcile are model-driven, drive them via transcript content that *demands* each op, OR run a sequence of captures across crafted transcripts:
 - (create) transcript introduces a new spec fact → expect `wiki.create`.
 - (add) second capture (new SID, **new transcript extending the first** so dedup doesn't fire) adds a *new statement to an existing section* of the same guide → expect `wiki.add_statement`.
 - (revise) third capture whose transcript **reverses** a prior fact ("actually, make it a modal not a hovercard") → expect `wiki.revise_statement`; prior `[^id]`s preserved (see CAP-05).
@@ -204,7 +204,7 @@ Setup: after a successful capture (CAP-02), same SID, same transcript (unchanged
 Action: `$BIN capture` again.
 Expected: `is_already_captured` true (`captured_at_exchanges` >= current) → "already captured ... skipping", **no wiki mutation, no new `_citations.log` entries, no new guide events.**
 Verify: snapshot `wiki/` + `_citations.log` byte size before/after — identical. No new `capture.start`. Then **extend the transcript** (append exchanges) and re-run → expect it proceeds (exchanges increased past marker).
-Bug to watch (REG): `mark_captured` is written *before* the agent loop (CAP-12) — confirm a *successful* re-run is correctly a no-op, and separately test the failure case in CAP-12.
+Bug to watch (REG): errored/timed-out staged runs may still be marked attempted (CAP-12) — confirm a *successful* re-run is correctly a no-op, and separately test the failure case in CAP-12.
 
 ### CAP-07 — Positive-specification framing — NTH (semantic)
 Verify guide prose describes **desired state** ("On the feed, tapping an avatar opens a hovercard"), not events ("avatar was broken"/"remember to..."). Read created guides.
@@ -230,10 +230,10 @@ Action: `echo '{...}' | $BIN capture --in 1`. Returns immediately, spawns a deta
 Expected: only ONE capture eventually runs (the latest scheduled wins; `scheduled_at_secs != launched_at` guard cancels the superseded run). After ~2s, a `capture.done` for the SID.
 Verify: exactly one `capture.start`/`capture.done` pair for the SID; pending-captures files cleaned up. Bug to watch: double-capture (both deferred runners proceed) or zero-capture (both cancel each other).
 
-### CAP-12 — mark_captured BEFORE agent loop → failed capture is lost forever — CRITICAL (suspected bug)
-Setup: fresh wiki, valid transcript that passes triage. Force the agent to FAIL: set `capture_model` to a bogus model id (e.g. `"anthropic/does-not-exist"`) so the agent loop errors. Unique SID.
+### CAP-12 — failed staged capture is marked attempted → retry is skipped — CRITICAL (suspected bug)
+Setup: fresh wiki, valid transcript that passes triage. Force staged capture to FAIL: set `capture_model` to a bogus model id (e.g. `"anthropic/does-not-exist"`) so the capture run errors. Unique SID.
 Action: `$BIN capture`.
-Expected per code: `mark_captured` is called *before* `run_wiki_agent`; on agent error, `error(stage:"wiki.agent")` is logged but the marker persists. A subsequent re-run with valid model + same transcript → **skipped as already-captured**, so the lessons are permanently lost.
+Expected per code: `error(stage:"wiki.agent")` is logged and the marker is still written after the attempted run. A subsequent re-run with valid model + same transcript → **skipped as already-captured**, so the lessons are permanently lost.
 Verify: confirm `captured-sessions/<SID>.json` exists after the failed run; restore a valid model; re-run same SID/transcript → it skips (no `capture.start`). **Report this as a correctness bug** (capture is meant to be guarantee-of-last-resort). 
 
 ### CAP-13 — Capture too-short guard — NTH
@@ -439,8 +439,8 @@ The select agent, compile agent, and capture agent all pass `max_tokens` via BOT
 Verify (behavioral proxy): inject compile output never balloons (out_words bounded by `inject_max_tokens` default 700). If a logging proxy is available, capture the outbound OpenRouter body and assert `max_tokens` present for select(300)/compile(700)/agent(2000). Otherwise mark as code-confirmed.
 
 ### REG-02 — Capture retry on transient OpenRouter errors — CRITICAL (scoped)
-`call_openrouter` (triage only) retries up to 3 attempts on 429/5xx with backoff. **The wiki agent loop uses rig's client and does NOT have this 3-attempt retry.** 
-Verify: do NOT assert the agent loop retries (it doesn't). For the triage path, if you can inject a transient failure (e.g. point at a proxy returning 503 twice then 200), confirm it retries and succeeds; else code-confirm. Report the asymmetry (agent loop has no retry, only a 300s timeout) as a robustness note.
+`call_openrouter` (triage only) retries up to 3 attempts on 429/5xx with backoff. **The staged capture calls do NOT have this 3-attempt retry.**
+Verify: do NOT assert the staged pipeline retries (it doesn't). For the triage path, if you can inject a transient failure (e.g. point at a proxy returning 503 twice then 200), confirm it retries and succeeds; else code-confirm. Report the asymmetry (staged capture has no retry, only a 300s timeout) as a robustness note.
 
 ### REG-03 — inject `verbose` flag preserved end-to-end — CRITICAL
 Confirm `--verbose` reaches `run_inject(verbose)` and changes output shape (JSON vs raw) in every arm: skipped, short-circuit, compiled, fallback, error, timeout, no-index. 
@@ -478,7 +478,7 @@ Spec §"Per-project wiki write-lock" says mutating tools serialize on a project 
 **Counts by category:** INJECT 13 · CAPTURE 13 · E2E 4 · STATUSLINE 10 · TAIL 6 · ADVERSARIAL 13 · REGRESSION/DIVERGENCE 6 → **65 scenarios** (CRITICAL: ~45).
 
 **Top 7 most likely to surface real bugs:**
-1. **CAP-12** — `mark_captured` runs *before* the agent loop; a failed/timed-out capture is marked done and never retried → lessons permanently lost.
+1. **CAP-12** — a failed/timed-out staged capture is marked attempted and never retried → lessons permanently lost.
 2. **ADV-01** — structural maintenance (`rebuild_index` / `enforce_bidirectional_links` / `index_files_into_db`) runs OUTSIDE the project wiki lock → concurrent same-project captures race on `_index.md` and guide rewrites.
 3. **ADV-08** — citation log written even when the mutation fails (wrong heading) → orphan `_citations.log` entries + counter gaps (caught by AUDIT #2).
 4. **ADV-09** — out-of-range evidence → empty Rust slice → empty `_citations.log` entry with a real marker in prose → an assertion that *looks* cited but isn't (caught by AUDIT #3).

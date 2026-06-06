@@ -772,8 +772,6 @@ fn run_retopic(
 
     #[derive(serde::Deserialize)]
     struct Taxonomy {
-        #[serde(default)]
-        topics: Vec<String>,
         assignments: HashMap<String, String>,
     }
     let tax: Taxonomy = serde_json::from_str(&json)

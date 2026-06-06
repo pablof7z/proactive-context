@@ -1977,6 +1977,11 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
     };
     let feed_block = Block::default().borders(Borders::ALL).title(feed_title);
     let feed_inner_h = feed_block.inner(chunks[2]).height as usize;
+    let total = view.feed.len();
+    // Window of feed_inner_h rows, anchored to the bottom (newest). The cursor moves *within*
+    // this window; the window only scrolls up once the cursor climbs above its top. This keeps
+    // the rows below the cursor visible instead of peeling them off the bottom on every Up.
+    let cursor_idx = feed_cursor_idx(total, view.feed_scroll);
     let (start, end) = feed_window(total, feed_inner_h, view.feed_scroll, cursor_idx);
     let items: Vec<ListItem> = view
         .feed

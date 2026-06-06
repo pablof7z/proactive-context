@@ -35,7 +35,7 @@
 | CAP-09 | CAPTURE | PASS | `_index.md` slugs match guide files exactly: `{avatar-behavior, profile-updates, search-behavior, sidebar-behavior}`. |
 | CAP-10 | CAPTURE | PASS (partial) | `index.db` (6.1MB) created after capture (stderr: `"Index complete: 5 files, 6 chunks"`). Live query BLOCKED (embedding 403). |
 | CAP-11 | CAPTURE | SKIPPED | NTH; debounce timing test requires idle environment. |
-| CAP-12 | CAPTURE | FAIL — BUG CONFIRMED | See Bug #2 below. `mark_captured` runs before agent loop; bogus model → agent fails → marker persists → re-run skipped. Also observed live: CAP-01 session hit API 403 → `mark_captured` already written → same session cannot retry even after limit resets. |
+| CAP-12 | CAPTURE | FAIL — BUG CONFIRMED | See Bug #2 below. Bogus model → staged capture fails → marker persists → re-run skipped. Also observed live: CAP-01 session hit API 403 → same session could not retry even after limit reset. |
 | CAP-13 | CAPTURE | PASS | Short transcript (32 chars, 1 exchange) → `"too short — skipping"`. No `capture.triage` event logged. |
 | E2E-01 | E2E | BLOCKED | Embedding 403 rate limit. Structurally verified: CAP-02 wiki created correct guides, inject code path reads wiki index even with 0 vector hits. |
 | E2E-02 | E2E | BLOCKED | Rate limit. |
@@ -73,8 +73,8 @@
 | ADV-11(d) | ADVERSARIAL | PASS | Literal user-typed `[^fake-99]` marker: Audit check #1 correctly flags it as dangling (no log entry). Inject still slices fine; preamble appears (body contains `[^`). |
 | ADV-12 | ADVERSARIAL | SKIPPED | NTH; race timing impractical to reliably trigger in automated test. |
 | ADV-13 | ADVERSARIAL | SKIPPED | NTH; need concurrent captures with same 5-char prefix. |
-| REG-01 | REGRESSION | PASS | Code-confirmed: select agent `.max_tokens(300)` + `.additional_params({"max_tokens":300})`; compile agent same with configured `max_tokens`; wiki agent `.max_tokens(2000)` + `.additional_params({"max_tokens":2000})`. Triage call: no max_tokens (acceptable — YES/NO, small). |
-| REG-02 | REGRESSION | PASS | Code-confirmed: `call_openrouter` (triage path) retries up to 3× on 429/5xx. Wiki agent (rig client) has no explicit retry; 300s timeout. Asymmetry documented. |
+| REG-01 | REGRESSION | PASS | Code-confirmed: select agent `.max_tokens(300)` + `.additional_params({"max_tokens":300})`; compile agent same with configured `max_tokens`; staged capture calls pass explicit max token budgets. Triage call: no max_tokens (acceptable — YES/NO, small). |
+| REG-02 | REGRESSION | PASS | Code-confirmed: `call_openrouter` (triage path) retries up to 3× on 429/5xx. Staged capture calls have no explicit retry; 300s timeout. Asymmetry documented. |
 | REG-03 | REGRESSION | PARTIAL | Skipped arm: verbose emits `systemMessage`. Short-circuit: verbose emits `systemMessage` (confirmed from prior non-rate-limited run). Retrieval-error arm (inject.rs:303-315): `return Ok()` with **no `emit` call** — verbose mode produces empty output. Minor violation: one arm ignores `verbose` flag. |
 | REG-04 | REGRESSION | PASS | `inject.done` payload `{title:"Precise Test Title", out_words:123, lat_ms:3456}` → statusline renders `⬡ Precise Test Title · 123w · 3.5s · Project Wiki: 2 guides`. Byte-for-byte match. |
 | DIV-01 | DIVERGENCE | REPORT | See Divergences section below. |
@@ -169,10 +169,10 @@ fn cap_tail_bytes(s: &str, cap: usize) -> String {
 
 ---
 
-### Bug #3 — CAP-12: mark_captured before agent loop → failed captures permanently lost (HIGH)
+### Bug #3 — CAP-12: failed staged captures are marked attempted (HIGH)
 
 **Severity:** HIGH — permanent data loss on any agent failure  
-**File:line:** `src/capture.rs:1437` (mark_captured), `src/capture.rs:1443` (agent loop)
+**File:** `src/capture.rs`
 
 **Repro:**
 ```bash
@@ -200,21 +200,7 @@ echo '{"session_id":"cap12-test","cwd":"/tmp/test","transcript_path":"/tmp/valid
 
 **Live impact:** OpenRouter 403 rate-limit errors during this test run caused real sessions (e.g., CAP-01 session) to be permanently marked as captured despite zero wiki mutations.
 
-**Root cause:** `mark_captured` (line 1437) runs unconditionally before `run_wiki_agent` (line 1443). Any agent error/timeout/API failure marks the session as done.
-
-**Suggested fix:** Move `mark_captured` to after a successful agent run:
-```rust
-match agent_result {
-    Ok(Ok(summary)) => {
-        let _ = mark_captured(&input.session_id, exchanges); // move here
-        // ... log success
-    }
-    Ok(Err(e)) | Err(e) => {
-        // delete marker if exists? or don't write it
-        // ... log error
-    }
-}
-```
+**Status in current code:** The old `mark_captured` helper was removed. Capture now writes the marker via `mark_captured_in` after the staged capture run is attempted, so setup/API failures before the run do not suppress retry. The remaining policy question is whether errored or timed-out staged runs should be marked as attempted, or only fully successful runs should be marked.
 
 ---
 
@@ -225,7 +211,7 @@ match agent_result {
 **Severity:** MEDIUM — data integrity risk under concurrent load  
 **File:line:** `src/capture.rs:1479-1499` (post-loop maintenance)
 
-**Observed (structural):** After the wiki agent loop completes, `enforce_bidirectional_links`, `rebuild_index`, and `index_files_into_db` run with only the per-session flock held — not the project wiki lock. Two concurrent captures of the same project that both complete their agent loops simultaneously can race on `_index.md` writes and on re-serializing every guide (which `enforce_bidirectional_links` does).
+**Observed (structural):** After staged capture completes, `enforce_bidirectional_links`, `rebuild_index`, and `index_files_into_db` run with only the per-session flock held — not the project wiki lock. Two concurrent captures of the same project that both complete simultaneously can race on `_index.md` writes and on re-serializing every guide (which `enforce_bidirectional_links` does).
 
 **Live test:** Blocked by rate limit. Not observed in practice during this test run.
 

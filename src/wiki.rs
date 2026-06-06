@@ -664,7 +664,7 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
 /// exist on disk but are absent from the cache. ROUTE reading the stale cache was blind
 /// to its own recent siblings and minted near-duplicate slugs for the same topic.
 ///
-/// Mirrors `WikiListTool::call`'s filter (skips any `_`-prefixed file, e.g. `_index`,
+/// Mirrors capture's live-guide filter (skips any `_`-prefixed file, e.g. `_index`,
 /// `_citations`) and reuses `rebuild_index`'s row construction, but performs NO write —
 /// it is a pure read so it is safe to call on every ROUTE without churning the cache.
 /// Inject/statusline keep using the cheap `read_index` cache read to stay within budget.
@@ -902,10 +902,7 @@ fn strip_empty_see_also(body: &str) -> String {
                         rest = &rest[end + 3..];
                         in_comment = false;
                     }
-                    None => {
-                        rest = "";
-                        break;
-                    }
+                    None => break,
                 }
             }
             match rest.find("<!--") {

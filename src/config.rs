@@ -152,8 +152,9 @@ pub struct Config {
     pub inject_ledger_char_cap: usize,
 
     // ---- Citation-anchored capture (v0.4) ----
-    /// Maximum number of turns the wiki_* tool-calling agent loop may take during capture.
-    /// Higher values allow more thorough wiki edits at the cost of latency/tokens.
+    /// Legacy max-turn setting for the pre-v0.4 tool-calling capture loop.
+    /// The staged capture pipeline is fixed-shot and currently ignores this value; kept
+    /// to avoid breaking existing configs.
     /// Default: 16
     #[serde(default = "default_capture_max_turns")]
     pub capture_max_turns: usize,
@@ -409,7 +410,7 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_ledger_entries = 50;
     }
 
-    // Citation-anchored capture: max turns for wiki_* agent loop
+    // Citation-anchored capture: legacy max-turn setting.
     if c.capture_max_turns < 1 {
         c.capture_max_turns = 1;
     } else if c.capture_max_turns > 64 {

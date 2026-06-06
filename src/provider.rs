@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rig_core::providers::{ollama, openrouter};
+use rig_core::providers::ollama;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Provider {
@@ -44,11 +44,6 @@ impl ModelSpec {
             Provider::Ollama => "Ollama",
         }
     }
-}
-
-pub fn build_openrouter_client(api_key: &str) -> Result<openrouter::Client> {
-    openrouter::Client::new(api_key.to_string())
-        .map_err(|e| anyhow::anyhow!("OpenRouter client: {}", e))
 }
 
 pub fn build_ollama_client(base_url: &str, api_key: Option<&str>) -> Result<ollama::Client> {
