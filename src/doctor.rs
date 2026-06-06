@@ -42,7 +42,7 @@ use crate::embed::{build_embedder, Embedder};
 use crate::provider::ModelSpec;
 use crate::route_recall::cosine;
 use crate::wiki::{
-    self, enforce_bidirectional_links, read_index_live, wiki_dir, Guide, GuideFrontmatter,
+    self, enforce_bidirectional_links, read_index_live, wiki_dir, Guide,
     IndexRow,
 };
 use anyhow::{Context, Result};
