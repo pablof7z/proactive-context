@@ -2592,7 +2592,7 @@ fn strip_harness_xml(text: &str) -> String {
 /// `max_chars` — preserves whole turns rather than cutting mid-sentence.
 ///
 /// Note: tool_result and tool_use content blocks are already excluded upstream by
-/// `parse_transcript` / `extract_text` (only `type:"text"` blocks reach `turns`).
+/// `parse_transcript` / `extract_text`; only text-bearing content blocks reach `turns`.
 fn build_open_questions_transcript(turns: &[(String, String)], max_chars: usize) -> String {
     let labeled: Vec<String> = turns.iter().filter_map(|(role, text)| {
         let cleaned = strip_harness_xml(text);

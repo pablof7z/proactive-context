@@ -85,13 +85,46 @@ Global config lives at `~/.proactive-context/config.json`. Per-project state (in
 
 ## The assistant integration
 
-The engine is standalone, but the two motions come alive when they hook into an assistant's lifecycle. Today that integration is [Claude Code](https://claude.com/claude-code), via its hooks:
+The engine is standalone, but the two motions come alive when they hook into an assistant's lifecycle. Today that integration works with [Claude Code](https://claude.com/claude-code) and Codex, via lifecycle hooks:
 
 - **`UserPromptSubmit` → `inject`** — compiles the cited briefing and prepends it to your prompt. Fast, synchronous, and degrades to a free raw-hits fallback (or silence) before it would ever block a turn.
 - **`SessionEnd` (or a debounced `Stop`) → `capture`** — distills the finished session into the wiki, off the hot path. The debounce survives the hook process dying, so capture runs after you've actually stopped, not on every turn.
 - **`statusLine` → `statusline`** — a sub-10ms, no-network indicator of what the system did this turn.
 
-Nothing about capture-then-inject is specific to Claude Code, or to code — it's the lifecycle of any assistant that has a beginning and end of turn. Claude Code is simply the host that exposes those seams today.
+Codex exposes compatible `UserPromptSubmit`, `SessionStart`, and `Stop` hooks. Configure them in `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+
+[[hooks.SessionStart]]
+matcher = ""
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/path/to/pc session-start"
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+matcher = ""
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/path/to/pc inject"
+timeout = 60
+
+[[hooks.Stop]]
+matcher = ""
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/path/to/pc capture --in 300"
+timeout = 30
+```
+
+In the Codex TUI, injected hook output is shown as `UserPromptSubmit hook (completed)` and is added to model-visible context. In current Codex builds, `codex exec` may not execute lifecycle hooks even though the interactive session does.
+
+Nothing about capture-then-inject is specific to Claude Code, Codex, or code — it's the lifecycle of any assistant that has a beginning and end of turn.
 
 To watch it think, in any terminal:
 

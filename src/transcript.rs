@@ -1,84 +1,234 @@
 use anyhow::Result;
+use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRole {
+    User,
+    Assistant,
+}
+
+impl TranscriptRole {
+    fn parse(role: &str) -> Option<Self> {
+        match role {
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawMessage {
+    role: String,
+    content: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMessage {
+    role: TranscriptRole,
+    text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LineMeta {
+    cwd: Option<String>,
+    timestamp: Option<String>,
+    is_sidechain: bool,
+    is_meta: bool,
+}
+
+impl LineMeta {
+    fn has_value(&self) -> bool {
+        self.cwd.is_some() || self.timestamp.is_some() || self.is_sidechain || self.is_meta
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedLine {
+    message: Option<ParsedMessage>,
+    meta: LineMeta,
+}
+
+type MessageDecoder = fn(&Value) -> Option<RawMessage>;
+
+const MESSAGE_DECODERS: &[MessageDecoder] = &[
+    decode_claude_code_message,
+    decode_flat_message,
+    decode_codex_response_item,
+];
+
 /// Extract plain text from a message `content` value (string or block array).
-pub(crate) fn extract_text(content: &serde_json::Value) -> String {
+pub(crate) fn extract_text(content: &Value) -> String {
     match content {
         // Skip harness-injected XML messages: <task-notification>, <system-reminder>,
         // raw tool output with <tool-use-id>/<output-file>, etc. Human prose never
         // starts with '<'; these do.
-        serde_json::Value::String(s) if s.trim_start().starts_with('<') => String::new(),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(blocks) => blocks
+        Value::String(s) => visible_text(s).unwrap_or_default().to_string(),
+        Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|b| {
-                if b.get("type")?.as_str()? == "text" {
-                    b.get("text")?.as_str().map(str::to_string)
-                } else {
-                    None
-                }
-            })
+            .filter_map(extract_text_block)
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
     }
 }
 
-/// Parse a Claude Code JSONL transcript into `(role, text)` pairs.
-/// Supports the nested format `{ type: user/assistant, message: { role, content } }`
-/// and the flat format `{ role, content }`.
-pub(crate) fn parse_transcript(path: &str) -> Result<Vec<(String, String)>> {
-    let content = fs::read_to_string(path)?;
-    let mut turns = Vec::new();
+fn visible_text(text: &str) -> Option<&str> {
+    (!text.trim_start().starts_with('<')).then_some(text)
+}
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Nested Claude Code format: { "type": "user"|"assistant", "message": { ... } }
-        // Flat format: { "role": "user"|"assistant", "content": ... }
-        let (role, content_val) = {
-            let top = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if top == "user" || top == "assistant" {
-                let msg = entry.get("message");
-                let role = msg
-                    .and_then(|m| m.get("role"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or(top)
-                    .to_string();
-                let content = msg
-                    .and_then(|m| m.get("content"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                (role, content)
-            } else if let Some(r) = entry.get("role").and_then(|r| r.as_str()) {
-                let content = entry
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                (r.to_string(), content)
-            } else {
-                continue;
-            }
-        };
-
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let text = extract_text(&content_val).trim().to_string();
-        if !text.is_empty() {
-            turns.push((role, text));
-        }
+fn extract_text_block(block: &Value) -> Option<String> {
+    let ty = block.get("type")?.as_str()?;
+    match ty {
+        // Claude Code content blocks use `text`; Codex session logs use
+        // `input_text` for user messages and `output_text` for assistant messages.
+        "text" | "input_text" | "output_text" => block
+            .get("text")
+            .and_then(|text| text.as_str())
+            .and_then(visible_text)
+            .map(str::to_string),
+        _ => None,
     }
+}
 
-    Ok(turns)
+fn decode_claude_code_message(entry: &Value) -> Option<RawMessage> {
+    let top = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if top == "user" || top == "assistant" {
+        let msg = entry.get("message");
+        let role = msg
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or(top)
+            .to_string();
+        let content = msg
+            .and_then(|m| m.get("content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return Some(RawMessage { role, content });
+    }
+    None
+}
+
+fn decode_flat_message(entry: &Value) -> Option<RawMessage> {
+    if let Some(r) = entry.get("role").and_then(|r| r.as_str()) {
+        let content = entry.get("content").cloned().unwrap_or(Value::Null);
+        return Some(RawMessage {
+            role: r.to_string(),
+            content,
+        });
+    }
+    None
+}
+
+fn decode_codex_response_item(entry: &Value) -> Option<RawMessage> {
+    if entry.get("type").and_then(|v| v.as_str())? != "response_item" {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|v| v.as_str())? != "message" {
+        return None;
+    }
+    let role = payload.get("role").and_then(|r| r.as_str())?.to_string();
+    let content = payload.get("content").cloned().unwrap_or(Value::Null);
+    Some(RawMessage { role, content })
+}
+
+fn decode_message(entry: &Value) -> Option<ParsedMessage> {
+    for decoder in MESSAGE_DECODERS {
+        let Some(raw) = decoder(entry) else {
+            continue;
+        };
+        let Some(role) = TranscriptRole::parse(&raw.role) else {
+            return None;
+        };
+        let text = extract_text(&raw.content).trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        return Some(ParsedMessage { role, text });
+    }
+    None
+}
+
+fn line_meta(entry: &Value) -> LineMeta {
+    LineMeta {
+        cwd: entry
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                entry
+                    .get("payload")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_string),
+        timestamp: entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        is_sidechain: entry
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        is_meta: entry
+            .get("isMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+fn parse_entry(entry: &Value) -> Option<ParsedLine> {
+    let meta = line_meta(entry);
+    let message = decode_message(entry);
+    if message.is_none() && !meta.has_value() {
+        return None;
+    }
+    Some(ParsedLine { message, meta })
+}
+
+fn parse_jsonl_lines(path: &str) -> Result<Vec<ParsedLine>> {
+    let content = fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .filter_map(parse_jsonl_line)
+        .filter_map(|entry| parse_entry(&entry))
+        .collect())
+}
+
+fn parse_jsonl_line(line: &str) -> Option<Value> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    serde_json::from_str(line).ok()
+}
+
+/// Parse an assistant transcript into `(role, text)` pairs.
+/// Supports the nested format `{ type: user/assistant, message: { role, content } }`
+/// and the flat format `{ role, content }` used by Claude Code fixtures, plus
+/// Codex's `response_item` message rows.
+pub(crate) fn parse_transcript(path: &str) -> Result<Vec<(String, String)>> {
+    Ok(parse_jsonl_lines(path)?
+        .into_iter()
+        .filter_map(|line| line.message)
+        .map(|message| (message.role.as_str().to_string(), message.text))
+        .collect())
 }
 
 // ─── Rich transcript message (archeologist / per-message metadata) ────────────
@@ -105,83 +255,25 @@ pub struct TranscriptMessage {
 /// **Does not change `parse_transcript`** — existing callers (`capture.rs`, `inject.rs`) are
 /// unaffected. This is a sibling, not a replacement.
 pub fn parse_transcript_meta(path: &str) -> Result<Vec<TranscriptMessage>> {
-    let content = fs::read_to_string(path)?;
-    let mut messages = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Reuse the same role/content extraction as parse_transcript.
-        let (role, content_val) = {
-            let top = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if top == "user" || top == "assistant" {
-                let msg = entry.get("message");
-                let role = msg
-                    .and_then(|m| m.get("role"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or(top)
-                    .to_string();
-                let content = msg
-                    .and_then(|m| m.get("content"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                (role, content)
-            } else if let Some(r) = entry.get("role").and_then(|r| r.as_str()) {
-                let content = entry
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                (r.to_string(), content)
-            } else {
-                continue;
-            }
-        };
-
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-
-        let text = extract_text(&content_val).trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-
-        let timestamp = entry
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let is_sidechain = entry
-            .get("isSidechain")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let is_meta = entry
-            .get("isMeta")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        messages.push(TranscriptMessage {
-            role,
-            text,
-            timestamp,
-            is_sidechain,
-            is_meta,
-        });
-    }
-
-    Ok(messages)
+    Ok(parse_jsonl_lines(path)?
+        .into_iter()
+        .filter_map(|line| {
+            let message = line.message?;
+            Some(TranscriptMessage {
+                role: message.role.as_str().to_string(),
+                text: message.text,
+                timestamp: line.meta.timestamp,
+                is_sidechain: line.meta.is_sidechain,
+                is_meta: line.meta.is_meta,
+            })
+        })
+        .collect())
 }
 
-// ─── Cheap picker helpers (one-pass, no full content-block parse) ─────────────
+// ─── Picker helpers ──────────────────────────────────────────────────────────
 
-/// Return the `cwd` field from the first message-bearing line of the transcript.
-/// O(first message line) — early-returns immediately.
+/// Return the first `cwd` field surfaced by a transcript line.
+/// O(first matching line) — early-returns immediately.
 pub fn transcript_cwd(path: &str) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -194,26 +286,21 @@ pub fn transcript_cwd(path: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // Only consider message-bearing lines
-        let top = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let has_role = top == "user" || top == "assistant"
-            || entry.get("role").and_then(|r| r.as_str()).map(|r| r == "user" || r == "assistant").unwrap_or(false);
-        if !has_role {
+        let Some(entry) = parse_jsonl_line(&line) else {
             continue;
-        }
-        if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
-            return Some(cwd.to_string());
+        };
+        let Some(parsed) = parse_entry(&entry) else {
+            continue;
+        };
+        if let Some(cwd) = parsed.meta.cwd {
+            return Some(cwd);
         }
     }
     None
 }
 
-/// Return the RFC3339 timestamp from the first message-bearing line of the transcript.
-/// O(first message line) — early-returns immediately.
+/// Return the first RFC3339 timestamp surfaced by a transcript line.
+/// O(first matching line) — early-returns immediately.
 pub fn transcript_first_ts(path: &str) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -226,46 +313,30 @@ pub fn transcript_first_ts(path: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let top = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let has_role = top == "user" || top == "assistant"
-            || entry.get("role").and_then(|r| r.as_str()).map(|r| r == "user" || r == "assistant").unwrap_or(false);
-        if !has_role {
+        let Some(entry) = parse_jsonl_line(&line) else {
             continue;
-        }
-        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str()) {
-            return Some(ts.to_string());
+        };
+        let Some(parsed) = parse_entry(&entry) else {
+            continue;
+        };
+        if let Some(ts) = parsed.meta.timestamp {
+            return Some(ts);
         }
     }
     None
 }
 
-/// Count user/assistant message lines in the transcript — cheap byte/substring scan,
-/// no JSON parse. Used only for the picker's estimate "Messages" column.
-///
-/// Assumption: Claude Code writes compact JSONL (no space after the `:` in object keys),
-/// so the role markers appear verbatim as `"type":"user"` / `"type":"assistant"` (nested
-/// format) or `"role":"user"` / `"role":"assistant"` (flat format). This is an estimate
-/// column, so a stray miscount on a non-compact line is acceptable. One line ≈ one message.
+/// Count user/assistant message lines in the transcript. Used only for the
+/// picker's estimate "Messages" column.
 pub fn transcript_message_count(path: &str) -> usize {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let mut count = 0usize;
-    for line in content.lines() {
-        if line.contains("\"type\":\"user\"")
-            || line.contains("\"type\":\"assistant\"")
-            || line.contains("\"role\":\"user\"")
-            || line.contains("\"role\":\"assistant\"")
-        {
-            count += 1;
-        }
-    }
-    count
+    parse_jsonl_lines(path)
+        .map(|lines| {
+            lines
+                .into_iter()
+                .filter(|line| line.message.is_some())
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Join turns into a simple "User: ...\n\nAssistant: ..." string.
@@ -273,7 +344,10 @@ pub(crate) fn build_transcript_string(turns: &[(String, String)]) -> String {
     turns
         .iter()
         .map(|(role, text)| {
-            format!("{}: {}", if role == "user" { "User" } else { "Assistant" }, text)
+            let role = TranscriptRole::parse(role)
+                .map(TranscriptRole::label)
+                .unwrap_or("Assistant");
+            format!("{role}: {text}")
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -356,7 +430,10 @@ pub(crate) fn reduce_turns_to_fit(
     // after A2 is dropped) — this matches "assistant followed by assistant".
     for i in 0..turns.len() {
         let is_asst = turns[i].0 == "assistant";
-        let next_asst = turns.get(i + 1).map(|t| t.0 == "assistant").unwrap_or(false);
+        let next_asst = turns
+            .get(i + 1)
+            .map(|t| t.0 == "assistant")
+            .unwrap_or(false);
         if is_asst && next_asst {
             kept[i] = false;
             if measure(&kept) <= max_chars {
@@ -376,9 +453,91 @@ pub(crate) fn reduce_turns_to_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn t(role: &str, text: &str) -> (String, String) {
         (role.to_string(), text.to_string())
+    }
+
+    fn write_temp_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn parses_supported_message_shapes_through_one_pipeline() {
+        let file = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-06-06T10:00:00.000Z","type":"user","cwd":"/repo","message":{"role":"user","content":[{"type":"text","text":"Claude nested user"}]}}"#,
+            r#"{"role":"assistant","content":"Flat assistant"}"#,
+            r#"{"timestamp":"2026-06-06T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Codex user"}]}}"#,
+        ]);
+
+        let path = file.path().to_str().unwrap();
+        assert_eq!(
+            parse_transcript(path).unwrap(),
+            vec![
+                t("user", "Claude nested user"),
+                t("assistant", "Flat assistant"),
+                t("user", "Codex user"),
+            ]
+        );
+        assert_eq!(transcript_cwd(path).as_deref(), Some("/repo"));
+        assert_eq!(transcript_message_count(path), 3);
+    }
+
+    #[test]
+    fn skips_harness_xml_in_strings_and_text_blocks() {
+        let file = write_temp_jsonl(&[
+            r#"{"role":"user","content":"<system-reminder>ignored</system-reminder>"}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>ignored</environment_context>"}]}}"#,
+            r#"{"role":"assistant","content":"visible"}"#,
+        ]);
+
+        assert_eq!(
+            parse_transcript(file.path().to_str().unwrap()).unwrap(),
+            vec![t("assistant", "visible")]
+        );
+        assert_eq!(transcript_message_count(file.path().to_str().unwrap()), 1);
+    }
+
+    #[test]
+    fn parses_codex_response_item_messages() {
+        let file = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-06-06T10:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/demo"}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Remember zinc marker."}]}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"ignored developer note"}]}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"x","output":"ignored tool output"}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Zinc marker noted."}]}}"#,
+        ]);
+
+        let turns = parse_transcript(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            turns,
+            vec![
+                t("user", "Remember zinc marker."),
+                t("assistant", "Zinc marker noted."),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_helpers_read_meta_and_count_messages() {
+        let file = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-06-06T10:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/demo"}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            r#"{"timestamp":"2026-06-06T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        ]);
+        let path = file.path().to_str().unwrap();
+
+        assert_eq!(transcript_cwd(path).as_deref(), Some("/tmp/demo"));
+        assert_eq!(
+            transcript_first_ts(path).as_deref(),
+            Some("2026-06-06T10:00:00.000Z")
+        );
+        assert_eq!(transcript_message_count(path), 2);
     }
 
     #[test]
