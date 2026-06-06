@@ -16,7 +16,10 @@ use crate::config::{load_config, normalize_path, resolve_project_root};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
-use crate::transcript::{build_transcript_string, parse_transcript, parse_transcript_meta};
+use crate::transcript::{
+    build_transcript_string, parse_transcript, parse_transcript_meta, reduce_turns_to_fit,
+    tail_capped,
+};
 use crate::wiki::{
     self, add_statement_to_section, guide_path, load_guide,
     new_guide, read_index, read_index_live, rebuild_index, revise_section, save_guide, slugify, wiki_dir,
@@ -2238,16 +2241,24 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
 
     // Build line-numbered transcript for evidence-range addressing, plus the
     // line→role map used for mechanical authorship attribution (§5).
+    //
+    // When the session exceeds the EXTRACT budget, reduce by dropping in-between
+    // assistant turns (never user turns), NOT by tail-slicing the head — the head is
+    // where the user's initial requirements live. Critically, the numbered transcript
+    // AND the parallel lines/roles vectors are all built from the SAME reduced set, so
+    // absolute line numbers stay consistent across what the model cites and how Rust
+    // slices/attributes evidence (evidence_is_valid / author_for_ranges / cite).
+    let reduced_numbered = reduce_turns_to_fit(&turns, 250_000, true);
     let (numbered_transcript, transcript_lines, transcript_roles) =
-        build_line_numbered_transcript_with_roles(&turns);
+        build_line_numbered_transcript_with_roles(&reduced_numbered);
 
-    // Build plain transcript for triage
-    let plain_ts = build_transcript_string(&turns);
-    let plain_ts = if plain_ts.len() > 200_000 {
-        plain_ts[plain_ts.len() - 200_000..].to_string()
-    } else {
-        plain_ts
-    };
+    // Build plain transcript for triage. When over budget, drop in-between assistant
+    // turns (assistant-followed-by-assistant) rather than tail-slicing the head, so the
+    // user's turns — where the load-bearing direction lives — are always preserved.
+    // tail_capped is a char-safe hard backstop for the pathological over-budget case.
+    let reduced_plain = reduce_turns_to_fit(&turns, 200_000, false);
+    let plain_ts = build_transcript_string(&reduced_plain);
+    let plain_ts = tail_capped(&plain_ts, 200_000);
 
     // Substance gate. We only veto on CONTENT (char floor) + a minimal "user actually
     // spoke" floor — NOT on exchange count. A heavily-agentic session (one directive, then
@@ -2351,12 +2362,10 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         today_str.clone(),
     ));
 
-    // Truncate numbered transcript if too long (keep tail — most recent context is most relevant)
-    let truncated_numbered = if numbered_transcript.len() > 250_000 {
-        numbered_transcript[numbered_transcript.len() - 250_000..].to_string()
-    } else {
-        numbered_transcript
-    };
+    // Hard backstop: reduce_turns_to_fit (above) already preserved user turns by dropping
+    // in-between assistant turns; this only fires if surviving content still exceeds budget.
+    // Char-safe tail-keep (never slices mid-codepoint).
+    let truncated_numbered = tail_capped(&numbered_transcript, 250_000);
 
     // Run the async wiki agent loop
     // NOTE: mark_captured_in is called AFTER the loop so that a failed agent
@@ -2676,7 +2685,6 @@ pub(crate) fn archeologist_project_dir(cwd: &str, output_dir: Option<&PathBuf>) 
 }
 
 /// Expose the captured-sessions directory for the archeologist picker's "New" count.
-#[allow(dead_code)] // available to archeologist; currently uses archeologist_is_already_captured instead
 pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
     captured_sessions_dir()
 }

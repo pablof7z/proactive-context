@@ -278,3 +278,167 @@ pub(crate) fn build_transcript_string(turns: &[(String, String)]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n")
 }
+
+/// Keep at most the last `max_bytes` bytes of `s`, snapping the cut forward to a
+/// UTF-8 char boundary so we never slice mid-codepoint (transcripts contain emoji;
+/// a raw byte slice would panic and abort the whole capture). Tail-keep, because the
+/// most recent context is the most relevant. This is a hard backstop only — the real
+/// reduction is `reduce_turns_to_fit`, which preserves user turns; this fires solely
+/// in the pathological case where surviving (mostly user) content alone exceeds budget.
+pub(crate) fn tail_capped(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// Reduce a transcript to fit within `max_chars` of rendered length by dropping ONLY
+/// "in-between" assistant turns — an assistant turn immediately followed by another
+/// assistant turn (i.e. the non-final turns of a consecutive assistant run, typically
+/// tool-call narration / intermediate steps). User turns are NEVER dropped, and the
+/// final assistant turn of each run (the substantive response, followed by a user turn)
+/// is kept. Dropping is oldest-first, so the most recent intermediate context survives.
+///
+/// Returns the original turns unchanged when already under budget — this only prunes
+/// when truncation is actually required. If dropping every in-between assistant turn is
+/// still insufficient (e.g. user content alone exceeds budget), the result may still be
+/// over `max_chars`; callers apply `tail_capped` as a final hard backstop.
+///
+/// `numbered` selects the cost model: `false` measures plain "Role: text" length (the
+/// triage input); `true` adds the per-physical-line `NNNN| ` prefix overhead so the
+/// budget reflects the line-numbered EXTRACT input and the backstop won't re-trim the
+/// head. The numbered estimate is a deliberate slight over-count (drops a few extra
+/// low-value turns) so the numbered output lands safely under budget.
+pub(crate) fn reduce_turns_to_fit(
+    turns: &[(String, String)],
+    max_chars: usize,
+    numbered: bool,
+) -> Vec<(String, String)> {
+    // Upper-bound per-line prefix overhead for the numbered view:
+    // `format!("{:>4}| {}\n", n, line)` ⇒ ≥4-wide number + "| " + "\n" (more for
+    // 5–6 digit line numbers). 9 covers realistic transcript sizes.
+    let line_overhead = if numbered { 9 } else { 0 };
+    let turn_cost = |t: &(String, String)| -> usize {
+        let role = if t.0 == "user" { "User" } else { "Assistant" };
+        let base = role.len() + 2 + t.1.len(); // "Role" + ": " + text
+        let phys_lines = t.1.matches('\n').count() + 1;
+        base + line_overhead * phys_lines
+    };
+    // Separator between turns: "\n\n" (plain) or one numbered blank line (numbered).
+    let sep_cost = if numbered { line_overhead } else { 2 };
+
+    let mut kept: Vec<bool> = vec![true; turns.len()];
+    let measure = |kept: &[bool]| -> usize {
+        let n = kept.iter().filter(|k| **k).count();
+        if n == 0 {
+            return 0;
+        }
+        let body: usize = turns
+            .iter()
+            .zip(kept.iter())
+            .filter(|(_, k)| **k)
+            .map(|(t, _)| turn_cost(t))
+            .sum();
+        body + sep_cost * (n - 1)
+    };
+
+    if measure(&kept) <= max_chars {
+        return turns.to_vec();
+    }
+
+    // Classification uses ORIGINAL adjacency: a turn is "in-between" iff it is an
+    // assistant turn whose immediate successor in the original transcript is also an
+    // assistant turn. Drops don't reclassify (an A1 in A1 A2 A3 stays droppable even
+    // after A2 is dropped) — this matches "assistant followed by assistant".
+    for i in 0..turns.len() {
+        let is_asst = turns[i].0 == "assistant";
+        let next_asst = turns.get(i + 1).map(|t| t.0 == "assistant").unwrap_or(false);
+        if is_asst && next_asst {
+            kept[i] = false;
+            if measure(&kept) <= max_chars {
+                break;
+            }
+        }
+    }
+
+    turns
+        .iter()
+        .zip(kept.into_iter())
+        .filter(|(_, k)| *k)
+        .map(|(t, _)| t.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(role: &str, text: &str) -> (String, String) {
+        (role.to_string(), text.to_string())
+    }
+
+    #[test]
+    fn under_budget_returns_unchanged() {
+        let turns = vec![t("user", "hi"), t("assistant", "a1"), t("assistant", "a2")];
+        let out = reduce_turns_to_fit(&turns, 100_000, false);
+        assert_eq!(out, turns, "no reduction when already under budget");
+    }
+
+    #[test]
+    fn drops_in_between_assistants_keeps_user_and_final_assistant() {
+        // Run: U  A1 A2 A3  U  A4  — A1,A2 are in-between (followed by assistant);
+        // A3 (followed by user) and A4 (last turn) are final-of-run → kept.
+        let big = "x".repeat(5_000);
+        let turns = vec![
+            t("user", &format!("U0 {big}")),
+            t("assistant", &format!("A1 {big}")),
+            t("assistant", &format!("A2 {big}")),
+            t("assistant", &format!("A3 {big}")),
+            t("user", &format!("U1 {big}")),
+            t("assistant", &format!("A4 {big}")),
+        ];
+        // Budget between the 4-keeper size (~20k) and the full 6-turn size (~30k):
+        // forces dropping both in-between assistants, fits the rest.
+        let out = reduce_turns_to_fit(&turns, 25_000, false);
+
+        // Every user turn survives.
+        assert!(out.iter().any(|(_, x)| x.starts_with("U0")));
+        assert!(out.iter().any(|(_, x)| x.starts_with("U1")));
+        // The in-between assistants are gone, oldest-first.
+        assert!(!out.iter().any(|(_, x)| x.starts_with("A1")));
+        assert!(!out.iter().any(|(_, x)| x.starts_with("A2")));
+        // Final-of-run assistants are kept.
+        assert!(out.iter().any(|(_, x)| x.starts_with("A3")));
+        assert!(out.iter().any(|(_, x)| x.starts_with("A4")));
+        // And we actually got under budget.
+        assert!(build_transcript_string(&out).len() <= 25_000);
+    }
+
+    #[test]
+    fn never_drops_user_even_when_unfittable() {
+        // All-user content far exceeding budget: nothing is droppable, so all user
+        // turns must survive (the caller's tail_capped backstop handles the overflow).
+        let big = "u".repeat(10_000);
+        let turns = vec![
+            t("user", &format!("U0 {big}")),
+            t("user", &format!("U1 {big}")),
+            t("user", &format!("U2 {big}")),
+        ];
+        let out = reduce_turns_to_fit(&turns, 1_000, false);
+        assert_eq!(out, turns, "user turns are never dropped");
+    }
+
+    #[test]
+    fn tail_capped_is_char_boundary_safe() {
+        // Multibyte content: a naive byte slice could panic mid-codepoint.
+        let s = "é".repeat(1_000); // 2 bytes each → 2_000 bytes
+        let out = tail_capped(&s, 999); // cut lands mid-codepoint → must snap forward
+        assert!(out.len() <= 999);
+        assert!(out.chars().all(|c| c == 'é'), "no broken codepoints");
+        assert!(s.ends_with(&out));
+    }
+}
