@@ -2979,22 +2979,14 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
 // LLM is fed and what it returns, without running ROUTE/RECONCILE (no disk writes).
 
 /// Mirror the live capture preprocessing for a `.jsonl` transcript file: parse turns,
-/// build the line-numbered transcript + the parallel line→role map, and apply the SAME
-/// 250 KB tail-truncation the live EXTRACT call uses. Returns
-/// `(truncated_numbered, full_lines, full_roles)`.
-///
-/// NOTE: like the live path, the numbered string is byte-tail-truncated while the
-/// lines/roles vectors are the FULL set — evidence verification in `WikiAgentCtx`
-/// resolves against the full lines, so this reproduces live behavior 1:1.
+/// reduce via `reduce_turns_to_fit` (drops middle assistant turns, preserves user turns —
+/// same strategy as `run_capture_from_input`), build the line-numbered transcript + the
+/// parallel line→role map. Returns `(numbered, lines, roles)`.
 fn debug_preprocess_transcript(path: &str) -> Result<(String, Vec<String>, Vec<String>)> {
     let turns = parse_transcript(path)?;
-    let (numbered, lines, roles) = build_line_numbered_transcript_with_roles(&turns);
-    let truncated = if numbered.len() > 250_000 {
-        numbered[numbered.len() - 250_000..].to_string()
-    } else {
-        numbered
-    };
-    Ok((truncated, lines, roles))
+    let reduced = reduce_turns_to_fit(&turns, 250_000, true);
+    let (numbered, lines, roles) = build_line_numbered_transcript_with_roles(&reduced);
+    Ok((numbered, lines, roles))
 }
 
 /// Resolve the wiki dir to feed EXTRACT. Precedence:
