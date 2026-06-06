@@ -278,6 +278,42 @@ enum Commands {
         #[command(subcommand)]
         action: WikiAction,
     },
+
+    /// Capture-pipeline instrumentation. Inspect what the EXTRACT stage is fed and what
+    /// it returns, without touching the wiki. Use to investigate dropped/missed facts.
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugAction {
+    /// Print the line-numbered transcript EXACTLY as the EXTRACT stage sees it (after the
+    /// same preprocessing + 250KB tail-truncation the live capture path applies).
+    Transcript {
+        /// Path to a `.jsonl` transcript (same format as ~/.claude/projects/**/*.jsonl).
+        file: PathBuf,
+    },
+
+    /// Run the EXTRACT stage on a transcript and print the system prompt, numbered
+    /// transcript, raw LLM response, parsed claims, and an admit/drop summary. Runs
+    /// STAGE 1 (EXTRACT) + STAGE 2 (evidence verification) only — no ROUTE/RECONCILE,
+    /// no wiki writes.
+    Extract {
+        /// Path to a `.jsonl` transcript.
+        file: PathBuf,
+
+        /// Feed EXTRACT the wiki index from this dir (slug|title|summary grouped by topic).
+        /// Defaults to the discovered project wiki for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// Baseline: run EXTRACT with NO wiki index, ignoring discovery. Use to compare
+        /// against the default (with-index) run.
+        #[arg(long)]
+        no_wiki: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -472,6 +508,15 @@ fn main() -> Result<()> {
                 .context("No openrouter_api_key in ~/.proactive-context/config.json")?;
             probe_openrouter(&api_key, &model, &prompt, with_generation)?;
         }
+
+        Commands::Debug { action } => match action {
+            DebugAction::Transcript { file } => {
+                crate::capture::run_debug_transcript(&file)?;
+            }
+            DebugAction::Extract { file, wiki_dir, no_wiki } => {
+                crate::capture::run_debug_extract(&file, wiki_dir.as_deref(), no_wiki)?;
+            }
+        },
 
         Commands::Archeologist {
             project,
