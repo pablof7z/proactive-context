@@ -1457,9 +1457,13 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd
             if let Some(line) = feed_line_for_event(&rec) {
                 let was_at_bottom = view.feed_scroll == 0;
                 view.push_feed(line);
-                // auto-scroll only if not scrolled up and not paused
-                if view.feed_paused && !was_at_bottom {
-                    view.feed_scroll += 1;
+                // If the user is scrolled up (reading history) or has paused, hold their
+                // position as new lines arrive instead of letting the view drift toward the
+                // bottom: bump feed_scroll in lock-step with the growing feed so the cursor
+                // stays on the same logical line. Live-follow resumes once they scroll back to
+                // the bottom (feed_scroll == 0). The .min keeps it valid as the ring drops rows.
+                if view.feed_paused || !was_at_bottom {
+                    view.feed_scroll = (view.feed_scroll + 1).min(view.feed.len());
                 }
             }
         }
@@ -1961,23 +1965,19 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
     );
 
     // ── Live feed ──
-    let feed_title = if view.feed_paused {
-        " live feed [PAUSED] "
+    let total = view.feed.len();
+    let cursor_idx = feed_cursor_idx(total, view.feed_scroll);
+    // Show the cursor's position in the feed while scrolled up so it's clear where you are.
+    let feed_title = if view.feed_scroll > 0 {
+        format!(" feed · line {}/{}{} ", cursor_idx + 1, total, if view.feed_paused { " [PAUSED]" } else { "" })
+    } else if view.feed_paused {
+        " live feed [PAUSED] ".to_string()
     } else {
-        " live feed "
+        " live feed ".to_string()
     };
     let feed_block = Block::default().borders(Borders::ALL).title(feed_title);
     let feed_inner_h = feed_block.inner(chunks[2]).height as usize;
-    let total = view.feed.len();
-    // Window of feed_inner_h rows, anchored to the bottom (newest). The cursor moves *within*
-    // this window; the window only scrolls up once the cursor climbs above its top. This keeps
-    // the rows below the cursor visible instead of peeling them off the bottom on every Up.
-    let cursor_idx = feed_cursor_idx(total, view.feed_scroll);
-    let mut start = total.saturating_sub(feed_inner_h);
-    if view.feed_scroll > 0 && cursor_idx < start {
-        start = cursor_idx;
-    }
-    let end = (start + feed_inner_h).min(total);
+    let (start, end) = feed_window(total, feed_inner_h, view.feed_scroll, cursor_idx);
     let items: Vec<ListItem> = view
         .feed
         .iter()
@@ -2615,6 +2615,29 @@ mod tests {
         assert_eq!(feed_cursor_idx(10, 10), 0, "scrolling to the top selects the oldest");
         assert_eq!(feed_cursor_idx(10, 999), 0, "over-scroll clamps to the oldest");
         assert_eq!(feed_cursor_idx(0, 5), 0, "empty feed never indexes out of range");
+    }
+
+    #[test]
+    fn feed_window_always_keeps_the_cursor_visible() {
+        // For a feed taller than the viewport, the selected line must stay inside the rendered
+        // window at every scroll position — i.e. scrolling never hides the cursor.
+        let total = 100;
+        let h = 20;
+        for feed_scroll in 1..=total {
+            let cursor = feed_cursor_idx(total, feed_scroll);
+            let (start, end) = feed_window(total, h, feed_scroll, cursor);
+            assert!(start <= cursor && cursor < end,
+                "cursor {} must be within window [{},{}) at feed_scroll {}", cursor, start, end, feed_scroll);
+            assert!(end - start <= h, "window never exceeds the viewport height");
+        }
+        // Bottom-anchored until the cursor reaches the top edge, then the window scrolls up.
+        let (s_bottom, e_bottom) = feed_window(total, h, 1, feed_cursor_idx(total, 1));
+        assert_eq!((s_bottom, e_bottom), (80, 100), "feed_scroll=1 shows the newest page");
+        let top_edge = feed_window(total, h, h, feed_cursor_idx(total, h)).0;
+        let past_edge = feed_window(total, h, h + 5, feed_cursor_idx(total, h + 5)).0;
+        assert!(past_edge < top_edge, "the window scrolls up once the cursor passes the top edge");
+        // A feed shorter than the viewport shows everything from index 0.
+        assert_eq!(feed_window(5, 20, 3, feed_cursor_idx(5, 3)), (0, 5));
     }
 
     #[test]
