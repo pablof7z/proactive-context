@@ -2717,3 +2717,62 @@ pub(crate) fn run_debug_extract(
     }
     Ok(())
 }
+
+/// `pc debug extract --all` — run EXTRACT on every transcript for the current project.
+pub(crate) fn run_debug_extract_all(
+    cwd: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    use crate::transcript::transcript_cwd;
+
+    let root = resolve_project_root(cwd);
+    let target_key = normalize_path(&root);
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        anyhow::bail!("~/.claude/projects/ not found");
+    }
+
+    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    for entry in std::fs::read_dir(&claude_projects)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&entry_path)? {
+            let file = file?;
+            let path = file.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if let Some(tcwd) = transcript_cwd(&path_str) {
+                let key = normalize_path(&resolve_project_root(&PathBuf::from(&tcwd)));
+                if key == target_key {
+                    let mtime = path.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    matches.push((mtime, path));
+                }
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        eprintln!("no transcripts found for {} (key: {})", cwd.display(), target_key);
+        return Ok(());
+    }
+
+    matches.sort_by_key(|(mtime, _)| *mtime);
+
+    eprintln!("{} transcript(s) for project key: {}", matches.len(), target_key);
+
+    for (i, (_, path)) in matches.iter().enumerate() {
+        eprintln!("\n[{}/{}] {}", i + 1, matches.len(), path.display());
+        run_debug_extract(path, wiki_dir_arg, no_wiki)?;
+    }
+    Ok(())
+}

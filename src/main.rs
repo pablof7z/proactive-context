@@ -314,8 +314,8 @@ enum DebugAction {
     /// STAGE 1 (EXTRACT) + STAGE 2 (evidence verification) only — no ROUTE/RECONCILE,
     /// no wiki writes.
     Extract {
-        /// Path to a `.jsonl` transcript.
-        file: PathBuf,
+        /// Path to a `.jsonl` transcript. Omit when using --all.
+        file: Option<PathBuf>,
 
         /// Feed EXTRACT the wiki index from this dir (slug|title|summary grouped by topic).
         /// Defaults to the discovered project wiki for the current repo.
@@ -326,6 +326,11 @@ enum DebugAction {
         /// against the default (with-index) run.
         #[arg(long)]
         no_wiki: bool,
+
+        /// Process all transcripts for the current project (matched by CWD) found in
+        /// ~/.claude/projects/, running EXTRACT on each in turn.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -533,8 +538,15 @@ fn main() -> Result<()> {
                     anyhow::bail!("provide a transcript file path or pass --all");
                 }
             }
-            DebugAction::Extract { file, wiki_dir, no_wiki } => {
-                crate::capture::run_debug_extract(&file, wiki_dir.as_deref(), no_wiki)?;
+            DebugAction::Extract { file, wiki_dir, no_wiki, all } => {
+                if all {
+                    let cwd = std::env::current_dir()?;
+                    crate::capture::run_debug_extract_all(&cwd, wiki_dir.as_deref(), no_wiki)?;
+                } else if let Some(f) = file {
+                    crate::capture::run_debug_extract(&f, wiki_dir.as_deref(), no_wiki)?;
+                } else {
+                    anyhow::bail!("provide a transcript file path or pass --all");
+                }
             }
         },
 
