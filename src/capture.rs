@@ -1422,6 +1422,81 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
+/// Sweep-completeness nudge, appended to EXTRACT_PREAMBLE by `build_extract_system`.
+/// Kept as a separate constant so it can be toggled off (PC_EXTRACT_NO_GRANULARITY=1) for
+/// A/B comparison against the original prompt.
+///
+/// SCOPE (deliberately narrow): this nudges COMPLETENESS of the sweep — read the whole
+/// transcript, don't stop after the first few obvious decisions — WITHOUT pushing finer
+/// splitting. We intentionally do NOT say 'emit more atomic claims' or 'split one mechanism
+/// into several': over-splitting is this project's known capture failure mode (ROUTE is the
+/// bottleneck; see ROUTE_PREAMBLE's OVER-SPLIT section), and a coverage A/B showed the extra
+/// claims a split-finer nudge produced were re-phrasings/splits of facts already captured,
+/// not newly-covered decisions. So the win we keep is 'don't quit the sweep early'; the
+/// granularity stays at one-fact-each, as the base preamble already specifies.
+const EXTRACT_GRANULARITY_BLOCK: &str = "\n\
+## Sweep the WHOLE transcript — do not stop early\n\
+A long working session puts decisions everywhere, not just at the top. Read the transcript \
+top to bottom and capture load-bearing facts from the LATER turns too — a constraint added \
+mid-session, a decision reversed near the end, a subtle rule stated once in passing are \
+exactly the facts most often missed. Do not stop after the first few obvious decisions.\n\
+- Keep emitting one atomic fact each, at the same granularity the rules above specify — this \
+is about COMPLETENESS of the sweep, NOT about splitting one decision into many finer claims.\n\
+- Capture load-bearing facts the ASSISTANT proposed and acted on (code written, design \
+chosen), not only facts the user spelled out — set `ratified` per the rule above, still EMIT \
+them.\n\
+- Prefer a specific, self-contained assertion over a vague summary. 'The cache uses an LRU \
+eviction policy with a 1000-entry cap' beats 'caching was discussed'.\n";
+
+/// Optional wiki-index block, appended to `EXTRACT_PREAMBLE` to tell EXTRACT what topics
+/// the wiki already tracks — so it captures at the right granularity, reuses the project's
+/// existing vocabulary, and does not skip a fact merely because it extends a known topic.
+/// Mirrors ROUTE's full-catalog format (slug | title | summary, grouped by topic). Returns
+/// an empty string when there are no guides (the EXTRACT prompt is then unchanged).
+fn build_extract_wiki_index_block(index_rows: &[wiki::IndexRow]) -> String {
+    use std::collections::BTreeMap;
+    if index_rows.is_empty() {
+        return String::new();
+    }
+    let mut by_topic: BTreeMap<String, Vec<&wiki::IndexRow>> = BTreeMap::new();
+    for row in index_rows {
+        let t = if row.topic.is_empty() { "general" } else { row.topic.as_str() };
+        by_topic.entry(t.to_string()).or_default().push(row);
+    }
+    let mut s = String::from(
+        "\n## EXISTING WIKI — topics this project already tracks\n\
+This is the wiki you are contributing to. Use it to (1) understand the project's surface \
+area and vocabulary, (2) capture facts at a granularity that fits these topics, and (3) \
+NOT skip a fact just because a related topic already exists — an UPDATE, REVERSAL, new \
+constraint, or new detail of a known topic is exactly what must be captured. Do not invent \
+facts to match a topic; only emit what the transcript actually supports.\n",
+    );
+    for (topic, rows) in &by_topic {
+        s.push_str(&format!(
+            "### {} ({} guide{})\n",
+            topic, rows.len(), if rows.len() == 1 { "" } else { "s" }
+        ));
+        for row in rows {
+            s.push_str(&format!("  - {} | {} | {}\n", row.slug, row.title, row.summary));
+        }
+    }
+    s
+}
+
+/// Assemble the EXTRACT system prompt: the base preamble plus an optional wiki-index block.
+/// Used by BOTH the live capture path (`run_wiki_agent`) and `pc debug extract`, so the
+/// production prompt and the debug command stay in lockstep.
+fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
+    let mut s = String::from(EXTRACT_PREAMBLE);
+    // Granularity nudge on by default; PC_EXTRACT_NO_GRANULARITY=1 reproduces the original
+    // prompt for A/B comparison.
+    if std::env::var("PC_EXTRACT_NO_GRANULARITY").ok().as_deref() != Some("1") {
+        s.push_str(EXTRACT_GRANULARITY_BLOCK);
+    }
+    s.push_str(&build_extract_wiki_index_block(index_rows));
+    s
+}
+
 const ROUTE_PREAMBLE: &str = "\
 You are the RERANK half of the ROUTE stage. Each claim must be assigned to the ONE wiki guide \
 whose topic it belongs to, OR to a NEW guide. You are given TWO inputs: (1) a FULL CATALOG of \
@@ -1695,14 +1770,24 @@ async fn run_wiki_agent(
     ctx: Arc<WikiAgentCtx>,
     numbered_transcript: &str,
 ) -> Result<String> {
+    // Live on-disk wiki index — embedded fresh (read_index_live), not the stale index.db.
+    // Used by ROUTE recall below. NOT fed to EXTRACT by default: an A/B over real transcripts
+    // showed feeding the index to EXTRACT adds run-to-run variance and (on large transcripts)
+    // pushes the response toward the 6000-token cap → occasional whole-extraction truncation,
+    // with NO coverage gain over the index-free prompt. The wiki-index-in-EXTRACT variant is
+    // reachable only via `pc debug extract --wiki-dir <dir>` for experimentation.
+    let index_rows = read_index_live(&ctx.wiki_path);
+
     // ── STAGE 1: EXTRACT ────────────────────────────────────────────────────────
+    // EXTRACT runs WITHOUT the wiki index (pass &[]); see rationale above.
+    let extract_system = build_extract_system(&[]);
     let extract_user = format!(
         "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
         numbered_transcript
     );
     let extract_raw = run_stage(
         spec, openrouter_api_key, ollama_base_url, ollama_api_key,
-        EXTRACT_PREAMBLE, &extract_user, 6000,
+        &extract_system, &extract_user, 6000,
     ).await?;
 
     let extracted: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
@@ -1764,7 +1849,7 @@ async fn run_wiki_agent(
     // the on-disk index.db vector store, which is only rebuilt at checkpoints and would be
     // stale within a bulk archeologist window (the bug we fixed for the text index). Guide
     // counts are tens, so per-session in-memory embedding is cheap.
-    let index_rows = read_index_live(&ctx.wiki_path);
+    // (Already fetched once before EXTRACT and reused here — see `index_rows` above.)
 
     // RECALL tuning knobs. ROUTE_TOP_K = candidate set size per claim; ROUTE_TAU = minimum
     // cosine similarity to surface a guide at all (best-guide-below-tau ⇒ empty set ⇒ the
@@ -2885,4 +2970,200 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
         filter_sidechains: false,
         output_dir: None,
     })
+}
+
+// ─── Debug commands (`pc debug …`) ─────────────────────────────────────────────
+//
+// Instrumentation for the capture pipeline. These do NOT mutate the wiki — they
+// replicate the EXTRACT preprocessing + STAGE 1/2 so you can SEE exactly what the
+// LLM is fed and what it returns, without running ROUTE/RECONCILE (no disk writes).
+
+/// Mirror the live capture preprocessing for a `.jsonl` transcript file: parse turns,
+/// build the line-numbered transcript + the parallel line→role map, and apply the SAME
+/// 250 KB tail-truncation the live EXTRACT call uses. Returns
+/// `(truncated_numbered, full_lines, full_roles)`.
+///
+/// NOTE: like the live path, the numbered string is byte-tail-truncated while the
+/// lines/roles vectors are the FULL set — evidence verification in `WikiAgentCtx`
+/// resolves against the full lines, so this reproduces live behavior 1:1.
+fn debug_preprocess_transcript(path: &str) -> Result<(String, Vec<String>, Vec<String>)> {
+    let turns = parse_transcript(path)?;
+    let (numbered, lines, roles) = build_line_numbered_transcript_with_roles(&turns);
+    let truncated = if numbered.len() > 250_000 {
+        numbered[numbered.len() - 250_000..].to_string()
+    } else {
+        numbered
+    };
+    Ok((truncated, lines, roles))
+}
+
+/// Resolve the wiki dir to feed EXTRACT. Precedence:
+///   1. explicit `--wiki-dir <dir>` (used as-is),
+///   2. otherwise the discovered project wiki for THIS repo.
+/// Pass `no_wiki = true` to force the baseline (no index) regardless of discovery —
+/// this is the off-switch that makes the before/after comparison reachable from the CLI.
+fn debug_resolve_wiki_dir(wiki_dir_arg: Option<&Path>, no_wiki: bool) -> Option<PathBuf> {
+    if no_wiki {
+        return None;
+    }
+    if let Some(d) = wiki_dir_arg {
+        return Some(d.to_path_buf());
+    }
+    // Discover the project wiki from cwd, mirroring the live capture path.
+    let cwd = std::env::current_dir().ok()?;
+    let root = resolve_project_root(&cwd);
+    let wp = wiki_dir(&root);
+    if wp.exists() { Some(wp) } else { None }
+}
+
+/// `pc debug transcript <file>` — print the numbered transcript EXACTLY as EXTRACT sees it.
+pub(crate) fn run_debug_transcript(file: &Path) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let (numbered, lines, _roles) = debug_preprocess_transcript(&path)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)\n",
+        path, lines.len(), numbered.len()
+    )?;
+    out.write_all(numbered.as_bytes())?;
+    Ok(())
+}
+
+/// `pc debug extract <file> [--wiki-dir <dir>] [--no-wiki]` — run STAGE 1 (EXTRACT) +
+/// STAGE 2 (authority tagging / evidence verification) and print every intermediate
+/// artifact: system prompt, user message, raw response, parsed claims, summary.
+/// Does NOT run ROUTE/RECONCILE and writes nothing to the wiki.
+pub(crate) fn run_debug_extract(
+    file: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let cfg = load_config()?;
+    let capture_spec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+
+    // Resolve wiki index (or baseline).
+    let resolved_wiki = debug_resolve_wiki_dir(wiki_dir_arg, no_wiki);
+    let index_rows: Vec<wiki::IndexRow> = match &resolved_wiki {
+        Some(d) => {
+            // read_index_live mirrors the live EXTRACT path (fresh on-disk guides).
+            let rows = read_index_live(d);
+            rows
+        }
+        None => vec![],
+    };
+
+    // Preprocess transcript identically to the live path.
+    let (numbered, lines, roles) = debug_preprocess_transcript(&path)?;
+
+    // Build a ctx so evidence verification + mechanical authorship match live behavior.
+    let ctx = WikiAgentCtx::new(
+        PathBuf::from(resolved_wiki.clone().unwrap_or_else(|| PathBuf::from("/tmp/pc-debug-wiki"))),
+        "debug".to_string(),
+        "debug-session".to_string(),
+        lines.clone(),
+        roles.clone(),
+        today(),
+    );
+
+    let system = build_extract_system(&index_rows);
+    let user = format!(
+        "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
+        numbered
+    );
+
+    let stdout = io::stdout();
+    let mut o = stdout.lock();
+
+    writeln!(o, "════════════════════════════════════════════════════════════════")?;
+    writeln!(o, " pc debug extract")?;
+    writeln!(o, "   transcript : {}", path)?;
+    writeln!(o, "   model      : {}", cfg.capture_model)?;
+    match &resolved_wiki {
+        Some(d) => writeln!(o, "   wiki index : {} ({} guides)", d.display(), index_rows.len())?,
+        None => writeln!(o, "   wiki index : (none — baseline, --no-wiki or no project wiki)")?,
+    }
+    writeln!(o, "════════════════════════════════════════════════════════════════\n")?;
+
+    writeln!(o, "──── (1) SYSTEM PROMPT ────────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", system)?;
+
+    writeln!(o, "──── (2) USER MESSAGE (numbered transcript) ───────────────────\n")?;
+    writeln!(o, "{}\n", user)?;
+
+    writeln!(o, "──── (3) RAW LLM RESPONSE ─────────────────────────────────────\n")?;
+    o.flush()?;
+    let rt = Runtime::new()
+        .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+    let raw = rt.block_on(async {
+        run_stage(
+            &capture_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(),
+            &system, &user, 6000,
+        ).await
+    })?;
+    writeln!(o, "{}\n", raw)?;
+
+    writeln!(o, "──── (4) PARSED CLAIMS ────────────────────────────────────────\n")?;
+    let blob = extract_json_blob(&raw);
+    let extracted: Vec<ExtractedClaim> = match &blob {
+        Some(b) => match serde_json::from_str::<Vec<ExtractedClaim>>(b) {
+            Ok(v) => v,
+            Err(e) => {
+                // Surface parse failure explicitly — do NOT silently coerce to [] like
+                // the live path's unwrap_or_default(), so "0 claims" is never ambiguous
+                // between "model said []" and "model emitted unparseable garbage".
+                writeln!(o, "⚠ JSON parse FAILED on the extracted blob: {}", e)?;
+                writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+                Vec::new()
+            }
+        },
+        None => {
+            writeln!(o, "⚠ No JSON array/object found in the response at all.")?;
+            writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+            Vec::new()
+        }
+    };
+    writeln!(o, "{}", serde_json::to_string_pretty(
+        &extracted.iter().map(|c| serde_json::json!({
+            "assertion": c.assertion,
+            "evidence": c.evidence.iter().map(|e| serde_json::json!({"start": e.start, "end": e.end})).collect::<Vec<_>>(),
+            "ratified": c.ratified,
+        })).collect::<Vec<_>>()
+    )?)?;
+    writeln!(o)?;
+
+    // ── (5) AUTHORITY TAGGING / EVIDENCE VERIFICATION SUMMARY ──
+    writeln!(o, "──── (5) SUMMARY ──────────────────────────────────────────────\n")?;
+    let mut admitted = 0usize;
+    let (mut n_explicit, mut n_implicit, mut n_dropped) = (0usize, 0usize, 0usize);
+    let mut dropped_examples: Vec<String> = Vec::new();
+    for c in &extracted {
+        if !ctx.evidence_is_valid(&c.evidence) {
+            n_dropped += 1;
+            if dropped_examples.len() < 5 {
+                let ev: Vec<String> = c.evidence.iter().map(|e| format!("{}-{}", e.start, e.end)).collect();
+                dropped_examples.push(format!("  · [{}] {}", ev.join(","), truncate(&c.assertion, 100)));
+            }
+            continue;
+        }
+        let author = ctx.author_for_ranges(&c.evidence);
+        if author == "user" { n_explicit += 1; } else { n_implicit += 1; }
+        admitted += 1;
+    }
+    writeln!(o, "  claims extracted          : {}", extracted.len())?;
+    writeln!(o, "  admitted (evidence valid) : {}  ({} explicit/user, {} implicit/agent)",
+        admitted, n_explicit, n_implicit)?;
+    writeln!(o, "  dropped (evidence invalid): {}", n_dropped)?;
+    if !dropped_examples.is_empty() {
+        writeln!(o, "\n  dropped claims (unverifiable evidence ranges — likely hallucinated cites):")?;
+        for d in &dropped_examples {
+            writeln!(o, "{}", d)?;
+        }
+    }
+    Ok(())
 }
