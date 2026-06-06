@@ -300,7 +300,13 @@ enum DebugAction {
     /// same preprocessing + 250KB tail-truncation the live capture path applies).
     Transcript {
         /// Path to a `.jsonl` transcript (same format as ~/.claude/projects/**/*.jsonl).
-        file: PathBuf,
+        /// Omit when using --all.
+        file: Option<PathBuf>,
+
+        /// Process all transcripts for the current project (matched by CWD) found in
+        /// ~/.claude/projects/, printing each in turn.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Run the EXTRACT stage on a transcript and print the system prompt, numbered
@@ -517,8 +523,15 @@ fn main() -> Result<()> {
         }
 
         Commands::Debug { action } => match action {
-            DebugAction::Transcript { file } => {
-                crate::capture::run_debug_transcript(&file)?;
+            DebugAction::Transcript { file, all } => {
+                if all {
+                    let cwd = std::env::current_dir()?;
+                    crate::capture::run_debug_transcript_all(&cwd)?;
+                } else if let Some(f) = file {
+                    crate::capture::run_debug_transcript(&f)?;
+                } else {
+                    anyhow::bail!("provide a transcript file path or pass --all");
+                }
             }
             DebugAction::Extract { file, wiki_dir, no_wiki } => {
                 crate::capture::run_debug_extract(&file, wiki_dir.as_deref(), no_wiki)?;
