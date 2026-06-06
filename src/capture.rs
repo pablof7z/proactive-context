@@ -2016,7 +2016,10 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
             let new_title_c = new_title.clone();
             let new_summary_c = new_summary.clone();
             let new_topic_c = new_topic.clone();
+            let created_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+            let created_flag_c = created_flag.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
+                created_flag_c.set(existing.is_none());
                 let mut guide = match existing {
                     Some(g) => g,
                     None => {
@@ -2046,6 +2049,18 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                 eprintln!("capture: citation log write failed: {}", e);
             }
             eprintln!("capture: op {} → {}", op.op, result);
+            // Emit wiki.create only when a guide was genuinely created (existing was None).
+            // A reconcile that labels many statements of one brand-new guide as "create"
+            // otherwise produces N "New guide" feed lines; the rest are add_statement claims.
+            if !result.starts_with("Error:") {
+                let ev_name = if created_flag.get() { "wiki.create" } else { "wiki.add_statement" };
+                crate::events::log_event(ev_name, None, serde_json::json!({
+                    "slug": &lock_slug,
+                    "title": &new_title,
+                    "section": &section,
+                    "text": crate::events::truncate(&op.text, 300)
+                }));
+            }
             true
         }
         "revise" => {
@@ -2096,6 +2111,11 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                 eprintln!("capture: citation log write failed: {}", e);
             }
             eprintln!("capture: op revise → {}", result);
+            crate::events::log_event("wiki.revise_statement", None, serde_json::json!({
+                "slug": &lock_slug,
+                "section": &section,
+                "text": crate::events::truncate(&op.text, 300)
+            }));
             true
         }
         "remove" => {
@@ -2347,7 +2367,9 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         "transcript_chars": plain_ts.len(),
         "exchanges": exchanges,
         "model": model,
-        "max_turns": max_turns
+        "max_turns": max_turns,
+        "date": &today_str,
+        "session_id": &input.session_id
     }));
 
     eprintln!("capture: running wiki_* agent loop with {} (max_turns={})...", model, max_turns);

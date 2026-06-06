@@ -225,6 +225,13 @@ enum Commands {
         /// Requires a valid ~/.tenex/config.json.
         #[arg(long)]
         tenex: bool,
+
+        /// Forget capture markers so sessions count as new again — use after deleting the
+        /// wiki to start over. Scope with --project (one project) or none (all projects,
+        /// plus pending/lock state). Respects --output-dir for isolated ledgers. Prompts
+        /// for confirmation unless --yes. Does nothing else: no scan, no LLM, no picker.
+        #[arg(long)]
+        reset: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -483,6 +490,7 @@ fn main() -> Result<()> {
             include_sidechains,
             output_dir,
             tenex,
+            reset,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
                 project,
@@ -494,6 +502,7 @@ fn main() -> Result<()> {
                 include_sidechains,
                 output_dir,
                 include_tenex: tenex,
+                reset,
             })?;
         }
 

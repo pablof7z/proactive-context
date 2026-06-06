@@ -668,6 +668,44 @@ pub fn run_doctor(root: &Path, args: DoctorArgs) -> Result<()> {
 /// cosine-distant, so flat pairwise clustering either over-chains (one 25-guide nmp blob
 /// at tau 0.55) or under-groups (singletons at 0.62+). Topic assignment needs the global
 /// semantic view only an LLM reading all titles+summaries at once provides.
+/// Run a blocking closure while a side thread prints a spinner + elapsed seconds to stderr,
+/// so a long, non-streaming model call doesn't read as a hang. Clears its line when done so
+/// it doesn't collide with the structured stdout report that follows.
+fn with_heartbeat<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let label = label.to_string();
+    let ticker = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let start = std::time::Instant::now();
+            let mut i = 0usize;
+            while !done.load(Ordering::Relaxed) {
+                eprint!(
+                    "\r  {} {} … {}s elapsed   ",
+                    frames[i % frames.len()],
+                    label,
+                    start.elapsed().as_secs()
+                );
+                let _ = std::io::stderr().flush();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            eprint!("\r{:width$}\r", "", width = label.len() + 28);
+            let _ = std::io::stderr().flush();
+        })
+    };
+
+    let out = f();
+    done.store(true, Ordering::Relaxed);
+    let _ = ticker.join();
+    out
+}
+
 fn run_retopic(
     root: &Path,
     live_wiki: &Path,
@@ -723,7 +761,13 @@ fn run_retopic(
     };
 
     println!("\nretopic: asking {} to propose a taxonomy for {} guides...", model, rows.len());
-    let raw = llm.call(system, &user)?;
+    // The taxonomy call is a single blocking, non-streaming request over the whole catalog
+    // to an often-slow cloud reasoning model (up to a 600s timeout). Without feedback the CLI
+    // looks hung for minutes; print an elapsed-time heartbeat on a side thread so it's
+    // visibly alive and the user can tell waiting-on-model from actually-stuck.
+    let raw = with_heartbeat(&format!("retopic: waiting on {}", model), || {
+        llm.call(system, &user)
+    })?;
     let json = strip_code_fence(&raw);
 
     #[derive(serde::Deserialize)]
