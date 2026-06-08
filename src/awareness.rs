@@ -49,12 +49,14 @@ struct AwarenessInput {
     transcript_path: Option<String>,
 }
 
-fn read_stdin_input() -> AwarenessInput {
+fn read_stdin_input(harness: &str) -> AwarenessInput {
     let mut raw = String::new();
     if io::stdin().read_to_string(&mut raw).is_err() {
         return AwarenessInput::default();
     }
-    serde_json::from_str(raw.trim()).unwrap_or_default()
+    // Translate the harness's stdin/transcript into pc's canonical Claude shape.
+    let raw = crate::harness::normalize_stdin(&crate::harness::lookup(harness), raw.trim());
+    serde_json::from_str(&raw).unwrap_or_default()
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
@@ -117,7 +119,7 @@ fn git_branch(cwd: &str) -> Option<String> {
 
 /// Hook dispatcher. `hook` is one of UserPromptSubmit | PostToolUse | Stop | SessionEnd.
 /// Always returns Ok and never blocks/errors the originating prompt or tool.
-pub fn run_hook(hook: &str) -> Result<()> {
+pub fn run_hook(hook: &str, harness: &str) -> Result<()> {
     let cfg = match load_config() {
         Ok(c) => c,
         Err(_) => return Ok(()),
@@ -125,7 +127,7 @@ pub fn run_hook(hook: &str) -> Result<()> {
     if !cfg.awareness_enabled {
         return Ok(());
     }
-    let input = read_stdin_input();
+    let input = read_stdin_input(harness);
     if input.session_id.is_empty() || input.cwd.is_empty() {
         return Ok(());
     }

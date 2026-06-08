@@ -85,13 +85,37 @@ Global config lives at `~/.proactive-context/config.json`. Per-project state (in
 
 ## The assistant integration
 
-The engine is standalone, but the two motions come alive when they hook into an assistant's lifecycle. Today that integration is [Claude Code](https://claude.com/claude-code), via its hooks:
+The engine is standalone, but the two motions come alive when they hook into an assistant's lifecycle. The original host is [Claude Code](https://claude.com/claude-code), via its hooks:
 
 - **`UserPromptSubmit` → `inject`** — compiles the cited briefing and prepends it to your prompt. Fast, synchronous, and degrades to a free raw-hits fallback (or silence) before it would ever block a turn.
 - **`SessionEnd` (or a debounced `Stop`) → `capture`** — distills the finished session into the wiki, off the hot path. The debounce survives the hook process dying, so capture runs after you've actually stopped, not on every turn.
 - **`statusLine` → `statusline`** — a sub-10ms, no-network indicator of what the system did this turn.
 
-Nothing about capture-then-inject is specific to Claude Code, or to code — it's the lifecycle of any assistant that has a beginning and end of turn. Claude Code is simply the host that exposes those seams today.
+Nothing about capture-then-inject is specific to Claude Code, or to code — it's the lifecycle of any assistant that has a beginning and end of turn.
+
+### `pc install` — wire up your harnesses
+
+Most agent harnesses speak the same Claude-style hook protocol pc was built for. `pc install` detects the ones on your machine and wires them up — pick from an interactive checklist, or pass `--all` / `--harness claude,codex`:
+
+```bash
+pc install            # interactive: pick from detected harnesses
+pc install --status   # what's detected / installed, per harness
+pc install --dry-run --all   # show exactly what would be written
+pc install --all      # wire every detected harness
+pc install --uninstall --all # cleanly remove everything pc added
+```
+
+Each integration is **idempotent** (safe to re-run) and **reversible** (`--uninstall` strips only pc's managed blocks). Hooks call the absolute path of the running binary, so they work regardless of `$PATH`.
+
+| Harness | Inject | Capture | Config written | Notes |
+|---|---|---|---|---|
+| **Claude Code** | `UserPromptSubmit` | `SessionEnd` + debounced `Stop` | `~/.claude/settings.json` | also `session_start`, `PostToolUse` awareness, `statusLine` |
+| **Codex** | `UserPromptSubmit` | `Stop` | `~/.codex/config.toml` | run `/hooks` in Codex to trust the new hooks |
+| **opencode** | `messages.transform` | `session.idle` | `~/.config/opencode/plugin/` | drops a self-contained plugin (see [`integrations/opencode`](integrations/opencode/)) |
+| **Hermes** | `pre_llm_call` | `on_session_end` | `~/.hermes/config.yaml` | first-use consent prompt (or `--accept-hooks`) |
+| **TENEX** | `UserPromptSubmit` | `Stop` | `.tenex-hooks.json` (per-project) | config is written and ready; activates once TENEX ships its hook loader ([tenex-chat/tenex#126](https://github.com/tenex-chat/tenex/issues/126)) |
+
+Under the hood, every hook command carries a `--harness <id>` flag. pc translates that harness's stdin shape and transcript format into its canonical pipeline and formats the reply in the harness's dialect — so the retrieval/capture core stays harness-agnostic and **adding a new harness is one declarative spec in `src/harness/`**, not changes scattered across the codebase.
 
 To watch it think, in any terminal:
 
@@ -111,6 +135,7 @@ proactive-context tail -v         # sub-queries, hits, per-stage latency
 | `generate` | LLM-synthesized answer with a `read_file` tool for full-document retrieval. |
 | `capture` | Distill a finished session into the wiki (SessionEnd / debounced Stop hook). |
 | `inject` | Compile a cited, verbatim briefing for the current prompt (UserPromptSubmit hook). |
+| `install` | Detect local agent harnesses (Claude Code, Codex, opencode, Hermes, TENEX) and wire pc's hooks into each. `--status`, `--dry-run`, `--all`, `--harness`, `--uninstall`. |
 | `statusline` | One-line status indicator. |
 | `tail` | Follow the live event log. |
 | `stats` | Index health: files, chunks, model, daemon status. `--watch` to live-update. |

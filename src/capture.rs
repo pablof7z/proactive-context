@@ -2631,14 +2631,16 @@ pub(crate) fn archeologist_is_already_captured(session_id: &str, marker_dir: Opt
 
 // ─── SessionEnd entry point ───────────────────────────────────────────────────
 
-pub fn run_capture() -> Result<()> {
+pub fn run_capture(harness: &str) -> Result<()> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(());
     }
-    let input: CaptureInput = match serde_json::from_str(raw) {
+    // Translate the harness's stdin/transcript into pc's canonical Claude shape.
+    let raw = crate::harness::normalize_stdin(&crate::harness::lookup(harness), raw);
+    let input: CaptureInput = match serde_json::from_str(&raw) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("capture: stdin parse failed: {}", e);
@@ -2650,15 +2652,19 @@ pub fn run_capture() -> Result<()> {
 
 // ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
 
-pub fn run_capture_scheduled(delay_secs: u64) -> Result<()> {
+pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(());
     }
+    // Normalize now so the canonical (and, for non-Claude harnesses, converted)
+    // transcript_path is what gets persisted into the pending-capture record and
+    // read later by the detached deferred worker.
+    let raw = crate::harness::normalize_stdin(&crate::harness::lookup(harness), &raw);
 
-    let hook_input: CaptureInput = match serde_json::from_str(raw) {
+    let hook_input: CaptureInput = match serde_json::from_str(&raw) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("capture --in: stdin parse failed: {}", e);

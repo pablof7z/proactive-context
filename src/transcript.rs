@@ -81,6 +81,56 @@ pub(crate) fn parse_transcript(path: &str) -> Result<Vec<(String, String)>> {
     Ok(turns)
 }
 
+/// Parse a Codex `rollout-*.jsonl` transcript into `(role, text)` pairs.
+/// Codex lines are `{ "type": "response_item", "payload": { "type": "message",
+/// "role": "user"|"assistant", "content": [{ "type": "input_text"|"output_text"|"text",
+/// "text": "..." }] } }`. `session_meta` and non-message items are skipped.
+/// Returns the same shape as `parse_transcript`, so all downstream callers are unaffected.
+pub(crate) fn parse_codex_rollout(path: &str) -> Result<Vec<(String, String)>> {
+    let content = fs::read_to_string(path)?;
+    let mut turns = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let payload = match entry.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        let role = match payload.get("role").and_then(|r| r.as_str()) {
+            Some(r) if r == "user" || r == "assistant" => r.to_string(),
+            _ => continue,
+        };
+        // content is an array of blocks each with a `text` field (input_text/output_text/text).
+        let text = match payload.get("content") {
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let text = text.trim();
+        // Skip harness-injected XML (mirrors extract_text's '<' rule).
+        if !text.is_empty() && !text.starts_with('<') {
+            turns.push((role, text.to_string()));
+        }
+    }
+    Ok(turns)
+}
+
 // ─── Rich transcript message (archeologist / per-message metadata) ────────────
 
 /// A transcript turn with full per-message metadata.

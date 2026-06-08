@@ -14,6 +14,7 @@ mod daemon;
 mod db;
 mod embed;
 mod events;
+mod harness;
 mod inject;
 mod openrouter;
 mod provider;
@@ -118,6 +119,10 @@ enum Commands {
         // Internal: run the deferred capture for this session_id (spawned by --in).
         #[arg(long, hide = true)]
         deferred: Option<String>,
+
+        /// Which harness's hook dialect the stdin is in (claude | codex | hermes | tenex | opencode).
+        #[arg(long, default_value = "claude")]
+        harness: String,
     },
 
     /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
@@ -127,6 +132,11 @@ enum Commands {
         /// Show a systemMessage with hits, guides read, and the generated briefing
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Which harness's hook dialect to read stdin / format stdout for
+        /// (claude | codex | hermes | tenex | opencode).
+        #[arg(long, default_value = "claude")]
+        harness: String,
     },
 
     /// Cross-agent awareness hook (invoked from Claude Code hooks). Reads the hook
@@ -145,6 +155,10 @@ enum Commands {
         // Internal: cwd to locate the per-repo agents.db for --distill.
         #[arg(long, hide = true)]
         cwd: Option<String>,
+
+        /// Which harness's hook dialect the stdin is in (claude | codex | tenex).
+        #[arg(long, default_value = "claude")]
+        harness: String,
     },
 
     /// Show the cross-agent standup board for this repo: every concurrent Claude Code
@@ -262,7 +276,41 @@ enum Commands {
     /// session's capture pass and injects them as additionalContext so Claude can answer
     /// them naturally during the session. Reads { session_id, cwd, source } JSON from stdin.
     /// Always exits 0.
-    SessionStart,
+    SessionStart {
+        /// Harness whose hook invoked this (accepted for a uniform hook command; the
+        /// session_start input/output shape is identical across harnesses).
+        #[arg(long, default_value = "claude")]
+        harness: String,
+    },
+
+    /// Detect local agent harnesses (Claude Code, Codex, opencode, Hermes, TENEX)
+    /// and wire pc's inject/capture hooks into each. With no flags, shows an
+    /// interactive checklist of detected harnesses to install.
+    Install {
+        /// Install into every detected harness (skip the interactive picker).
+        #[arg(long)]
+        all: bool,
+
+        /// Comma-separated harness ids to install (e.g. `claude,codex`). Skips the picker.
+        #[arg(long, value_delimiter = ',')]
+        harness: Option<Vec<String>>,
+
+        /// Project directory for project-scoped harnesses (TENEX). Defaults to cwd.
+        #[arg(long)]
+        project: Option<PathBuf>,
+
+        /// Print exactly what would be written without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show detection + install status for every known harness and exit.
+        #[arg(long)]
+        status: bool,
+
+        /// Remove pc's hooks from the selected harnesses instead of installing.
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -367,21 +415,21 @@ fn main() -> Result<()> {
             crate::configure::run_configure()?;
         }
 
-        Commands::Capture { r#in, deferred } => {
+        Commands::Capture { r#in, deferred, harness } => {
             if let Some(session_id) = deferred {
                 crate::capture::run_deferred_capture(&session_id)?;
             } else if let Some(secs) = r#in {
-                crate::capture::run_capture_scheduled(secs)?;
+                crate::capture::run_capture_scheduled(secs, &harness)?;
             } else {
-                crate::capture::run_capture()?;
+                crate::capture::run_capture(&harness)?;
             }
         }
 
-        Commands::Inject { verbose } => {
-            crate::inject::run_inject(verbose)?;
+        Commands::Inject { verbose, harness } => {
+            crate::inject::run_inject(verbose, &harness)?;
         }
 
-        Commands::Awareness { hook, distill, cwd } => {
+        Commands::Awareness { hook, distill, cwd, harness } => {
             if let Some(session_id) = distill {
                 // Detached worker spawned by a hook tick.
                 let cwd = cwd.unwrap_or_default();
@@ -389,7 +437,7 @@ fn main() -> Result<()> {
                     eprintln!("awareness distill: {}", e);
                 }
             } else if let Some(hook) = hook {
-                let _ = crate::awareness::run_hook(&hook);
+                let _ = crate::awareness::run_hook(&hook, &harness);
             }
         }
 
@@ -462,8 +510,19 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::SessionStart => {
+        Commands::SessionStart { harness: _ } => {
             crate::session_start::run_session_start()?;
+        }
+
+        Commands::Install { all, harness, project, dry_run, status, uninstall } => {
+            crate::harness::install::run_install(crate::harness::install::InstallOpts {
+                harnesses: harness,
+                all,
+                project,
+                dry_run,
+                status,
+                uninstall,
+            })?;
         }
     }
 
