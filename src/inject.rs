@@ -105,25 +105,53 @@ fn parse_query_line(line: &str) -> Option<String> {
 
 // ─── Output helper ───────────────────────────────────────────────────────────
 
-/// Non-verbose: prints `context_block` as plain text (→ context injection).
-/// Verbose: prints JSON with `systemMessage` (visible to user) and, if there is
-/// a context block, `hookSpecificOutput.additionalContext` (context injection).
-fn emit(verbose: bool, context_block: Option<&str>, verbose_msg: &str) {
-    if verbose {
-        let obj = if let Some(block) = context_block {
-            serde_json::json!({
-                "systemMessage": verbose_msg,
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": block
+/// How to render the injected context on stdout.
+/// `Verbose` is the Claude `-v` debug shape; `Plain` follows the harness dialect.
+enum OutMode {
+    Verbose,
+    Plain(crate::harness::OutputDialect),
+}
+
+/// Verbose: JSON with `systemMessage` (visible to user) and, if there is a
+/// context block, `hookSpecificOutput.additionalContext`.
+/// Plain: renders `context_block` in the harness's output dialect — raw text
+/// (Claude), `hookSpecificOutput.additionalContext` JSON (Codex/TENEX), or
+/// `{"context":…}` JSON (Hermes).
+fn emit(out: &OutMode, context_block: Option<&str>, verbose_msg: &str) {
+    use crate::harness::OutputDialect;
+    match out {
+        OutMode::Verbose => {
+            let obj = if let Some(block) = context_block {
+                serde_json::json!({
+                    "systemMessage": verbose_msg,
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": block
+                    }
+                })
+            } else {
+                serde_json::json!({ "systemMessage": verbose_msg })
+            };
+            print!("{}", serde_json::to_string(&obj).unwrap_or_default());
+        }
+        OutMode::Plain(dialect) => {
+            let Some(block) = context_block else { return };
+            match dialect {
+                OutputDialect::RawText => print!("{}", block),
+                OutputDialect::AdditionalContextJson => print!(
+                    "{}",
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "UserPromptSubmit",
+                            "additionalContext": block
+                        }
+                    })
+                ),
+                OutputDialect::ContextJson => {
+                    print!("{}", serde_json::json!({ "context": block }))
                 }
-            })
-        } else {
-            serde_json::json!({ "systemMessage": verbose_msg })
-        };
-        print!("{}", serde_json::to_string(&obj).unwrap_or_default());
-    } else if let Some(block) = context_block {
-        print!("{}", block);
+            }
+        }
     }
 }
 
@@ -175,7 +203,7 @@ fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
 /// - does nothing (≤5 files),
 /// - auto-inits the daemon (>5 files, ≤5000 total LOC), or
 /// - emits a suggestion block to Claude Code (>5 files, >5000 LOC).
-fn handle_no_index(root: &Path, verbose: bool) -> Result<()> {
+fn handle_no_index(root: &Path, out: &OutMode) -> Result<()> {
     let candidates = scan_indexable_files(root);
 
     if candidates.len() <= 5 {
@@ -213,7 +241,7 @@ fn handle_no_index(root: &Path, verbose: bool) -> Result<()> {
     block.push_str("If yes, run: proactive-context init\n");
 
     emit(
-        verbose,
+        out,
         Some(&block),
         &format!(
             "inject | no-index | {} files ~{} LOC — suggestion emitted",
@@ -259,7 +287,7 @@ fn scan_indexable_files(root: &Path) -> Vec<(PathBuf, usize)> {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Always returns Ok(()). Every internal failure is swallowed and degrades gracefully.
-pub fn run_inject(verbose: bool) -> Result<()> {
+pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     // Read stdin
     let mut raw = String::new();
     let _ = io::stdin().read_to_string(&mut raw);
@@ -268,7 +296,13 @@ pub fn run_inject(verbose: bool) -> Result<()> {
     if raw.is_empty() {
         return Ok(());
     }
-    let input: InjectInput = match serde_json::from_str(raw) {
+    // Normalize the harness's stdin/transcript into pc's canonical Claude shape,
+    // and pick the output dialect for this harness.
+    let spec = crate::harness::lookup(harness);
+    let normalized = crate::harness::normalize_stdin(&spec, raw);
+    let out_mode = if verbose { OutMode::Verbose } else { OutMode::Plain(spec.output) };
+
+    let input: InjectInput = match serde_json::from_str(&normalized) {
         Ok(i) => i,
         Err(_) => return Ok(()),
     };
@@ -276,7 +310,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
     let db_path = project_db_path(&root);
     if !db_path.exists() {
-        return handle_no_index(&root, verbose);
+        return handle_no_index(&root, &out_mode);
     }
 
     let cfg = match load_config() {
@@ -299,7 +333,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             "prompt_chars": input.prompt.len()
         }));
         let preview = input.prompt.chars().take(40).collect::<String>();
-        emit(verbose, None, &format!("inject | skipped trivial prompt: {:?}", preview));
+        emit(&out_mode, None, &format!("inject | skipped trivial prompt: {:?}", preview));
         return Ok(());
     }
 
@@ -362,7 +396,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 "out_chars": 0,
                 "prompt_preview": &prompt_preview
             }));
-            emit(verbose, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
+            emit(&out_mode, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
                 start.elapsed().as_millis()));
             return Ok(());
         }
@@ -375,7 +409,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
             "out_chars": out_chars,
             "prompt_preview": &prompt_preview
         }));
-        emit(verbose, Some(&fallback_block), &format!(
+        emit(&out_mode, Some(&fallback_block), &format!(
             "inject [{}ms] | {} hits | fallback (no API key) | injected {}c",
             elapsed_ms, hits.len(), out_chars));
         return Ok(());
@@ -459,7 +493,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "out_chars": 0,
                     "prompt_preview": &prompt_preview
                 }));
-                emit(verbose, None, &format!(
+                emit(&out_mode, None, &format!(
                     "inject [{}ms] | {} hits | guides: {} | briefing: NONE",
                     elapsed_ms, hits.len(), format_guides(&guides_read)));
                 return Ok(());
@@ -491,7 +525,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 done_payload["title"] = serde_json::Value::String(t.clone());
             }
             log_event("inject.done", Some(elapsed_ms as u64), done_payload);
-            emit(verbose, Some(&out), &format!(
+            emit(&out_mode, Some(&out), &format!(
                 "inject [{}ms] | {} hits | guides: {} | compiled {}c\n\nBriefing:\n{}",
                 elapsed_ms, hits.len(), format_guides(&guides_read),
                 out_chars, body));
@@ -508,7 +542,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                 "out_chars": 0,
                 "prompt_preview": &prompt_preview
             }));
-            emit(verbose, None, &format!(
+            emit(&out_mode, None, &format!(
                 "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
                 elapsed_ms, hits.len(), format_guides(&guides_read)));
         }
@@ -528,7 +562,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "out_chars": out_chars,
                     "prompt_preview": &prompt_preview
                 }));
-                emit(verbose, Some(&fallback_block), &format!(
+                emit(&out_mode, Some(&fallback_block), &format!(
                     "inject [{}ms] | {} hits | error: {} | fallback {}c",
                     elapsed_ms, hits.len(), truncate(&format!("{}", e), 120),
                     out_chars));
@@ -539,7 +573,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "out_chars": 0,
                     "prompt_preview": &prompt_preview
                 }));
-                emit(verbose, None, &format!(
+                emit(&out_mode, None, &format!(
                     "inject [{}ms] | 0 hits | error: {}",
                     elapsed_ms, truncate(&format!("{}", e), 120)));
             }
@@ -556,7 +590,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "out_chars": out_chars,
                     "prompt_preview": &prompt_preview
                 }));
-                emit(verbose, Some(&fallback_block), &format!(
+                emit(&out_mode, Some(&fallback_block), &format!(
                     "inject [{}ms] | {} hits | timeout → fallback {}c",
                     elapsed_ms, hits.len(), out_chars));
             } else {
@@ -566,7 +600,7 @@ pub fn run_inject(verbose: bool) -> Result<()> {
                     "out_chars": 0,
                     "prompt_preview": &prompt_preview
                 }));
-                emit(verbose, None, &format!(
+                emit(&out_mode, None, &format!(
                     "inject [{}ms] | 0 hits | timeout — nothing injected", elapsed_ms));
             }
         }
