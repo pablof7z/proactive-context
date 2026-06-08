@@ -2,25 +2,32 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rig_core::client::CompletionClient;
-use rig_core::completion::{Prompt, ToolDefinition};
-use rig_core::tool::Tool;
+use rig_core::completion::Prompt;
 use tokio::runtime::Runtime;
 
+#[path = "capture/state.rs"]
+mod state;
+
 use crate::config::{load_config, normalize_path, resolve_project_root};
-use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::daemon::index_files_into_db;
 use crate::events::{init_context, log_event, truncate};
-use crate::transcript::{build_transcript_string, parse_transcript, parse_transcript_meta};
+use crate::provider::{build_ollama_client, ModelSpec, Provider};
+use crate::transcript::{
+    build_transcript_string, parse_transcript, parse_transcript_meta, reduce_turns_to_fit,
+    tail_capped,
+};
 use crate::wiki::{
-    self, add_statement_to_section, guide_path, load_guide,
-    new_guide, read_index, read_index_live, rebuild_index, revise_section, save_guide, slugify, wiki_dir,
-    Guide,
+    self, add_statement_to_section, guide_path, load_guide, new_guide, read_index, read_index_live,
+    rebuild_index, revise_section, save_guide, slugify, wiki_dir, Guide,
+};
+use state::{
+    acquire_project_wiki_lock, acquire_session_lock, captured_sessions_dir, is_already_captured_in,
+    mark_captured_in, pending_captures_dir, project_dir_from_cwd,
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -66,145 +73,14 @@ struct PendingCapture {
     debounce_secs: u64,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct CaptureMarker {
-    captured_at_exchanges: usize,
-}
-
-// ─── Dormant v0.3 types (kept for backward-compat; not called in v0.4) ────────
-
-/// Kept dormant. The v0.4 agent loop replaces distill→plan→apply.
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-struct Lesson {
-    slug: String,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    scope: String,
-    #[serde(default)]
-    volatility: String,
-    #[serde(default)]
-    context: String,
-    #[serde(default)]
-    symptom: String,
-    #[serde(default)]
-    root_cause: String,
-    #[serde(default)]
-    fix: String,
-    #[serde(default)]
-    rule: String,
-}
-
-// ─── Path helpers ─────────────────────────────────────────────────────────────
-
-fn home_dir() -> PathBuf {
-    dirs::home_dir().expect("cannot determine home directory")
-}
-
-fn captured_sessions_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("captured-sessions")
-}
-
-fn session_lock_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("session-locks")
-}
-
-fn pending_captures_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("pending-captures")
-}
-
-fn project_lock_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("project-locks")
-}
-
-// ─── Capture marker (dedup by transcript extent) ──────────────────────────────
-
-fn is_already_captured_in(session_id: &str, current_exchanges: usize, marker_dir: &PathBuf) -> bool {
-    if session_id.is_empty() {
-        return false;
-    }
-    let path = marker_dir.join(format!("{}.json", session_id));
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(marker) = serde_json::from_str::<CaptureMarker>(&data) {
-            return current_exchanges <= marker.captured_at_exchanges;
-        }
-    }
-    false
-}
-
-fn is_already_captured(session_id: &str, current_exchanges: usize) -> bool {
-    is_already_captured_in(session_id, current_exchanges, &captured_sessions_dir())
-}
-
-fn mark_captured_in(session_id: &str, exchanges: usize, marker_dir: &PathBuf) -> Result<()> {
-    if session_id.is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(marker_dir)?;
-    let marker = CaptureMarker { captured_at_exchanges: exchanges };
-    fs::write(marker_dir.join(format!("{}.json", session_id)), serde_json::to_string(&marker)?)?;
-    Ok(())
-}
-
-fn mark_captured(session_id: &str, exchanges: usize) -> Result<()> {
-    mark_captured_in(session_id, exchanges, &captured_sessions_dir())
-}
-
-// ─── Per-session flock ────────────────────────────────────────────────────────
-
-fn acquire_session_lock(session_id: &str) -> Result<fs::File> {
-    let dir = session_lock_dir();
-    fs::create_dir_all(&dir)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(dir.join(format!("{}.lock", session_id)))?;
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret != 0 {
-        anyhow::bail!("another capture is already running for this session (lock held)");
-    }
-    Ok(file)
-}
-
-// ─── Per-project wiki write-lock ──────────────────────────────────────────────
-//
-// BLOCKING (LOCK_EX without LOCK_NB): serializes concurrent captures across
-// different sessions writing to the same wiki. Acquired/released per mutating call.
-
-fn acquire_project_wiki_lock(project_key: &str) -> Result<fs::File> {
-    let dir = project_lock_dir();
-    fs::create_dir_all(&dir)?;
-    let safe_key: String = project_key.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .take(64)
-        .collect();
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(dir.join(format!("{}.wiki.lock", safe_key)))?;
-    // BLOCKING acquire — serializes concurrent captures of different sessions
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if ret != 0 {
-        anyhow::bail!("failed to acquire wiki project lock for {}", project_key);
-    }
-    Ok(file)
-}
-
 // ─── Unix timestamp helper ───────────────────────────────────────────────────
 
 pub(crate) fn unix_now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
-fn project_dir_from_cwd(cwd: &str) -> PathBuf {
-    let root = resolve_project_root(&PathBuf::from(cwd));
-    let normalized = normalize_path(&root);
-    home_dir()
-        .join(".proactive-context")
-        .join("projects")
-        .join(normalized)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ─── Date helpers ──────────────────────────────────────────────────────────────
@@ -262,6 +138,30 @@ pub(crate) fn call_model_blocking(
     system: &str,
     user_msg: &str,
 ) -> Result<String> {
+    call_model_blocking_with_timeout(
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        system,
+        user_msg,
+        120,
+    )
+}
+
+/// Like [`call_model_blocking`] but with a caller-specified HTTP timeout. Batch / off-hot-path
+/// jobs (e.g. the doctor's whole-catalog taxonomy or merge calls) need far more than the
+/// 120s hot-path default — a single large structured-output call on a slow local model can
+/// take several minutes.
+pub(crate) fn call_model_blocking_with_timeout(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    system: &str,
+    user_msg: &str,
+    timeout_secs: u64,
+) -> Result<String> {
     // Ollama uses its native /api/chat endpoint (works for both local and cloud);
     // /v1/chat/completions returns 401 on api.ollama.com.
     let (url, auth_header, is_ollama) = match spec.provider {
@@ -271,17 +171,14 @@ pub(crate) fn call_model_blocking(
             false,
         ),
         Provider::Ollama => (
-            format!(
-                "{}/api/chat",
-                ollama_base_url.trim_end_matches('/')
-            ),
+            format!("{}/api/chat", ollama_base_url.trim_end_matches('/')),
             ollama_api_key.map(|k| format!("Bearer {}", k)),
             true,
         ),
     };
 
     let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
 
     let body = if is_ollama {
@@ -308,9 +205,7 @@ pub(crate) fn call_model_blocking(
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let mut req = http
-            .post(&url)
-            .header("Content-Type", "application/json");
+        let mut req = http.post(&url).header("Content-Type", "application/json");
         if let Some(ref auth) = auth_header {
             req = req.header("Authorization", auth);
         }
@@ -326,7 +221,10 @@ pub(crate) fn call_model_blocking(
                     // Ollama native: {message:{content:"..."}}
                     // OpenRouter:    {choices:[{message:{content:"..."}}]}
                     let content = if is_ollama {
-                        data["message"]["content"].as_str().unwrap_or("").to_string()
+                        data["message"]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string()
                     } else {
                         data["choices"][0]["message"]["content"]
                             .as_str()
@@ -342,7 +240,12 @@ pub(crate) fn call_model_blocking(
                 if !transient || attempt == MAX_ATTEMPTS {
                     anyhow::bail!("{} error {}: {}", spec.provider_name(), status, snippet);
                 }
-                last_err = Some(anyhow::anyhow!("{} error {}: {}", spec.provider_name(), status, snippet));
+                last_err = Some(anyhow::anyhow!(
+                    "{} error {}: {}",
+                    spec.provider_name(),
+                    status,
+                    snippet
+                ));
             }
             Err(e) => {
                 if attempt == MAX_ATTEMPTS {
@@ -354,7 +257,9 @@ pub(crate) fn call_model_blocking(
 
         eprintln!(
             "capture: {} call failed (attempt {}/{}), retrying…",
-            spec.provider_name(), attempt, MAX_ATTEMPTS
+            spec.provider_name(),
+            attempt,
+            MAX_ATTEMPTS
         );
         std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
     }
@@ -374,7 +279,10 @@ fn triage_transcript(
 ) -> Result<bool> {
     let system = "You scan AI coding assistant conversations for durable lessons worth capturing.";
     let wiki_note = if !wiki_index.is_empty() {
-        format!("\n\nCURRENT WIKI INDEX (for 'already specified' check):\n{}", wiki_index)
+        format!(
+            "\n\nCURRENT WIKI INDEX (for 'already specified' check):\n{}",
+            wiki_index
+        )
     } else {
         String::new()
     };
@@ -391,38 +299,19 @@ fn triage_transcript(
         specified in the wiki above.{wiki_note}\n\n\
         TRANSCRIPT:\n{transcript}"
     );
-    let raw = call_model_blocking(spec, openrouter_api_key, ollama_base_url, ollama_api_key, system, &user_msg)?;
+    let raw = call_model_blocking(
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        system,
+        &user_msg,
+    )?;
     let answer = raw.trim().lines().next().unwrap_or("").to_uppercase();
     Ok(answer.starts_with("YES"))
 }
 
-// ─── Global pending queue (DORMANT — kept for backward compat) ────────────────
-
-/// Kept dormant. v0.4 agent loop handles all capture.
-#[allow(dead_code)]
-fn append_global_pending(lesson: &Lesson, session_id: &str) -> Result<()> {
-    let dir = home_dir().join(".proactive-context").join("global");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("pending-lessons.md");
-    let entry = format!(
-        "\n## Pending: {}\n\n- **Rule:** {}\n- **Category:** {}\n- **Source:** session:{}\n- **Date:** {}\n",
-        lesson.slug, lesson.rule, lesson.category, session_id, today()
-    );
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(entry.as_bytes())?;
-    eprintln!("capture: queued global lesson: {}", lesson.slug);
-    Ok(())
-}
-
 // ─── Line-numbered transcript rendering ──────────────────────────────────────
-
-/// Build a line-numbered transcript string, mirroring inject's `render_guides_for_select`.
-/// Format: `{:>4}| <line>` — 1-based. The lines vector is the SAME enumeration used
-/// when slicing evidence ranges.
-fn build_line_numbered_transcript(turns: &[(String, String)]) -> (String, Vec<String>) {
-    let (numbered, lines, _roles) = build_line_numbered_transcript_with_roles(turns);
-    (numbered, lines)
-}
 
 /// Like `build_line_numbered_transcript`, but also returns a parallel `Vec<String>`
 /// of the role ("user"/"assistant") that OWNS each 1-based transcript line.
@@ -463,7 +352,10 @@ pub(crate) fn build_line_numbered_transcript_with_roles(
     }
     // Defensive: keep roles aligned to lines if any edge case under/over-counts.
     if roles.len() < lines.len() {
-        let last = roles.last().cloned().unwrap_or_else(|| "assistant".to_string());
+        let last = roles
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "assistant".to_string());
         while roles.len() < lines.len() {
             roles.push(last.clone());
         }
@@ -486,8 +378,8 @@ fn slice_transcript_ranges(lines: &[String], ranges: &[EvidenceRange]) -> String
     for range in ranges {
         let start = range.start.saturating_sub(1); // convert to 0-based
         let end = range.end.min(lines.len()); // 1-based inclusive → 0-based exclusive
-        // Skip out-of-bounds, empty, or INVERTED ranges. The model can emit start > end
-        // (e.g. {start:1296,end:1197}); without this guard `lines[start..end]` panics.
+                                              // Skip out-of-bounds, empty, or INVERTED ranges. The model can emit start > end
+                                              // (e.g. {start:1296,end:1197}); without this guard `lines[start..end]` panics.
         if start >= lines.len() || start >= end {
             continue;
         }
@@ -550,7 +442,7 @@ fn append_citation_log(
     Ok(())
 }
 
-// ─── Shared wiki agent context ────────────────────────────────────────────────
+// ─── Shared wiki capture context ──────────────────────────────────────────────
 
 /// Evidence range: transcript line numbers (1-based, inclusive).
 #[derive(Debug, Deserialize, Clone)]
@@ -559,7 +451,7 @@ pub struct EvidenceRange {
     pub end: usize,
 }
 
-/// Shared context behind Arc — cloned into each wiki_* tool instance.
+/// Shared context behind Arc — passed through the staged capture pipeline.
 struct WikiAgentCtx {
     wiki_path: PathBuf,
     project_key: String,
@@ -625,7 +517,9 @@ impl WikiAgentCtx {
         if ranges.is_empty() {
             return false;
         }
-        !slice_transcript_ranges(&self.transcript_lines, ranges).trim().is_empty()
+        !slice_transcript_ranges(&self.transcript_lines, ranges)
+            .trim()
+            .is_empty()
     }
 
     /// Mint a new citation ID and increment the counter.
@@ -646,7 +540,7 @@ impl WikiAgentCtx {
 
     /// Write-locked guide mutation. Acquires project wiki lock, re-reads the guide
     /// from disk inside the lock (optimistic check-on-write), applies `f`, saves.
-    /// Returns Ok(message) or Ok("Error: ...") — never Err (tools degrade gracefully).
+    /// Returns Ok(message) or Ok("Error: ...") so reconcile operations degrade gracefully.
     fn with_guide_locked<F>(&self, slug: &str, f: F) -> String
     where
         F: FnOnce(Option<Guide>) -> Result<(Guide, String)>,
@@ -672,700 +566,12 @@ impl WikiAgentCtx {
     }
 }
 
-// ─── wiki_list tool ───────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiListTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiListArgs {}
-
-impl Tool for WikiListTool {
-    const NAME: &'static str = "wiki_list";
-
-    type Error = std::io::Error;
-    type Args = WikiListArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "List all guides in the project wiki. Returns [{slug, title, summary}]. \
-                           No side effects. Use this first to understand what already exists.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        }
-    }
-
-    async fn call(&self, _args: WikiListArgs) -> Result<Self::Output, Self::Error> {
-        // Scan live guide files (not _index.md) for freshness within the loop
-        let wiki_path = &self.ctx.wiki_path;
-        if !wiki_path.exists() {
-            return Ok("[]".to_string());
-        }
-
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        let dir = match fs::read_dir(wiki_path) {
-            Ok(d) => d,
-            Err(_) => return Ok("[]".to_string()),
-        };
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            if stem.starts_with('_') {
-                continue; // skip _index, _citations
-            }
-            if let Some(guide) = load_guide(&path) {
-                entries.push(serde_json::json!({
-                    "slug": guide.frontmatter.slug,
-                    "title": guide.frontmatter.title,
-                    "summary": guide.frontmatter.summary
-                }));
-            }
-        }
-        entries.sort_by(|a, b| {
-            a["slug"].as_str().unwrap_or("").cmp(b["slug"].as_str().unwrap_or(""))
-        });
-
-        log_event("wiki.list", None, serde_json::json!({ "count": entries.len() }));
-        Ok(serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()))
-    }
-}
-
-// ─── wiki_read tool ───────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiReadTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiReadArgs {
-    slug: String,
-}
-
-impl Tool for WikiReadTool {
-    const NAME: &'static str = "wiki_read";
-
-    type Error = std::io::Error;
-    type Args = WikiReadArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Read the full body of a wiki guide by slug, including section headings \
-                           and any existing [^id] citation markers. No side effects.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Guide slug (e.g. 'avatar-behavior')"
-                    }
-                },
-                "required": ["slug"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let path = guide_path(&self.ctx.wiki_path, &args.slug);
-        match load_guide(&path) {
-            Some(guide) => {
-                log_event("guide.read", None, serde_json::json!({ "slug": args.slug }));
-                Ok(guide.body)
-            }
-            None => {
-                Ok(format!(
-                    "Error: guide '{}' not found. Use wiki_list to see available guides.",
-                    args.slug
-                ))
-            }
-        }
-    }
-}
-
-// ─── wiki_create tool ──────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiCreateTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiCreateSection {
-    heading: String,
-    text: String,
-    evidence: Vec<EvidenceRange>,
-}
-
-#[derive(Deserialize)]
-struct WikiCreateArgs {
-    slug: String,
-    title: String,
-    summary: String,
-    sections: Vec<WikiCreateSection>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    volatility: String,
-}
-
-impl Tool for WikiCreateTool {
-    const NAME: &'static str = "wiki_create";
-
-    type Error = std::io::Error;
-    type Args = WikiCreateArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Create a new wiki guide. Each section requires evidence (transcript line \
-                           ranges). Rust slices the verbatim text and mints citation markers — \
-                           do NOT write [^id] yourself. If the guide already exists, use \
-                           wiki_add_statement or wiki_revise_statement instead.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "URL-safe kebab-case slug" },
-                    "title": { "type": "string" },
-                    "summary": { "type": "string", "description": "One-line summary" },
-                    "sections": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "heading": { "type": "string", "description": "Section heading, e.g. '## Overview'" },
-                                "text": { "type": "string", "description": "Section prose (no [^id] — Rust adds them)" },
-                                "evidence": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "start": { "type": "integer", "description": "First line number (1-based)" },
-                                            "end": { "type": "integer", "description": "Last line number (1-based, inclusive)" }
-                                        },
-                                        "required": ["start", "end"]
-                                    }
-                                }
-                            },
-                            "required": ["heading", "text", "evidence"]
-                        }
-                    },
-                    "tags": { "type": "array", "items": { "type": "string" } },
-                    "volatility": { "type": "string", "enum": ["hot", "warm", "cold"] }
-                },
-                "required": ["slug", "title", "summary", "sections"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let ctx = &self.ctx;
-        let safe_slug = slugify(&args.slug);
-        let path = guide_path(&ctx.wiki_path, &safe_slug);
-
-        if path.exists() {
-            return Ok(format!(
-                "Error: guide '{}' already exists. Use wiki_add_statement or wiki_revise_statement.",
-                safe_slug
-            ));
-        }
-
-        if args.sections.is_empty() {
-            return Ok("Error: at least one section with evidence is required.".to_string());
-        }
-
-        // Build body: for each section, mint citation + append marker
-        let mut body = format!("# {}\n\n> {}\n\n", args.title, args.summary);
-        let mut markers_minted: Vec<String> = Vec::new();
-
-        for section in &args.sections {
-            if section.evidence.is_empty() {
-                return Ok(format!(
-                    "Error: section '{}' has no evidence. Each section requires at least one evidence range.",
-                    section.heading
-                ));
-            }
-            let (marker, sliced) = ctx.cite(&section.evidence);
-            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
-            if let Err(e) = append_citation_log(&ctx.wiki_path, &id, &ctx.session_id, &sliced) {
-                eprintln!("capture: citation log write failed: {}", e);
-            }
-            markers_minted.push(marker.clone());
-            body.push_str(&format!("{}\n\n{} {}\n\n", section.heading, section.text.trim(), marker));
-        }
-
-        body.push_str("## See Also\n\n");
-
-        let tags = if args.tags.is_empty() {
-            vec!["capture".to_string()]
-        } else {
-            args.tags.clone()
-        };
-        let volatility = if args.volatility.is_empty() { "warm" } else { &args.volatility };
-        let markers_for_log = markers_minted.clone();
-        let title = args.title.clone();
-        let sections_count = args.sections.len();
-
-        let result_msg = ctx.with_guide_locked(&safe_slug, |_existing| {
-            let guide = new_guide(
-                &safe_slug,
-                &title,
-                &args.summary,
-                &tags,
-                volatility,
-                &body,
-                &ctx.session_id,
-                &ctx.today,
-            );
-            Ok((guide, format!("Created guide '{}' with {} section(s).", safe_slug, sections_count)))
-        });
-
-        log_event("wiki.create", None, serde_json::json!({
-            "slug": safe_slug,
-            "title": title,
-            "sections": sections_count,
-            "citations": markers_for_log
-        }));
-        eprintln!("capture: wiki_create → {}", safe_slug);
-        Ok(result_msg)
-    }
-}
-
-// ─── wiki_add_statement tool ──────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiAddStatementTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiAddStatementArgs {
-    slug: String,
-    section: String,
-    text: String,
-    evidence: Vec<EvidenceRange>,
-}
-
-impl Tool for WikiAddStatementTool {
-    const NAME: &'static str = "wiki_add_statement";
-
-    type Error = std::io::Error;
-    type Args = WikiAddStatementArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Add a statement to an existing section of a guide. Evidence (transcript \
-                           line ranges) is required. Rust slices the text and mints a [^id] marker.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string" },
-                    "section": { "type": "string", "description": "Exact section heading (e.g. '## Behavior')" },
-                    "text": { "type": "string", "description": "Statement to add (no [^id])" },
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start": { "type": "integer" },
-                                "end": { "type": "integer" }
-                            },
-                            "required": ["start", "end"]
-                        }
-                    }
-                },
-                "required": ["slug", "section", "text", "evidence"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let ctx = &self.ctx;
-        let safe_slug = slugify(&args.slug);
-
-        if args.evidence.is_empty() {
-            return Ok("Error: evidence (transcript line ranges) is required.".to_string());
-        }
-
-        let (marker, sliced) = ctx.cite(&args.evidence);
-        let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
-        let sliced_clone = sliced.clone();
-        let marker_clone = marker.clone();
-        let section = args.section.clone();
-        let text = args.text.clone();
-        let today = ctx.today.clone();
-        let session_id = ctx.session_id.clone();
-        let wiki_path = ctx.wiki_path.clone();
-
-        let result_msg = ctx.with_guide_locked(&safe_slug, |existing| {
-            let mut guide = match existing {
-                Some(g) => g,
-                None => {
-                    let body = format!(
-                        "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                        safe_slug, section, text.trim(), marker_clone
-                    );
-                    return Ok((
-                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today),
-                        format!("Note: guide '{}' did not exist — created with statement.", safe_slug)
-                    ));
-                }
-            };
-
-            guide.body = add_statement_to_section(&guide.body, &section, &text, &marker_clone, &today);
-            guide.frontmatter.updated = today.clone();
-            let source_key = format!("session:{}", session_id);
-            if !guide.frontmatter.sources.contains(&source_key) {
-                guide.frontmatter.sources.push(source_key);
-            }
-
-            Ok((guide, format!("Added statement to section '{}' in guide '{}'.", section, safe_slug)))
-        });
-
-        if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced_clone) {
-            eprintln!("capture: citation log write failed: {}", e);
-        }
-
-        log_event("wiki.add_statement", None, serde_json::json!({
-            "slug": safe_slug,
-            "section": args.section,
-            "citation": marker
-        }));
-        eprintln!("capture: wiki_add_statement → {} / {}", safe_slug, args.section);
-        Ok(result_msg)
-    }
-}
-
-// ─── wiki_revise_statement tool ────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiReviseStatementTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiReviseStatementArgs {
-    slug: String,
-    section: String,
-    text: String,
-    evidence: Vec<EvidenceRange>,
-}
-
-impl Tool for WikiReviseStatementTool {
-    const NAME: &'static str = "wiki_revise_statement";
-
-    type Error = std::io::Error;
-    type Args = WikiReviseStatementArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Revise (replace) the prose of a section in an existing guide. \
-                           Prior [^id] markers are preserved by Rust — do NOT include them \
-                           in 'text'. A new citation is minted for the evidence.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string" },
-                    "section": { "type": "string", "description": "Exact section heading to replace" },
-                    "text": { "type": "string", "description": "New prose (no [^id])" },
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start": { "type": "integer" },
-                                "end": { "type": "integer" }
-                            },
-                            "required": ["start", "end"]
-                        }
-                    }
-                },
-                "required": ["slug", "section", "text", "evidence"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let ctx = &self.ctx;
-        let safe_slug = slugify(&args.slug);
-
-        if args.evidence.is_empty() {
-            return Ok("Error: evidence (transcript line ranges) is required.".to_string());
-        }
-
-        let (marker, sliced) = ctx.cite(&args.evidence);
-        let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
-        let sliced_clone = sliced.clone();
-        let marker_clone = marker.clone();
-        let section = args.section.clone();
-        let text = args.text.clone();
-        let today = ctx.today.clone();
-        let session_id = ctx.session_id.clone();
-        let wiki_path = ctx.wiki_path.clone();
-
-        let result_msg = ctx.with_guide_locked(&safe_slug, |existing| {
-            let mut guide = match existing {
-                Some(g) => g,
-                None => {
-                    let body = format!(
-                        "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                        safe_slug, section, text.trim(), marker_clone
-                    );
-                    return Ok((
-                        new_guide(&safe_slug, &safe_slug, "", &[], "warm", &body, &session_id, &today),
-                        format!("Note: guide '{}' did not exist — created with section.", safe_slug)
-                    ));
-                }
-            };
-
-            match revise_section(&guide.body, &section, &text, &marker_clone) {
-                Ok(new_body) => {
-                    guide.body = new_body;
-                    guide.frontmatter.updated = today.clone();
-                    let source_key = format!("session:{}", session_id);
-                    if !guide.frontmatter.sources.contains(&source_key) {
-                        guide.frontmatter.sources.push(source_key);
-                    }
-                    Ok((guide, format!("Revised section '{}' in guide '{}'. Prior citations preserved.", section, safe_slug)))
-                }
-                Err(e) => {
-                    Ok((guide, format!("Error: {}. No changes made.", e)))
-                }
-            }
-        });
-
-        if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced_clone) {
-            eprintln!("capture: citation log write failed: {}", e);
-        }
-
-        log_event("wiki.revise_statement", None, serde_json::json!({
-            "slug": safe_slug,
-            "section": args.section,
-            "citation": marker
-        }));
-        eprintln!("capture: wiki_revise_statement → {} / {}", safe_slug, args.section);
-        Ok(result_msg)
-    }
-}
-
-// ─── wiki_remove_statement tool ────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiRemoveStatementTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiRemoveStatementArgs {
-    slug: String,
-    section: String,
-    evidence: Vec<EvidenceRange>,
-}
-
-impl Tool for WikiRemoveStatementTool {
-    const NAME: &'static str = "wiki_remove_statement";
-
-    type Error = std::io::Error;
-    type Args = WikiRemoveStatementArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Remove a section from a guide (the decision to remove is itself cited). \
-                           Evidence must show the transcript lines justifying removal.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string" },
-                    "section": { "type": "string", "description": "Exact section heading to remove" },
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start": { "type": "integer" },
-                                "end": { "type": "integer" }
-                            },
-                            "required": ["start", "end"]
-                        }
-                    }
-                },
-                "required": ["slug", "section", "evidence"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let ctx = &self.ctx;
-        let safe_slug = slugify(&args.slug);
-
-        if args.evidence.is_empty() {
-            return Ok("Error: evidence (transcript line ranges) is required.".to_string());
-        }
-
-        let (marker, sliced) = ctx.cite(&args.evidence);
-        let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
-        let sliced_clone = sliced.clone();
-        let section = args.section.clone();
-        let today = ctx.today.clone();
-        let session_id = ctx.session_id.clone();
-        let wiki_path = ctx.wiki_path.clone();
-
-        let result_msg = ctx.with_guide_locked(&safe_slug, |existing| {
-            let mut guide = match existing {
-                Some(g) => g,
-                None => {
-                    return Ok((
-                        new_guide(&safe_slug, &safe_slug, "", &[], "warm",
-                            &format!("# {}\n\n## See Also\n\n", safe_slug),
-                            &session_id, &today),
-                        format!("Error: guide '{}' not found — nothing removed.", safe_slug)
-                    ));
-                }
-            };
-
-            match wiki::find_full_section_range(&guide.body, &section) {
-                None => {
-                    let headings: Vec<String> = guide.body.lines()
-                        .filter(|l| l.trim_start().starts_with('#'))
-                        .take(10)
-                        .map(|l| l.to_string())
-                        .collect();
-                    Ok((guide, format!(
-                        "Error: section '{}' not found. Available: {}",
-                        section,
-                        if headings.is_empty() { "(none)".to_string() } else { headings.join(", ") }
-                    )))
-                }
-                Some((start, end)) => {
-                    guide.body.replace_range(start..end, "");
-                    guide.frontmatter.updated = today.clone();
-                    let source_key = format!("session:{}", session_id);
-                    if !guide.frontmatter.sources.contains(&source_key) {
-                        guide.frontmatter.sources.push(source_key);
-                    }
-                    Ok((guide, format!("Removed section '{}' from guide '{}'.", section, safe_slug)))
-                }
-            }
-        });
-
-        if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced_clone) {
-            eprintln!("capture: citation log write failed: {}", e);
-        }
-
-        log_event("wiki.remove_statement", None, serde_json::json!({
-            "slug": safe_slug,
-            "section": args.section,
-            "citation": marker
-        }));
-        eprintln!("capture: wiki_remove_statement → {} / {}", safe_slug, args.section);
-        Ok(result_msg)
-    }
-}
-
-// ─── wiki_link tool ───────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WikiLinkTool {
-    ctx: Arc<WikiAgentCtx>,
-}
-
-#[derive(Deserialize)]
-struct WikiLinkArgs {
-    slug_a: String,
-    slug_b: String,
-}
-
-impl Tool for WikiLinkTool {
-    const NAME: &'static str = "wiki_link";
-
-    type Error = std::io::Error;
-    type Args = WikiLinkArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Declare a bidirectional See-Also link between two guides. \
-                           Rust enforces all link/index/embed invariants.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "slug_a": { "type": "string" },
-                    "slug_b": { "type": "string" }
-                },
-                "required": ["slug_a", "slug_b"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let ctx = &self.ctx;
-        let slug_a = slugify(&args.slug_a);
-        let slug_b = slugify(&args.slug_b);
-        let today = ctx.today.clone();
-
-        let _lock = match acquire_project_wiki_lock(&ctx.project_key) {
-            Ok(l) => l,
-            Err(e) => return Ok(format!("Error: failed to acquire wiki lock: {}", e)),
-        };
-
-        let path_a = guide_path(&ctx.wiki_path, &slug_a);
-        let path_b = guide_path(&ctx.wiki_path, &slug_b);
-
-        if !path_a.exists() || !path_b.exists() {
-            return Ok(format!(
-                "Error: one or both guides ('{}', '{}') do not exist.",
-                slug_a, slug_b
-            ));
-        }
-
-        if let Some(mut guide_a) = load_guide(&path_a) {
-            let title_b = load_guide(&path_b)
-                .map(|g| g.frontmatter.title)
-                .unwrap_or_else(|| slug_b.replace('-', " "));
-            wiki::add_see_also_link(&mut guide_a.body, &slug_b, &title_b);
-            guide_a.frontmatter.updated = today.clone();
-            let _ = save_guide(&path_a, &guide_a);
-        }
-
-        if let Some(mut guide_b) = load_guide(&path_b) {
-            let title_a = load_guide(&path_a)
-                .map(|g| g.frontmatter.title)
-                .unwrap_or_else(|| slug_a.replace('-', " "));
-            wiki::add_see_also_link(&mut guide_b.body, &slug_a, &title_a);
-            guide_b.frontmatter.updated = today.clone();
-            let _ = save_guide(&path_b, &guide_b);
-        }
-
-        log_event("wiki.link", None, serde_json::json!({ "a": slug_a, "b": slug_b }));
-        Ok(format!("Linked '{}' <-> '{}'.", slug_a, slug_b))
-    }
-}
-
-// ─── Wiki agent loop (replaces distill→plan→apply) ────────────────────────────
+// ─── Staged wiki capture pipeline ─────────────────────────────────────────────
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Staged capture pipeline: EXTRACT → AUTHORITY GATE → ROUTE → RECONCILE → INDEX
 //
-//  Replaces the single free-edit agent loop (which accreted, per spec §3) with a
+//  Replaces the old free-edit agent loop (which accreted, per spec §3) with a
 //  reconciliation of a claim-set against the existing spec (§4). Each stage is a
 //  single-shot model call whose JSON output Rust parses, verifies, and applies via
 //  the existing wiki primitives. No model is trusted to write [^id], to pick the
@@ -1388,9 +594,10 @@ desired-state product spec.\n\n\
 - `assertion`: one self-contained statement of how the product SHOULD work.\n\
 - `evidence`: 1+ transcript line ranges (1-based, inclusive) that SUPPORT the assertion. \
 The cited lines must literally contain the basis for the claim.\n\
-- `ratified`: set TRUE only when a claim originates from the ASSISTANT proposing something \
-AND a LATER USER turn explicitly endorses/accepts/approves it (e.g. 'yes do that', 'go ahead'). \
-For claims the USER stated directly, `ratified` is irrelevant — set false. \
+- `ratified`: set TRUE when the user is the authority behind the claim — either (a) the \
+USER stated it directly, or (b) the ASSISTANT proposed it and a LATER USER turn explicitly \
+endorses/accepts/approves it (e.g. 'yes do that', 'go ahead'). Set FALSE for assistant \
+proposals the user never explicitly endorsed. \
 Do NOT report an `author` field; authorship is determined mechanically downstream.\n\n\
 ## Rules\n\
 - Decisions, requirements, behaviors, constraints, gotchas — capture them.\n\
@@ -1400,14 +607,97 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
+/// Sweep-completeness nudge, appended to EXTRACT_PREAMBLE by `build_extract_system`.
+/// Kept as a separate constant so it can be toggled off (PC_EXTRACT_NO_GRANULARITY=1) for
+/// A/B comparison against the original prompt.
+///
+/// SCOPE (deliberately narrow): this nudges COMPLETENESS of the sweep — read the whole
+/// transcript, don't stop after the first few obvious decisions — WITHOUT pushing finer
+/// splitting. We intentionally do NOT say 'emit more atomic claims' or 'split one mechanism
+/// into several': over-splitting is this project's known capture failure mode (ROUTE is the
+/// bottleneck; see ROUTE_PREAMBLE's OVER-SPLIT section), and a coverage A/B showed the extra
+/// claims a split-finer nudge produced were re-phrasings/splits of facts already captured,
+/// not newly-covered decisions. So the win we keep is 'don't quit the sweep early'; the
+/// granularity stays at one-fact-each, as the base preamble already specifies.
+const EXTRACT_GRANULARITY_BLOCK: &str = "\n\
+## Sweep the WHOLE transcript — do not stop early\n\
+A long working session puts decisions everywhere, not just at the top. Read the transcript \
+top to bottom and capture load-bearing facts from the LATER turns too — a constraint added \
+mid-session, a decision reversed near the end, a subtle rule stated once in passing are \
+exactly the facts most often missed. Do not stop after the first few obvious decisions.\n\
+- Keep emitting one atomic fact each, at the same granularity the rules above specify — this \
+is about COMPLETENESS of the sweep, NOT about splitting one decision into many finer claims.\n\
+- Capture load-bearing facts the ASSISTANT proposed and acted on (code written, design \
+chosen), not only facts the user spelled out — set `ratified` per the rule above, still EMIT \
+them.\n\
+- Prefer a specific, self-contained assertion over a vague summary. 'The cache uses an LRU \
+eviction policy with a 1000-entry cap' beats 'caching was discussed'.\n";
+
+/// Optional wiki-index block, appended to `EXTRACT_PREAMBLE` to tell EXTRACT what topics
+/// the wiki already tracks — so it captures at the right granularity, reuses the project's
+/// existing vocabulary, and does not skip a fact merely because it extends a known topic.
+/// Mirrors ROUTE's full-catalog format (slug | title | summary, grouped by topic). Returns
+/// an empty string when there are no guides (the EXTRACT prompt is then unchanged).
+fn build_extract_wiki_index_block(index_rows: &[wiki::IndexRow]) -> String {
+    use std::collections::BTreeMap;
+    if index_rows.is_empty() {
+        return String::new();
+    }
+    let mut by_topic: BTreeMap<String, Vec<&wiki::IndexRow>> = BTreeMap::new();
+    for row in index_rows {
+        let t = if row.topic.is_empty() { "general" } else { row.topic.as_str() };
+        by_topic.entry(t.to_string()).or_default().push(row);
+    }
+    let mut s = String::from(
+        "\n## EXISTING WIKI — topics this project already tracks\n\
+This is the wiki you are contributing to. Use it to (1) understand the project's surface \
+area and vocabulary, (2) capture facts at a granularity that fits these topics, and (3) \
+NOT skip a fact just because a related topic already exists — an UPDATE, REVERSAL, new \
+constraint, or new detail of a known topic is exactly what must be captured. Do not invent \
+facts to match a topic; only emit what the transcript actually supports.\n",
+    );
+    for (topic, rows) in &by_topic {
+        s.push_str(&format!(
+            "### {} ({} guide{})\n",
+            topic, rows.len(), if rows.len() == 1 { "" } else { "s" }
+        ));
+        for row in rows {
+            s.push_str(&format!("  - {} | {} | {}\n", row.slug, row.title, row.summary));
+        }
+    }
+    s
+}
+
+/// Assemble the EXTRACT system prompt: the base preamble plus an optional wiki-index block.
+/// Used by BOTH the live capture path (`run_wiki_agent`) and `pc debug extract`, so the
+/// production prompt and the debug command stay in lockstep.
+fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
+    let mut s = String::from(EXTRACT_PREAMBLE);
+    // Granularity nudge on by default; PC_EXTRACT_NO_GRANULARITY=1 reproduces the original
+    // prompt for A/B comparison.
+    if std::env::var("PC_EXTRACT_NO_GRANULARITY").ok().as_deref() != Some("1") {
+        s.push_str(EXTRACT_GRANULARITY_BLOCK);
+    }
+    s.push_str(&build_extract_wiki_index_block(index_rows));
+    s
+}
+
 const ROUTE_PREAMBLE: &str = "\
 You are the RERANK half of the ROUTE stage. Each claim must be assigned to the ONE wiki guide \
-whose topic it belongs to, OR to a NEW guide. To save you from scanning the whole wiki, each \
-claim already lists its CANDIDATE GUIDES — the existing guides a semantic-similarity search found \
-most relevant (with a similarity score 0..1, higher = closer). You choose among ONLY those \
-candidates, or declare NEW.\n\n\
+whose topic it belongs to, OR to a NEW guide. You are given TWO inputs: (1) a FULL CATALOG of \
+every existing guide organized by topic — use this to understand the topic landscape and reuse \
+existing topics; (2) per-claim CANDIDATE GUIDES from semantic-similarity search (score 0..1). \
+You choose among only a claim's CANDIDATE GUIDES or declare NEW.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else — one entry per claim, SAME ORDER & COUNT as input\n\
-[{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \"is_new\": true|false}]\n\n\
+[{\"claim_index\": 0, \"slug\": \"existing-or-new-slug\", \"title\": \"Title\", \
+\"topic\": \"kebab-case-topic\", \"is_new\": true|false}]\n\n\
+## Topic field — required on every entry\n\
+- For an EXISTING guide (is_new=false): copy its topic from the catalog exactly.\n\
+- For a NEW guide (is_new=true): pick a topic from the catalog's existing topic vocabulary \
+if one fits. Only mint a new topic name when the claim is in a domain area genuinely absent \
+from the catalog. Topics are 1-3 word kebab-case groupings (e.g. 'playback', 'nostr-protocol', \
+'ui-components', 'data-persistence', 'agent-system'). Prefer reuse over invention.\n\
+- Within-batch NEW guides about the same area share ONE topic name.\n\n\
 ## How to choose — TRUST THE CANDIDATES\n\
 The candidates were retrieved by SEMANTIC similarity, so they can be the right home EVEN WITH ZERO \
 SHARED VOCABULARY. This is the whole point: 'token-bucket rate limiting' and 'the throttling layer \
@@ -1432,40 +722,30 @@ decision in place. Minting `postgres-session-store` beside `redis-session-store`
 new mechanism.\n\
 - You may ONLY reuse a slug that appears in that claim's CANDIDATE GUIDES list. Never invent a reuse \
 of some other guide you remember; if it isn't a listed candidate, treat the mechanism as NEW.\n\n\
-## GUIDE ALTITUDE — a guide is ONE mechanism (one sub-concern)\n\
-A guide is a SUB-CONCERN: ONE distinct mechanism / responsibility a reader would look up on its own \
-— NOT the whole subsystem, and NOT one guide per fact. Split a subsystem at its DISTINCT-MECHANISM \
-boundaries.\n\
-- DISTINCT mechanisms → SEPARATE guides. Example: inject's relevance/select GATE (`inject-gate`) and \
-its COMPILE/synthesis step (`inject-compile`) are different mechanisms → different guides. The inject \
-pipeline is rightly ~6 guides (gate, compile, recent-context, no-DB/auto-index, noun-resolution, \
-architecture). Splitting at real mechanism seams is CORRECT and expected — a healthy whole-project \
-wiki is ~25-30 guides.\n\
-- A FEATURE, OPTION, FLAG, or SUB-STEP of one mechanism is a SECTION of that mechanism's guide, NOT \
-its own guide. E.g. the archeologist's picker, dry-run, resume/dedup, and output-dir are features of \
-ONE `archeologist` guide. The test: would these claims read as SECTIONS of a single coherent guide a \
-person would open under one title? Then they are ONE guide.\n\
-## CONCRETE MERGES — do NOT mint these near-duplicate guides; fold them into the parent mechanism\n\
-- INJECT is ~6 guides total: the GATE, the COMPILE/synthesis step, recent-context, no-DB/auto-index, \
-noun-resolution, and the overall pipeline/architecture. Everything else about inject is a SECTION of \
-one of those. Do NOT create separate guides like `inject-timeouts`, `inject-verbose`, \
-`inject-statusline`, `inject-event-log`, `inject-model-selection`, `inject-hook-implementation`, or \
-`inject-catalog`: a timeout/retry knob and a verbose/log flag are OBSERVABILITY/CONFIG facets → fold \
-into recent-context-and-observability or the pipeline guide; model selection → the gate guide; \
-hook/catalog → the pipeline/architecture guide.\n\
-- EMBEDDINGS + the VECTOR STORE are ONE guide (`embeddings-and-vector-db`). Do NOT split into \
-`local-embeddings`, `openrouter-embeddings`, `vector-distance-metrics`, `embedding-dimension-mismatch`, \
-and `onnx-reranker-caching` — provider choice, distance metric, dimension handling, and reranker \
-caching are all facets of the SAME embeddings/vector mechanism → ONE guide with sections.\n\
-- Likewise config/storage-layout details, daemon init/stop/ps, and the citation id/markers/log are \
-each ONE guide, not several.\n\n\
-## Granularity guidance — split ONLY at true mechanism seams\n\
-Because candidates are pre-retrieved by similarity, a later same-subsystem claim WILL be shown the \
-existing guide — route it THERE. The failure mode to avoid is OVER-SPLITTING: minting a new guide for \
-every feature/option/flag/sub-step/observability facet of a mechanism a candidate already covers. When \
-a candidate is in the claim's subsystem, default to REUSE; only mint NEW when the claim is a separate \
-mechanism with its own distinct responsibility (gate vs compile), never for a facet of an existing \
-one.\n\n\
+## GUIDE ALTITUDE — a guide is ONE coherent TOPIC a reader opens under one title\n\
+A guide is a TOPIC someone would deliberately open and read top-to-bottom under a single title — a \
+subsystem-level chapter that holds several related mechanisms as SECTIONS, NOT one guide per \
+mechanism and NEVER one guide per fact. Split ONLY at real topic seams: two guides are justified \
+only when a reader would look for the two things in genuinely SEPARATE places. Do NOT target any \
+guide count — the right number of guides is whatever the project's actual surface area demands; a \
+large multi-platform project legitimately has many topics, a tiny tool has few. Never split to hit \
+a number, and never merge unrelated things to hit one.\n\
+- The DEFAULT is to fold a claim into an existing topic as a SECTION. Mint a new guide only when the \
+claim opens a genuinely new topic with no existing home — not merely a new mechanism, option, flag, \
+sub-step, timeout/retry knob, or observability facet of a topic that already exists.\n\
+- Example of right altitude: the whole inject pipeline is ONE topic (gate, compile, recent-context, \
+noun-resolution, hooks are SECTIONS of it) unless a sub-area is genuinely large enough to warrant its \
+own chapter. The archeologist's picker, dry-run, resume/dedup, and output-dir are SECTIONS of ONE \
+`archeologist` guide, not separate guides. The test: would these claims read as SECTIONS of a single \
+coherent guide a person would open under one title? Then they are ONE guide.\n\
+## THE OVER-SPLIT FAILURE MODE — what to fold instead of minting\n\
+The dominant failure is OVER-SPLITTING: minting a fresh guide for a feature, option, flag, sub-step, \
+timeout/retry knob, config detail, or observability facet of a topic that already has a home. These \
+are SECTIONS, never guides. Concretely: a 'verbose flag' or 'timeout knob' for subsystem X folds into \
+X's guide; provider/dimension/caching variations of one mechanism are sections of that mechanism's \
+guide, not a guide each; init/stop/status variants of one tool are sections of that tool's guide. \
+When an existing guide plausibly owns the topic, ROUTE the claim THERE and let RECONCILE add it as a \
+section — reuse is the default, minting is the exception.\n\n\
 ## WITHIN-BATCH sibling convergence (still required)\n\
 Two or more claims in THIS batch about the SAME mechanism MUST share ONE slug — especially when the \
 mechanism is NEW (no candidate exists yet, so similarity search cannot converge them; only you, \
@@ -1540,9 +820,17 @@ async fn run_stage(
                 crate::openrouter::system_msg(system),
                 crate::openrouter::user_msg(user),
             ];
-            Ok(crate::openrouter::chat_once(&client, openrouter_api_key, &spec.model, &msgs, None, max_tokens, 1)
-                .await?
-                .content)
+            Ok(crate::openrouter::chat_once(
+                &client,
+                openrouter_api_key,
+                &spec.model,
+                &msgs,
+                None,
+                max_tokens,
+                1,
+            )
+            .await?
+            .content)
         }
         Provider::Ollama => {
             let t0 = std::time::Instant::now();
@@ -1555,7 +843,12 @@ async fn run_stage(
                 .prompt(user)
                 .await?;
             crate::openrouter::record_external_turn(
-                &spec.model, 1, system, user, &resp, t0.elapsed().as_millis() as u64,
+                &spec.model,
+                1,
+                system,
+                user,
+                &resp,
+                t0.elapsed().as_millis() as u64,
             );
             Ok(resp)
         }
@@ -1634,8 +927,8 @@ struct ExtractedClaim {
 struct AdmittedClaim {
     assertion: String,
     evidence: Vec<EvidenceRange>,
-    author: String,            // "user" | "assistant"
-    authority: &'static str,   // "explicit" (user) | "implicit" (agent-inferred, provisional)
+    author: String,          // "user" | "assistant"
+    authority: &'static str, // "explicit" (user) | "implicit" (agent-inferred, provisional)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1644,6 +937,8 @@ struct RouteDecision {
     slug: String,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    topic: String,
     #[serde(default)]
     #[allow(dead_code)]
     is_new: bool,
@@ -1660,11 +955,10 @@ struct ReconcileOp {
     evidence: Vec<EvidenceRange>,
 }
 
-/// The staged capture pipeline. Replaces the old free-edit agent loop. Keeps the same
-/// fn signature + call site so `run_capture_from_input` is unchanged. `max_turns` and
-/// `openrouter_api_key` are retained for signature compatibility (max_turns is unused —
-/// the pipeline is a fixed number of single-shot calls, not an agentic loop).
-async fn run_wiki_agent(
+/// The staged capture pipeline. Replaces the old free-edit agent loop. `max_turns`
+/// is retained for config compatibility but ignored because the pipeline is a fixed
+/// number of single-shot calls, not an agentic loop.
+async fn run_staged_capture(
     spec: &ModelSpec,
     openrouter_api_key: &str,
     ollama_base_url: &str,
@@ -1673,22 +967,41 @@ async fn run_wiki_agent(
     ctx: Arc<WikiAgentCtx>,
     numbered_transcript: &str,
 ) -> Result<String> {
+    // Live on-disk wiki index — embedded fresh (read_index_live), not the stale index.db.
+    // Used by ROUTE recall below. NOT fed to EXTRACT by default: an A/B over real transcripts
+    // showed feeding the index to EXTRACT adds run-to-run variance and (on large transcripts)
+    // pushes the response toward the 6000-token cap → occasional whole-extraction truncation,
+    // with NO coverage gain over the index-free prompt. The wiki-index-in-EXTRACT variant is
+    // reachable only via `pc debug extract --wiki-dir <dir>` for experimentation.
+    let index_rows = read_index_live(&ctx.wiki_path);
+
     // ── STAGE 1: EXTRACT ────────────────────────────────────────────────────────
+    // EXTRACT runs WITHOUT the wiki index (pass &[]); see rationale above.
     let extract_user = format!(
         "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
         numbered_transcript
     );
     let extract_raw = run_stage(
-        spec, openrouter_api_key, ollama_base_url, ollama_api_key,
-        EXTRACT_PREAMBLE, &extract_user, 6000,
-    ).await?;
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        EXTRACT_PREAMBLE,
+        &extract_user,
+        6000,
+    )
+    .await?;
 
     let extracted: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
         Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
         None => Vec::new(),
     };
     eprintln!("capture: EXTRACT → {} raw claim(s)", extracted.len());
-    log_event("capture.extract", None, serde_json::json!({ "claims": extracted.len() }));
+    log_event(
+        "capture.extract",
+        None,
+        serde_json::json!({ "claims": extracted.len() }),
+    );
 
     if extracted.is_empty() {
         return Ok("EXTRACT produced no claims.".to_string());
@@ -1709,8 +1022,16 @@ async fn run_wiki_agent(
             continue; // unverifiable evidence → drop (§2.4)
         }
         let author = ctx.author_for_ranges(&c.evidence);
-        let authority = if author == "user" { "explicit" } else { "implicit" };
-        if authority == "explicit" { n_explicit += 1; } else { n_implicit += 1; }
+        let authority = if author == "user" {
+            "explicit"
+        } else {
+            "implicit"
+        };
+        if authority == "explicit" {
+            n_explicit += 1;
+        } else {
+            n_implicit += 1;
+        }
         admitted.push(AdmittedClaim {
             assertion: c.assertion.trim().to_string(),
             evidence: c.evidence.clone(),
@@ -1720,12 +1041,18 @@ async fn run_wiki_agent(
     }
     eprintln!(
         "capture: AUTHORITY TAGGING → {} admitted ({} explicit, {} implicit)",
-        admitted.len(), n_explicit, n_implicit
+        admitted.len(),
+        n_explicit,
+        n_implicit
     );
-    log_event("capture.authority_tagging", None, serde_json::json!({
-        "admitted": admitted.len(), "extracted": extracted.len(),
-        "explicit": n_explicit, "implicit": n_implicit
-    }));
+    log_event(
+        "capture.authority_tagging",
+        None,
+        serde_json::json!({
+            "admitted": admitted.len(), "extracted": extracted.len(),
+            "explicit": n_explicit, "implicit": n_implicit
+        }),
+    );
     if admitted.is_empty() {
         return Ok("No evidence-verified claims to capture.".to_string());
     }
@@ -1742,16 +1069,20 @@ async fn run_wiki_agent(
     // the on-disk index.db vector store, which is only rebuilt at checkpoints and would be
     // stale within a bulk archeologist window (the bug we fixed for the text index). Guide
     // counts are tens, so per-session in-memory embedding is cheap.
-    let index_rows = read_index_live(&ctx.wiki_path);
+    // (Already fetched once before EXTRACT and reused here — see `index_rows` above.)
 
     // RECALL tuning knobs. ROUTE_TOP_K = candidate set size per claim; ROUTE_TAU = minimum
     // cosine similarity to surface a guide at all (best-guide-below-tau ⇒ empty set ⇒ the
     // reranker leans NEW). TAU is the split-vs-merge knob: higher ⇒ finer split (more NEW),
     // lower ⇒ coarser reuse. Overridable via env for tuning sweeps without recompiling.
-    let route_top_k: usize = std::env::var("PC_ROUTE_TOP_K").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(8);
-    let route_tau: f32 = std::env::var("PC_ROUTE_TAU").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(0.30);
+    let route_top_k: usize = std::env::var("PC_ROUTE_TOP_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let route_tau: f32 = std::env::var("PC_ROUTE_TAU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.30);
 
     let claim_assertions: Vec<String> = admitted.iter().map(|c| c.assertion.clone()).collect();
 
@@ -1765,66 +1096,134 @@ async fn run_wiki_agent(
     {
         Some(mut embedder) => {
             match crate::route_recall::recall_candidates(
-                embedder.as_mut(), &index_rows, &claim_assertions, route_top_k, route_tau,
+                embedder.as_mut(),
+                &index_rows,
+                &claim_assertions,
+                route_top_k,
+                route_tau,
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("capture: ROUTE recall failed ({e}); falling back to NEW-only candidates");
+                    eprintln!(
+                        "capture: ROUTE recall failed ({e}); falling back to NEW-only candidates"
+                    );
                     vec![crate::route_recall::ClaimRecall::default(); admitted.len()]
                 }
             }
         }
         None => {
-            eprintln!("capture: ROUTE could not build embedder; falling back to NEW-only candidates");
+            eprintln!(
+                "capture: ROUTE could not build embedder; falling back to NEW-only candidates"
+            );
             vec![crate::route_recall::ClaimRecall::default(); admitted.len()]
         }
     };
 
     let n_with_candidates = recalls.iter().filter(|r| !r.candidates.is_empty()).count();
-    let best_scores: Vec<String> = recalls.iter()
-        .map(|r| r.candidates.first().map(|c| format!("{:.2}", c.score)).unwrap_or_else(|| "-".to_string()))
+    let best_scores: Vec<String> = recalls
+        .iter()
+        .map(|r| {
+            r.candidates
+                .first()
+                .map(|c| format!("{:.2}", c.score))
+                .unwrap_or_else(|| "-".to_string())
+        })
         .collect();
     eprintln!(
         "capture: ROUTE recall → {}/{} claims have ≥1 candidate (top_k={}, tau={:.2}); top-cosine per claim: [{}]",
         n_with_candidates, admitted.len(), route_top_k, route_tau, best_scores.join(", ")
     );
-    log_event("capture.route_recall", None, serde_json::json!({
-        "claims": admitted.len(), "with_candidates": n_with_candidates,
-        "top_k": route_top_k, "tau": route_tau, "live_guides": index_rows.len()
-    }));
+    log_event(
+        "capture.route_recall",
+        None,
+        serde_json::json!({
+            "claims": admitted.len(), "with_candidates": n_with_candidates,
+            "top_k": route_top_k, "tau": route_tau, "live_guides": index_rows.len()
+        }),
+    );
 
     // RERANK prompt: each claim carries ONLY its own recalled candidates inline. A claim
     // with no candidates is told the wiki has nothing close (lean NEW). Batched in one call
     // so the LLM can still converge sibling claims about a brand-NEW topic onto one shared
     // slug (recall can't surface a guide that doesn't exist yet — only co-seeing the
     // siblings can converge them).
-    let claims_text = admitted.iter().enumerate()
+    let claims_text = admitted
+        .iter()
+        .enumerate()
         .map(|(i, c)| {
             let cands = &recalls[i].candidates;
             let cand_block = if cands.is_empty() {
                 "    (no similar existing guide — this is likely a NEW topic)".to_string()
             } else {
-                cands.iter()
-                    .map(|cand| format!(
-                        "    - {} | {} | {} (similarity {:.2})",
-                        cand.slug, cand.title, cand.summary, cand.score
-                    ))
+                cands
+                    .iter()
+                    .map(|cand| {
+                        format!(
+                            "    - {} | {} | {} (similarity {:.2})",
+                            cand.slug, cand.title, cand.summary, cand.score
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            format!("[{}] ({}) {}\n  CANDIDATE GUIDES:\n{}", i, c.author, c.assertion, cand_block)
+            format!(
+                "[{}] ({}) {}\n  CANDIDATE GUIDES:\n{}",
+                i, c.author, c.assertion, cand_block
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Build full-catalog block grouped by topic for global context
+    let full_catalog = {
+        use std::collections::BTreeMap;
+        let mut by_topic: BTreeMap<String, Vec<&wiki::IndexRow>> = BTreeMap::new();
+        for row in &index_rows {
+            let t = if row.topic.is_empty() {
+                "general"
+            } else {
+                row.topic.as_str()
+            };
+            by_topic.entry(t.to_string()).or_default().push(row);
+        }
+        if by_topic.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("## FULL WIKI CATALOG (organized by topic)\n");
+            for (topic, rows) in &by_topic {
+                s.push_str(&format!(
+                    "### {} ({} guide{})\n",
+                    topic,
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }
+                ));
+                for row in rows {
+                    s.push_str(&format!(
+                        "  - {} | {} | {}\n",
+                        row.slug, row.title, row.summary
+                    ));
+                }
+            }
+            s.push('\n');
+            s
+        }
+    };
+
     let route_user = format!(
-        "## CLAIMS (each with its pre-retrieved candidate guides)\n{}\n\n\
+        "{}\
+         ## CLAIMS (each with its pre-retrieved candidate guides)\n{}\n\n\
          Emit the JSON routing array now (one entry per claim, same order).",
-        claims_text
+        full_catalog, claims_text
     );
     let route_raw = run_stage(
-        spec, openrouter_api_key, ollama_base_url, ollama_api_key,
-        ROUTE_PREAMBLE, &route_user, 4000,
-    ).await?;
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        ROUTE_PREAMBLE,
+        &route_user,
+        4000,
+    )
+    .await?;
     let routes: Vec<RouteDecision> = match extract_json_blob(&route_raw) {
         Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
         None => Vec::new(),
@@ -1838,6 +1237,8 @@ async fn run_wiki_agent(
     // NEW guides so the NEXT session's ROUTE call sees a real description (not an empty
     // summary) and can reuse the slug instead of minting a near-duplicate.
     let mut slug_titles: BTreeMap<String, String> = BTreeMap::new();
+    // Topic assigned by ROUTE per slug — written to guide frontmatter.
+    let mut slug_topics: BTreeMap<String, String> = BTreeMap::new();
     let mut routed_claims: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for r in &routes {
         if r.claim_index >= admitted.len() {
@@ -1849,20 +1250,42 @@ async fn run_wiki_agent(
         }
         let title = r.title.trim();
         if !title.is_empty() {
-            slug_titles.entry(slug.clone()).or_insert_with(|| title.to_string());
+            slug_titles
+                .entry(slug.clone())
+                .or_insert_with(|| title.to_string());
+        }
+        let topic = r.topic.trim();
+        if !topic.is_empty() {
+            slug_topics
+                .entry(slug.clone())
+                .or_insert_with(|| topic.to_string());
         }
         by_slug.entry(slug).or_default().push(r.claim_index);
         routed_claims.insert(r.claim_index);
     }
     for (i, c) in admitted.iter().enumerate() {
         if !routed_claims.contains(&i) {
-            let slug = slugify(&c.assertion.split_whitespace().take(6).collect::<Vec<_>>().join(" "));
-            let slug = if slug.is_empty() { format!("claim-{}", i) } else { slug };
+            let slug = slugify(
+                &c.assertion
+                    .split_whitespace()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            let slug = if slug.is_empty() {
+                format!("claim-{}", i)
+            } else {
+                slug
+            };
             by_slug.entry(slug).or_default().push(i);
         }
     }
     eprintln!("capture: ROUTE → {} target guide(s)", by_slug.len());
-    log_event("capture.route", None, serde_json::json!({ "guides": by_slug.len() }));
+    log_event(
+        "capture.route",
+        None,
+        serde_json::json!({ "guides": by_slug.len() }),
+    );
 
     // ── STAGE 4: RECONCILE per slug (sequential — §9 forbids parallel) ───────────
     let mut applied = 0usize;
@@ -1870,10 +1293,13 @@ async fn run_wiki_agent(
         let path = guide_path(&ctx.wiki_path, slug);
         let current_body = load_guide(&path).map(|g| g.body).unwrap_or_default();
 
-        let claims_for_guide = claim_indices.iter()
+        let claims_for_guide = claim_indices
+            .iter()
             .map(|&i| {
                 let c = &admitted[i];
-                let ev = c.evidence.iter()
+                let ev = c
+                    .evidence
+                    .iter()
                     .map(|r| format!("{{\"start\":{},\"end\":{}}}", r.start, r.end))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -1890,9 +1316,15 @@ async fn run_wiki_agent(
             claims_for_guide
         );
         let reconcile_raw = run_stage(
-            spec, openrouter_api_key, ollama_base_url, ollama_api_key,
-            RECONCILE_PREAMBLE, &reconcile_user, 6000,
-        ).await?;
+            spec,
+            openrouter_api_key,
+            ollama_base_url,
+            ollama_api_key,
+            RECONCILE_PREAMBLE,
+            &reconcile_user,
+            6000,
+        )
+        .await?;
         let ops: Vec<ReconcileOp> = match extract_json_blob(&reconcile_raw) {
             Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
             None => Vec::new(),
@@ -1907,7 +1339,13 @@ async fn run_wiki_agent(
                     continue;
                 }
             }
-            let applied_op = apply_reconcile_op(&ctx, slug, slug_titles.get(slug).map(|s| s.as_str()), op);
+            let applied_op = apply_reconcile_op(
+                &ctx,
+                slug,
+                slug_titles.get(slug).map(|s| s.as_str()),
+                slug_topics.get(slug).map(|s| s.as_str()),
+                op,
+            );
             if applied_op {
                 applied += 1;
             }
@@ -1916,14 +1354,22 @@ async fn run_wiki_agent(
 
     Ok(format!(
         "Staged capture complete: {} claim(s) admitted across {} guide(s), {} op(s) applied.",
-        admitted.len(), by_slug.len(), applied
+        admitted.len(),
+        by_slug.len(),
+        applied
     ))
 }
 
 /// Apply a single RECONCILE op via the existing wiki primitives, mirroring the tool bodies:
 /// verify evidence → cite → mint marker → apply primitive → append_citation_log. Returns
 /// true if a mutation was applied.
-fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&str>, op: &ReconcileOp) -> bool {
+fn apply_reconcile_op(
+    ctx: &Arc<WikiAgentCtx>,
+    slug: &str,
+    route_title: Option<&str>,
+    route_topic: Option<&str>,
+    op: &ReconcileOp,
+) -> bool {
     let safe_slug = slugify(slug);
     // Title/summary for any NEW guide created here. Prefer ROUTE's human title; fall back to
     // the de-slugified form. Summary = the first statement's text (truncated) so the next
@@ -1950,63 +1396,129 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
     let today = ctx.today.clone();
     let session_id = ctx.session_id.clone();
     let wiki_path = ctx.wiki_path.clone();
+    let new_topic = route_topic.unwrap_or("").to_string();
 
     let lock_slug = safe_slug.clone();
     match op.op.as_str() {
         "create" | "add" => {
             let (marker, sliced) = ctx.cite(&op.evidence);
-            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let id = marker
+                .trim_start_matches("[^")
+                .trim_end_matches(']')
+                .to_string();
             let marker_clone = marker.clone();
             let text = op.text.clone();
             let section_c = section.clone();
             let new_title_c = new_title.clone();
             let new_summary_c = new_summary.clone();
+            let new_topic_c = new_topic.clone();
+            let created_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+            let created_flag_c = created_flag.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
+                created_flag_c.set(existing.is_none());
                 let mut guide = match existing {
                     Some(g) => g,
                     None => {
                         let body = format!(
                             "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                            new_title_c, section_c, text.trim(), marker_clone
+                            new_title_c,
+                            section_c,
+                            text.trim(),
+                            marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(
+                                &safe_slug,
+                                &new_title_c,
+                                &new_summary_c,
+                                &["capture".to_string()],
+                                "warm",
+                                &body,
+                                &session_id,
+                                &today,
+                                &new_topic_c,
+                            ),
                             format!("Created guide '{}'.", safe_slug),
                         ));
                     }
                 };
-                guide.body = add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
+                guide.body =
+                    add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
                 guide.frontmatter.updated = today.clone();
+                // Back-fill topic on existing guides that predate topic support
+                if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
+                    guide.frontmatter.topic = new_topic_c;
+                }
                 let source_key = format!("session:{}", session_id);
                 if !guide.frontmatter.sources.contains(&source_key) {
                     guide.frontmatter.sources.push(source_key);
                 }
-                Ok((guide, format!("Added to '{}' / '{}'.", safe_slug, section_c)))
+                Ok((
+                    guide,
+                    format!("Added to '{}' / '{}'.", safe_slug, section_c),
+                ))
             });
             if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
                 eprintln!("capture: citation log write failed: {}", e);
             }
             eprintln!("capture: op {} → {}", op.op, result);
+            // Emit wiki.create only when a guide was genuinely created (existing was None).
+            // A reconcile that labels many statements of one brand-new guide as "create"
+            // otherwise produces N "New guide" feed lines; the rest are add_statement claims.
+            if !result.starts_with("Error:") {
+                let ev_name = if created_flag.get() {
+                    "wiki.create"
+                } else {
+                    "wiki.add_statement"
+                };
+                crate::events::log_event(
+                    ev_name,
+                    None,
+                    serde_json::json!({
+                        "slug": &lock_slug,
+                        "title": &new_title,
+                        "section": &section,
+                        "text": crate::events::truncate(&op.text, 300)
+                    }),
+                );
+            }
             true
         }
         "revise" => {
             let (marker, sliced) = ctx.cite(&op.evidence);
-            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let id = marker
+                .trim_start_matches("[^")
+                .trim_end_matches(']')
+                .to_string();
             let marker_clone = marker.clone();
             let text = op.text.clone();
             let section_c = section.clone();
             let new_title_c = new_title.clone();
             let new_summary_c = new_summary.clone();
+            let new_topic_c = new_topic.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
                     None => {
                         let body = format!(
                             "# {}\n\n{}\n\n{} {}\n\n## See Also\n\n",
-                            new_title_c, section_c, text.trim(), marker_clone
+                            new_title_c,
+                            section_c,
+                            text.trim(),
+                            marker_clone
                         );
                         return Ok((
-                            new_guide(&safe_slug, &new_title_c, &new_summary_c, &["capture".to_string()], "warm", &body, &session_id, &today),
+                            new_guide(
+                                &safe_slug,
+                                &new_title_c,
+                                &new_summary_c,
+                                &["capture".to_string()],
+                                "warm",
+                                &body,
+                                &session_id,
+                                &today,
+                                &new_topic_c,
+                            ),
                             format!("Created guide '{}' (revise had no target).", safe_slug),
                         ));
                     }
@@ -2015,6 +1527,9 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                     Ok(new_body) => {
                         guide.body = new_body;
                         guide.frontmatter.updated = today.clone();
+                        if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
+                            guide.frontmatter.topic = new_topic_c;
+                        }
                         let source_key = format!("session:{}", session_id);
                         if !guide.frontmatter.sources.contains(&source_key) {
                             guide.frontmatter.sources.push(source_key);
@@ -2023,9 +1538,18 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                     }
                     Err(_) => {
                         // Section didn't exist → fall back to add so the fact is not lost.
-                        guide.body = add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
+                        guide.body = add_statement_to_section(
+                            &guide.body,
+                            &section_c,
+                            &text,
+                            &marker_clone,
+                            &today,
+                        );
                         guide.frontmatter.updated = today.clone();
-                        Ok((guide, format!("Revise target missing in '{}'; added instead.", safe_slug)))
+                        Ok((
+                            guide,
+                            format!("Revise target missing in '{}'; added instead.", safe_slug),
+                        ))
                     }
                 }
             });
@@ -2033,6 +1557,15 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
                 eprintln!("capture: citation log write failed: {}", e);
             }
             eprintln!("capture: op revise → {}", result);
+            crate::events::log_event(
+                "wiki.revise_statement",
+                None,
+                serde_json::json!({
+                    "slug": &lock_slug,
+                    "section": &section,
+                    "text": crate::events::truncate(&op.text, 300)
+                }),
+            );
             true
         }
         "remove" => {
@@ -2041,7 +1574,10 @@ fn apply_reconcile_op(ctx: &Arc<WikiAgentCtx>, slug: &str, route_title: Option<&
             } else {
                 ctx.cite(&op.evidence)
             };
-            let id = marker.trim_start_matches("[^").trim_end_matches(']').to_string();
+            let id = marker
+                .trim_start_matches("[^")
+                .trim_end_matches(']')
+                .to_string();
             let section_c = section.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
@@ -2117,10 +1653,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
 
     if !Path::new(&input.transcript_path).exists() {
         eprintln!("capture: transcript not found: {}", input.transcript_path);
-        log_event("error", None, serde_json::json!({
-            "stage": "capture.start",
-            "message": truncate(&format!("transcript not found: {}", input.transcript_path), 300)
-        }));
+        log_event(
+            "error",
+            None,
+            serde_json::json!({
+                "stage": "capture.start",
+                "message": truncate(&format!("transcript not found: {}", input.transcript_path), 300)
+            }),
+        );
         return Ok(());
     }
 
@@ -2136,10 +1676,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
                 .collect(),
             Err(e) => {
                 eprintln!("capture: transcript error: {}", e);
-                log_event("error", None, serde_json::json!({
-                    "stage": "capture.start",
-                    "message": truncate(&format!("transcript parse error: {}", e), 300)
-                }));
+                log_event(
+                    "error",
+                    None,
+                    serde_json::json!({
+                        "stage": "capture.start",
+                        "message": truncate(&format!("transcript parse error: {}", e), 300)
+                    }),
+                );
                 return Ok(());
             }
         }
@@ -2148,10 +1692,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("capture: transcript error: {}", e);
-                log_event("error", None, serde_json::json!({
-                    "stage": "capture.start",
-                    "message": truncate(&format!("transcript parse error: {}", e), 300)
-                }));
+                log_event(
+                    "error",
+                    None,
+                    serde_json::json!({
+                        "stage": "capture.start",
+                        "message": truncate(&format!("transcript parse error: {}", e), 300)
+                    }),
+                );
                 return Ok(());
             }
         }
@@ -2165,29 +1713,41 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     let exchanges = turns.iter().filter(|t| t.0 == "user").count();
 
     // Resolve output paths (output_dir override for isolated archeologist runs)
-    let marker_dir = input.output_dir.as_ref()
+    let marker_dir = input
+        .output_dir
+        .as_ref()
         .map(|d| d.join("captured-sessions"))
         .unwrap_or_else(captured_sessions_dir);
 
     // Fast dedup check
     if is_already_captured_in(&input.session_id, exchanges, &marker_dir) {
-        eprintln!("capture: already captured {} exchanges for session {} — skipping",
-            exchanges, input.session_id);
+        eprintln!(
+            "capture: already captured {} exchanges for session {} — skipping",
+            exchanges, input.session_id
+        );
         return Ok(());
     }
 
     // Build line-numbered transcript for evidence-range addressing, plus the
     // line→role map used for mechanical authorship attribution (§5).
+    //
+    // When the session exceeds the EXTRACT budget, reduce by dropping in-between
+    // assistant turns (never user turns), NOT by tail-slicing the head — the head is
+    // where the user's initial requirements live. Critically, the numbered transcript
+    // AND the parallel lines/roles vectors are all built from the SAME reduced set, so
+    // absolute line numbers stay consistent across what the model cites and how Rust
+    // slices/attributes evidence (evidence_is_valid / author_for_ranges / cite).
+    let reduced_numbered = reduce_turns_to_fit(&turns, 250_000, true);
     let (numbered_transcript, transcript_lines, transcript_roles) =
-        build_line_numbered_transcript_with_roles(&turns);
+        build_line_numbered_transcript_with_roles(&reduced_numbered);
 
-    // Build plain transcript for triage
-    let plain_ts = build_transcript_string(&turns);
-    let plain_ts = if plain_ts.len() > 200_000 {
-        plain_ts[plain_ts.len() - 200_000..].to_string()
-    } else {
-        plain_ts
-    };
+    // Build plain transcript for triage. When over budget, drop in-between assistant
+    // turns (assistant-followed-by-assistant) rather than tail-slicing the head, so the
+    // user's turns — where the load-bearing direction lives — are always preserved.
+    // tail_capped is a char-safe hard backstop for the pathological over-budget case.
+    let reduced_plain = reduce_turns_to_fit(&turns, 200_000, false);
+    let plain_ts = build_transcript_string(&reduced_plain);
+    let plain_ts = tail_capped(&plain_ts, 200_000);
 
     // Substance gate. We only veto on CONTENT (char floor) + a minimal "user actually
     // spoke" floor — NOT on exchange count. A heavily-agentic session (one directive, then
@@ -2195,7 +1755,11 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // veto wrongly dropped ~half such sessions. Triage (below) is the real "is there a durable
     // lesson?" filter, so let it decide; here we only skip genuinely empty/non-user sessions.
     if plain_ts.len() < 500 || exchanges < 1 {
-        eprintln!("capture: too short ({} chars, {} user-turns) — skipping", plain_ts.len(), exchanges);
+        eprintln!(
+            "capture: too short ({} chars, {} user-turns) — skipping",
+            plain_ts.len(),
+            exchanges
+        );
         return Ok(());
     }
 
@@ -2242,28 +1806,44 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         let wiki_index_text = if index_rows.is_empty() {
             String::new()
         } else {
-            index_rows.iter()
+            index_rows
+                .iter()
                 .map(|r| format!("  {} | {} | {}", r.slug, r.title, r.summary))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
 
-        match triage_transcript(&triage_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(), &plain_ts, &wiki_index_text) {
+        match triage_transcript(
+            &triage_spec,
+            &openrouter_api_key,
+            &ollama_base_url,
+            ollama_api_key.as_deref(),
+            &plain_ts,
+            &wiki_index_text,
+        ) {
             Ok(worth_it) => {
                 if !worth_it {
                     eprintln!("capture: triage says nothing worth capturing — skipping");
-                    log_event("capture.triage", None, serde_json::json!({
-                        "result": "skip",
-                        "exchanges": exchanges,
-                        "model": cfg.capture_triage_model
-                    }));
+                    log_event(
+                        "capture.triage",
+                        None,
+                        serde_json::json!({
+                            "result": "skip",
+                            "exchanges": exchanges,
+                            "model": cfg.capture_triage_model
+                        }),
+                    );
                     return Ok(());
                 }
-                log_event("capture.triage", None, serde_json::json!({
-                    "result": "proceed",
-                    "exchanges": exchanges,
-                    "model": cfg.capture_triage_model
-                }));
+                log_event(
+                    "capture.triage",
+                    None,
+                    serde_json::json!({
+                        "result": "proceed",
+                        "exchanges": exchanges,
+                        "model": cfg.capture_triage_model
+                    }),
+                );
             }
             Err(e) => {
                 eprintln!("capture: triage failed ({}), proceeding anyway", e);
@@ -2272,14 +1852,23 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     }
 
     // Emit capture.start
-    log_event("capture.start", None, serde_json::json!({
-        "transcript_chars": plain_ts.len(),
-        "exchanges": exchanges,
-        "model": model,
-        "max_turns": max_turns
-    }));
+    log_event(
+        "capture.start",
+        None,
+        serde_json::json!({
+            "transcript_chars": plain_ts.len(),
+            "exchanges": exchanges,
+            "model": model,
+            "max_turns": max_turns,
+            "date": &today_str,
+            "session_id": &input.session_id
+        }),
+    );
 
-    eprintln!("capture: running wiki_* agent loop with {} (max_turns={})...", model, max_turns);
+    eprintln!(
+        "capture: running staged capture pipeline with {} (legacy max_turns={} ignored)...",
+        model, max_turns
+    );
 
     let project_key = normalize_path(&PathBuf::from(&input.cwd));
     let ctx = Arc::new(WikiAgentCtx::new(
@@ -2291,53 +1880,75 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         today_str.clone(),
     ));
 
-    // Truncate numbered transcript if too long (keep tail — most recent context is most relevant)
-    let truncated_numbered = if numbered_transcript.len() > 250_000 {
-        numbered_transcript[numbered_transcript.len() - 250_000..].to_string()
-    } else {
-        numbered_transcript
-    };
+    // Hard backstop: reduce_turns_to_fit (above) already preserved user turns by dropping
+    // in-between assistant turns; this only fires if surviving content still exceeds budget.
+    // Char-safe tail-keep (never slices mid-codepoint).
+    let truncated_numbered = tail_capped(&numbered_transcript, 250_000);
 
-    // Run the async wiki agent loop
-    // NOTE: mark_captured_in is called AFTER the loop so that a failed agent
+    // Run the async staged capture pipeline.
+    // NOTE: mark_captured_in is called AFTER the run so that a pre-run failure
     // (API error, early timeout) doesn't permanently suppress a retry.
     // Concurrency is already serialized by the per-session flock above.
-    let rt = Runtime::new()
-        .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+    let rt =
+        Runtime::new().map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
 
     let agent_result = rt.block_on(async {
         let timeout = std::time::Duration::from_secs(300); // 5 min max
         tokio::time::timeout(
             timeout,
-            run_wiki_agent(&capture_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(), max_turns, Arc::clone(&ctx), &truncated_numbered)
-        ).await
+            run_staged_capture(
+                &capture_spec,
+                &openrouter_api_key,
+                &ollama_base_url,
+                ollama_api_key.as_deref(),
+                max_turns,
+                Arc::clone(&ctx),
+                &truncated_numbered,
+            ),
+        )
+        .await
     });
 
     match agent_result {
         Ok(Ok(summary)) => {
-            eprintln!("capture: wiki agent completed: {}", truncate(&summary, 200));
-            log_event("capture.agent_done", None, serde_json::json!({
-                "summary": truncate(&summary, 300)
-            }));
+            eprintln!(
+                "capture: staged capture completed: {}",
+                truncate(&summary, 200)
+            );
+            log_event(
+                "capture.agent_done",
+                None,
+                serde_json::json!({
+                    "summary": truncate(&summary, 300)
+                }),
+            );
         }
         Ok(Err(e)) => {
-            eprintln!("capture: wiki agent failed: {}", e);
-            log_event("error", None, serde_json::json!({
-                "stage": "wiki.agent",
-                "message": truncate(&format!("{}", e), 300)
-            }));
+            eprintln!("capture: staged capture failed: {}", e);
+            log_event(
+                "error",
+                None,
+                serde_json::json!({
+                    "stage": "wiki.agent",
+                    "message": truncate(&format!("{}", e), 300)
+                }),
+            );
         }
         Err(_timeout) => {
-            eprintln!("capture: wiki agent timed out after 300s");
-            log_event("error", None, serde_json::json!({
-                "stage": "wiki.agent",
-                "message": "timeout after 300s"
-            }));
+            eprintln!("capture: staged capture timed out after 300s");
+            log_event(
+                "error",
+                None,
+                serde_json::json!({
+                    "stage": "wiki.agent",
+                    "message": "timeout after 300s"
+                }),
+            );
         }
     }
 
-    // Mark session as captured now that the agent loop has run (success or partial).
-    // Doing this after the loop means a pre-write API failure doesn't permanently suppress retry.
+    // Mark session as captured now that the staged run has completed (success or partial).
+    // Doing this after the run means a pre-run failure doesn't permanently suppress retry.
     let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
 
     // Open-question extraction: detect undefined nouns in the transcript for the
@@ -2365,9 +1976,13 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         run_structural_maintenance(&wiki_path, &proj_dir, &today_str);
     }
 
-    log_event("capture.done", Some(capture_start.elapsed().as_millis() as u64), serde_json::json!({
-        "exchanges": exchanges
-    }));
+    log_event(
+        "capture.done",
+        Some(capture_start.elapsed().as_millis() as u64),
+        serde_json::json!({
+            "exchanges": exchanges
+        }),
+    );
 
     Ok(())
 }
@@ -2391,8 +2006,12 @@ struct OpenQuestionsFile {
 /// open-questions prompt. Removes `<tag>...</tag>` for known harness tags.
 fn strip_harness_xml(text: &str) -> String {
     const TAGS: &[&str] = &[
-        "system-reminder", "task-notification", "open-questions",
-        "antml:function_calls", "function_calls", "user-prompt-submit-hook",
+        "system-reminder",
+        "task-notification",
+        "open-questions",
+        "antml:function_calls",
+        "function_calls",
+        "user-prompt-submit-hook",
     ];
     let mut result = text.to_string();
     for tag in TAGS {
@@ -2416,25 +2035,36 @@ fn strip_harness_xml(text: &str) -> String {
 /// `max_chars` — preserves whole turns rather than cutting mid-sentence.
 ///
 /// Note: tool_result and tool_use content blocks are already excluded upstream by
-/// `parse_transcript` / `extract_text` (only `type:"text"` blocks reach `turns`).
+/// `parse_transcript` / `extract_text`; only text-bearing content blocks reach `turns`.
 fn build_open_questions_transcript(turns: &[(String, String)], max_chars: usize) -> String {
-    let labeled: Vec<String> = turns.iter().filter_map(|(role, text)| {
-        let cleaned = strip_harness_xml(text);
-        let cleaned = cleaned.trim().to_string();
-        if cleaned.is_empty() { return None; }
-        let label = if role == "user" { "User" } else { "Assistant" };
-        Some(format!("{}: {}", label, cleaned))
-    }).collect();
+    let labeled: Vec<String> = turns
+        .iter()
+        .filter_map(|(role, text)| {
+            let cleaned = strip_harness_xml(text);
+            let cleaned = cleaned.trim().to_string();
+            if cleaned.is_empty() {
+                return None;
+            }
+            let label = if role == "user" { "User" } else { "Assistant" };
+            Some(format!("{}: {}", label, cleaned))
+        })
+        .collect();
 
-    if labeled.is_empty() { return String::new(); }
+    if labeled.is_empty() {
+        return String::new();
+    }
 
     // Try the full transcript first; if too long, drop from the front one turn at a time
     let full = labeled.join("\n\n");
-    if full.len() <= max_chars { return full; }
+    if full.len() <= max_chars {
+        return full;
+    }
 
     for start in 1..labeled.len() {
         let candidate = labeled[start..].join("\n\n");
-        if candidate.len() <= max_chars { return candidate; }
+        if candidate.len() <= max_chars {
+            return candidate;
+        }
     }
 
     // Last resort: hard-truncate the last turn at a char boundary
@@ -2455,7 +2085,8 @@ fn extract_open_questions(
     let wiki_index = if index_rows.is_empty() {
         "(empty — no guides yet)".to_string()
     } else {
-        index_rows.iter()
+        index_rows
+            .iter()
             .map(|r| format!("  {} | {} | {}", r.slug, r.title, r.summary))
             .collect::<Vec<_>>()
             .join("\n")
@@ -2479,7 +2110,14 @@ fn extract_open_questions(
          If nothing meaningful is missing, return: []"
     );
 
-    let raw = match call_model_blocking(triage_spec, openrouter_api_key, ollama_base_url, ollama_api_key, system, &user) {
+    let raw = match call_model_blocking(
+        triage_spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        system,
+        &user,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("capture: open-question extraction failed: {}", e);
@@ -2496,7 +2134,11 @@ fn extract_open_questions(
     let new_questions: Vec<OpenQuestion> = match serde_json::from_str(cleaned) {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("capture: open-question parse failed: {} | raw: {}", e, &cleaned[..cleaned.len().min(200)]);
+            eprintln!(
+                "capture: open-question parse failed: {} | raw: {}",
+                e,
+                &cleaned[..cleaned.len().min(200)]
+            );
             return;
         }
     };
@@ -2520,13 +2162,19 @@ fn extract_open_questions(
         }
     }
 
-    let file = OpenQuestionsFile { generated_at: rfc3339_now(), questions: existing };
+    let file = OpenQuestionsFile {
+        generated_at: rfc3339_now(),
+        questions: existing,
+    };
     match serde_json::to_string_pretty(&file) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&oq_path, json) {
                 eprintln!("capture: failed to write open-questions.json: {}", e);
             } else {
-                eprintln!("capture: wrote {} open question(s) to open-questions.json", new_questions.len());
+                eprintln!(
+                    "capture: wrote {} open question(s) to open-questions.json",
+                    new_questions.len()
+                );
             }
         }
         Err(e) => eprintln!("capture: failed to serialize open-questions: {}", e),
@@ -2542,18 +2190,24 @@ pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, toda
     if !wiki_path.exists() {
         return;
     }
-    let link_count = wiki::enforce_bidirectional_links(wiki_path, today)
-        .unwrap_or_else(|e| { eprintln!("capture: bidir links failed: {}", e); 0 });
+    let link_count = wiki::enforce_bidirectional_links(wiki_path, today).unwrap_or_else(|e| {
+        eprintln!("capture: bidir links failed: {}", e);
+        0
+    });
     if link_count > 0 {
         eprintln!("capture: added {} bidirectional link(s)", link_count);
     }
 
     match rebuild_index(wiki_path, today) {
         Ok(rows) => {
-            log_event("wiki.index_read", None, serde_json::json!({
-                "guide_count": rows.len(),
-                "action": "rebuilt"
-            }));
+            log_event(
+                "wiki.index_read",
+                None,
+                serde_json::json!({
+                    "guide_count": rows.len(),
+                    "action": "rebuilt"
+                }),
+            );
             eprintln!("capture: rebuilt _index.md ({} guide(s))", rows.len());
         }
         Err(e) => eprintln!("capture: index rebuild failed: {}", e),
@@ -2564,7 +2218,11 @@ pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, toda
     // the wiki lives under the repo (docs/wiki/), so nothing else creates this dir. Without
     // it, opening index.db fails with ENOENT. Create it before indexing.
     if let Err(e) = fs::create_dir_all(proj_dir) {
-        eprintln!("capture: could not create project dir {}: {}", proj_dir.display(), e);
+        eprintln!(
+            "capture: could not create project dir {}: {}",
+            proj_dir.display(),
+            e
+        );
     } else {
         match index_files_into_db(wiki_path, &db_path) {
             Ok(_) => eprintln!("capture: indexed wiki into index.db"),
@@ -2606,7 +2264,10 @@ pub(crate) fn run_capture_for_archeologist(
 }
 
 /// Expose `project_dir_from_cwd` for `archeologist`'s checkpoint maintenance calls.
-pub(crate) fn archeologist_project_dir(cwd: &str, output_dir: Option<&PathBuf>) -> std::path::PathBuf {
+pub(crate) fn archeologist_project_dir(
+    cwd: &str,
+    output_dir: Option<&PathBuf>,
+) -> std::path::PathBuf {
     if let Some(out) = output_dir {
         let normalized = normalize_path(&resolve_project_root(&PathBuf::from(cwd)));
         out.join("projects").join(normalized)
@@ -2616,7 +2277,6 @@ pub(crate) fn archeologist_project_dir(cwd: &str, output_dir: Option<&PathBuf>) 
 }
 
 /// Expose the captured-sessions directory for the archeologist picker's "New" count.
-#[allow(dead_code)] // available to archeologist; currently uses archeologist_is_already_captured instead
 pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
     captured_sessions_dir()
 }
@@ -2624,7 +2284,10 @@ pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
 /// Expose `is_already_captured` for archeologist's work-list filtering.
 /// A session is "new" when this returns false.
 /// Pass `marker_dir` to check against an isolated output dir; `None` uses the global default.
-pub(crate) fn archeologist_is_already_captured(session_id: &str, marker_dir: Option<&PathBuf>) -> bool {
+pub(crate) fn archeologist_is_already_captured(
+    session_id: &str,
+    marker_dir: Option<&PathBuf>,
+) -> bool {
     let dir = marker_dir.cloned().unwrap_or_else(captured_sessions_dir);
     is_already_captured_in(session_id, 0, &dir)
 }
@@ -2728,7 +2391,8 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
     let session_id = hook_input.session_id.clone();
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("capture")
-        .arg("--deferred").arg(&session_id)
+        .arg("--deferred")
+        .arg(&session_id)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2745,7 +2409,9 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
             let _ = fs::write(&pid_path, child.id().to_string());
             eprintln!(
                 "capture --in: debounce started (pid={}, delay={}s, session={}…)",
-                child.id(), delay_secs, &session_id[..session_id.len().min(8)]
+                child.id(),
+                delay_secs,
+                &session_id[..session_id.len().min(8)]
             );
         }
         Err(e) => {
@@ -2778,7 +2444,8 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(delay_secs));
 
-    let pending: PendingCapture = match fs::read_to_string(&pending_path).ok()
+    let pending: PendingCapture = match fs::read_to_string(&pending_path)
+        .ok()
         .and_then(|d| serde_json::from_str(&d).ok())
     {
         Some(p) => p,
@@ -2801,4 +2468,317 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
         filter_sidechains: false,
         output_dir: None,
     })
+}
+
+// ─── Debug commands (`pc debug …`) ─────────────────────────────────────────────
+//
+// Instrumentation for the capture pipeline. These do NOT mutate the wiki — they
+// replicate the EXTRACT preprocessing + STAGE 1/2 so you can SEE exactly what the
+// LLM is fed and what it returns, without running ROUTE/RECONCILE (no disk writes).
+
+/// Mirror the live capture preprocessing for a `.jsonl` transcript file: parse turns,
+/// reduce via `reduce_turns_to_fit` (drops middle assistant turns, preserves user turns —
+/// same strategy as `run_capture_from_input`), build the line-numbered transcript + the
+/// parallel line→role map. Returns `(numbered, lines, roles)`.
+fn debug_preprocess_transcript(path: &str) -> Result<(String, Vec<String>, Vec<String>)> {
+    let turns = parse_transcript(path)?;
+    let reduced = reduce_turns_to_fit(&turns, 250_000, true);
+    let (numbered, lines, roles) = build_line_numbered_transcript_with_roles(&reduced);
+    Ok((numbered, lines, roles))
+}
+
+/// Resolve the wiki dir to feed EXTRACT. Precedence:
+///   1. explicit `--wiki-dir <dir>` (used as-is),
+///   2. otherwise the discovered project wiki for THIS repo.
+/// Pass `no_wiki = true` to force the baseline (no index) regardless of discovery —
+/// this is the off-switch that makes the before/after comparison reachable from the CLI.
+fn debug_resolve_wiki_dir(wiki_dir_arg: Option<&Path>, no_wiki: bool) -> Option<PathBuf> {
+    if no_wiki {
+        return None;
+    }
+    if let Some(d) = wiki_dir_arg {
+        return Some(d.to_path_buf());
+    }
+    // Discover the project wiki from cwd, mirroring the live capture path.
+    let cwd = std::env::current_dir().ok()?;
+    let root = resolve_project_root(&cwd);
+    let wp = wiki_dir(&root);
+    if wp.exists() { Some(wp) } else { None }
+}
+
+/// `pc debug transcript <file>` — print the numbered transcript EXACTLY as EXTRACT sees it.
+pub(crate) fn run_debug_transcript(file: &Path) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let (numbered, lines, _roles) = debug_preprocess_transcript(&path)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)\n",
+        path, lines.len(), numbered.len()
+    )?;
+    out.write_all(numbered.as_bytes())?;
+    Ok(())
+}
+
+/// `pc debug transcript --all` — find all transcripts for the current CWD in
+/// `~/.claude/projects/` and print each one's numbered output.
+pub(crate) fn run_debug_transcript_all(cwd: &Path) -> Result<()> {
+    use crate::transcript::transcript_cwd;
+
+    let root = resolve_project_root(cwd);
+    let target_key = normalize_path(&root);
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        anyhow::bail!("~/.claude/projects/ not found");
+    }
+
+    // Collect all .jsonl files whose transcript cwd matches this project.
+    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    for entry in std::fs::read_dir(&claude_projects)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&entry_path)? {
+            let file = file?;
+            let path = file.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if let Some(tcwd) = transcript_cwd(&path_str) {
+                let key = normalize_path(&resolve_project_root(&PathBuf::from(&tcwd)));
+                if key == target_key {
+                    let mtime = path.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    matches.push((mtime, path));
+                }
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        eprintln!("no transcripts found for {} (key: {})", cwd.display(), target_key);
+        return Ok(());
+    }
+
+    matches.sort_by_key(|(mtime, _)| *mtime);
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "# {} transcript(s) for project key: {}\n", matches.len(), target_key)?;
+
+    for (_, path) in &matches {
+        let path_str = path.to_string_lossy().to_string();
+        let (numbered, lines, _roles) = debug_preprocess_transcript(&path_str)?;
+        writeln!(
+            out,
+            "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)\n",
+            path_str, lines.len(), numbered.len()
+        )?;
+        out.write_all(numbered.as_bytes())?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// `pc debug extract <file> [--wiki-dir <dir>] [--no-wiki]` — run STAGE 1 (EXTRACT) +
+/// STAGE 2 (authority tagging / evidence verification) and print every intermediate
+/// artifact: system prompt, user message, raw response, parsed claims, summary.
+/// Does NOT run ROUTE/RECONCILE and writes nothing to the wiki.
+pub(crate) fn run_debug_extract(
+    file: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let cfg = load_config()?;
+    let capture_spec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+
+    // Resolve wiki index (or baseline).
+    let resolved_wiki = debug_resolve_wiki_dir(wiki_dir_arg, no_wiki);
+    let index_rows: Vec<wiki::IndexRow> = match &resolved_wiki {
+        Some(d) => {
+            // read_index_live mirrors the live EXTRACT path (fresh on-disk guides).
+            let rows = read_index_live(d);
+            rows
+        }
+        None => vec![],
+    };
+
+    // Preprocess transcript identically to the live path.
+    let (numbered, lines, roles) = debug_preprocess_transcript(&path)?;
+
+    // Build a ctx so evidence verification + mechanical authorship match live behavior.
+    let ctx = WikiAgentCtx::new(
+        PathBuf::from(resolved_wiki.clone().unwrap_or_else(|| PathBuf::from("/tmp/pc-debug-wiki"))),
+        "debug".to_string(),
+        "debug-session".to_string(),
+        lines.clone(),
+        roles.clone(),
+        today(),
+    );
+
+    let system = build_extract_system(&index_rows);
+    let user = format!(
+        "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
+        numbered
+    );
+
+    let stdout = io::stdout();
+    let mut o = stdout.lock();
+
+    writeln!(o, "════════════════════════════════════════════════════════════════")?;
+    writeln!(o, " pc debug extract")?;
+    writeln!(o, "   transcript : {}", path)?;
+    writeln!(o, "   model      : {}", cfg.capture_model)?;
+    match &resolved_wiki {
+        Some(d) => writeln!(o, "   wiki index : {} ({} guides)", d.display(), index_rows.len())?,
+        None => writeln!(o, "   wiki index : (none — baseline, --no-wiki or no project wiki)")?,
+    }
+    writeln!(o, "════════════════════════════════════════════════════════════════\n")?;
+
+    writeln!(o, "──── (1) SYSTEM PROMPT ────────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", system)?;
+
+    writeln!(o, "──── (2) USER MESSAGE (numbered transcript) ───────────────────\n")?;
+    writeln!(o, "{}\n", user)?;
+
+    writeln!(o, "──── (3) RAW LLM RESPONSE ─────────────────────────────────────\n")?;
+    o.flush()?;
+    let rt = Runtime::new()
+        .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+    let raw = rt.block_on(async {
+        run_stage(
+            &capture_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(),
+            &system, &user, 6000,
+        ).await
+    })?;
+    writeln!(o, "{}\n", raw)?;
+
+    writeln!(o, "──── (4) PARSED CLAIMS ────────────────────────────────────────\n")?;
+    let blob = extract_json_blob(&raw);
+    let extracted: Vec<ExtractedClaim> = match &blob {
+        Some(b) => match serde_json::from_str::<Vec<ExtractedClaim>>(b) {
+            Ok(v) => v,
+            Err(e) => {
+                // Surface parse failure explicitly — do NOT silently coerce to [] like
+                // the live path's unwrap_or_default(), so "0 claims" is never ambiguous
+                // between "model said []" and "model emitted unparseable garbage".
+                writeln!(o, "⚠ JSON parse FAILED on the extracted blob: {}", e)?;
+                writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+                Vec::new()
+            }
+        },
+        None => {
+            writeln!(o, "⚠ No JSON array/object found in the response at all.")?;
+            writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+            Vec::new()
+        }
+    };
+    writeln!(o, "{}", serde_json::to_string_pretty(
+        &extracted.iter().map(|c| serde_json::json!({
+            "assertion": c.assertion,
+            "evidence": c.evidence.iter().map(|e| serde_json::json!({"start": e.start, "end": e.end})).collect::<Vec<_>>(),
+            "ratified": c.ratified,
+        })).collect::<Vec<_>>()
+    )?)?;
+    writeln!(o)?;
+
+    // ── (5) AUTHORITY TAGGING / EVIDENCE VERIFICATION SUMMARY ──
+    writeln!(o, "──── (5) SUMMARY ──────────────────────────────────────────────\n")?;
+    let mut admitted = 0usize;
+    let (mut n_explicit, mut n_implicit, mut n_dropped) = (0usize, 0usize, 0usize);
+    let mut dropped_examples: Vec<String> = Vec::new();
+    for c in &extracted {
+        if !ctx.evidence_is_valid(&c.evidence) {
+            n_dropped += 1;
+            if dropped_examples.len() < 5 {
+                let ev: Vec<String> = c.evidence.iter().map(|e| format!("{}-{}", e.start, e.end)).collect();
+                dropped_examples.push(format!("  · [{}] {}", ev.join(","), truncate(&c.assertion, 100)));
+            }
+            continue;
+        }
+        let author = ctx.author_for_ranges(&c.evidence);
+        if author == "user" { n_explicit += 1; } else { n_implicit += 1; }
+        admitted += 1;
+    }
+    writeln!(o, "  claims extracted          : {}", extracted.len())?;
+    writeln!(o, "  admitted (evidence valid) : {}  ({} explicit/user, {} implicit/agent)",
+        admitted, n_explicit, n_implicit)?;
+    writeln!(o, "  dropped (evidence invalid): {}", n_dropped)?;
+    if !dropped_examples.is_empty() {
+        writeln!(o, "\n  dropped claims (unverifiable evidence ranges — likely hallucinated cites):")?;
+        for d in &dropped_examples {
+            writeln!(o, "{}", d)?;
+        }
+    }
+    Ok(())
+}
+
+/// `pc debug extract --all` — run EXTRACT on every transcript for the current project.
+pub(crate) fn run_debug_extract_all(
+    cwd: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    use crate::transcript::transcript_cwd;
+
+    let root = resolve_project_root(cwd);
+    let target_key = normalize_path(&root);
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        anyhow::bail!("~/.claude/projects/ not found");
+    }
+
+    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    for entry in std::fs::read_dir(&claude_projects)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&entry_path)? {
+            let file = file?;
+            let path = file.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if let Some(tcwd) = transcript_cwd(&path_str) {
+                let key = normalize_path(&resolve_project_root(&PathBuf::from(&tcwd)));
+                if key == target_key {
+                    let mtime = path.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    matches.push((mtime, path));
+                }
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        eprintln!("no transcripts found for {} (key: {})", cwd.display(), target_key);
+        return Ok(());
+    }
+
+    matches.sort_by_key(|(mtime, _)| *mtime);
+
+    eprintln!("{} transcript(s) for project key: {}", matches.len(), target_key);
+
+    for (i, (_, path)) in matches.iter().enumerate() {
+        eprintln!("\n[{}/{}] {}", i + 1, matches.len(), path.display());
+        run_debug_extract(path, wiki_dir_arg, no_wiki)?;
+    }
+    Ok(())
 }

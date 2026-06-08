@@ -132,9 +132,29 @@ pub struct Config {
     #[serde(default = "default_inject_min_prompt_words")]
     pub inject_min_prompt_words: usize,
 
+    // ---- Cross-turn dedup (inject v3) ----
+    /// Fold query resolution into the gate call: the gate emits a leading
+    /// `QUERY:` standalone-question line (decontextualizing follow-ups against
+    /// the recent conversation) that becomes the compile focal message.
+    /// When false, the compile uses the raw prompt (pre-v3 behavior).
+    /// Default: true
+    #[serde(default = "default_inject_resolve_query")]
+    pub inject_resolve_query: bool,
+
+    /// Max prior injected briefings (this session) fed to the compile model as
+    /// "already in context — surface only new facts". 0 disables the ledger.
+    /// Default: 8
+    #[serde(default = "default_inject_ledger_entries")]
+    pub inject_ledger_entries: usize,
+
+    /// Char cap (tail) on the assembled "already injected" block. Default: 3000
+    #[serde(default = "default_inject_ledger_char_cap")]
+    pub inject_ledger_char_cap: usize,
+
     // ---- Citation-anchored capture (v0.4) ----
-    /// Maximum number of turns the wiki_* tool-calling agent loop may take during capture.
-    /// Higher values allow more thorough wiki edits at the cost of latency/tokens.
+    /// Legacy max-turn setting for the pre-v0.4 tool-calling capture loop.
+    /// The staged capture pipeline is fixed-shot and currently ignores this value; kept
+    /// to avoid breaking existing configs.
     /// Default: 16
     #[serde(default = "default_capture_max_turns")]
     pub capture_max_turns: usize,
@@ -278,6 +298,18 @@ fn default_inject_min_prompt_words() -> usize {
     4
 }
 
+fn default_inject_resolve_query() -> bool {
+    true
+}
+
+fn default_inject_ledger_entries() -> usize {
+    8
+}
+
+fn default_inject_ledger_char_cap() -> usize {
+    3000
+}
+
 fn default_capture_max_turns() -> usize {
     16
 }
@@ -366,7 +398,19 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_min_prompt_words = 20;
     }
 
-    // Citation-anchored capture: max turns for wiki_* agent loop
+    // Cross-turn dedup: bound the ledger block so a long session can't bloat
+    // the compile prompt. Entries are uncapped by count here (read-time takes
+    // the last N), but the assembled char block is capped at read time.
+    if c.inject_ledger_char_cap > 16000 {
+        eprintln!("proactive-context: clamping inject_ledger_char_cap to 16000");
+        c.inject_ledger_char_cap = 16000;
+    }
+    if c.inject_ledger_entries > 50 {
+        eprintln!("proactive-context: clamping inject_ledger_entries to 50");
+        c.inject_ledger_entries = 50;
+    }
+
+    // Citation-anchored capture: legacy max-turn setting.
     if c.capture_max_turns < 1 {
         c.capture_max_turns = 1;
     } else if c.capture_max_turns > 64 {
@@ -427,6 +471,10 @@ impl Default for Config {
             inject_max_guides: default_inject_max_guides(),
             inject_max_link_hops: default_inject_max_link_hops(),
             inject_min_prompt_words: default_inject_min_prompt_words(),
+            // Cross-turn dedup (inject v3)
+            inject_resolve_query: default_inject_resolve_query(),
+            inject_ledger_entries: default_inject_ledger_entries(),
+            inject_ledger_char_cap: default_inject_ledger_char_cap(),
             // Citation-anchored capture (v0.4)
             capture_max_turns: default_capture_max_turns(), // usize
             // Cross-agent awareness (v0.1)

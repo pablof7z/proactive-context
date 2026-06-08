@@ -4,6 +4,7 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod archeologist;
+mod tenex;
 mod awareness;
 mod capture;
 mod session_start;
@@ -12,10 +13,12 @@ mod config;
 mod configure;
 mod daemon;
 mod db;
+mod doctor;
 mod embed;
 mod events;
 mod harness;
 mod inject;
+mod ledger;
 mod openrouter;
 mod provider;
 mod query;
@@ -230,6 +233,19 @@ enum Commands {
         /// Safe to delete afterwards.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<std::path::PathBuf>,
+
+        /// Also scan TENEX conversation databases (~/.tenex/projects/) as a source.
+        /// Only conversations where the user participated are included.
+        /// Requires a valid ~/.tenex/config.json.
+        #[arg(long)]
+        tenex: bool,
+
+        /// Forget capture markers so sessions count as new again — use after deleting the
+        /// wiki to start over. Scope with --project (one project) or none (all projects,
+        /// plus pending/lock state). Respects --output-dir for isolated ledgers. Prompts
+        /// for confirmation unless --yes. Does nothing else: no scan, no LLM, no picker.
+        #[arg(long)]
+        reset: bool,
     },
 
     /// Follow the proactive-context event log live across all projects.
@@ -310,6 +326,107 @@ enum Commands {
         /// Remove pc's hooks from the selected harnesses instead of installing.
         #[arg(long)]
         uninstall: bool,
+    },
+
+    /// Wiki maintenance commands (off-hot-path).
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+    },
+
+    /// Capture-pipeline instrumentation. Inspect what the EXTRACT stage is fed and what
+    /// it returns, without touching the wiki. Use to investigate dropped/missed facts.
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugAction {
+    /// Print the line-numbered transcript EXACTLY as the EXTRACT stage sees it (after the
+    /// same preprocessing + 250KB tail-truncation the live capture path applies).
+    Transcript {
+        /// Path to a `.jsonl` transcript (same format as ~/.claude/projects/**/*.jsonl).
+        /// Omit when using --all.
+        file: Option<PathBuf>,
+
+        /// Process all transcripts for the current project (matched by CWD) found in
+        /// ~/.claude/projects/, printing each in turn.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Run the EXTRACT stage on a transcript and print the system prompt, numbered
+    /// transcript, raw LLM response, parsed claims, and an admit/drop summary. Runs
+    /// STAGE 1 (EXTRACT) + STAGE 2 (evidence verification) only — no ROUTE/RECONCILE,
+    /// no wiki writes.
+    Extract {
+        /// Path to a `.jsonl` transcript. Omit when using --all.
+        file: Option<PathBuf>,
+
+        /// Feed EXTRACT the wiki index from this dir (slug|title|summary grouped by topic).
+        /// Defaults to the discovered project wiki for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// Baseline: run EXTRACT with NO wiki index, ignoring discovery. Use to compare
+        /// against the default (with-index) run.
+        #[arg(long)]
+        no_wiki: bool,
+
+        /// Process all transcripts for the current project (matched by CWD) found in
+        /// ~/.claude/projects/, running EXTRACT on each in turn.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiAction {
+    /// Periodic consolidation/compaction: detect near-duplicate guide clusters, LLM-confirm,
+    /// and merge each into one canonical guide. Default = dry-run: reads the live wiki
+    /// read-only and writes the proposed consolidated wiki to --output-dir.
+    Doctor {
+        /// Write the consolidated wiki here (dry-run). Defaults to a temp dir. NEVER touches
+        /// the real docs/wiki/ unless --apply.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+
+        /// Write the consolidation in-place to the real wiki. Use with care.
+        #[arg(long)]
+        apply: bool,
+
+        /// Only detect + print candidate clusters; skip the LLM confirm/merge (tau tuning).
+        #[arg(long)]
+        detect_only: bool,
+
+        /// Override the clustering cosine threshold (else PC_DOCTOR_TAU env, else 0.6).
+        #[arg(long, value_name = "TAU")]
+        tau: Option<f32>,
+
+        /// Topic-taxonomy mode: one LLM pass assigns every guide a coherent `topic`
+        /// (GROUP, not merge — bodies/citations untouched). Dry-run prints the proposed
+        /// taxonomy; with --apply it stamps the `topic` frontmatter field in place.
+        #[arg(long)]
+        retopic: bool,
+
+        /// Override the model for the --retopic taxonomy call (e.g. `ollama:glm-5.1:cloud`).
+        /// Defaults to capture_model. Useful when capture_model is a slow local model.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
+
+    /// Tidy a wiki directory into its published, human-readable form: hide inline
+    /// citation markers (audit-preserved) and drop empty `## See Also` scaffolds.
+    /// Idempotent; only touches parseable pc guides (a coexisting topic KB is skipped).
+    Tidy {
+        /// Wiki directory of *.md guides (e.g. <repo>/docs/wiki)
+        #[arg(long)]
+        dir: PathBuf,
+        /// Apply changes in place (default is a dry-run summary only)
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -458,6 +575,29 @@ fn main() -> Result<()> {
             probe_openrouter(&api_key, &model, &prompt, with_generation)?;
         }
 
+        Commands::Debug { action } => match action {
+            DebugAction::Transcript { file, all } => {
+                if all {
+                    let cwd = std::env::current_dir()?;
+                    crate::capture::run_debug_transcript_all(&cwd)?;
+                } else if let Some(f) = file {
+                    crate::capture::run_debug_transcript(&f)?;
+                } else {
+                    anyhow::bail!("provide a transcript file path or pass --all");
+                }
+            }
+            DebugAction::Extract { file, wiki_dir, no_wiki, all } => {
+                if all {
+                    let cwd = std::env::current_dir()?;
+                    crate::capture::run_debug_extract_all(&cwd, wiki_dir.as_deref(), no_wiki)?;
+                } else if let Some(f) = file {
+                    crate::capture::run_debug_extract(&f, wiki_dir.as_deref(), no_wiki)?;
+                } else {
+                    anyhow::bail!("provide a transcript file path or pass --all");
+                }
+            }
+        },
+
         Commands::Archeologist {
             project,
             since,
@@ -467,6 +607,8 @@ fn main() -> Result<()> {
             yes,
             include_sidechains,
             output_dir,
+            tenex,
+            reset,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
                 project,
@@ -477,6 +619,8 @@ fn main() -> Result<()> {
                 yes,
                 include_sidechains,
                 output_dir,
+                include_tenex: tenex,
+                reset,
             })?;
         }
 
@@ -524,6 +668,79 @@ fn main() -> Result<()> {
                 uninstall,
             })?;
         }
+
+        Commands::Wiki { action } => match action {
+            WikiAction::Doctor {
+                output_dir,
+                apply,
+                detect_only,
+                tau,
+                retopic,
+                model,
+            } => {
+                crate::doctor::run_doctor(
+                    &root,
+                    crate::doctor::DoctorArgs {
+                        output_dir,
+                        apply,
+                        detect_only,
+                        tau,
+                        retopic,
+                        model,
+                    },
+                )?;
+            }
+            WikiAction::Tidy { dir, write } => {
+                let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+                    .collect();
+                entries.sort();
+                let mut scanned = 0usize;
+                let mut changed = 0usize;
+                for path in entries {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    let raw = match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let guide = match crate::wiki::parse_guide(&raw) {
+                        Some(g) => g,
+                        None => continue,
+                    };
+                    scanned += 1;
+                    let normalized = crate::wiki::normalize_for_publish(&guide.body);
+                    if normalized != guide.body {
+                        changed += 1;
+                        if write {
+                            let mut g = guide;
+                            g.body = normalized;
+                            crate::wiki::save_guide(&path, &g)?;
+                        } else {
+                            println!("would tidy: {}", name);
+                        }
+                    }
+                }
+                if write {
+                    println!(
+                        "wiki tidy: {} guide(s) scanned, {} rewritten in {}",
+                        scanned, changed, dir.display()
+                    );
+                } else {
+                    println!(
+                        "wiki tidy (dry-run): {} guide(s) scanned, {} would change. Re-run with --write.",
+                        scanned, changed
+                    );
+                }
+            }
+        },
     }
 
     Ok(())

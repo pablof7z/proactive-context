@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 pub struct GuideFrontmatter {
     pub title: String,
     pub slug: String,
+    pub topic: String,         // kebab-case domain grouping, e.g. "playback", "nostr-protocol"
     pub summary: String,
     pub tags: Vec<String>,
     pub volatility: String,    // hot|warm|cold
@@ -150,6 +151,7 @@ fn assign_scalar_field(fm: &mut GuideFrontmatter, key: &str, val: String) {
     match key {
         "title"         => fm.title = val,
         "slug"          => fm.slug = val,
+        "topic"         => fm.topic = val,
         "summary"       => fm.summary = val,
         "volatility"    => fm.volatility = val,
         "confidence"    => fm.confidence = val,
@@ -178,6 +180,9 @@ pub fn serialize_guide(guide: &Guide) -> String {
     out.push_str("---\n");
     write_scalar(&mut out, "title", &fm.title);
     write_scalar(&mut out, "slug", &fm.slug);
+    if !fm.topic.is_empty() {
+        write_scalar(&mut out, "topic", &fm.topic);
+    }
     write_scalar(&mut out, "summary", &fm.summary);
     write_list(&mut out, "tags", &fm.tags);
     write_scalar(&mut out, "volatility", &fm.volatility);
@@ -255,12 +260,21 @@ pub fn load_guide(path: &Path) -> Option<Guide> {
     parse_guide(&content)
 }
 
-/// Write a guide to disk, creating parent dirs as needed.
+/// Write a guide to disk, creating parent dirs as needed. The body is normalized
+/// into its published (human-readable) form on the way out — see [`normalize_for_publish`].
 pub fn save_guide(path: &Path, guide: &Guide) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serialize_guide(guide))?;
+    let normalized = normalize_for_publish(&guide.body);
+    let content = if normalized == guide.body {
+        serialize_guide(guide)
+    } else {
+        let mut g = guide.clone();
+        g.body = normalized;
+        serialize_guide(&g)
+    };
+    fs::write(path, content)?;
     Ok(())
 }
 
@@ -474,6 +488,7 @@ fn find_see_also_insertion_point(body: &str) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct IndexRow {
     pub slug: String,
+    pub topic: String,
     pub title: String,
     pub summary: String,
     pub tags: Vec<String>,
@@ -510,6 +525,7 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
                 slug: fm.slug.clone(),
+                topic: fm.topic.clone(),
                 title: fm.title.clone(),
                 summary: fm.summary.clone(),
                 tags: fm.tags.clone(),
@@ -520,8 +536,8 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
         }
     }
 
-    // Sort deterministically by slug
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    // Sort deterministically by topic then slug
+    rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
 
     write_index_file(wiki_dir, today, &rows)?;
     Ok(rows)
@@ -535,23 +551,36 @@ fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<(
     out.push_str("# Wiki Index\n\n");
     out.push_str("> Derived cache — do not hand-edit. Rebuilt by proactive-context after each capture.\n\n");
     out.push_str(&format!("Last updated: {}\n\n", today));
-    out.push_str("## Guides\n\n");
 
     if rows.is_empty() {
         out.push_str("*(no guides yet)*\n");
-    } else {
-        out.push_str("| Slug | Title | Summary | Tags | Volatility | Verified |\n");
-        out.push_str("|------|-------|---------|------|------------|----------|\n");
-        for row in rows {
+        fs::write(&path, out)?;
+        return Ok(());
+    }
+
+    // Group rows by topic (empty topic = "general")
+    let mut by_topic: std::collections::BTreeMap<String, Vec<&IndexRow>> = std::collections::BTreeMap::new();
+    for row in rows {
+        let topic = if row.topic.is_empty() { "general".to_string() } else { row.topic.clone() };
+        by_topic.entry(topic).or_default().push(row);
+    }
+
+    // Render one table section per topic
+    for (topic, topic_rows) in &by_topic {
+        out.push_str(&format!("## {} ({} guide{})\n\n", topic, topic_rows.len(),
+            if topic_rows.len() == 1 { "" } else { "s" }));
+        out.push_str("| Slug | Title | Summary | Tags | Volatility | Verified | Topic |\n");
+        out.push_str("|------|-------|---------|------|------------|----------|-------|\n");
+        for row in topic_rows.iter() {
             let tags_str = row.tags.join(", ");
-            // Escape pipe chars in summary
             let summary = row.summary.replace('|', "\\|");
             let title = row.title.replace('|', "\\|");
             out.push_str(&format!(
-                "| [{}]({}.md) | {} | {} | {} | {} | {} |\n",
-                row.slug, row.slug, title, summary, tags_str, row.volatility, row.verified
+                "| [{}]({}.md) | {} | {} | {} | {} | {} | {} |\n",
+                row.slug, row.slug, title, summary, tags_str, row.volatility, row.verified, topic
             ));
         }
+        out.push('\n');
     }
 
     fs::write(&path, out)?;
@@ -605,9 +634,11 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
                     .collect();
                 let volatility = cols[4].to_string();
                 let verified = cols.get(5).unwrap_or(&"").to_string();
+                let topic = cols.get(6).unwrap_or(&"").to_string();
 
                 rows.push(IndexRow {
                     slug,
+                    topic,
                     title,
                     summary,
                     tags,
@@ -633,7 +664,7 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
 /// exist on disk but are absent from the cache. ROUTE reading the stale cache was blind
 /// to its own recent siblings and minted near-duplicate slugs for the same topic.
 ///
-/// Mirrors `WikiListTool::call`'s filter (skips any `_`-prefixed file, e.g. `_index`,
+/// Mirrors capture's live-guide filter (skips any `_`-prefixed file, e.g. `_index`,
 /// `_citations`) and reuses `rebuild_index`'s row construction, but performs NO write —
 /// it is a pure read so it is safe to call on every ROUTE without churning the cache.
 /// Inject/statusline keep using the cheap `read_index` cache read to stay within budget.
@@ -656,6 +687,7 @@ pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
                 slug: fm.slug.clone(),
+                topic: fm.topic.clone(),
                 title: fm.title.clone(),
                 summary: fm.summary.clone(),
                 tags: fm.tags.clone(),
@@ -665,7 +697,7 @@ pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
             });
         }
     }
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
     rows
 }
 
@@ -681,11 +713,13 @@ pub fn new_guide(
     body: &str,
     session_id: &str,
     today: &str,
+    topic: &str,
 ) -> Guide {
     Guide {
         frontmatter: GuideFrontmatter {
             title: title.to_string(),
             slug: slug.to_string(),
+            topic: topic.to_string(),
             summary: summary.to_string(),
             tags: tags.to_vec(),
             volatility: volatility.to_string(),
@@ -759,6 +793,153 @@ pub fn collect_citation_markers(text: &str) -> Vec<String> {
         i += 1;
     }
     markers
+}
+
+/// Number of bytes in the UTF-8 sequence whose leading byte is `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 { 1 }
+    else if b >> 5 == 0b110 { 2 }
+    else if b >> 4 == 0b1110 { 3 }
+    else if b >> 3 == 0b11110 { 4 }
+    else { 1 }
+}
+
+/// Normalize a guide body into its *published* (committed, human-readable) form.
+/// Idempotent — running it repeatedly yields the same output.
+///
+/// The capture pipeline writes guides with inline `[^id]` citation markers and a
+/// `## See Also` scaffold, both of which are meaningful to the pipeline but render
+/// as broken noise on GitHub/markdown viewers. This collapses the two consumers
+/// (pipeline audit vs. human reader) at the disk-write choke point:
+///
+/// 1. Bare inline `[^id]` markers are wrapped in HTML comments so they render
+///    invisibly, while remaining discoverable by [`collect_citation_markers`]
+///    (the pipeline's carry-forward logic) and preserved for audit.
+/// 2. A trailing `## See Also` section containing no links is dropped (the
+///    bidirectional-link enforcer re-creates it when an actual link is added).
+pub fn normalize_for_publish(body: &str) -> String {
+    strip_empty_see_also(&hide_bare_citation_markers(body))
+}
+
+/// Wrap bare `[^id]` markers — those not already inside an HTML comment — in
+/// `<!-- ... -->`. Markers already inside a comment (e.g. a `<!-- citations: -->`
+/// trailer written by [`revise_section`]) are left untouched, so this is idempotent.
+fn hide_bare_citation_markers(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut i = 0;
+    let mut in_comment = false;
+    while i < bytes.len() {
+        if !in_comment && body[i..].starts_with("<!--") {
+            in_comment = true;
+            out.push_str("<!--");
+            i += 4;
+            continue;
+        }
+        if in_comment && body[i..].starts_with("-->") {
+            in_comment = false;
+            out.push_str("-->");
+            i += 3;
+            continue;
+        }
+        if !in_comment && bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+            if let Some(close_rel) = body[i..].find(']') {
+                let marker = &body[i..i + close_rel + 1];
+                let id = &marker[2..marker.len() - 1];
+                if !id.is_empty() && !id.contains(' ') {
+                    out.push_str("<!-- ");
+                    out.push_str(marker);
+                    out.push_str(" -->");
+                    i += close_rel + 1;
+                    continue;
+                }
+            }
+        }
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Drop a `## See Also` section ONLY when it is genuinely empty — i.e. it has no visible
+/// content at all, just blank lines and HTML/citation comments (`<!-- ... -->`). A section
+/// holding ANY visible text — link entries (`[[wikilink]]`/`[text](url)`) OR authored prose
+/// — is KEPT verbatim. We never delete links or content (keep-everything). Preserves any
+/// content after the section. Idempotent.
+fn strip_empty_see_also(body: &str) -> String {
+    let pos = match find_see_also_pos(body) {
+        Some(p) => p,
+        None => return body.to_string(),
+    };
+    // Span of the See Also section: from its heading to the next heading, or EOF.
+    let after_heading = body[pos..]
+        .find('\n')
+        .map(|n| pos + n + 1)
+        .unwrap_or(body.len());
+    let mut sec_end = body.len();
+    let mut off = after_heading;
+    for line in body[after_heading..].lines() {
+        if line.trim_start().starts_with('#') {
+            sec_end = off;
+            break;
+        }
+        off += line.len() + 1;
+    }
+    // Inspect the section body (after the heading line). It is safe to drop ONLY if every
+    // non-blank line is a link entry or a citation/HTML comment. Any other text → KEEP.
+    let mut has_real_content = false;
+    let mut in_comment = false;
+    for raw in body[after_heading..sec_end].lines() {
+        // Remove any HTML/citation comment spans from this line (handles multi-line comments
+        // via the `in_comment` carry). Whatever text remains is "visible" content.
+        let mut visible = String::new();
+        let mut rest = raw;
+        loop {
+            if in_comment {
+                match rest.find("-->") {
+                    Some(end) => {
+                        rest = &rest[end + 3..];
+                        in_comment = false;
+                    }
+                    None => break,
+                }
+            }
+            match rest.find("<!--") {
+                Some(start) => {
+                    visible.push_str(&rest[..start]);
+                    rest = &rest[start..];
+                    in_comment = true;
+                }
+                None => {
+                    visible.push_str(rest);
+                    break;
+                }
+            }
+        }
+        // Any visible non-blank text — a link entry OR authored prose — counts as content.
+        // Only a section whose visible content is entirely blank (just whitespace + HTML/
+        // citation comments) is considered empty and safe to drop.
+        if !visible.trim().is_empty() {
+            has_real_content = true;
+            break;
+        }
+    }
+    if has_real_content {
+        return body.to_string(); // section holds links or authored content — never delete it
+    }
+    let mut result = String::with_capacity(body.len());
+    result.push_str(body[..pos].trim_end());
+    result.push('\n');
+    let tail = &body[sec_end..];
+    if !tail.trim().is_empty() {
+        result.push('\n');
+        result.push_str(tail);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 /// Find the byte range [start, end) of the section body with the given heading.
@@ -975,6 +1156,86 @@ pub fn render_index_for_inject(rows: &[IndexRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hide_bare_citation_markers() {
+        let body = "# G\n\n## Behavior\n\nAvatars fade in over 0.2s. [^19e07-2]\n\n## See Also\n";
+        let out = hide_bare_citation_markers(body);
+        assert!(out.contains("0.2s. <!-- [^19e07-2] -->"), "got: {out}");
+        assert!(!out.contains("0.2s. [^19e07-2]"));
+    }
+
+    #[test]
+    fn test_hide_markers_idempotent_and_skips_comments() {
+        let body = "Text [^a-1] more.\n<!-- citations: [^b-2] [^c-3] -->\n";
+        let once = hide_bare_citation_markers(body);
+        let twice = hide_bare_citation_markers(&once);
+        assert_eq!(once, twice, "not idempotent");
+        // the citations-trailer markers stay inside their original comment, un-rewrapped
+        assert!(once.contains("<!-- citations: [^b-2] [^c-3] -->"));
+        assert!(once.contains("Text <!-- [^a-1] --> more."));
+        // markers still discoverable by the pipeline
+        assert_eq!(collect_citation_markers(&once).len(), 3);
+    }
+
+    #[test]
+    fn test_strip_empty_see_also() {
+        let body = "# G\n\n## Behavior\n\nFoo. [^a]\n\n## See Also\n\n";
+        let out = strip_empty_see_also(body);
+        assert!(!out.contains("See Also"), "empty See Also not stripped: {out}");
+        assert!(out.contains("Foo. [^a]"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_keep_see_also_with_links() {
+        let body = "# G\n\n## Behavior\n\nFoo.\n\n## See Also\n\n- [[other-guide|Other]]\n";
+        let out = strip_empty_see_also(body);
+        assert!(out.contains("## See Also"), "See Also with links wrongly stripped");
+        assert!(out.contains("[[other-guide|Other]]"));
+    }
+
+    #[test]
+    fn test_keep_see_also_with_prose_content() {
+        // Regression: a See Also section holding authored prose + a citation comment (a
+        // capture quirk that misfiles content under the heading) must NOT be deleted —
+        // that destroyed cited content in a real --retopic --apply run (keep-everything).
+        let body = "# G\n\n## Behavior\n\nFoo.\n\n## See Also\n\n\
+                    If X allows swipe-to-dismiss, the handler would trigger auto-send.\n\n\
+                    <!-- citations: [^5b223-2] -->\n";
+        let out = normalize_for_publish(body);
+        assert!(out.contains("swipe-to-dismiss"), "deleted authored See-Also content: {out}");
+        assert!(out.contains("[^5b223-2]"), "lost citation under See Also");
+        assert!(out.contains("## See Also"), "wrongly dropped a non-empty See Also");
+        // still idempotent
+        assert_eq!(out, normalize_for_publish(&out));
+    }
+
+    #[test]
+    fn test_strip_see_also_with_only_comment_and_links() {
+        // A See Also whose only non-blank content is links + a citation comment IS empty
+        // enough to drop (the comment is a stray trailer, not authored prose).
+        let body = "# G\n\n## Behavior\n\nFoo. [^a-1]\n\n## See Also\n\n<!-- citations: [^a-1] -->\n";
+        let out = strip_empty_see_also(body);
+        assert!(!out.contains("## See Also"), "comment-only See Also should be dropped: {out}");
+    }
+
+    #[test]
+    fn test_normalize_for_publish_idempotent() {
+        let body = "# G\n\n## Behavior\n\nAvatars fade in. [^19e07-2]\n\n## See Also\n\n";
+        let once = normalize_for_publish(body);
+        let twice = normalize_for_publish(&once);
+        assert_eq!(once, twice);
+        assert!(once.contains("<!-- [^19e07-2] -->"));
+        assert!(!once.contains("## See Also"));
+    }
+
+    #[test]
+    fn test_normalize_preserves_unicode_body() {
+        let body = "# Guía\n\n## Comportamiento\n\nLos íconos se desvanecen → suave. [^x-1]\n\n## See Also\n";
+        let out = normalize_for_publish(body);
+        assert!(out.contains("íconos se desvanecen → suave. <!-- [^x-1] -->"), "got: {out}");
+    }
 
     #[test]
     fn test_parse_serialize_roundtrip() {

@@ -5,7 +5,7 @@
 **One-line description:**
 A bulk-historical capture driver that replays the existing per-session `capture` agent over the user's entire `~/.claude/projects/**/*.jsonl` backlog — chronologically, project by project — to retroactively grow the per-project wiki from months of past conversations. It is the cold-start fix: instead of an empty wiki that warms up only from future sessions, the user gets a populated, cross-linked spec wiki on day one. Because it is long-running, it ships with a rich live TUI.
 
-> **Meta note:** This document follows the house style of `lessons-capture.md`, `tail-system.md`, and `citation-anchored-capture.md` — problem → reframe → locked decisions → exact reuse map → open questions → non-goals. Every claim about current behavior is grounded in `src/capture.rs` (the v0.4 agent loop), `src/transcript.rs`, `src/main.rs`, and `src/tui.rs`, not in the older v0.2 spec, which has diverged.
+> **Meta note:** This document follows the house style of `lessons-capture.md`, `tail-system.md`, and `citation-anchored-capture.md` — problem → reframe → locked decisions → exact reuse map → open questions → non-goals. Every claim about current behavior is grounded in `src/capture.rs` (the v0.4 staged capture pipeline), `src/transcript.rs`, `src/main.rs`, and `src/tui.rs`, not in the older v0.2 spec, which has diverged.
 
 ---
 
@@ -23,7 +23,7 @@ It is also, by construction (see *Resume / idempotency*), a recurring **"catch u
 
 ## The reframe: archeologist is a *driver*, not a new capture engine
 
-The single load-bearing design decision: **archeologist does not reimplement capture.** It wraps `run_capture_from_input` — the exact entry point the live hooks already call (`src/capture.rs::run_capture_from_input`, reached from `Commands::Capture` in `src/main.rs`). Everything that makes capture trustworthy — the citation-anchored `wiki_*` agent loop, the triage gate, evidence-by-construction, the per-session dedup marker, the per-project wiki write-lock — is inherited unchanged. archeologist supplies three things the live path gets from the hook harness:
+The single load-bearing design decision: **archeologist does not reimplement capture.** It wraps `run_capture_from_input` — the exact entry point the live hooks already call (`src/capture.rs::run_capture_from_input`, reached from `Commands::Capture` in `src/main.rs`). Everything that makes capture trustworthy — the citation-anchored staged pipeline, the triage gate, evidence-by-construction, the per-session dedup marker, the per-project wiki write-lock — is inherited unchanged. archeologist supplies three things the live path gets from the hook harness:
 
 1. **A list of transcript files to replay**, instead of one `transcript_path` from stdin.
 2. **The session's real historical date**, instead of `today()` (deliverable b — see *Transcript-dated stamping*).
@@ -42,12 +42,12 @@ These were decided with Pablo and verified against this machine's real `~/.claud
 3. **Replay is chronological.** Within a project, sort that project's sessions by their first message `timestamp` ascending, replay oldest → newest. Supersession depends on this ordering.
 4. **Stamp dates from the transcript, not `today()`.** The timestamps exist in the JSONL but `parse_transcript` drops them; the spec extends the parser and threads the session's real date through `CaptureContext.today`. Without this, a guide mined from a six-month-old session looks freshly verified and the whole staleness model breaks.
 5. **Route by the real `cwd` field, not the encoded dir name.** Message entries carry `cwd` (`/Users/pablofernandez/Work/nostr-multi-platform`); the dir name (`-Users-pablofernandez-Work-nostr-multi-platform`) is a lossy dash-encoding (path dashes and separators collide). Read `cwd` from inside the transcript and route via `project_dir_from_cwd`.
-6. **Resume / idempotency is free.** `is_already_captured(session_id, exchanges)` (capture.rs:100) already markers captured sessions. Re-runs skip done work; a dead run resumes. The picker counts only NEW (un-captured) sessions per project.
+6. **Resume / idempotency is free.** Capture markers record completed session extents, so re-runs skip done work and a dead run resumes. The picker counts only NEW (un-captured) sessions per project.
 7. **Periodic synthesis checkpoints** via `--synth-every K` (default 12). See *Periodic-checkpoint synthesis* — the meaning of this flag is sharpened below to match what the code can actually do.
 8. **Parallelism: serial by default for TUI legibility.** Within a project: forced serial (chronology + accumulating state). Across projects: also serial by default, so the live feed stays coherent. `--jobs N` parallelizes across projects for headless runs only.
-9. **Live-feed granularity = per-mutation, not token-stream.** Capture is one blocking agent loop per session (`call_model_blocking`, no streaming), but it emits a structured event per wiki mutation. The feed renders those as they land. Intra-call token streaming is a STRETCH GOAL.
+9. **Live-feed granularity = per-mutation, not token-stream.** Capture runs a staged set of blocking model calls, but it emits a structured event per wiki mutation. The feed renders those as they land. Intra-call token streaming is a STRETCH GOAL.
 10. **Non-TTY fallback.** When stdout isn't a TTY, skip the TUI, emit structured line-logging.
-11. **Global-scope promotion** follows current v0.4 reality (project-only; globals are dead code). See *Sidechains, globals, and what capture actually does today*.
+11. **Global-scope promotion** follows current v0.4 reality: capture is project-only and the old global queue has been removed. See *Sidechains, globals, and what capture actually does today*.
 
 ---
 
@@ -104,7 +104,7 @@ For each selected project, archeologist builds an ordered work list:
 4. Filter out sessions already captured (`is_already_captured`) and, if `--since DATE` is set, sessions whose first timestamp predates it.
 5. Replay oldest → newest, **strictly serial within the project.**
 
-Serial-within-project is non-negotiable: each capture's agent loop calls `wiki_list`/`wiki_read` to see the wiki-so-far, then restates. Replaying chronologically means a later session's capture sees what earlier sessions wrote. This is what makes supersession work for free (see next section).
+Serial-within-project is non-negotiable: each capture routes against the live wiki-so-far, then reconciles the target guides. Replaying chronologically means a later session's capture sees what earlier sessions wrote. This is what makes supersession work for free (see next section).
 
 Because RFC3339 UTC timestamps are fixed-width, the sort is a plain lexicographic string compare — no date library needed (the same property `tail --since` exploits, tail-system.md §5.3).
 
@@ -116,11 +116,11 @@ Because RFC3339 UTC timestamps are fixed-width, the sort is a plain lexicographi
 
 Constraint #7's own example is *"an early 'we use npm' gets superseded by a later 'switched to bun' during the run."* That self-correction **already happens**, for free, from *Chronological replay* — and it is critical to state *why*, because it determines what `--synth-every K` can mean.
 
-The v0.4 capture agent (`run_wiki_agent`, capture.rs:1258) is driven by a **line-numbered transcript**, and **every mutating tool hard-requires `evidence` = transcript line ranges** (capture.rs:758/864/972/1083 each bail with `"Error: evidence ... is required"` on an empty range). Rust slices the verbatim cited text out of those transcript lines (citation-anchored-capture.md, *Integrity by construction*). When the later "we switched to bun" session is replayed, its agent calls `wiki_read("package-manager")`, sees the stale "npm" statement, and calls `wiki_revise_statement` **citing its own transcript's lines** ("let's move to bun") as evidence. The supersession is a normal capture mutation, evidence-anchored, produced by replaying that session in order. No separate synthesis pass is involved or needed.
+The v0.4 staged capture pipeline is driven by a **line-numbered transcript**, and every reconcile mutation requires `evidence` = transcript line ranges. Rust slices the verbatim cited text out of those transcript lines (citation-anchored-capture.md, *Integrity by construction*). When the later "we switched to bun" session is replayed, ROUTE sends the claim to the existing package-manager guide, RECONCILE sees the stale "npm" statement, and emits a revise operation **citing its own transcript's lines** ("let's move to bun") as evidence. The supersession is a normal capture mutation, evidence-anchored, produced by replaying that session in order. No separate synthesis pass is involved or needed.
 
 ### Therefore `--synth-every K` is a *maintenance-cadence* knob, not the supersession engine
 
-A naive "re-run the agent over the accumulated wiki every K sessions" is **impossible by construction**: the accumulated wiki is not a transcript, so the agent has no transcript line ranges to cite, so **it cannot call a single mutating tool** — every call would bail on missing evidence. An evidence-free synthesis pass can mutate nothing. We do not pretend otherwise.
+A naive "re-run reconciliation over the accumulated wiki every K sessions" is **impossible by construction**: the accumulated wiki is not a transcript, so the pipeline has no transcript line ranges to cite. An evidence-free synthesis pass can mutate nothing. We do not pretend otherwise.
 
 What `--synth-every K` *does* do is control the cadence of the **structural-maintenance** work that capture already runs after every session (capture.rs:1528–1551):
 
@@ -128,7 +128,7 @@ What `--synth-every K` *does* do is control the cadence of the **structural-main
 - `rebuild_index(wiki_path, today)` — regenerate `_index.md`
 - `index_files_into_db(wiki_path, db_path)` — re-embed changed guides into `index.db`
 
-Re-embedding the whole wiki after *every* one of (potentially) hundreds of replayed sessions is wasteful. archeologist **defers** this maintenance, running it once per **K** sessions (default 12) instead of once per session, plus a **mandatory final checkpoint** at the end of each project's replay so the wiki is always left consistent. This is a pure throughput optimization that changes nothing about the wiki's final content — the per-session agent loop still reads live guide files directly (`wiki_list` scans the directory, capture.rs:570), so deferring index/embed maintenance does not blind a later session to an earlier one's writes.
+Re-embedding the whole wiki after *every* one of (potentially) hundreds of replayed sessions is wasteful. archeologist **defers** this maintenance, running it once per **K** sessions (default 12) instead of once per session, plus a **mandatory final checkpoint** at the end of each project's replay so the wiki is always left consistent. This is a pure throughput optimization that changes nothing about the wiki's final content — the per-session pipeline reads live guide files directly during route/reconcile, so deferring index/embed maintenance does not blind a later session to an earlier one's writes.
 
 > **Implementation note:** the per-session maintenance block (capture.rs:1528–1551) must become *suppressible per call* so archeologist can batch it. Cleanest: a `CaptureContext` flag (e.g. `skip_structural_maintenance: bool`, default false → live hook behavior unchanged) that short-circuits the block; archeologist sets it true for non-checkpoint sessions and calls the three maintenance fns directly at each checkpoint. This keeps the live path byte-for-byte identical.
 
@@ -204,11 +204,11 @@ JSONL message entries carry `isSidechain` (sub-agent / Task-tool turns) and `isM
 
 ### What v0.4 capture.rs actually does — synthesis & globals
 
-Verified by reading `src/capture.rs` (the v0.4 agent loop), **not** the v0.2 `lessons-capture.md` spec, which has diverged:
+Verified by reading `src/capture.rs` (the v0.4 staged capture pipeline), **not** the v0.2 `lessons-capture.md` spec, which has diverged:
 
-- **Synthesis:** there is **no separate `synthesize_product_model` pass** in v0.4. (The v0.2 spec and `tail-system.md`'s event table reference `synth.write`, but no such code path exists.) Self-correction across a session is done *inside* the single agent loop via `wiki_revise_statement`/`wiki_remove_statement` reading existing guides. The only post-loop work is structural maintenance (bidir links, `_index.md`, `index.db` re-embed — capture.rs:1528–1551). This is exactly why *Periodic-checkpoint synthesis* above redefines `--synth-every` as a maintenance-cadence knob.
+- **Synthesis:** there is **no separate `synthesize_product_model` pass** in v0.4. (The v0.2 spec and `tail-system.md`'s event table reference `synth.write`, but no such code path exists.) Self-correction across a session is done *inside* the staged EXTRACT → ROUTE → RECONCILE pipeline via reconcile operations that create, add, revise, or remove guide content. The only post-loop work is structural maintenance (bidir links, `_index.md`, `index.db` re-embed). This is exactly why *Periodic-checkpoint synthesis* above redefines `--synth-every` as a maintenance-cadence knob.
 
-- **Globals:** v0.4 captures **project scope only.** The agent preamble explicitly forbids global entries: *"Do NOT create global/user-preference entries. Project-scoped spec facts only."* (capture.rs:1254–1255). The old global queue (`append_global_pending`, capture.rs:351) is `#[allow(dead_code)]` and **never called** — the comment marks it "DORMANT — v0.4 agent loop handles all capture." A global citation-anchored wiki is *spec'd but unimplemented* (citation-anchored-capture.md, *Global / user-perspective scope* + Open Q3).
+- **Globals:** v0.4 captures **project scope only.** The capture prompt explicitly requires project-scoped facts and forbids global/user-preference entries. The old global pending queue has been removed. A global citation-anchored wiki is *spec'd but unimplemented* (citation-anchored-capture.md, *Global / user-perspective scope* + Open Q3).
 
   **archeologist follows current reality: it does not write globals, and it does not flood any queue.** Across a 1,431-transcript backlog, the worst failure mode would be promoting hundreds of "global" candidates into an append queue — so the safe behavior is precisely the current one: capture stays project-scoped. If/when the global wiki lands, archeologist inherits it automatically (it just drives the same capture body). Global handling is therefore an *open question*, deliberately not a feature of this version.
 
@@ -225,7 +225,7 @@ The scrolling fact-feed keys off the events v0.4 capture **actually emits** (ver
 | v0.4 event (real) | feed meaning |
 |---|---|
 | `capture.triage` (`result: skip\|proceed`) | session entering/skipped by triage |
-| `capture.start` | agent loop starting on a session |
+| `capture.start` | staged capture starting on a session |
 | `wiki.create` (`slug`, `sections`, `citations`) | new guide → feed line |
 | `wiki.add_statement` (`slug`, `section`, `citation`) | statement added → feed line |
 | `wiki.revise_statement` (`slug`, `section`, `citation`) | **supersession** → feed line, highlighted |
@@ -332,12 +332,12 @@ proactive-context archeologist [OPTIONS]
 
 archeologist is **idempotent and resumable for free**, because it routes through the same dedup machinery the live path uses:
 
-- Before replaying a session, the capture body checks `is_already_captured(session_id, exchanges)` (capture.rs:1379, re-checked post-lock at 1411). A session already captured at ≥ this exchange count is skipped with no LLM call.
-- `mark_captured(session_id, exchanges)` (capture.rs:113) is written *before* the agent loop (capture.rs:1487), so a crash mid-loop still leaves the marker — but note the current marker semantics: a session is "done" once it's marked, even if the agent loop later errored/timed out. (For a bulk run this is acceptable: the wiki simply missed one session's worth; re-running won't retry it unless the marker is cleared. Whether archeologist should mark *after* success is an open question.)
+- Before replaying a session, the picker filters sessions through the capture marker store, and the capture body re-checks the marker both before and after taking the per-session lock. A session already captured at ≥ this exchange count is skipped with no LLM call.
+- `mark_captured_in(session_id, exchanges)` is written after the staged capture run is attempted, so setup/API failures before the run do not permanently suppress a retry. Current marker semantics still treat an errored or timed-out staged run as "attempted"; re-running will skip it unless the marker is cleared. Whether archeologist should mark only after a fully successful run is an open question.
 - The picker's **New** column is exactly `sessions − already-captured`, so the user sees up front how much real work a run entails. A re-run after new sessions accumulate mines only the delta — this is the "catch up on backlog" recurring use.
-- A killed run (Ctrl-C, machine sleep) resumes on the next invocation: completed sessions are skipped, the in-flight one re-runs from scratch (it was marked, so it is skipped — see caveat above), and replay continues from where it left off.
+- A killed run (Ctrl-C, machine sleep) resumes on the next invocation: completed sessions are skipped, an in-flight session re-runs if it died before the marker write, and replay continues from the remaining uncaptured sessions.
 
-Idempotency holds across `--jobs N` too: different projects never share a wiki, and the per-session flock (capture.rs:126) + per-project wiki write-lock (capture.rs:145) prevent any cross-worker corruption.
+Idempotency holds across `--jobs N` too: different projects never share a wiki, and the per-session flock plus per-project wiki write-lock prevent any cross-worker corruption.
 
 ---
 
@@ -346,7 +346,7 @@ Idempotency holds across `--jobs N` too: different projects never share a wiki, 
 The picker's `~$` and `--dry-run` produce an **estimate**, never a measurement, from free signals:
 
 - **Triage calls** = `New` sessions that clear the cheap pre-filters (`< 500 chars` / `< 3 exchanges` are skipped before triage, capture.rs:1396). Each is one `triage_transcript` call on the cheap triage model (`capture_triage_model`).
-- **Capture (agent) calls** = an assumed triage-pass rate (heuristic, e.g. 50–65%, surfaced as a range) × those sessions, each costing a multi-turn agent loop on `capture_model` up to `capture_max_turns`.
+- **Capture pipeline calls** = an assumed triage-pass rate (heuristic, e.g. 50–65%, surfaced as a range) × those sessions, each running the staged capture pipeline on `capture_model`.
 - **Token volume** ≈ transcript bytes ÷ ~4 chars/token, capped at capture's truncation limits (triage at 200 K chars, capture.rs:1390; agent transcript at 250 K chars, capture.rs:1480) — so very long sessions don't blow the estimate.
 - **Structural checkpoints** = `ceil(New / K)` per project — **free** (local embed + file writes, no LLM).
 
@@ -366,9 +366,9 @@ The estimate is a **range** (`~$2.1–$3.0`) reflecting the unknown triage-pass 
 
 | Need | Reuse (existing) | New code |
 |---|---|---|
-| Capture pipeline (triage → agent loop → maintenance) | `capture::run_capture_from_input` (capture.rs:1311) | thin loop calling it per session |
-| Dedup / resume | `is_already_captured`, `mark_captured` (capture.rs:100/113) | picker **New** column reads `captured_sessions_dir()` |
-| Routing key | `project_dir_from_cwd`, `config::normalize_path` (capture.rs:171) | group transcripts by `normalize_path(cwd)` |
+| Capture pipeline (triage → staged capture → maintenance) | `capture::run_capture_from_input` | thin loop calling it per session |
+| Dedup / resume | capture marker helpers and `captured_sessions_dir()` | picker **New** column reads the marker store |
+| Routing key | `capture::archeologist_project_dir`, `config::normalize_path` | group transcripts by `normalize_path(cwd)` |
 | Date stamping | `WikiAgentCtx.today` → `wiki::new_guide` (wiki.rs:632) | `today_override` on `CaptureInput`; set at capture.rs:1418 |
 | Transcript parse | role/content logic in `transcript.rs:42–70`, `extract_text` | **`parse_transcript_meta`** + `transcript_cwd`/`transcript_first_ts`/`transcript_message_count` (timestamp/cwd/flags) |
 | Structural maintenance | `enforce_bidirectional_links`, `rebuild_index`, `index_files_into_db` (capture.rs:1528–1551) | make suppressible per call (`skip_structural_maintenance`); call at checkpoints |
@@ -379,7 +379,7 @@ The estimate is a **range** (`~$2.1–$3.0`) reflecting the unknown triage-pass 
 
 **New modules:** `src/archeologist.rs` (the driver: picker, work-list build, replay loop, cost estimate, line-log fallback) and a run-view added to `src/tui.rs` (or a sibling `src/tui_archeologist.rs` reusing the same primitives). **Changed:** `src/transcript.rs` (+ sibling parser & cheap helpers), `src/capture.rs` (`CaptureInput.today_override`; suppressible maintenance), `src/main.rs` (subcommand + dispatch + `mod archeologist`).
 
-**Out of scope (do not touch):** the live `capture`/`inject` hook behavior, the `wiki_*` tool contract, the citation/evidence model, the event schema (we *consume* it).
+**Out of scope (do not touch):** the live `capture`/`inject` hook behavior, the staged capture/evidence model, the event schema (we *consume* it).
 
 ---
 
@@ -388,7 +388,7 @@ The estimate is a **range** (`~$2.1–$3.0`) reflecting the unknown triage-pass 
 1. **Semantic synthesis pass.** Is an evidence-aware cross-guide reconciliation (merge redundant guides, reconcile contradictions no single transcript addresses) wanted as a future feature? It needs a new provenance class for synthesis-authored edits (what does a merge cite?). `--synth-every` is *not* this today (see *Periodic-checkpoint synthesis*).
 2. **`verified` on revise.** Should `wiki_revise_statement`/`wiki_add_statement` re-stamp `verified` (not just `updated`) to the revising session's date? Currently `verified` = creating session's date. Affects how stale a much-revised guide looks. (Capture-side change, broader than archeologist.)
 3. **Globals.** v0.4 captures project-only; the global citation-anchored wiki is spec'd-but-unimplemented (citation-anchored-capture.md Open Q3). When it lands, archeologist inherits it — but should bulk-mining write globals at all, or stay project-only to avoid flooding on a huge backlog?
-4. **Marker-on-failure semantics.** Should archeologist mark a session captured only after the agent loop *succeeds* (so transient failures get retried on re-run), versus the current mark-before-loop behavior?
+4. **Marker-on-failure semantics.** Should archeologist mark a session captured only after the staged run *succeeds* (so transient failures get retried on re-run), versus the current mark-after-attempt behavior?
 5. **Live capture sidechain filtering.** archeologist skips sidechains; should the live hook path (which uses `parse_transcript`, blind to the flag) do the same? Related but separable.
 6. **Triage-pass rate for the estimate.** Is a fixed heuristic range acceptable, or should `--dry-run` optionally triage a small *sample* (e.g. 5 sessions/project) to calibrate the estimate — paying a small, disclosed cost for a tighter number?
 

@@ -133,6 +133,7 @@ mod tests {
     fn row(slug: &str, title: &str, summary: &str) -> IndexRow {
         IndexRow {
             slug: slug.to_string(),
+            topic: String::new(),
             title: title.to_string(),
             summary: summary.to_string(),
             tags: vec![],

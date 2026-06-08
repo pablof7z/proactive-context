@@ -57,10 +57,6 @@ pub struct FunctionCall {
 
 pub struct ChatResponse {
     pub content: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub finish_reason: String,
-    pub usage: Usage,
-    pub generation_id: Option<String>,
 }
 
 // ─── Message constructors ─────────────────────────────────────────────────────
@@ -81,26 +77,6 @@ pub fn user_msg(content: &str) -> ChatMessage {
         content: Some(content.into()),
         tool_calls: None,
         tool_call_id: None,
-        name: None,
-    }
-}
-
-pub fn assistant_tool_calls_msg(content: Option<String>, tool_calls: Vec<ToolCall>) -> ChatMessage {
-    ChatMessage {
-        role: "assistant".into(),
-        content,
-        tool_calls: Some(tool_calls),
-        tool_call_id: None,
-        name: None,
-    }
-}
-
-pub fn tool_result_msg(tool_call_id: &str, content: &str) -> ChatMessage {
-    ChatMessage {
-        role: "tool".into(),
-        content: Some(content.into()),
-        tool_calls: None,
-        tool_call_id: Some(tool_call_id.into()),
         name: None,
     }
 }
@@ -232,13 +208,7 @@ pub async fn chat_once(
         }),
     );
 
-    Ok(ChatResponse {
-        content,
-        tool_calls,
-        finish_reason,
-        usage,
-        generation_id,
-    })
+    Ok(ChatResponse { content })
 }
 
 // ─── Sidecar ──────────────────────────────────────────────────────────────────
