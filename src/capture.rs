@@ -2295,22 +2295,13 @@ pub(crate) fn archeologist_is_already_captured(
 // ─── SessionEnd entry point ───────────────────────────────────────────────────
 
 pub fn run_capture(harness: &str) -> Result<()> {
-    let mut raw = String::new();
-    io::stdin().read_to_string(&mut raw)?;
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(());
-    }
-    // Translate the harness's stdin/transcript into pc's canonical Claude shape.
-    let raw = crate::harness::normalize_stdin(&crate::harness::lookup(harness), raw);
-    let input: CaptureInput = match serde_json::from_str(&raw) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("capture: stdin parse failed: {}", e);
-            return Ok(());
-        }
-    };
-    run_capture_from_input(input)
+    // SessionEnd hook. Run the capture in a detached background process (delay 0)
+    // so the hook returns immediately instead of holding the harness open for the
+    // full capture (which can take many seconds). This reuses the Stop-hook detach
+    // machinery; delay 0 means "capture now, just not in the foreground". If a Stop
+    // debounce worker is still pending for this session, scheduling here supersedes
+    // it (SIGTERM + winner-check), so the session is still captured exactly once.
+    run_capture_scheduled(0, harness)
 }
 
 // ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
@@ -2330,20 +2321,20 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
     let hook_input: CaptureInput = match serde_json::from_str(&raw) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("capture --in: stdin parse failed: {}", e);
+            eprintln!("capture: stdin parse failed: {}", e);
             return Ok(());
         }
     };
 
     if hook_input.session_id.is_empty() {
-        eprintln!("capture --in: no session_id — skipping");
+        eprintln!("capture: no session_id — skipping");
         return Ok(());
     }
 
     let cfg = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("capture --in: config error: {}", e);
+            eprintln!("capture: config error: {}", e);
             return Ok(());
         }
     };
@@ -2362,7 +2353,7 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
 
     let dir = pending_captures_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("capture --in: can't create pending dir: {}", e);
+        eprintln!("capture: can't create pending dir: {}", e);
         return Ok(());
     }
 
@@ -2376,14 +2367,14 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
     }
 
     if let Err(e) = fs::write(&pending_path, serde_json::to_string(&pending)?) {
-        eprintln!("capture --in: can't write pending file: {}", e);
+        eprintln!("capture: can't write pending file: {}", e);
         return Ok(());
     }
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("capture --in: can't find binary path: {}", e);
+            eprintln!("capture: can't find binary path: {}", e);
             return Ok(());
         }
     };
@@ -2408,14 +2399,14 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
         Ok(child) => {
             let _ = fs::write(&pid_path, child.id().to_string());
             eprintln!(
-                "capture --in: debounce started (pid={}, delay={}s, session={}…)",
+                "capture: background capture started (pid={}, delay={}s, session={}…)",
                 child.id(),
                 delay_secs,
                 &session_id[..session_id.len().min(8)]
             );
         }
         Err(e) => {
-            eprintln!("capture --in: failed to spawn background process: {}", e);
+            eprintln!("capture: failed to spawn background process: {}", e);
         }
     }
 

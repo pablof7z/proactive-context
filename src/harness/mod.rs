@@ -108,7 +108,7 @@ pub struct HarnessSpec {
 const CLAUDE_WIRINGS: &[Wiring] = &[
     Wiring { event: "UserPromptSubmit", args: "inject", matcher: None, timeout: 30 },
     Wiring { event: "SessionStart", args: "session_start", matcher: None, timeout: 10 },
-    Wiring { event: "SessionEnd", args: "capture", matcher: None, timeout: 120 },
+    Wiring { event: "SessionEnd", args: "capture", matcher: None, timeout: 10 },
     Wiring { event: "Stop", args: "capture --in 45", matcher: None, timeout: 10 },
     Wiring { event: "PostToolUse", args: "awareness --hook PostToolUse", matcher: Some(".*"), timeout: 10 },
 ];
@@ -122,7 +122,7 @@ const CODEX_WIRINGS: &[Wiring] = &[
 
 const HERMES_WIRINGS: &[Wiring] = &[
     Wiring { event: "pre_llm_call", args: "inject", matcher: None, timeout: 30 },
-    Wiring { event: "on_session_end", args: "capture", matcher: None, timeout: 120 },
+    Wiring { event: "on_session_end", args: "capture", matcher: None, timeout: 10 },
 ];
 
 const TENEX_WIRINGS: &[Wiring] = &[
