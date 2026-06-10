@@ -1,5 +1,132 @@
 # Claims-First Validation Results
 
+**Two corpora tested.** Run 3 = `nostr-multi-platform` (agent-orchestration corpus).
+Run 4 = `proactive-context` (this repo's own dev history — richer, design-heavy, and the
+corpus with known direction reversals for Probe 2). Runs 1–2 were null due to harness bugs.
+**Judge / capture / compile model:** `ollama:glm-5.1:cloud`. **Embedder:** local fastembed (384-dim).
+**Total OpenRouter spend across all four runs: $0.00** (everything ran on Ollama Cloud + local embed).
+
+## Cross-corpus verdict summary
+
+| | Run 3 — nostr (orchestration) | Run 4 — proactive-context (design) |
+|---|---|---|
+| HISTORY / FUTURE | 25 / 200 | 30 / 39 |
+| P1 labels | 37 | 42 |
+| P1 recall ALL (A / B) | 62.2% / 64.9% | 69.0% / 69.0% |
+| P1 user-direction (A / B) | 62.5% / **81.2%** (n=16) | 66.7% / 33.3% (n=3) |
+| P2 reversals scored | N/A (none in corpus) | **8** |
+| P2 trajectory recoverable (A / B) | — | **7/8 / 3/8** |
+| P3 latency reduction | −44% | −19% |
+| §5 verdict | **PROMISING** | **FAILS (kill criterion) — but see caveats** |
+
+**The two corpora disagree, and that disagreement is the finding.** Store B (claims-first) wins
+on an *orchestration* corpus where the same user directions recur verbatim, but loses on a
+*design* corpus where the value is in the supersession narrative — exactly what Probe 2 exposes.
+
+---
+
+# Run 4 — proactive-context (Probe 2 priority)
+
+**Corpus:** `~/.claude/projects/-Users-pablofernandez-src-proactive-context`, 69 dated sessions,
+chronological 80/20 split capped at 30 → HISTORY = oldest 30 (2026-05-28→05-29, the project's
+dense design period), FUTURE = 39 (through 2026-06-10). Stores built fresh under an isolated
+`PC_HOME`; the live `~/.proactive-context/projects/<key>` state and the repo were never touched.
+
+**Self-referential guard (how the circularity was handled).** These transcripts can contain pc's
+own injected `<system-reminder>Relevant project context …</system-reminder>` briefings and pasted
+wiki-index dumps. A label or reversal mined from pc's *own* injection would be circular. The
+transcript prep now (a) strips `<system-reminder>…</system-reminder>` spans (raw and HTML-escaped)
+from every user turn before the judge sees it, and (b) drops any turn dominated by pc's derived
+artifacts (the "Relevant project context (" briefing header, the "Derived cache — do not hand-edit"
+/ "Rebuilt by proactive-context" wiki-index banner, or a `# Wiki Index` table). In practice this
+corpus had almost no *live* injected briefings persisted into user turns (1 turn, and it was an
+HTML-escaped paste inside a human message), so the guard mostly mattered as insurance — but it
+ensures no label is sourced from machine output.
+
+### Store contents (from 30 HISTORY sessions)
+- Store B: 303 claims, 22 wiki guides. Store A: independently-built wiki guides.
+- Reversal capture confirmed in-store: 28 compile/synthesize claims, 13 supersession claims,
+  3 ratified claims — all three spec-named reversals are represented.
+
+## Probe 1 — Restatement recall (42 verified labels; 39 implicit / 3 explicit)
+
+| Cohort | Store A (wiki) | Store B (claims) |
+|--------|---------------|------------------|
+| **All (n=42)** | c14 / p15 / a13 → **69.0%** | c12 / p17 / a13 → **69.0%** |
+| **Explicit / user-direction (n=3)** | c2 / p0 / a1 → 66.7% | c1 / p0 / a2 → 33.3% |
+| **Implicit (n=39)** | c12 / p15 / a12 → 69.2% | c11 / p17 / a11 → **71.8%** |
+
+On overall recall the stores are **tied (69% each)**; B slightly leads on implicit facts. The
+"user-direction" cohort is only **n=3** here (this corpus's human turns are mostly design
+discussion, not standing directives), so the 66.7%→33.3% gap is a one-label swing and is NOT a
+reliable signal — unlike Run 3 where n=16 made the user-direction win meaningful.
+
+## Probe 2 — Direction-change fidelity (THE PRIORITY; 8 reversals, all verified)
+
+The reversal miner found 8 real reversals from the store (all with both X and Y verifiable),
+including the capture-pipeline redesign (3-step distill→plan→apply ⇒ single tool-agent loop) and
+the capture-evidence format change (free-form quotes ⇒ transcript line-range Rust slicing) — the
+EXTRACT and citation-anchoring evolutions the spec hinted at. Examples:
+- *Embedding provider:* OpenAI 1536-dim via OpenRouter ⇒ local all-MiniLM-L6-v2 (384-dim).
+- *Primary command:* `generate` (with Ask/Search roles) ⇒ removed; `inject` is now primary.
+- *Inject hook language:* TypeScript ⇒ Rust.
+
+| Metric | Store A (wiki) | Store B (claims) |
+|--------|---------------|------------------|
+| asserts current Y | **8/8** | 6/8 |
+| leaks stale X as current (the sin) | 1/8 | 2/8 |
+| **trajectory X→Y recoverable** | **7/8** | **3/8** |
+
+**Store A (wiki) wins Probe 2 decisively.** Concrete example (embedding provider): Store A's
+briefing says *"This configuration replaced OpenAI's 1536-dim model via OpenRouter, which was
+previously supported"* — the prose guide retains the supersession narrative. Store B correctly
+asserts the current local-embedding truth but **drops the "replaced OpenAI" history**, so the
+X→Y trajectory is unrecoverable. This is structural: reconciliation into prose naturally writes
+"current Y (was X)", whereas retrieving top atomic claims surfaces the latest claim and leaves
+the prior state behind. B also leaks a stale direction as current twice (vs A's once).
+
+## Probe 3 — Operational metrics (42 inject runs/store)
+
+| Metric | Store A (wiki) | Store B (claims) | Δ |
+|--------|---------------|------------------|---|
+| p50 latency | 3839 ms | 3103 ms | −19% |
+| p95 latency | 13757 ms | 6729 ms | −51% |
+| total tokens in | 194,087 | 64,749 | **−67%** |
+| total tokens out | 13,312 | 8,175 | −39% |
+| incoherent / fact-confetti | — | 0/42 | — |
+
+B is still much cheaper on tokens (−67% in) and tail latency (−51% p95), but only −19% at p50 —
+below the 30% bar on this corpus (Store A's guides here are smaller/faster to compile than the
+nostr corpus's, narrowing the median gap).
+
+## §5 Pre-registered read (applied verbatim) — Run 4
+
+- **P1 user-direction recall ≥ Store A** — **FAIL** (33.3% vs 66.7%), but **n=3** — a single-label
+  swing, not a reliable signal on this corpus.
+- **P2 strictly fewer stale leaks than Store A** — **FAIL** (B leaks 2/8 vs A 1/8; and B recovers
+  trajectory on only 3/8 vs A's 7/8). This is the robust, meaningful result.
+- **P3 ≥30% latency reduction** — **FAIL** (−19% at p50).
+- **Coherence <20% incoherent** — **PASS** (0/42).
+
+**Overall verdict (Run 4): FAILS — Store B does not clear the bar on this corpus.** The decisive,
+statistically-real reason is Probe 2: claims-first loses the supersession trajectory that prose
+guides preserve. The P1 user-direction "fail" is real per the rule but rests on n=3 and should not
+be over-read; overall P1 recall is tied at 69%.
+
+## What Run 3 + Run 4 together say
+
+Claims-first is **not** a universal win. It shines when the payload is recurring atomic user
+direction (Run 3: +19pts user-direction recall, −44% latency) but regresses when the payload is an
+evolving design with reversals (Run 4: −4/8 on trajectory recovery). A claims store that wants to
+match prose on Probe 2 needs to render supersession explicitly ("current Y (was X)") at compile
+time, not just retrieve the latest claim in a cluster — which is exactly the supersession-rendering
+the original claims-first proposal called for but this Phase-0 compile path does not yet do.
+
+---
+
+# Run 3 + earlier — nostr-multi-platform (and the Run 1-2 nulls)
+
+
 **Corpus:** `nostr-multi-platform` (`/Users/pablofernandez/Work/nostr-multi-platform`), 225 sessions
 **Judge / capture / compile model:** `ollama:glm-5.1:cloud` (Ollama Cloud)
 **Embedder:** local fastembed (384-dim)

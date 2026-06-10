@@ -60,6 +60,33 @@ struct ProbeResult {
     store_b_tokens_out: usize,
 }
 
+/// A mined direction reversal: the user/work established `old_direction` (X), then later
+/// overrode it with `new_direction` (Y). `query` is an on-topic prompt to probe both stores.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Reversal {
+    topic: String,
+    old_direction: String, // X — the superseded decision
+    new_direction: String, // Y — the current truth
+    query: String,         // on-topic probe prompt
+    verified: bool,        // both X and Y findable in the store representation
+}
+
+/// Probe 2 scoring for one reversal against one store.
+#[derive(Debug, Serialize, Deserialize)]
+struct Probe2Result {
+    reversal_idx: usize,
+    topic: String,
+    store_a_briefing: String,
+    store_b_briefing: String,
+    // Per-store fidelity judgments.
+    store_a_asserts_current: bool, // briefing asserts Y as current
+    store_b_asserts_current: bool,
+    store_a_leaks_stale: bool, // briefing presents X as if current (a sin)
+    store_b_leaks_stale: bool,
+    store_a_trajectory: bool, // X→Y trajectory recoverable
+    store_b_trajectory: bool,
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run_eval(args: EvalArgs) -> Result<()> {
@@ -200,8 +227,32 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
         &exp_dir,
     )?;
 
+    // ── PROBE 2: DIRECTION-CHANGE FIDELITY ─────────────────────────────────
+    // Reuse frozen reversals in --score-only if reversals.jsonl exists & is non-empty.
+    let reversals_path = exp_dir.join("reversals.jsonl");
+    let reuse_reversals = args.score_only && reversals_path.exists()
+        && fs::read_to_string(&reversals_path).map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let reversals: Vec<Reversal> = if reuse_reversals {
+        let raw = fs::read_to_string(&reversals_path)?;
+        let loaded: Vec<Reversal> = raw.lines().filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Reversal>(l).ok()).collect();
+        println!("\neval: === REUSING FROZEN REVERSALS ({}) ===", loaded.len());
+        loaded
+    } else {
+        println!("\neval: === MINING REVERSALS (Probe 2) ===");
+        mine_reversals(&store_a_dir, &store_b_dir, &project_key, &judge_model, &cfg, &exp_dir)?
+    };
+    let verified_reversals: Vec<&Reversal> = reversals.iter().filter(|r| r.verified).collect();
+    let probe2_results = if verified_reversals.is_empty() {
+        println!("eval: WARNING — no verified reversals; Probe 2 cannot be scored");
+        Vec::new()
+    } else {
+        println!("\neval: === SCORING (Probe 2) — {} reversal(s) ===", verified_reversals.len());
+        score_probe2(&verified_reversals, &corpus_root, &store_a_dir, &store_b_dir, &judge_model, &cfg, &exp_dir)?
+    };
+
     // ── WRITE RESULTS ─────────────────────────────────────────────────────
-    write_results(&exp_dir, &labels, &probe_results, n_history, n_future, &judge_model)?;
+    write_results(&exp_dir, &labels, &probe_results, &reversals, &probe2_results, n_history, n_future, &judge_model)?;
     println!("\neval: DONE. Results → {}", exp_dir.display());
     Ok(())
 }
@@ -548,19 +599,65 @@ fn mine_labels(
     Ok(labels)
 }
 
+/// Strip proactive-context's own injected content from a user turn before the judge sees it.
+///
+/// SELF-REFERENTIAL GUARD (Run 4): when the corpus is pc's own repo, transcripts can contain
+/// pc's injected `<system-reminder>Relevant project context …</system-reminder>` briefings and
+/// pasted wiki-index dumps. A "restatement" mined from pc's OWN injection would be circular —
+/// it is assistant-side machine output, not human direction. We remove those spans here so the
+/// judge only ever sees what the human actually typed.
+fn strip_injected_context(text: &str) -> String {
+    let mut s = text.to_string();
+    // Remove <system-reminder>…</system-reminder> blocks (both raw and HTML-escaped forms).
+    for (open, close) in [
+        ("<system-reminder>", "</system-reminder>"),
+        ("&lt;system-reminder&gt;", "&lt;/system-reminder&gt;"),
+    ] {
+        loop {
+            let Some(start) = s.find(open) else { break };
+            let after = start + open.len();
+            if let Some(rel_end) = s[after..].find(close) {
+                let end = after + rel_end + close.len();
+                s.replace_range(start..end, " ");
+            } else {
+                // Unterminated reminder → drop to end of string.
+                s.truncate(start);
+                break;
+            }
+        }
+    }
+    s
+}
+
+/// True if a turn is dominated by pc's own injected/derived artifacts (briefing header, wiki
+/// index cache, citation log) rather than human text — these must never become labels.
+fn is_pc_self_referential(t: &str) -> bool {
+    let lower = t.to_lowercase();
+    lower.contains("relevant project context (")
+        || lower.contains("derived cache — do not hand-edit")
+        || lower.contains("rebuilt by proactive-context after each capture")
+        || (lower.contains("# wiki index") && lower.contains("| slug |"))
+}
+
 /// Extract human (user) conversational turns from a parsed transcript.
 ///
-/// Filters out: assistant turns, tool-notification / command XML blobs, and the giant
-/// system-style first directive that opens agent-driven sessions.  Keeps the genuine
-/// back-and-forth the human typed — this is where restatements live.
+/// Filters out: assistant turns, tool-notification / command XML blobs, the giant
+/// system-style first directive that opens agent-driven sessions, and pc's own injected
+/// briefings / wiki dumps (self-referential guard). Keeps the genuine human back-and-forth.
 fn extract_human_turns(turns: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (idx, (role, text)) in turns.iter().enumerate() {
         if role != "user" {
             continue;
         }
-        let t = text.trim();
+        // Self-referential guard: strip pc's injected briefings, then skip turns that are
+        // dominated by pc's own derived artifacts.
+        let stripped = strip_injected_context(text);
+        let t = stripped.trim();
         if t.len() < 25 {
+            continue;
+        }
+        if is_pc_self_referential(t) {
             continue;
         }
         // Skip tool-notification / command / caveat XML and image placeholders.
@@ -1031,12 +1128,206 @@ fn judge_briefing(
     }
 }
 
+// ─── Probe 2: direction-change fidelity ───────────────────────────────────────
+
+/// Mine direction reversals from the captured stores.
+///
+/// A reversal is a topic where an earlier decision X was later overridden by Y. We feed the
+/// judge the full store representation (wiki guide bodies + claim assertions, both of which
+/// carry supersession phrasing like "previously: …", "was: …", "no longer", "reversed",
+/// "replaced", "instead of") and ask it to extract X→Y pairs. We then verify both X and Y are
+/// findable in the store representation so the reversal is real, not hallucinated.
+fn mine_reversals(
+    store_a_dir: &Path,
+    store_b_dir: &Path,
+    project_key: &str,
+    judge_model: &str,
+    cfg: &crate::config::Config,
+    exp_dir: &Path,
+) -> Result<Vec<Reversal>> {
+    let history_text = build_history_context_from_stores(store_a_dir, store_b_dir, project_key);
+    let store_repr_lower = history_text.to_lowercase();
+    let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+    let judge_spec = crate::provider::ModelSpec::parse(judge_model);
+
+    let system = format!(
+        "You are mining DIRECTION REVERSALS from a project's captured knowledge for an evaluation.\n\
+         A reversal = a decision/approach X that was LATER overridden by a different decision Y \
+         on the same topic. Look for supersession language: 'previously', 'was X now Y', \
+         'no longer', 'reversed', 'replaced X with Y', 'instead of', 'originally … later', \
+         'superseded', 'deprecated in favor of', 'used to … now'.\n\n\
+         PROJECT KNOWLEDGE:\n{}\n\n\
+         Output a JSON array (use [] only if truly none):\n\
+         [\n\
+           {{\n\
+             \"topic\": \"short topic name\",\n\
+             \"old_direction\": \"X — the earlier/superseded decision (one sentence)\",\n\
+             \"new_direction\": \"Y — the current decision that replaced it (one sentence)\",\n\
+             \"query\": \"a natural on-topic question a developer would ask about this area\"\n\
+           }}\n\
+         ]\n\
+         Only include reversals where BOTH X and Y are supported by the PROJECT KNOWLEDGE above. \
+         Output ONLY the JSON array.",
+        history_text.chars().take(16000).collect::<String>()
+    );
+    let user = "Extract all direction reversals you can find:".to_string();
+
+    let raw = crate::capture::call_model_blocking(
+        &judge_spec, &api_key, &ollama_base_url, ollama_api_key.as_deref(), &system, &user,
+    );
+
+    let mut reversals: Vec<Reversal> = Vec::new();
+    if let Ok(resp) = raw {
+        if let Some(blob) = crate::capture::extract_json_blob_pub(&resp) {
+            #[derive(Deserialize)]
+            struct Cand {
+                topic: String,
+                old_direction: String,
+                new_direction: String,
+                #[serde(default)]
+                query: String,
+            }
+            if let Ok(cands) = serde_json::from_str::<Vec<Cand>>(&blob) {
+                for c in cands {
+                    let verified = verify_in_store_repr(&c.old_direction, &store_repr_lower)
+                        && verify_in_store_repr(&c.new_direction, &store_repr_lower);
+                    let query = if c.query.trim().is_empty() {
+                        format!("What is the current approach for {}?", c.topic)
+                    } else {
+                        c.query
+                    };
+                    reversals.push(Reversal {
+                        topic: c.topic,
+                        old_direction: c.old_direction,
+                        new_direction: c.new_direction,
+                        query,
+                        verified,
+                    });
+                }
+            }
+        }
+    }
+    // Persist the raw reversal candidates for audit.
+    let path = exp_dir.join("reversals.jsonl");
+    if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
+        for r in &reversals {
+            let _ = writeln!(f, "{}", serde_json::to_string(r).unwrap_or_default());
+        }
+    }
+    println!(
+        "eval: reversal mining: {} candidate(s), {} verified (both X and Y in store repr)",
+        reversals.len(),
+        reversals.iter().filter(|r| r.verified).count()
+    );
+    Ok(reversals)
+}
+
+/// Score Probe 2 for both stores against the verified reversals.
+fn score_probe2(
+    reversals: &[&Reversal],
+    corpus_root: &Path,
+    store_a_dir: &Path,
+    store_b_dir: &Path,
+    judge_model: &str,
+    cfg: &crate::config::Config,
+    exp_dir: &Path,
+) -> Result<Vec<Probe2Result>> {
+    let mut results = Vec::new();
+    let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+    let compile_spec = crate::provider::ModelSpec::parse(&cfg.inject_compile_model);
+    let judge_spec = crate::provider::ModelSpec::parse(judge_model);
+    let project_key = normalize_path(corpus_root);
+    let store_b_claims_dir = store_b_dir.join("projects").join(&project_key);
+    let store_a_wiki_dir = store_a_dir.join("projects").join(&project_key).join("docs").join("wiki");
+
+    for (idx, rev) in reversals.iter().enumerate() {
+        println!("eval: probe2 {}/{}: {}", idx + 1, reversals.len(), rev.topic.chars().take(50).collect::<String>());
+        let (briefing_a, _, _) = run_wiki_inject(&rev.query, &store_a_wiki_dir, &compile_spec, &api_key, &ollama_base_url, ollama_api_key.as_deref(), cfg);
+        let (briefing_b, _, _) = run_claims_inject_for_eval(&rev.query, &store_b_claims_dir, &compile_spec, &api_key, &ollama_base_url, ollama_api_key.as_deref(), cfg);
+
+        let (ac, al, at) = judge_probe2(&briefing_a, rev, &judge_spec, &api_key, &ollama_base_url, ollama_api_key.as_deref());
+        let (bc, bl, bt) = judge_probe2(&briefing_b, rev, &judge_spec, &api_key, &ollama_base_url, ollama_api_key.as_deref());
+
+        println!(
+            "eval:   A: current={} stale_leak={} trajectory={}  B: current={} stale_leak={} trajectory={}",
+            ac, al, at, bc, bl, bt
+        );
+        results.push(Probe2Result {
+            reversal_idx: idx,
+            topic: rev.topic.clone(),
+            store_a_briefing: briefing_a,
+            store_b_briefing: briefing_b,
+            store_a_asserts_current: ac,
+            store_b_asserts_current: bc,
+            store_a_leaks_stale: al,
+            store_b_leaks_stale: bl,
+            store_a_trajectory: at,
+            store_b_trajectory: bt,
+        });
+    }
+
+    let path = exp_dir.join("probe2_results.jsonl");
+    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
+    for r in &results {
+        writeln!(f, "{}", serde_json::to_string(r)?)?;
+    }
+    println!("eval: probe2 results → {}", path.display());
+    Ok(results)
+}
+
+/// Judge one briefing against one reversal. Returns (asserts_current_Y, leaks_stale_X, trajectory_recoverable).
+fn judge_probe2(
+    briefing: &str,
+    rev: &Reversal,
+    judge_spec: &crate::provider::ModelSpec,
+    api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+) -> (bool, bool, bool) {
+    if briefing.starts_with('(') && briefing.ends_with(')') {
+        return (false, false, false); // error placeholder
+    }
+    let system = "You judge a context briefing against a known direction reversal (X was replaced by Y).\n\
+                  Answer three yes/no questions about the BRIEFING and output ONLY a JSON object:\n\
+                  {\"asserts_current\": bool, \"leaks_stale\": bool, \"trajectory\": bool}\n\
+                  - asserts_current: does the briefing present Y (the NEW direction) as the current truth?\n\
+                  - leaks_stale: does the briefing present X (the OLD direction) AS IF it were current truth? \
+                  (mentioning X explicitly as past/superseded is NOT a leak; asserting X as current IS)\n\
+                  - trajectory: can a reader tell that X was the old approach and Y replaced it?\n\
+                  Output ONLY the JSON object.";
+    let user = format!(
+        "OLD direction X: {}\nNEW direction Y (current): {}\n\nBRIEFING:\n{}\n\nJSON verdict:",
+        rev.old_direction.chars().take(300).collect::<String>(),
+        rev.new_direction.chars().take(300).collect::<String>(),
+        briefing.chars().take(1600).collect::<String>(),
+    );
+    match crate::capture::call_model_blocking(judge_spec, api_key, ollama_base_url, ollama_api_key, system, &user) {
+        Ok(resp) => {
+            if let Some(blob) = crate::capture::extract_json_blob_pub(&resp) {
+                #[derive(Deserialize)]
+                struct V { #[serde(default)] asserts_current: bool, #[serde(default)] leaks_stale: bool, #[serde(default)] trajectory: bool }
+                if let Ok(v) = serde_json::from_str::<V>(&blob) {
+                    return (v.asserts_current, v.leaks_stale, v.trajectory);
+                }
+            }
+            (false, false, false)
+        }
+        Err(_) => (false, false, false),
+    }
+}
+
 // ─── Results report ───────────────────────────────────────────────────────────
 
 fn write_results(
     exp_dir: &Path,
     labels: &[Label],
     probe_results: &[ProbeResult],
+    reversals: &[Reversal],
+    probe2_results: &[Probe2Result],
     n_history: usize,
     n_future: usize,
     judge_model: &str,
@@ -1104,6 +1395,54 @@ fn write_results(
         incoherent_rate,
     );
 
+    // Probe 2 — direction-change fidelity summary.
+    let n_rev_verified = reversals.iter().filter(|r| r.verified).count();
+    let probe2_section = if probe2_results.is_empty() {
+        format!(
+            "## Probe 2 — Direction-change fidelity\n\n\
+             Reversal candidates mined: {} ({} verified). Scored: 0.\n\
+             {}\n\n",
+            reversals.len(),
+            n_rev_verified,
+            if reversals.is_empty() {
+                "No reversals mined — if this corpus is known to contain reversals, this indicates a miner bug."
+            } else {
+                "No verified reversals to score (mined candidates failed store-representation verification)."
+            }
+        )
+    } else {
+        let n = probe2_results.len();
+        let a_current = probe2_results.iter().filter(|r| r.store_a_asserts_current).count();
+        let b_current = probe2_results.iter().filter(|r| r.store_b_asserts_current).count();
+        let a_leak = probe2_results.iter().filter(|r| r.store_a_leaks_stale).count();
+        let b_leak = probe2_results.iter().filter(|r| r.store_b_leaks_stale).count();
+        let a_traj = probe2_results.iter().filter(|r| r.store_a_trajectory).count();
+        let b_traj = probe2_results.iter().filter(|r| r.store_b_trajectory).count();
+        let mut topics = String::new();
+        for r in probe2_results.iter().take(8) {
+            topics.push_str(&format!(
+                "- **{}** — A[current={} leak={} traj={}] B[current={} leak={} traj={}]\n",
+                r.topic.chars().take(60).collect::<String>(),
+                r.store_a_asserts_current, r.store_a_leaks_stale, r.store_a_trajectory,
+                r.store_b_asserts_current, r.store_b_leaks_stale, r.store_b_trajectory,
+            ));
+        }
+        format!(
+            "## Probe 2 — Direction-change fidelity (n={n})\n\n\
+             Reversals mined: {mined} ({verified} verified, all scored).\n\n\
+             | Metric | Store A (wiki) | Store B (claims) |\n\
+             |---|---|---|\n\
+             | asserts current Y | {a_current}/{n} | {b_current}/{n} |\n\
+             | leaks stale X as current (SIN) | {a_leak}/{n} | {b_leak}/{n} |\n\
+             | trajectory X→Y recoverable | {a_traj}/{n} | {b_traj}/{n} |\n\n\
+             Per-reversal:\n\n{topics}\n",
+            n = n, mined = reversals.len(), verified = n_rev_verified,
+            a_current = a_current, b_current = b_current,
+            a_leak = a_leak, b_leak = b_leak,
+            a_traj = a_traj, b_traj = b_traj, topics = topics,
+        )
+    };
+
     let report_path = exp_dir.join("claims-first-validation-results.md");
     let report = format!(
         "# Claims-First Validation Results\n\n\
@@ -1129,6 +1468,7 @@ fn write_results(
          | partial | {ua_partial} | {ub_partial} |\n\
          | absent | {ua_absent} | {ub_absent} |\n\
          | recall (contained+partial) | {a_recall:.1}% | {b_recall:.1}% |\n\n\
+         {probe2_section}\
          ## Probe 3 — Operational metrics\n\n\
          | Metric | Store A (wiki) | Store B (claims) |\n\
          |---|---|---|\n\
@@ -1147,6 +1487,8 @@ fn write_results(
          ## Raw artifacts\n\n\
          - Labels: `{exp_dir}/labels.jsonl`\n\
          - Probe results: `{exp_dir}/probe_results.jsonl`\n\
+         - Reversals (Probe 2): `{exp_dir}/reversals.jsonl`\n\
+         - Probe 2 results: `{exp_dir}/probe2_results.jsonl`\n\
          - Store A wiki: `{exp_dir}/store-a/`\n\
          - Store B claims: `{exp_dir}/store-b/`\n\
          - Split manifest: `{exp_dir}/split_manifest.json`\n\
@@ -1154,6 +1496,7 @@ fn write_results(
         exp_dir = exp_dir.display(),
         judge_model = judge_model,
         date = format_date_now(),
+        probe2_section = probe2_section,
         n_history = n_history,
         n_future = n_future,
         n_verified = n_verified,
