@@ -2497,18 +2497,91 @@ fn debug_resolve_wiki_dir(wiki_dir_arg: Option<&Path>, no_wiki: bool) -> Option<
     if wp.exists() { Some(wp) } else { None }
 }
 
+// ─── ANSI colorization for `pc debug transcript` ────────────────────────────
+// Human prompts are the needle in a haystack of assistant output. We highlight
+// user-owned lines (bold bright-yellow) so they pop, and leave assistant lines at
+// the terminal's default foreground (only their gutter is dimmed) so the bulk of
+// the transcript stays readable. The role of each line comes from `_roles` — and
+// because `extract_text` already drops tool_result blocks and `<`-prefixed
+// system-reminders, a "user" line is a genuine human turn, never tool noise.
+const TC_RESET: &str = "\x1b[0m";
+const TC_DIM: &str = "\x1b[2m"; // assistant gutter — recedes
+const TC_USER: &str = "\x1b[1;93m"; // bold bright-yellow — human turns, highlighted
+const TC_HEADER: &str = "\x1b[1;36m"; // bold cyan — banners & section dividers
+const TC_GREEN: &str = "\x1b[32m"; // admitted counts — the good outcome
+const TC_RED: &str = "\x1b[1;31m"; // dropped counts & ⚠ warnings — needs attention
+
+/// Wrap `text` in an ANSI `code` when `use_color`, else return it unchanged.
+/// Keeps the colorized debug-print sites terse and reads the same whether or
+/// not color is live.
+fn paint(use_color: bool, code: &str, text: &str) -> String {
+    if use_color {
+        format!("{code}{text}{TC_RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Color is on when stdout is a TTY and neither `NO_COLOR` nor `--no-color`-style
+/// suppression applies. Mirrors the logic in `tail.rs`.
+fn debug_use_color() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    crate::tail::stdout_is_tty()
+}
+
+/// Render the line-numbered transcript with per-line ANSI color keyed by the
+/// owning role. When `use_color` is false this is byte-identical to the plain
+/// `{:>4}| {line}` rendering EXTRACT sees, so piped/redirected output is unchanged.
+fn render_colored_numbered(lines: &[String], roles: &[String], use_color: bool) -> String {
+    let mut out = String::with_capacity(lines.len() * 24);
+    for (i, line) in lines.iter().enumerate() {
+        let num = i + 1;
+        if !use_color {
+            out.push_str(&format!("{:>4}| {}\n", num, line));
+            continue;
+        }
+        let is_user = roles.get(i).map(|r| r == "user").unwrap_or(false);
+        if is_user {
+            // Whole line bold bright-yellow — gutter included — so it pops.
+            out.push_str(&format!("{TC_USER}{num:>4}| {line}{TC_RESET}\n"));
+        } else {
+            // Dim gutter, default-fg body — assistant text stays readable.
+            out.push_str(&format!("{TC_DIM}{num:>4}|{TC_RESET} {line}\n"));
+        }
+    }
+    out
+}
+
+/// Write the `# numbered transcript …` banner, bold-cyan when color is on.
+fn write_transcript_header(
+    out: &mut impl Write,
+    path: &str,
+    line_count: usize,
+    byte_count: usize,
+    use_color: bool,
+) -> io::Result<()> {
+    let banner = format!(
+        "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)",
+        path, line_count, byte_count
+    );
+    if use_color {
+        writeln!(out, "{TC_HEADER}{banner}{TC_RESET}\n")
+    } else {
+        writeln!(out, "{banner}\n")
+    }
+}
+
 /// `pc debug transcript <file>` — print the numbered transcript EXACTLY as EXTRACT sees it.
 pub(crate) fn run_debug_transcript(file: &Path) -> Result<()> {
     let path = file.to_string_lossy().to_string();
-    let (numbered, lines, _roles) = debug_preprocess_transcript(&path)?;
+    let (numbered, lines, roles) = debug_preprocess_transcript(&path)?;
+    let use_color = debug_use_color();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    writeln!(
-        out,
-        "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)\n",
-        path, lines.len(), numbered.len()
-    )?;
-    out.write_all(numbered.as_bytes())?;
+    write_transcript_header(&mut out, &path, lines.len(), numbered.len(), use_color)?;
+    out.write_all(render_colored_numbered(&lines, &roles, use_color).as_bytes())?;
     Ok(())
 }
 
@@ -2560,19 +2633,21 @@ pub(crate) fn run_debug_transcript_all(cwd: &Path) -> Result<()> {
 
     matches.sort_by_key(|(mtime, _)| *mtime);
 
+    let use_color = debug_use_color();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "# {} transcript(s) for project key: {}\n", matches.len(), target_key)?;
+    let count_banner = format!("# {} transcript(s) for project key: {}", matches.len(), target_key);
+    if use_color {
+        writeln!(out, "{TC_HEADER}{count_banner}{TC_RESET}\n")?;
+    } else {
+        writeln!(out, "{count_banner}\n")?;
+    }
 
     for (_, path) in &matches {
         let path_str = path.to_string_lossy().to_string();
-        let (numbered, lines, _roles) = debug_preprocess_transcript(&path_str)?;
-        writeln!(
-            out,
-            "# numbered transcript for {} ({} physical lines, {} bytes after 250KB tail-truncation)\n",
-            path_str, lines.len(), numbered.len()
-        )?;
-        out.write_all(numbered.as_bytes())?;
+        let (numbered, lines, roles) = debug_preprocess_transcript(&path_str)?;
+        write_transcript_header(&mut out, &path_str, lines.len(), numbered.len(), use_color)?;
+        out.write_all(render_colored_numbered(&lines, &roles, use_color).as_bytes())?;
         writeln!(out)?;
     }
     Ok(())
@@ -2624,26 +2699,36 @@ pub(crate) fn run_debug_extract(
         numbered
     );
 
+    let use_color = debug_use_color();
+    let bar = "════════════════════════════════════════════════════════════════";
     let stdout = io::stdout();
     let mut o = stdout.lock();
 
-    writeln!(o, "════════════════════════════════════════════════════════════════")?;
-    writeln!(o, " pc debug extract")?;
-    writeln!(o, "   transcript : {}", path)?;
-    writeln!(o, "   model      : {}", cfg.capture_model)?;
+    writeln!(o, "{}", paint(use_color, TC_HEADER, bar))?;
+    writeln!(o, "{}", paint(use_color, TC_HEADER, " pc debug extract"))?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "transcript"), path)?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "model     "), cfg.capture_model)?;
     match &resolved_wiki {
-        Some(d) => writeln!(o, "   wiki index : {} ({} guides)", d.display(), index_rows.len())?,
-        None => writeln!(o, "   wiki index : (none — baseline, --no-wiki or no project wiki)")?,
+        Some(d) => writeln!(o, "   {} : {} ({} guides)", paint(use_color, TC_DIM, "wiki index"), d.display(), index_rows.len())?,
+        None => writeln!(o, "   {} : (none — baseline, --no-wiki or no project wiki)", paint(use_color, TC_DIM, "wiki index"))?,
     }
-    writeln!(o, "════════════════════════════════════════════════════════════════\n")?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, bar))?;
 
-    writeln!(o, "──── (1) SYSTEM PROMPT ────────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (1) SYSTEM PROMPT ────────────────────────────────────────"))?;
     writeln!(o, "{}\n", system)?;
 
-    writeln!(o, "──── (2) USER MESSAGE (numbered transcript) ───────────────────\n")?;
-    writeln!(o, "{}\n", user)?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (2) USER MESSAGE (numbered transcript) ───────────────────"))?;
+    if use_color {
+        // Re-render the user message with the embedded transcript colorized — same
+        // content the model receives (`user`), just with user turns highlighted.
+        writeln!(o, "## LINE-NUMBERED TRANSCRIPT\n")?;
+        o.write_all(render_colored_numbered(&lines, &roles, true).as_bytes())?;
+        writeln!(o, "\nEmit the JSON array of atomic cited claims now.\n")?;
+    } else {
+        writeln!(o, "{}\n", user)?;
+    }
 
-    writeln!(o, "──── (3) RAW LLM RESPONSE ─────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (3) RAW LLM RESPONSE ─────────────────────────────────────"))?;
     o.flush()?;
     let rt = Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
@@ -2655,7 +2740,7 @@ pub(crate) fn run_debug_extract(
     })?;
     writeln!(o, "{}\n", raw)?;
 
-    writeln!(o, "──── (4) PARSED CLAIMS ────────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (4) PARSED CLAIMS ────────────────────────────────────────"))?;
     let blob = extract_json_blob(&raw);
     let extracted: Vec<ExtractedClaim> = match &blob {
         Some(b) => match serde_json::from_str::<Vec<ExtractedClaim>>(b) {
@@ -2664,13 +2749,13 @@ pub(crate) fn run_debug_extract(
                 // Surface parse failure explicitly — do NOT silently coerce to [] like
                 // the live path's unwrap_or_default(), so "0 claims" is never ambiguous
                 // between "model said []" and "model emitted unparseable garbage".
-                writeln!(o, "⚠ JSON parse FAILED on the extracted blob: {}", e)?;
+                writeln!(o, "{}", paint(use_color, TC_RED, &format!("⚠ JSON parse FAILED on the extracted blob: {}", e)))?;
                 writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
                 Vec::new()
             }
         },
         None => {
-            writeln!(o, "⚠ No JSON array/object found in the response at all.")?;
+            writeln!(o, "{}", paint(use_color, TC_RED, "⚠ No JSON array/object found in the response at all."))?;
             writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
             Vec::new()
         }
@@ -2685,7 +2770,7 @@ pub(crate) fn run_debug_extract(
     writeln!(o)?;
 
     // ── (5) AUTHORITY TAGGING / EVIDENCE VERIFICATION SUMMARY ──
-    writeln!(o, "──── (5) SUMMARY ──────────────────────────────────────────────\n")?;
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (5) SUMMARY ──────────────────────────────────────────────"))?;
     let mut admitted = 0usize;
     let (mut n_explicit, mut n_implicit, mut n_dropped) = (0usize, 0usize, 0usize);
     let mut dropped_examples: Vec<String> = Vec::new();
@@ -2702,14 +2787,20 @@ pub(crate) fn run_debug_extract(
         if author == "user" { n_explicit += 1; } else { n_implicit += 1; }
         admitted += 1;
     }
+    // Color the outcome counts: admitted green, dropped red (only when nonzero —
+    // a green-on-zero "dropped" reads cleaner than alarm-red on a clean run), and
+    // the explicit/user tally bright-yellow to echo the transcript's user highlight.
+    let dropped_color = if n_dropped > 0 { TC_RED } else { TC_DIM };
     writeln!(o, "  claims extracted          : {}", extracted.len())?;
     writeln!(o, "  admitted (evidence valid) : {}  ({} explicit/user, {} implicit/agent)",
-        admitted, n_explicit, n_implicit)?;
-    writeln!(o, "  dropped (evidence invalid): {}", n_dropped)?;
+        paint(use_color, TC_GREEN, &admitted.to_string()),
+        paint(use_color, TC_USER, &n_explicit.to_string()),
+        n_implicit)?;
+    writeln!(o, "  dropped (evidence invalid): {}", paint(use_color, dropped_color, &n_dropped.to_string()))?;
     if !dropped_examples.is_empty() {
-        writeln!(o, "\n  dropped claims (unverifiable evidence ranges — likely hallucinated cites):")?;
+        writeln!(o, "\n  {}", paint(use_color, TC_RED, "dropped claims (unverifiable evidence ranges — likely hallucinated cites):"))?;
         for d in &dropped_examples {
-            writeln!(o, "{}", d)?;
+            writeln!(o, "{}", paint(use_color, TC_DIM, d))?;
         }
     }
     Ok(())
