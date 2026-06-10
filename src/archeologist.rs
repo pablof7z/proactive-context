@@ -51,6 +51,10 @@ pub struct ArcheologistArgs {
     pub output_dir: Option<std::path::PathBuf>,
     /// Also scan TENEX conversation databases (~/.tenex/projects/) as a source.
     pub include_tenex: bool,
+    /// Also scan Codex session files (~/.codex/sessions/) as a source.
+    pub include_codex: bool,
+    /// Also scan opencode session database (~/.local/share/opencode/opencode.db) as a source.
+    pub include_opencode: bool,
     /// Forget capture markers so sessions count as new again, then exit. See `run_reset`.
     pub reset: bool,
 }
@@ -101,6 +105,56 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
             }
             None => {
                 eprintln!("archeologist: --tenex: ~/.tenex/config.json not found or missing required fields");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Optionally merge Codex session sources (~/.codex/sessions/).
+    // Codex JSONL files are passed through directly — no temp synthesis needed.
+    if args.include_codex {
+        match crate::codex::scan_codex_sessions(&args.since, args.output_dir.as_ref()) {
+            Ok(codex_projects) => {
+                if codex_projects.is_empty() {
+                    println!("archeologist: --codex: no sessions with cwd found in ~/.codex/");
+                } else {
+                    println!(
+                        "archeologist: --codex: found {} project(s) with Codex sessions",
+                        codex_projects.len()
+                    );
+                    projects.extend(codex_projects);
+                }
+            }
+            Err(e) => {
+                eprintln!("archeologist: --codex scan failed: {}", e);
+            }
+        }
+    }
+
+    // Optionally merge opencode session sources (~/.local/share/opencode/opencode.db).
+    // Synthesized JSONL files are kept in a temp dir for the duration of the run.
+    let _opencode_tmp = if args.include_opencode {
+        let tmp = tempfile::Builder::new()
+            .prefix("pc-opencode-")
+            .tempdir()
+            .context("failed to create temp dir for opencode synthesis")?;
+        match crate::opencode::scan_opencode_sessions(&args.since, tmp.path(), args.output_dir.as_ref()) {
+            Ok(opencode_projects) => {
+                if opencode_projects.is_empty() {
+                    println!("archeologist: --opencode: no sessions found in opencode database");
+                } else {
+                    println!(
+                        "archeologist: --opencode: found {} project(s) with opencode sessions",
+                        opencode_projects.len()
+                    );
+                    projects.extend(opencode_projects);
+                }
+                Some(tmp)
+            }
+            Err(e) => {
+                eprintln!("archeologist: --opencode scan failed: {}", e);
                 None
             }
         }

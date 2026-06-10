@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 mod archeologist;
 mod tenex;
+mod codex;
+mod opencode;
 mod awareness;
 mod capture;
 mod research_capture;
@@ -240,6 +242,15 @@ enum Commands {
         /// Requires a valid ~/.tenex/config.json.
         #[arg(long)]
         tenex: bool,
+
+        /// Also scan Codex session files (~/.codex/sessions/, ~/.codex/archived_sessions/).
+        /// Processes rollout-*.jsonl files; legacy rollout-*.json files (no cwd) are skipped.
+        #[arg(long)]
+        codex: bool,
+
+        /// Also scan opencode sessions from ~/.local/share/opencode/opencode.db.
+        #[arg(long)]
+        opencode: bool,
 
         /// Forget capture markers so sessions count as new again — use after deleting the
         /// wiki to start over. Scope with --project (one project) or none (all projects,
@@ -631,6 +642,8 @@ fn main() -> Result<()> {
             include_sidechains,
             output_dir,
             tenex,
+            codex,
+            opencode,
             reset,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
@@ -643,6 +656,8 @@ fn main() -> Result<()> {
                 include_sidechains,
                 output_dir,
                 include_tenex: tenex,
+                include_codex: codex,
+                include_opencode: opencode,
                 reset,
             })?;
         }
