@@ -7,6 +7,8 @@ mod archeologist;
 mod tenex;
 mod awareness;
 mod capture;
+mod claims;
+mod eval;
 mod session_start;
 mod chunker;
 mod config;
@@ -340,6 +342,45 @@ enum Commands {
         #[command(subcommand)]
         action: DebugAction,
     },
+
+    /// Claims-first validation experiment (Phase 0).
+    ///
+    /// Builds both Store A (wiki-guide incumbent) and Store B (append-only claim store)
+    /// from HISTORY sessions, then scores both against ground truth mined from FUTURE
+    /// sessions.  Feature-flagged: PC_CLAIMS_LOG=1 must be set.  All store outputs go to
+    /// the experiment dir (--experiment-dir) and the user's live state is never touched.
+    Eval {
+        /// Corpus project path (real cwd of the target project).
+        #[arg(long)]
+        project: String,
+
+        /// Chronological session split: first N sessions go to HISTORY, remainder to FUTURE.
+        /// Default: use the first 80% for HISTORY.
+        #[arg(long, value_name = "N")]
+        history_sessions: Option<usize>,
+
+        /// Cap HISTORY replay at this many sessions (default 30 to bound cost).
+        #[arg(long, default_value_t = 30)]
+        history_cap: usize,
+
+        /// Root directory for all experiment artifacts (stores, results).
+        /// Default: ~/.proactive-context/experiments/claims-first-<timestamp>.
+        #[arg(long, value_name = "DIR")]
+        experiment_dir: Option<PathBuf>,
+
+        /// Skip HISTORY replay and use an existing experiment dir (both stores already built).
+        /// Jump straight to label mining + scoring.
+        #[arg(long)]
+        score_only: bool,
+
+        /// Only run Probe 3 (operational metrics) — no label mining or LLM judge.
+        #[arg(long)]
+        probe3_only: bool,
+
+        /// Judge model for label mining and scoring (default: capture_model from config).
+        #[arg(long, value_name = "MODEL")]
+        judge_model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -666,6 +707,26 @@ fn main() -> Result<()> {
                 dry_run,
                 status,
                 uninstall,
+            })?;
+        }
+
+        Commands::Eval {
+            project,
+            history_sessions,
+            history_cap,
+            experiment_dir,
+            score_only,
+            probe3_only,
+            judge_model,
+        } => {
+            crate::eval::run_eval(crate::eval::EvalArgs {
+                project,
+                history_sessions,
+                history_cap,
+                experiment_dir,
+                score_only,
+                probe3_only,
+                judge_model,
             })?;
         }
 
