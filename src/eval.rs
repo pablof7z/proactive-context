@@ -191,37 +191,68 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
 // ─── Session collection ───────────────────────────────────────────────────────
 
 fn collect_sessions(corpus_root: &Path) -> Result<Vec<String>> {
-    let project_key = normalize_path(corpus_root);
+    // The routing key for session matching: normalize_path of the resolved project root.
+    let target_key = normalize_path(&resolve_project_root(corpus_root));
+
+    // Sessions live under ~/.claude/projects/<encoded-dir>/*.jsonl.  The encoded dir name
+    // uses hyphens (not underscores), so we cannot directly join target_key.  Instead,
+    // scan ALL project dirs and match via the cwd embedded in each session file.
     let claude_projects = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude/projects")
-        .join(&project_key);
+        .join(".claude/projects");
 
     if !claude_projects.exists() {
         return Ok(vec![]);
     }
 
-    let mut sessions: Vec<(String, String)> = fs::read_dir(&claude_projects)?
+    let mut sessions: Vec<(String, String)> = Vec::new();
+
+    let project_dirs = fs::read_dir(&claude_projects)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "jsonl")
-                .unwrap_or(false)
-        })
-        .filter_map(|e| {
-            let path = e.path();
-            let path_str = path.to_string_lossy().to_string();
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path());
+
+    for pdir in project_dirs {
+        // Quick heuristic: the encoded dir name should contain the project base name.
+        // Skip dirs that clearly don't match (avoids reading every session in every project).
+        let dir_name = pdir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        // Convert dir_name (hyphen-encoded) to approximate normalized form for prefix match.
+        let approx_key = dir_name.trim_start_matches('-').replace('-', "_");
+        if !approx_key.starts_with(&target_key[..target_key.len().min(20)]) {
+            continue;
+        }
+
+        // Scan *.jsonl in this project dir.
+        let jsonl_files = match fs::read_dir(&pdir) {
+            Ok(d) => d
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                .map(|e| e.path())
+                .collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
+
+        for jsonl_path in jsonl_files {
+            let path_str = jsonl_path.to_string_lossy().to_string();
+            // Read cwd from this session.
+            let cwd = crate::transcript::transcript_cwd(&path_str).unwrap_or_default();
+            if cwd.is_empty() {
+                continue;
+            }
+            let session_key = normalize_path(&resolve_project_root(&PathBuf::from(&cwd)));
+            if session_key != target_key {
+                continue;
+            }
             let ts = transcript_first_ts(&path_str).unwrap_or_default();
             if ts.is_empty() {
-                None
-            } else {
-                Some((ts, path_str))
+                continue;
             }
-        })
-        .collect();
+            sessions.push((ts, path_str));
+        }
+    }
 
     sessions.sort_by(|a, b| a.0.cmp(&b.0));
+    sessions.dedup_by(|a, b| a.1 == b.1);
     Ok(sessions.into_iter().map(|(_, p)| p).collect())
 }
 
