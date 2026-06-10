@@ -32,7 +32,7 @@ pub fn run_research_capture(
         .unwrap_or_else(|| derive_session_id(transcript_path));
 
     eprintln!("[research-capture] parsing transcript: {}", transcript_path);
-    let (numbered, raw_lines) = build_research_transcript(transcript_path)?;
+    let (numbered, raw_lines, spans) = build_research_transcript_with_spans(transcript_path)?;
 
     eprintln!("[research-capture] transcript lines: {}", raw_lines.len());
     if raw_lines.is_empty() {
@@ -57,10 +57,20 @@ pub fn run_research_capture(
 
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, artifact) in artifacts.iter().enumerate() {
-        let sliced = slice_lines(&raw_lines, artifact.start_line, artifact.end_line);
+        // Snap the recognized range to its containing task-result block(s) so a
+        // conservative end-line never truncates the report (the F7/P3 bug).
+        let (snap_start, snap_end) =
+            snap_range_to_blocks(&spans, artifact.start_line, artifact.end_line);
+        if (snap_start, snap_end) != (artifact.start_line, artifact.end_line) {
+            eprintln!(
+                "[research-capture] artifact {} range {}-{} snapped to block boundary {}-{}",
+                idx + 1, artifact.start_line, artifact.end_line, snap_start, snap_end
+            );
+        }
+        let sliced = slice_lines(&raw_lines, snap_start, snap_end);
         if sliced.trim().is_empty() {
             eprintln!("[research-capture] WARNING: artifact {} sliced to empty text (lines {}-{}), skipping",
-                idx + 1, artifact.start_line, artifact.end_line);
+                idx + 1, snap_start, snap_end);
             continue;
         }
         let slug = slugify_artifact(&artifact.characterization, idx + 1);
@@ -76,6 +86,8 @@ pub fn run_research_capture(
             &session_id,
             transcript_path,
             artifact,
+            snap_start,
+            snap_end,
             &sliced,
         )?;
         eprintln!("[research-capture] persisted: {}", record_path.display());
@@ -98,8 +110,30 @@ pub fn run_research_capture(
 /// exist ONLY inside these blocks in the main session transcript. Without special handling,
 /// 100% of the investigation artifacts are invisible to the pipeline.
 pub fn build_research_transcript(path: &str) -> Result<(String, Vec<String>)> {
+    let (numbered, lines, _spans) = build_research_transcript_with_spans(path)?;
+    Ok((numbered, lines))
+}
+
+/// A turn's 1-based, inclusive line span in the flattened transcript, plus a flag
+/// marking whether the turn is an extracted agent task-result block (the unit
+/// research records should be sliced as).
+#[derive(Debug, Clone, Copy)]
+pub struct TurnSpan {
+    pub start: usize, // 1-based inclusive
+    pub end: usize,   // 1-based inclusive
+    pub is_task_result: bool,
+}
+
+/// Like [`build_research_transcript`], but also returns each turn's line span.
+/// Spans let the slicer snap a recognized range to its containing task-result
+/// block — the fix for the Run-5 truncation bug (F7/P3 dropped because the model
+/// picked a conservative end-line inside the block).
+pub fn build_research_transcript_with_spans(
+    path: &str,
+) -> Result<(String, Vec<String>, Vec<TurnSpan>)> {
     let content = fs::read_to_string(path)?;
-    let mut turns: Vec<(String, String)> = Vec::new();
+    // (role, text, is_task_result)
+    let mut turns: Vec<(String, String, bool)> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -125,24 +159,28 @@ pub fn build_research_transcript(path: &str) -> Result<(String, Vec<String>)> {
         let content_val = msg.get("content").unwrap_or(&Value::Null);
         if let Some(text) = extract_research_text(content_val) {
             if !text.is_empty() {
-                turns.push((role.to_string(), text));
+                let is_task_result = text.starts_with("[Agent task result");
+                turns.push((role.to_string(), text, is_task_result));
             }
         }
     }
 
-    // Build line-numbered string
+    // Build line-numbered string AND track each turn's span in lockstep.
     let mut lines: Vec<String> = Vec::new();
-    for (role, text) in &turns {
+    let mut spans: Vec<TurnSpan> = Vec::with_capacity(turns.len());
+    for (idx, (role, text, is_task_result)) in turns.iter().enumerate() {
         let label = if role == "user" { "User" } else { "Assistant" };
         let turn_text = format!("{}: {}", label, text);
+        let start = lines.len() + 1; // 1-based
         for l in turn_text.lines() {
             lines.push(l.to_string());
         }
-        lines.push(String::new()); // blank separator between turns
-    }
-    // Remove trailing blank
-    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop();
+        let end = lines.len(); // 1-based inclusive (last content line of this turn)
+        spans.push(TurnSpan { start, end, is_task_result: *is_task_result });
+        // Blank separator between turns (not after the last).
+        if idx + 1 < turns.len() {
+            lines.push(String::new());
+        }
     }
 
     let mut numbered = String::new();
@@ -150,7 +188,7 @@ pub fn build_research_transcript(path: &str) -> Result<(String, Vec<String>)> {
         numbered.push_str(&format!("{:>4}| {}\n", i + 1, l));
     }
 
-    Ok((numbered, lines))
+    Ok((numbered, lines, spans))
 }
 
 /// Extract text from a content value, INCLUDING task-notification result content.
@@ -428,13 +466,39 @@ fn write_research_record(
     session_id: &str,
     transcript_path: &str,
     artifact: &RecognizedArtifact,
+    start_line: usize,
+    end_line: usize,
     sliced_text: &str,
 ) -> Result<()> {
-    let ts = rfc3339_now();
-    let date = &ts[..10];
+    let content = render_research_record(
+        session_id,
+        transcript_path,
+        artifact,
+        start_line,
+        end_line,
+        sliced_text,
+        &rfc3339_now(),
+    );
+    let mut f = fs::File::create(path)?;
+    f.write_all(content.as_bytes())?;
+    Ok(())
+}
 
-    let content = format!(
+/// Render an immutable research record (frontmatter + characterization + verbatim slice).
+/// Split out from the file write so it can be unit-tested deterministically.
+pub fn render_research_record(
+    session_id: &str,
+    transcript_path: &str,
+    artifact: &RecognizedArtifact,
+    start_line: usize,
+    end_line: usize,
+    sliced_text: &str,
+    captured_at: &str,
+) -> String {
+    let date = &captured_at[..captured_at.len().min(10)];
+    format!(
         "---\n\
+type: research-record\n\
 date: {date}\n\
 session: {session_id}\n\
 transcript: {transcript_path}\n\
@@ -452,20 +516,51 @@ captured_at: {ts}\n\
         date = date,
         session_id = session_id,
         transcript_path = transcript_path,
-        start = artifact.start_line,
-        end = artifact.end_line,
+        start = start_line,
+        end = end_line,
         agent = artifact.agent_attribution,
         criteria = artifact.has_preregistered_criteria,
         method = artifact.has_method,
         report = artifact.has_structured_report,
         char = artifact.characterization,
-        ts = ts,
+        ts = captured_at,
         text = sliced_text
-    );
+    )
+}
 
-    let mut f = fs::File::create(path)?;
-    f.write_all(content.as_bytes())?;
-    Ok(())
+// ─── Block-boundary snapping (slice-truncation fix) ──────────────────────────
+
+/// Snap a recognized `[start, end]` range (1-based inclusive) outward to fully
+/// cover every task-result block it overlaps. If the range touches any
+/// `is_task_result` turn, the result spans from the start of the first such block
+/// it touches to the end of the last — so a conservative model end-line never
+/// truncates the report. Ranges that touch no task-result block are returned
+/// unchanged (e.g. an inline structured report in an assistant turn).
+pub fn snap_range_to_blocks(
+    spans: &[TurnSpan],
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
+    let mut snapped_start = start;
+    let mut snapped_end = end;
+    let mut touched = false;
+    for span in spans {
+        if !span.is_task_result {
+            continue;
+        }
+        // Overlap test (inclusive ranges).
+        let overlaps = span.start <= end && start <= span.end;
+        if overlaps {
+            touched = true;
+            snapped_start = snapped_start.min(span.start);
+            snapped_end = snapped_end.max(span.end);
+        }
+    }
+    if touched {
+        (snapped_start, snapped_end)
+    } else {
+        (start, end)
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -584,4 +679,128 @@ pub struct CoverageJudgment {
     pub finding_id: String,
     pub verdict: CoverageVerdict,
     pub reason: String,
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(start: usize, end: usize, is_task_result: bool) -> TurnSpan {
+        TurnSpan { start, end, is_task_result }
+    }
+
+    #[test]
+    fn snap_extends_end_to_block_boundary() {
+        // A task-result block spans lines 100-150; the model conservatively
+        // recognized only 100-120. Snapping must extend the end to 150.
+        let spans = vec![
+            span(1, 50, false),
+            span(60, 99, false),
+            span(100, 150, true), // the report block
+            span(152, 200, false),
+        ];
+        let (s, e) = snap_range_to_blocks(&spans, 100, 120);
+        assert_eq!((s, e), (100, 150));
+    }
+
+    #[test]
+    fn snap_extends_start_to_block_boundary() {
+        // Model recognized 110-150 but the block starts at 100.
+        let spans = vec![span(100, 150, true)];
+        let (s, e) = snap_range_to_blocks(&spans, 110, 150);
+        assert_eq!((s, e), (100, 150));
+    }
+
+    #[test]
+    fn snap_spans_multiple_overlapping_blocks() {
+        let spans = vec![
+            span(100, 150, true),
+            span(152, 200, true),
+        ];
+        // Range straddles both blocks → covers 100..200.
+        let (s, e) = snap_range_to_blocks(&spans, 140, 160);
+        assert_eq!((s, e), (100, 200));
+    }
+
+    #[test]
+    fn snap_leaves_non_task_result_ranges_unchanged() {
+        // An inline structured report living in an assistant (non-task-result) turn.
+        let spans = vec![
+            span(1, 50, false),
+            span(100, 200, false),
+        ];
+        let (s, e) = snap_range_to_blocks(&spans, 110, 140);
+        assert_eq!((s, e), (110, 140));
+    }
+
+    #[test]
+    fn snap_ignores_blocks_it_does_not_touch() {
+        let spans = vec![
+            span(100, 150, true),
+            span(300, 350, true),
+        ];
+        let (s, e) = snap_range_to_blocks(&spans, 110, 120);
+        assert_eq!((s, e), (100, 150)); // only the first block, not the distant one
+    }
+
+    #[test]
+    fn extract_task_result_pulls_result_and_unescapes() {
+        let xml = "<task-notification>\n\
+<task-id>abc</task-id>\n\
+<summary>Agent \"Run validation\" completed</summary>\n\
+<result>## Run 4 Report\n\nStore B: 303 claims &amp; 22 guides.\n&lt;system&gt; tag.\nVerdict: FAIL.</result>\n\
+</task-notification>";
+        let got = extract_task_result(xml).expect("should extract");
+        assert!(got.starts_with("[Agent task result: Agent \"Run validation\" completed]"));
+        assert!(got.contains("## Run 4 Report"));
+        assert!(got.contains("303 claims & 22 guides")); // &amp; unescaped
+        assert!(got.contains("<system> tag")); // &lt;/&gt; unescaped
+    }
+
+    #[test]
+    fn extract_task_result_drops_trivial_completions() {
+        let xml = "<task-notification>\n\
+<summary>Background command completed</summary>\n\
+<result>exit 0</result>\n\
+</task-notification>";
+        assert!(extract_task_result(xml).is_none());
+    }
+
+    #[test]
+    fn record_frontmatter_has_research_record_type() {
+        let artifact = RecognizedArtifact {
+            start_line: 100,
+            end_line: 150,
+            characterization: "Run 4 — FAIL on Probe 2".to_string(),
+            agent_attribution: "validation-agent".to_string(),
+            has_preregistered_criteria: true,
+            has_method: true,
+            has_structured_report: true,
+        };
+        let rendered = render_research_record(
+            "sess-123",
+            "/path/to/transcript.jsonl",
+            &artifact,
+            100,
+            150,
+            "## Run 4 Report\nverbatim body",
+            "2026-06-11T10:00:00Z",
+        );
+        assert!(rendered.contains("type: research-record"));
+        assert!(rendered.contains("date: 2026-06-11"));
+        assert!(rendered.contains("source_lines: 100-150"));
+        assert!(rendered.contains("agent_attribution: validation-agent"));
+        assert!(rendered.contains("## Run 4 Report\nverbatim body"));
+    }
+
+    #[test]
+    fn slice_lines_is_verbatim_and_bounded() {
+        let lines: Vec<String> = (1..=10).map(|n| format!("line {}", n)).collect();
+        assert_eq!(slice_lines(&lines, 3, 5), "line 3\nline 4\nline 5");
+        // Out-of-bounds end clamps; inverted range yields empty.
+        assert_eq!(slice_lines(&lines, 9, 100), "line 9\nline 10");
+        assert_eq!(slice_lines(&lines, 5, 3), "");
+    }
 }
