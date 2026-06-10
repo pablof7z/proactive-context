@@ -296,9 +296,115 @@ accepting a longer context, or to include a dedicated "pre-registered criteria" 
 
 ---
 
+## Post-Fix Update (Integration Quality, 2026-06-11)
+
+After the initial validation, four integration items were completed.
+
+### 1. Slice-truncation fixed → coverage 75% → 88%
+
+**The bug.** Recognition emitted a conservative end-line (Run 5: lines 1083–1112),
+cutting the task-result block before its diagnostic tail — so F7 (cosine-cluster
+split root cause) and P3 (clusters-aren't-versions) were dropped.
+
+**The fix.** `build_research_transcript_with_spans` now records each turn's 1-based
+line span and an `is_task_result` flag. `snap_range_to_blocks` extends any
+recognized range outward to fully cover every task-result block it overlaps, so a
+conservative model end-line can never sever a report. Ranges that touch no
+task-result block (an inline report in an assistant turn) pass through unchanged.
+Nine unit tests cover the snapping cases plus extraction/frontmatter/slicing.
+
+**Re-run coverage (same judge, same gold standard):**
+
+| Finding | Before | After | Note |
+|---------|--------|-------|------|
+| F7 — supersession is relation-detection | ABSENT | **PRESENT** | Run 5 slice now reaches the cosine-cluster diagnosis |
+| P3 — clusters aren't versions | ABSENT | **PRESENT** | same Run 5 tail, now captured |
+| F1 | PARTIAL | PARTIAL | unchanged |
+| F4 | PRESENT | PARTIAL | judge non-determinism (the F4 latency diagnosis is still present in-record) |
+| F5 | PRESENT | PARTIAL | judge non-determinism (0/42 reported; 0/79 cross-corpus total not in this record set) |
+| F6 | PARTIAL | PRESENT | judge non-determinism |
+| others | — | — | stable |
+
+**New coverage: 6 PRESENT + 8 PARTIAL + 2 ABSENT = 14/16 = 88%** (was 75%). Bar
+≥70%, PASS with a wider margin.
+
+The two remaining ABSENT findings are **T1** (restatement mining as a labeling
+method) and **P1** (the Runs 1–2 silent-null bug). Both live in the orchestrating
+agent's *narrative* reflections, not in any structured task-result report — so
+they fall outside research-capture's R7 gate by design. Capturing them is the job
+of ordinary EXTRACT (or a future lighter-weight "investigation narrative" type).
+The F4/F5/F6 PRESENT↔PARTIAL wobble between runs is the single-judge ±non-determinism
+the gold standard itself names in P4 — the underlying substance is present in the
+records both times.
+
+*Caveat on reproducibility:* the target session file kept growing (this very
+validation work was written into it), so re-runs see a shifting transcript. The
+second run recognized Run 4, Run 5, and the validation-results task-result (a
+self-referential artifact, excluded from the coverage corpus). The coverage
+measurement uses the Run 4 + Run 5 records, which carry the original investigation.
+
+### 2. Product-quality feature-flagged capture stage
+
+A `research` recognition pass now runs inside the capture pipeline, after the
+normal pass and independent of it, gated by `capture_research` (default **OFF**).
+
+- **Flag:** `config.capture_research: bool` (serde default `false`; absent from
+  existing configs → OFF). `src/config.rs`.
+- **Stage:** `research_capture::run_research_stage(wiki_dir, transcript, session_id)`
+  persists immutable records to `<wiki>/research/<date>-<slug>.md` with
+  `type: research-record` frontmatter (date, session, source line ranges, agent
+  attribution). Best-effort: errors are logged and swallowed so a research-stage
+  failure never breaks normal capture. Immutable (R1): an existing record file is
+  never overwritten. `src/capture.rs` call site is a no-op when the flag is off.
+- **Index:** `rebuild_index` now calls `scan_research_records` and appends a
+  "Research Records" section to `_index.md`, linking into the `research/` subdir.
+  `read_index` resets table state on section headings so research rows are never
+  misparsed as guide rows. (Without this, the non-recursive `read_dir` in
+  `rebuild_index` would have ignored the subdir entirely — that was the gap.)
+- **Tests:** `rebuild_index_lists_research_records`, `scan_research_records_ignores_non_records`.
+
+### 3. Task-result visibility for the MAIN pipeline (isolated, master-candidate)
+
+The R3 finding matters beyond research-capture: because `visible_text` drops every
+string starting with `<`, **EXTRACT cannot see subagent reports in ANY agentic
+session today.** A surgical opt-in fixes this without touching the default path:
+
+- **Flag:** env `PC_INCLUDE_TASK_RESULTS=1` (default off).
+- **Behavior:** when set, `extract_text` surfaces a `<task-notification>`'s
+  `<result>` body (HTML-unescaped, summary-prefixed) instead of dropping it;
+  trivial background-command completions are still skipped.
+- **Isolated:** the entire change is in `src/transcript.rs` (one commit), making it
+  a clean candidate to land on master independently of research-capture.
+- **End-to-end verified:** on the real agentic session, `pc debug transcript`
+  surfaces **0** agent reports with the flag off and **11** with it on.
+- **Tests:** 3 unit tests (extraction, trivial-skip, flag gate).
+
+### 4. Test status
+
+`cargo test`: **105 passed, 0 failed** (was 100; +5 new across research_capture,
+wiki, transcript; +1 pre-existing doctor.rs test-compile fix). Verified green with
+`PC_INCLUDE_TASK_RESULTS` both unset and set. With `capture_research` off (default)
+and `PC_INCLUDE_TASK_RESULTS` unset, all pipeline behavior is byte-for-byte
+unchanged.
+
+### Commits (this branch)
+
+| Commit | What |
+|--------|------|
+| `fix(doctor)` | import GuideFrontmatter in test module (pre-existing breakage) |
+| `fix(research-capture)` | block-boundary-aware slicing + 9 tests |
+| `feat(config)` | `capture_research` flag (default OFF) |
+| `feat(wiki)` | `rebuild_index` lists research records + 2 tests |
+| `feat(capture)` | feature-flagged research stage wired into pipeline |
+| `feat(transcript)` | opt-in `PC_INCLUDE_TASK_RESULTS` + 3 tests (master-candidate) |
+
+---
+
 ## Standing Assets
 
 - **Prototype code:** `src/research_capture.rs` + `pc research` subcommand
-- **Experiment output:** `/tmp/research-capture-experiment/` (3 records)
+- **Pipeline stage:** `run_research_stage` → `<wiki>/research/<date>-<slug>.md`
+- **Flags:** `capture_research` (config, default OFF), `PC_INCLUDE_TASK_RESULTS` (env, default OFF)
+- **Experiment output:** `/tmp/research-capture-experiment/` (records)
 - **Target session:** `~/.claude/projects/…/0323ebcf-373e-4e5d-b1c6-8dac16f3055d.jsonl`
 - **Precision sessions tested:** `1886c5b1`, `b3c7dfbe`, `11099da8`
