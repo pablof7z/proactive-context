@@ -152,8 +152,11 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
     // ── MINE LABELS FROM FUTURE (Probe 1) ─────────────────────────────────
     let cfg = load_config()?;
     let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
-    println!("\neval: === MINING LABELS FROM FUTURE ({} sessions) ===", future_sessions.len());
-    let labels = mine_labels(future_sessions, history_sessions, &corpus_root, &judge_model, &exp_dir)?;
+    // Cap future sessions used for label mining to bound LLM cost.
+    // Use first 20 FUTURE sessions (chronologically earliest after the split).
+    let future_for_mining = &future_sessions[..future_sessions.len().min(20)];
+    println!("\neval: === MINING LABELS FROM FUTURE ({}/{} sessions, capped at 20) ===", future_for_mining.len(), future_sessions.len());
+    let labels = mine_labels(future_for_mining, history_sessions, &corpus_root, &judge_model, &exp_dir)?;
     println!("eval: mined {} verified label(s)", labels.iter().filter(|l| l.verified).count());
 
     let labels_path = exp_dir.join("labels.jsonl");
@@ -691,14 +694,41 @@ fn run_wiki_inject(
         return ("(wiki empty)".to_string(), 0, 0);
     }
 
-    // Simple retrieval: embed query, pick top-k guides by embedding similarity.
+    // Embedding-based retrieval: embed query, pick top-k guides by cosine similarity.
+    // This mirrors what the live inject path does (minus the SELECT LLM call which is
+    // what we're A/B testing against).
     let top_guides: Vec<(String, String)> = {
+        let ok_cfg = match load_config() {
+            Ok(c) => c,
+            Err(_) => cfg.clone(),
+        };
+        let mut guides_with_scores: Vec<(f32, String, String)> = match crate::embed::build_embedder(&ok_cfg) {
+            Ok(mut embedder) => {
+                let guide_reprs: Vec<String> = index_rows.iter().map(|r| {
+                    format!("{}. {}", r.title.trim(), r.summary.trim())
+                }).collect();
+                let query_vec = embedder.embed(&[prompt.to_string()]).unwrap_or_default();
+                let guide_vecs = embedder.embed(&guide_reprs).unwrap_or_default();
+                let qv = query_vec.into_iter().next().unwrap_or_default();
+                index_rows.iter().zip(guide_vecs.iter()).map(|(row, gv)| {
+                    let score = crate::route_recall::cosine(&qv, gv);
+                    (score, row.slug.clone(), String::new())
+                }).collect()
+            }
+            Err(_) => {
+                // Fallback: use first N guides (no retrieval).
+                index_rows.iter().take(cfg.inject_max_guides).map(|r| (0.0f32, r.slug.clone(), String::new())).collect()
+            }
+        };
+        guides_with_scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        guides_with_scores.truncate(cfg.inject_max_guides);
+
         let mut guides = Vec::new();
-        for row in index_rows.iter().take(cfg.inject_max_guides) {
-            let guide_path = crate::wiki::guide_path(wiki_dir, &row.slug);
+        for (_, slug, _) in guides_with_scores {
+            let guide_path = crate::wiki::guide_path(wiki_dir, &slug);
             let content = fs::read_to_string(&guide_path).unwrap_or_default();
             if !content.is_empty() {
-                guides.push((row.slug.clone(), content));
+                guides.push((slug, content));
             }
         }
         guides
