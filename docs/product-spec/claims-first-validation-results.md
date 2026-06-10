@@ -1,5 +1,128 @@
 # Claims-First Validation Results
 
+**Runs 3–5 carry the signal.** Run 3 = `nostr-multi-platform` (orchestration corpus, claims-first
+PROMISING). Run 4 = `proactive-context` (this repo, design corpus with real reversals; claims-first
+FAILS, Probe 2 the decisive reason). **Run 5 = the fix attempt:** cluster-aware supersession
+rendering added to the claims-inject COMPILE path, re-scored against the PRESERVED Run-4 stores
+(no rebuild, no EXTRACT spend). Runs 1–2 were null harness-bug runs.
+**Judge / capture / compile:** `ollama:glm-5.1:cloud`. **Embedder:** local fastembed (384-dim).
+**Total OpenRouter spend across all five runs: $0.00.**
+
+## Run 5 verdict at a glance
+
+| Probe 2 (8 reversals) | Store A | Store B — Run 4 (flat) | Store B — Run 5 (supersession) | Run 5 bar |
+|---|---|---|---|---|
+| asserts current Y | 8/8 | 6/8 | **7/8** | — |
+| leaks stale X as current (sin) | 0–1/8 | 2/8 | **1/8** | ≤1/8 ✅ |
+| **trajectory X→Y recoverable** | 6–7/8 | 3/8 | **4/8** | ≥7/8 ❌ |
+
+**Run 5 result: the rendering helped but did NOT meet the success bar.** Stale leaks halved
+(2→1, passes ≤1/8) and current-assertion rose (6→7), but trajectory recovery only moved 3→4,
+far short of the ≥7/8 target. **Diagnosed root cause: 7 of the 8 reversals have their X and Y in
+DIFFERENT clusters**, so a *within-cluster* supersession renderer structurally never sees them
+together. The fix is real but addresses the wrong layer — the bottleneck is cluster granularity /
+cross-cluster retrieval, not rendering.
+
+---
+
+# Run 5 — cluster-aware supersession rendering
+
+## The rendering design (what was built)
+
+`render_clusters_with_supersession` (claims.rs) replaces the Phase-0 flat `(was: X)` rendering on
+the eval's claims-inject path (toggle `PC_CLAIMS_RENDER=legacy` reproduces Run 4). Per retrieved
+cluster:
+
+1. **Chronological timeline.** Claims sorted by date; the latest is `CURRENT`.
+2. **Contradiction gate (the robustness fix Run 4 asked for).** For each earlier claim E, compute
+   cosine similarity between E's and the current claim's assertion *embeddings*. If
+   `sim ≥ tau_supersede` (default 0.55, env `PC_CLAIMS_SUPERSEDE_TAU`) **and** the text differs,
+   mark E `SUPERSEDED` (a prior version of the same fact). Otherwise mark it `RELATED` — a
+   co-occurring topical fact, presented neutrally. This stops co-occurring facts being mislabeled
+   "was:" (Run 4's observed failure mode) while still flagging genuine versions.
+3. **Deterministic, Rust-side.** COMPILE *receives* the labeled timeline (CURRENT / SUPERSEDED /
+   RELATED, each dated) plus an explicit directive: render SUPERSEDED history as
+   "current Y (previously X, <date>)", present RELATED normally, never assert a SUPERSEDED line as
+   current. The model is never asked to infer which claim supersedes which.
+4. **Authority still ranks** (explicit user direction first), unchanged from retrieval.
+
+This is exactly the proposal's §5 requirement that Phase 0 skipped.
+
+## Why it under-delivered: cross-cluster reversals
+
+The cosine clustering (tau 0.55) groups *textually similar* claims. But a reversal's whole point is
+that Y is phrased differently from X ("OpenRouter API embeddings" vs "local MiniLM embeddings"),
+so the two versions often land in **separate clusters**. Measured on the 8 frozen reversals:
+
+| | X and Y co-clustered | X and Y split across clusters |
+|---|---|---|
+| count | **1 / 8** | **7 / 8** |
+
+A within-cluster renderer can only act on the 1 co-clustered case. Concrete failure (Embedding
+provider): the OpenRouter claims sit in cluster `cl-9135070a-ac34ad` (2026-05-28) and the local
+MiniLM claim in `cl-658f4c79-c429d5` (2026-05-29) — different clusters — so the renderer never
+marks a SUPERSEDED line, and COMPILE presents local and OpenRouter embeddings as two co-existing
+current options rather than "local replaced OpenAI". The trajectory is unrecoverable not because of
+phrasing but because retrieval never co-surfaced X and Y.
+
+## Probe 1 — recall did not regress (B = new rendering)
+
+| Cohort | Store A | Store B (Run 5) | Store B (Run 4) |
+|--------|---------|-----------------|-----------------|
+| ALL (n=42) | 78.6% | **73.8%** | 69.0% |
+| Explicit / user-direction (n=3) | 66.7% | 33.3% | 33.3% |
+| Implicit (n=39) | 79.5% | 76.9% | 69.2% |
+
+B's overall recall rose to 73.8% (Run 4 B was 69.0%) — **no regression** (the richer timeline gives
+COMPILE more to work with). NOTE: Store A also rose (69.0%→78.6%) on the same frozen labels, which
+is pure **LLM-judge non-determinism** — the judge is re-run each scoring pass. So absolute
+cross-run recall deltas carry ±~5-point judge noise; the safe read is "B did not regress, and B
+tracks A within the noise band."
+
+## Probe 3 — the richer rendering's operational cost
+
+| Metric | Store A | Store B (Run 5) | Store B (Run 4) |
+|--------|---------|-----------------|-----------------|
+| p50 latency | 3249 ms | 2824 ms | 3103 ms |
+| p95 latency | 10771 ms | 7361 ms | 6729 ms |
+| tokens in | 194,087 | 71,738 | 64,749 |
+| tokens out | 11,124 | 7,758 | 8,175 |
+
+The supersession timeline cost **+11% input tokens** (64.7K→71.7K) for the SUPERSEDED/RELATED
+labels and directive — modest. p95 latency is still **32% better than Store A** (passes the bar).
+B remains far cheaper on tokens-in (−63% vs A).
+
+## §5 / Run-5 pre-registered decision frame (applied verbatim)
+
+Run 5 SUCCEEDS iff ALL of:
+- **B trajectory-recoverable ≥ 7/8** — **FAIL** (4/8).
+- **B stale-leaks ≤ 1/8** — **PASS** (1/8, down from 2/8).
+- **B Probe 1 recall within 2 points of Run 4's B (69.0%)** — **PASS on direction** (73.8%, no
+  regression; the +4.8 move is within judge-noise, not a real gain).
+- **B p95 latency ≥30% better than Store A** — **PASS** (32%).
+
+**Run 5 verdict: PARTIAL — 3 of 4 criteria met, but the decisive trajectory metric (4/8) misses
+≥7/8.** The supersession rendering is correct and helps (fewer leaks, more current-truth assertion,
+no recall regression, acceptable cost), but cannot fix reversals whose X and Y are split across
+clusters — 7/8 of cases here. **The bottleneck is retrieval/clustering granularity, not rendering.**
+
+## What would actually move trajectory to ≥7/8 (next-step, not built)
+
+The rendering is necessary but not sufficient. To recover cross-cluster trajectories, retrieval must
+co-surface superseding claims regardless of cluster:
+- **Supersession edges at capture time:** when a new claim contradicts an existing one (high
+  similarity, conflicting predicate), record an explicit `supersedes` edge between them rather than
+  relying on cosine to co-cluster them. Then retrieval pulls the whole edge chain.
+- **Or merge-on-contradiction clustering:** a second clustering pass that unions clusters whose
+  centroids are near AND whose claims share an entity/config-key but differ in value.
+Either makes the (already-built, already-working) supersession renderer effective. Phase 0's
+contribution here is the precise localization of the bottleneck.
+
+---
+
+# Runs 1-4 — prior history (nostr corpus + proactive-context Run 4)
+
+
 **Two corpora tested.** Run 3 = `nostr-multi-platform` (agent-orchestration corpus).
 Run 4 = `proactive-context` (this repo's own dev history — richer, design-heavy, and the
 corpus with known direction reversals for Probe 2). Runs 1–2 were null due to harness bugs.

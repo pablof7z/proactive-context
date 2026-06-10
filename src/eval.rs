@@ -1045,7 +1045,20 @@ fn run_claims_inject_for_eval(
     }
 
     // Render clusters as a single "guide" for the compile model.
-    let rendered = crate::claims::render_clusters_for_compile(&clusters);
+    // Run 5: supersession-aware timeline rendering (proposal §5). Toggle off via
+    // PC_CLAIMS_RENDER=legacy to reproduce the Run 4 (Phase-0) flat rendering.
+    let legacy_render = std::env::var("PC_CLAIMS_RENDER")
+        .map(|v| v.eq_ignore_ascii_case("legacy"))
+        .unwrap_or(false);
+    let rendered = if legacy_render {
+        crate::claims::render_clusters_for_compile(&clusters)
+    } else {
+        let tau_supersede = std::env::var("PC_CLAIMS_SUPERSEDE_TAU")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.55);
+        crate::claims::render_clusters_with_supersession(&clusters, embedder.as_mut(), tau_supersede)
+    };
     let tokens_in = rendered.len() / 4 + prompt.len() / 4;
 
     // Single virtual guide source.

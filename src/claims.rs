@@ -410,6 +410,96 @@ pub fn render_clusters_for_compile(clusters: &[ClaimCluster]) -> String {
     out
 }
 
+/// Cluster-aware supersession rendering (Run 5 / proposal §5).
+///
+/// For each retrieved cluster, build an explicit chronological timeline and decide, per earlier
+/// claim, whether it is a genuine SUPERSEDED version of the current claim or merely a co-occurring
+/// RELATED fact. The distinction is made deterministically Rust-side via embedding cosine
+/// similarity between assertion texts (Run 4 showed clusters mix true X→Y versions with
+/// co-occurring topical facts; blindly marking every older claim "was:" mislabels co-occurring
+/// facts and confuses COMPILE).
+///
+/// Decision rule for an earlier claim E vs the current (latest) claim C:
+/// - if cosine(embed(E), embed(C)) ≥ `tau_supersede` AND E.assertion != C.assertion
+///   → SUPERSEDED (a prior version of the same fact)
+/// - else → RELATED (a co-occurring fact in the same topic cluster; presented neutrally)
+///
+/// The compile model RECEIVES the labeled timeline (CURRENT / SUPERSEDED / RELATED, with dates)
+/// plus an explicit directive to preserve "current Y (was X, <date>)" phrasing — it is never asked
+/// to figure out which claim supersedes which.
+///
+/// Authority still ranks: clusters arrive pre-ordered by retrieve_top_clusters (explicit-boosted),
+/// and within a cluster the current claim's authority is surfaced.
+pub fn render_clusters_with_supersession(
+    clusters: &[ClaimCluster],
+    embedder: &mut dyn Embedder,
+    tau_supersede: f32,
+) -> String {
+    if clusters.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## CLAIM STORE — supersession-aware timeline\n\n\
+         Each numbered item is one fact's history. The line marked CURRENT is the present truth. \
+         Lines marked SUPERSEDED are earlier versions of that SAME fact that were overridden — when \
+         a fact has SUPERSEDED history, state it as \"current Y (previously X, <date>)\" so the \
+         reader sees both the current truth and what it replaced. Lines marked RELATED are \
+         co-occurring facts in the same topic, not supersessions — present them normally. Never \
+         present a SUPERSEDED line as if it were current.\n\n",
+    );
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        // claims arrive most-recent-first; current = claims[0].
+        let current = &cluster.claims[0];
+        let authority_tag = if current.authority == "explicit" {
+            "[user direction]"
+        } else {
+            "[agent-inferred]"
+        };
+        out.push_str(&format!(
+            "{}. CURRENT ({}) {}: {}\n",
+            i + 1,
+            current.ts,
+            authority_tag,
+            current.assertion.trim()
+        ));
+
+        if cluster.claims.len() > 1 {
+            // Embed current + all earlier assertions in one batch for the contradiction gate.
+            let mut texts: Vec<String> = Vec::with_capacity(cluster.claims.len());
+            texts.push(current.assertion.clone());
+            for old in &cluster.claims[1..] {
+                texts.push(old.assertion.clone());
+            }
+            let embs = embedder.embed(&texts).unwrap_or_default();
+            let current_emb = embs.first().cloned().unwrap_or_default();
+
+            for (idx, old) in cluster.claims[1..].iter().enumerate() {
+                let sim = embs
+                    .get(idx + 1)
+                    .map(|e| cosine(&current_emb, e))
+                    .unwrap_or(0.0);
+                let is_supersession =
+                    sim >= tau_supersede && old.assertion.trim() != current.assertion.trim();
+                let label = if is_supersession { "SUPERSEDED" } else { "RELATED" };
+                out.push_str(&format!(
+                    "   {} ({}): {}\n",
+                    label,
+                    old.ts,
+                    old.assertion.trim()
+                ));
+            }
+        }
+
+        if !current.evidence_text.is_empty() {
+            let snippet: String = current.evidence_text.chars().take(120).collect();
+            out.push_str(&format!("   evidence: \"{}\"\n", snippet.trim()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ─── Utility ──────────────────────────────────────────────────────────────────
 
 fn floats_to_bytes(v: &[f32]) -> Vec<u8> {
