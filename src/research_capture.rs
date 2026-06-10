@@ -269,13 +269,15 @@ fn call_recognition(
     ollama_key: Option<&str>,
     numbered_transcript: &str,
 ) -> Result<String> {
-    // Truncate if very long — take first 12000 chars (recognition needs structure, not every word)
-    let transcript_excerpt = if numbered_transcript.len() > 40000 {
-        // Take first 20000 and last 10000 chars to capture both setup and reports
+    // For long transcripts: investigation artifacts (structured reports with verdicts) appear
+    // in agent task-result blocks, which tend to appear in the LATTER half of a session.
+    // Strategy: pass full transcript up to a generous limit; if it exceeds that, take the
+    // first 10K (for session framing/method) and the last 80K (where reports usually land).
+    let transcript_excerpt = if numbered_transcript.len() > 90000 {
         format!(
-            "{}\n\n[... middle truncated for length ...]\n\n{}",
-            &numbered_transcript[..20000],
-            &numbered_transcript[numbered_transcript.len() - 10000..]
+            "{}\n\n[... early middle truncated for length, resuming below ...]\n\n{}",
+            &numbered_transcript[..10000],
+            &numbered_transcript[numbered_transcript.len() - 80000..]
         )
     } else {
         numbered_transcript.to_string()
