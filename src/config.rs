@@ -548,6 +548,18 @@ pub fn resolve_project_root(path: &std::path::Path) -> PathBuf {
         }
     }
 
+    // Relative path (e.g. ".git") → normal repo running from a subdirectory.
+    // Use --show-toplevel so we always land at the repo root, not the cwd.
+    if let Ok(o) = std::process::Command::new("git")
+        .args(["-C", &abs.to_string_lossy().as_ref(), "rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if o.status.success() {
+            let toplevel = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            return PathBuf::from(toplevel);
+        }
+    }
+
     abs
 }
 
