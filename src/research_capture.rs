@@ -97,6 +97,80 @@ pub fn run_research_capture(
     Ok(persisted)
 }
 
+// ─── Pipeline integration (feature-flagged capture stage) ────────────────────
+
+/// Research-capture stage invoked from the main capture pipeline AFTER the normal
+/// pass completes. Persists immutable research records under `<wiki_dir>/research/`.
+///
+/// Gated by `capture_research` (default OFF) at the call site — this function does
+/// the work unconditionally once called. It is independent of the normal pipeline:
+/// it re-reads the transcript with R3-aware parsing and runs its own recognition.
+///
+/// Best-effort: errors are logged and swallowed by the caller so a research-stage
+/// failure never breaks the normal capture path.
+///
+/// Records are immutable: a record is written once per (session, slug). If a record
+/// file already exists it is left untouched (never reconciled / rewritten — R1).
+pub fn run_research_stage(
+    wiki_dir: &Path,
+    transcript_path: &str,
+    session_id: &str,
+) -> Result<Vec<PathBuf>> {
+    let research_dir = wiki_dir.join("research");
+    let cfg = load_config()?;
+    let spec: ModelSpec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    let ollama_base = cfg.ollama_base_url.as_str();
+    let ollama_key = cfg.ollama_api_key.as_deref();
+
+    let (numbered, raw_lines, spans) = build_research_transcript_with_spans(transcript_path)?;
+    if raw_lines.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let recognition_response = call_recognition(&spec, openrouter_key, ollama_base, ollama_key, &numbered)?;
+    let artifacts = parse_recognition_response(&recognition_response)?;
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    fs::create_dir_all(&research_dir)?;
+    let captured_at = rfc3339_now();
+    let date = &captured_at[..captured_at.len().min(10)];
+
+    let mut persisted = Vec::new();
+    for (idx, artifact) in artifacts.iter().enumerate() {
+        let (snap_start, snap_end) =
+            snap_range_to_blocks(&spans, artifact.start_line, artifact.end_line);
+        let sliced = slice_lines(&raw_lines, snap_start, snap_end);
+        if sliced.trim().is_empty() {
+            continue;
+        }
+        let slug = slugify_artifact(&artifact.characterization, idx + 1);
+        // Filename: <date>-<slug>.md (spec §6 D2: docs/wiki/research/<date>-<slug>.md).
+        let filename = format!("{}-{}.md", date, slug);
+        let record_path = research_dir.join(&filename);
+        // Immutability (R1): never overwrite an existing record.
+        if record_path.exists() {
+            persisted.push(record_path);
+            continue;
+        }
+        let content = render_research_record(
+            session_id,
+            transcript_path,
+            artifact,
+            snap_start,
+            snap_end,
+            &sliced,
+            &captured_at,
+        );
+        fs::write(&record_path, content)?;
+        persisted.push(record_path);
+    }
+
+    Ok(persisted)
+}
+
 // ─── Research-aware transcript builder (R3) ──────────────────────────────────
 
 /// Extracts a line-numbered transcript from a Claude Code JSONL file.
