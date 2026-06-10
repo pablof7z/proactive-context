@@ -539,11 +539,79 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
     // Sort deterministically by topic then slug
     rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
 
-    write_index_file(wiki_dir, today, &rows)?;
+    let research = scan_research_records(wiki_dir);
+    write_index_file_with_research(wiki_dir, today, &rows, &research)?;
     Ok(rows)
 }
 
+/// A research record listed in the index. Distinct from a guide: immutable, dated,
+/// lives in `<wiki>/research/`. Linked from the index but never reconciled.
+#[derive(Debug, Clone)]
+pub struct ResearchRow {
+    pub filename: String,      // e.g. "2026-06-10-run-4-fail.md"
+    pub date: String,
+    pub characterization: String,
+    pub agent_attribution: String,
+}
+
+/// Scan `<wiki>/research/*.md` for research records (frontmatter `type: research-record`).
+/// Returns an empty vec if the subdir does not exist. Non-recursive, parse-tolerant.
+pub fn scan_research_records(wiki_dir: &Path) -> Vec<ResearchRow> {
+    let research_dir = wiki_dir.join("research");
+    let entries = match fs::read_dir(&research_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let filename = match path.file_name().and_then(|s| s.to_str()) {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Only list files that declare themselves research records.
+        if !content.contains("type: research-record") {
+            continue;
+        }
+        let fm = |key: &str| -> String {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
+                    return rest.trim().trim_matches('"').to_string();
+                }
+                if line.trim() == "---" && !rows.is_empty() {
+                    break;
+                }
+            }
+            String::new()
+        };
+        rows.push(ResearchRow {
+            filename,
+            date: fm("date"),
+            characterization: fm("characterization"),
+            agent_attribution: fm("agent_attribution"),
+        });
+    }
+    rows.sort_by(|a, b| a.filename.cmp(&b.filename));
+    rows
+}
+
 fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<()> {
+    write_index_file_with_research(wiki_dir, today, rows, &[])
+}
+
+fn write_index_file_with_research(
+    wiki_dir: &Path,
+    today: &str,
+    rows: &[IndexRow],
+    research: &[ResearchRow],
+) -> Result<()> {
     fs::create_dir_all(wiki_dir)?;
     let path = wiki_dir.join("_index.md");
 
@@ -552,7 +620,7 @@ fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<(
     out.push_str("> Derived cache — do not hand-edit. Rebuilt by proactive-context after each capture.\n\n");
     out.push_str(&format!("Last updated: {}\n\n", today));
 
-    if rows.is_empty() {
+    if rows.is_empty() && research.is_empty() {
         out.push_str("*(no guides yet)*\n");
         fs::write(&path, out)?;
         return Ok(());
@@ -583,6 +651,26 @@ fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<(
         out.push('\n');
     }
 
+    // Research records (immutable, dated) — listed but never reconciled.
+    if !research.is_empty() {
+        out.push_str(&format!(
+            "## Research Records ({} record{})\n\n",
+            research.len(),
+            if research.len() == 1 { "" } else { "s" }
+        ));
+        out.push_str("| Record | Date | Finding | Agent |\n");
+        out.push_str("|--------|------|---------|-------|\n");
+        for r in research {
+            let stem = r.filename.strip_suffix(".md").unwrap_or(&r.filename);
+            let finding = r.characterization.replace('|', "\\|");
+            out.push_str(&format!(
+                "| [{}](research/{}) | {} | {} | {} |\n",
+                stem, r.filename, r.date, finding, r.agent_attribution
+            ));
+        }
+        out.push('\n');
+    }
+
     fs::write(&path, out)?;
     Ok(())
 }
@@ -607,6 +695,13 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
 
         if trimmed.starts_with("| Slug ") || trimmed.starts_with("| slug ") {
             in_table = true;
+            header_passed = false;
+            continue;
+        }
+        // A new section heading (e.g. "## Research Records") ends the current guide
+        // table so its non-guide rows are never misread as guides.
+        if trimmed.starts_with('#') {
+            in_table = false;
             header_passed = false;
             continue;
         }
@@ -1403,5 +1498,51 @@ More info.
         let serialized2 = serialize_guide(&reparsed);
         let reparsed2 = parse_guide(&serialized2).expect("third parse failed");
         assert_eq!(reparsed2.body, guide.body, "body not idempotent after second round-trip");
+    }
+
+    #[test]
+    fn rebuild_index_lists_research_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        // One ordinary guide.
+        let guide = "---\ntitle: Embeddings\nslug: embeddings\nsummary: how embeddings work\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-06-01\nupdated: 2026-06-01\nverified: 2026-06-01\ncompiled-from: conversation\nsources: []\ntopic: infra\n---\n\n# Embeddings\n\nBody.\n";
+        fs::write(wiki.join("embeddings.md"), guide).unwrap();
+        // One research record in the subdir.
+        let research_dir = wiki.join("research");
+        fs::create_dir_all(&research_dir).unwrap();
+        let record = "---\ntype: research-record\ndate: 2026-06-10\nsession: sess-abc\ntranscript: /t.jsonl\nsource_lines: 100-150\nagent_attribution: validation-agent\nhas_preregistered_criteria: true\nhas_method: true\nhas_structured_report: true\ncharacterization: \"Run 4 — FAIL on Probe 2\"\ncaptured_at: 2026-06-10T10:00:00Z\n---\n\nRun 4 — FAIL on Probe 2\n\n---\n\nverbatim body\n";
+        fs::write(research_dir.join("2026-06-10-run-4-fail.md"), record).unwrap();
+
+        rebuild_index(wiki, "2026-06-11").unwrap();
+        let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
+
+        // Guide section present.
+        assert!(index.contains("embeddings"), "guide must be listed");
+        // Research section present and links into the subdir.
+        assert!(index.contains("## Research Records (1 record)"), "research section header missing:\n{}", index);
+        assert!(index.contains("](research/2026-06-10-run-4-fail.md)"), "research link missing:\n{}", index);
+        assert!(index.contains("Run 4 — FAIL on Probe 2"), "characterization missing");
+
+        // read_index must NOT pick up the research record as a guide row.
+        let rows = read_index(wiki);
+        let slugs: Vec<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
+        assert!(slugs.contains(&"embeddings"), "guide row missing from read_index");
+        assert!(!slugs.iter().any(|s| s.contains("run-4")), "research record leaked into guide rows: {:?}", slugs);
+    }
+
+    #[test]
+    fn scan_research_records_ignores_non_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let research_dir = tmp.path().join("research");
+        fs::create_dir_all(&research_dir).unwrap();
+        // A real record.
+        fs::write(research_dir.join("rec.md"), "---\ntype: research-record\ndate: 2026-06-10\ncharacterization: \"X\"\nagent_attribution: a\n---\nbody\n").unwrap();
+        // A stray non-record markdown file.
+        fs::write(research_dir.join("notes.md"), "# just notes\nno frontmatter\n").unwrap();
+
+        let rows = scan_research_records(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].filename, "rec.md");
+        assert_eq!(rows[0].date, "2026-06-10");
     }
 }

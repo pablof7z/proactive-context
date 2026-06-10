@@ -950,6 +950,7 @@ fn civil_date_from_days(z: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wiki::GuideFrontmatter;
 
     struct FakeEmbedder;
     impl Embedder for FakeEmbedder {

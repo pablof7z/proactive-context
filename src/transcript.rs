@@ -73,13 +73,36 @@ const MESSAGE_DECODERS: &[MessageDecoder] = &[
     decode_codex_response_item,
 ];
 
+/// Opt-in: surface agent task-result content that `visible_text` otherwise drops.
+///
+/// The standard rule skips any string starting with `<` (harness-injected XML).
+/// But agent/subagent final reports arrive as `<task-notification>…<result>…</result>…`
+/// blocks in user turns — so the default rule makes EXTRACT blind to every subagent
+/// report in agentic sessions. When `PC_INCLUDE_TASK_RESULTS=1`, the `<result>` body
+/// of a task-notification is surfaced (HTML-unescaped) instead of dropped. Default
+/// off → behavior unchanged.
+fn include_task_results() -> bool {
+    std::env::var("PC_INCLUDE_TASK_RESULTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Extract plain text from a message `content` value (string or block array).
 pub(crate) fn extract_text(content: &Value) -> String {
     match content {
         // Skip harness-injected XML messages: <task-notification>, <system-reminder>,
         // raw tool output with <tool-use-id>/<output-file>, etc. Human prose never
-        // starts with '<'; these do.
-        Value::String(s) => visible_text(s).unwrap_or_default().to_string(),
+        // starts with '<'; these do. EXCEPTION (opt-in): when
+        // PC_INCLUDE_TASK_RESULTS=1, surface <task-notification> <result> bodies so
+        // EXTRACT can see subagent reports.
+        Value::String(s) => {
+            if include_task_results() {
+                if let Some(result) = task_result_text(s) {
+                    return result;
+                }
+            }
+            visible_text(s).unwrap_or_default().to_string()
+        }
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(extract_text_block)
@@ -91,6 +114,40 @@ pub(crate) fn extract_text(content: &Value) -> String {
 
 fn visible_text(text: &str) -> Option<&str> {
     (!text.trim_start().starts_with('<')).then_some(text)
+}
+
+/// If `text` is a `<task-notification>` with a non-trivial `<result>` body, return
+/// that body (HTML-unescaped, summary-prefixed). Otherwise `None`. Trivial results
+/// (short, single-line background-command completions) are skipped.
+fn task_result_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("<task-notification>") {
+        return None;
+    }
+    let result = extract_xml_tag(trimmed, "result")?;
+    let result = result.trim();
+    if result.is_empty() || (result.len() < 100 && !result.contains('\n')) {
+        return None;
+    }
+    let unescaped = result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"");
+    let summary = extract_xml_tag(trimmed, "summary").unwrap_or("").trim().to_string();
+    if summary.is_empty() {
+        Some(format!("[Agent task result]\n{}", unescaped))
+    } else {
+        Some(format!("[Agent task result: {}]\n{}", summary, unescaped))
+    }
+}
+
+fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml.find(&close)?;
+    (start <= end).then(|| &xml[start..end])
 }
 
 fn extract_text_block(block: &Value) -> Option<String> {
@@ -649,5 +706,51 @@ mod tests {
         assert!(out.len() <= 999);
         assert!(out.chars().all(|c| c == 'é'), "no broken codepoints");
         assert!(s.ends_with(&out));
+    }
+
+    // ── PC_INCLUDE_TASK_RESULTS opt-in (item 3) ──────────────────────────────
+
+    #[test]
+    fn task_result_text_extracts_and_unescapes_nontrivial_result() {
+        let xml = "<task-notification>\n\
+<task-id>t1</task-id>\n\
+<summary>Agent \"Run validation\" completed</summary>\n\
+<result>## Run 4 Report\n\nStore B: 303 claims &amp; 22 guides.\nVerdict: FAIL.</result>\n\
+</task-notification>";
+        let got = task_result_text(xml).expect("non-trivial result should surface");
+        assert!(got.starts_with("[Agent task result: Agent \"Run validation\" completed]"));
+        assert!(got.contains("## Run 4 Report"));
+        assert!(got.contains("303 claims & 22 guides")); // &amp; unescaped
+    }
+
+    #[test]
+    fn task_result_text_skips_trivial_and_non_task_notifications() {
+        // Trivial background-command completion.
+        let trivial = "<task-notification><summary>bg done</summary><result>exit 0</result></task-notification>";
+        assert!(task_result_text(trivial).is_none());
+        // Not a task-notification at all.
+        let other = "<system-reminder>context</system-reminder>";
+        assert!(task_result_text(other).is_none());
+        // Plain prose.
+        assert!(task_result_text("just a normal message").is_none());
+    }
+
+    #[test]
+    fn extract_text_respects_task_result_flag() {
+        let content = Value::String(
+            "<task-notification>\n\
+<summary>Agent done</summary>\n\
+<result>## Report\nA multi-line finding body that exceeds one hundred characters so it is not treated as trivial.</result>\n\
+</task-notification>".to_string(),
+        );
+        // Flag OFF (default): the block is dropped (starts with '<').
+        std::env::remove_var("PC_INCLUDE_TASK_RESULTS");
+        assert_eq!(extract_text(&content), "");
+        // Flag ON: the <result> body surfaces.
+        std::env::set_var("PC_INCLUDE_TASK_RESULTS", "1");
+        let out = extract_text(&content);
+        assert!(out.contains("## Report"), "expected surfaced result, got: {out:?}");
+        assert!(out.contains("[Agent task result: Agent done]"));
+        std::env::remove_var("PC_INCLUDE_TASK_RESULTS");
     }
 }

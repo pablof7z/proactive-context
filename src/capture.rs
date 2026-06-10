@@ -1968,6 +1968,31 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         );
     }
 
+    // Research-capture stage (feature-flagged, default OFF). Runs AFTER the normal
+    // pass and is fully independent of it: recognizes investigation artifacts and
+    // persists immutable research records under <wiki>/research/. Best-effort — a
+    // failure here never breaks the normal capture path. When `capture_research`
+    // is false (the default) this block is a no-op and behavior is unchanged.
+    if cfg.capture_research {
+        match crate::research_capture::run_research_stage(
+            &wiki_path,
+            &input.transcript_path,
+            &input.session_id,
+        ) {
+            Ok(records) if !records.is_empty() => {
+                log_event(
+                    "capture.research",
+                    None,
+                    serde_json::json!({ "records": records.len() }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("capture: research stage failed: {}", e);
+            }
+        }
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
