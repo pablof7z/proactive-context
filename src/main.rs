@@ -7,6 +7,7 @@ mod archeologist;
 mod tenex;
 mod awareness;
 mod capture;
+mod research_capture;
 mod session_start;
 mod chunker;
 mod config;
@@ -340,6 +341,28 @@ enum Commands {
         #[command(subcommand)]
         action: DebugAction,
     },
+
+    /// Research-capture prototype (spec §4 validation). Recognizes investigation artifacts
+    /// in a session transcript and persists them as immutable research records.
+    /// Feature-flagged: does NOT touch the live capture pipeline or wiki state.
+    Research {
+        /// Path to the .jsonl transcript file to analyze.
+        #[arg(long, value_name = "FILE")]
+        transcript: PathBuf,
+
+        /// Directory to write research record files (default: /tmp/research-capture-experiment).
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+
+        /// Override the session ID (default: derived from transcript filename).
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+
+        /// Print the research-aware transcript (with task-notification results included)
+        /// instead of running recognition. Useful for R3 inspection.
+        #[arg(long)]
+        dump_transcript: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -656,6 +679,25 @@ fn main() -> Result<()> {
 
         Commands::SessionStart { harness: _ } => {
             crate::session_start::run_session_start()?;
+        }
+
+        Commands::Research { transcript, out_dir, session_id, dump_transcript } => {
+            let out_dir = out_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/research-capture-experiment"));
+            let transcript_str = transcript.to_string_lossy().to_string();
+            if dump_transcript {
+                let (numbered, _lines) = crate::research_capture::build_research_transcript(&transcript_str)?;
+                print!("{}", numbered);
+            } else {
+                let records = crate::research_capture::run_research_capture(
+                    &transcript_str,
+                    &out_dir,
+                    session_id.as_deref(),
+                )?;
+                println!("Research capture complete. {} record(s) persisted:", records.len());
+                for r in &records {
+                    println!("  {}", r.display());
+                }
+            }
         }
 
         Commands::Install { all, harness, project, dry_run, status, uninstall } => {
