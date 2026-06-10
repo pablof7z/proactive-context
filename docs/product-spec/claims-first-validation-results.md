@@ -1,136 +1,172 @@
 # Claims-First Validation Results
 
-**Experiment dir:** `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322`
-**Judge model:** `ollama:glm-5.1:cloud`
+**Corpus:** `nostr-multi-platform` (`/Users/pablofernandez/Work/nostr-multi-platform`), 225 sessions
+**Judge / capture / compile model:** `ollama:glm-5.1:cloud` (Ollama Cloud)
+**Embedder:** local fastembed (384-dim)
 **Date:** 2026-06-10
-**Corpus:** `nostr-multi-platform` (`/Users/pablofernandez/Work/nostr-multi-platform`)
+**Headline verdict (Run 3, §5 applied verbatim):** **PROMISING — all three evaluable criteria pass.**
+
+This experiment took three runs. Runs 1–2 were null due to two harness bugs in the
+label miner; Run 3 (after the fixes) produced a real, scoreable signal. All three runs
+are recorded below for honest history.
 
 ---
 
-## Corpus split
+## Spend
+
+**Total OpenRouter spend across all runs: $0.00.** Every LLM call (triage, EXTRACT,
+authority-tagging, route/reconcile, label-mining judge, inject-compile, recall judge)
+ran through the user's configured `ollama:glm-5.1:cloud` endpoint, not OpenRouter.
+Embeddings ran on the local fastembed model. The only cost was wall-clock + Ollama Cloud
+usage. Store builds (Run 3): Store B 2454s, Store A 2452s. Scoring 37 labels: ~12 min.
+
+---
+
+## Run history
+
+| Run | HISTORY | Judge HISTORY context | Labels mined | Outcome |
+|-----|---------|----------------------|--------------|---------|
+| 1 | 10 sessions | ~4 KB raw transcript | 0 | INCONCLUSIVE (bug) |
+| 2 | 10 sessions | 29 KB store-derived | 0 | INCONCLUSIVE (bug) |
+| 3 | 25 sessions | 115 KB store-derived | **37** | **PROMISING** |
+
+### What was wrong in Runs 1–2 (and fixed for Run 3)
+
+1. **History context was unintelligible (fixed Run 2).** `build_history_summary` fed the
+   judge raw transcript text — for this corpus that is mostly terse one-line commands and
+   tool-notification XML. Fix: build the judge's HISTORY context from the captured stores
+   (Store A wiki guide bodies + Store B claim assertions). Run 2 raised the context from
+   ~4 KB to 29 KB but still mined 0 — because of bug #2.
+
+2. **The future transcript was never parsed (the real root cause; fixed Run 3).**
+   `mine_labels` called `parse_transcript(&raw)` passing *file content*, but
+   `parse_transcript` takes a *file path* (it reads + parses the JSONL itself). Every
+   future session therefore errored at the parse step and was silently `continue`d — the
+   judge never saw a single FUTURE transcript in Runs 1–2. The "20/20 sessions" log line
+   was the loop iterating; each iteration bailed before the judge call. Fix: pass the path.
+
+3. **Two supporting fixes in Run 3:** (a) the mining prompt was broadened to count oblique
+   references and questions ("didn't we decide to use outbox?", "use rust-nostr's nip44,
+   don't reimplement") as restatements, not just verbatim re-explanations; (b) a
+   `extract_human_turns` helper now feeds the judge the actual human conversational turns
+   (dropping the giant bootstrap directive and tool-notification blobs) instead of a
+   raw-transcript-head truncation that cut off the real back-and-forth.
+
+4. **Verdict-mapping bug (fixed in code).** The null case (no verified labels) mapped to
+   "FAILS"; it now maps to "INCONCLUSIVE". A loss on P1 still maps to FAILS; genuine
+   pass/mixed cases are unchanged.
+
+5. **Frozen-label reuse (added).** `--score-only` now loads an existing `labels.jsonl`
+   instead of re-mining, so the label set is frozen before scoring (per spec §4) and
+   scoring is cheaply re-runnable.
+
+---
+
+## Run 3 — the scoreable run
+
+### Corpus split
 
 | | |
 |---|---|
-| Total sessions found | 225 |
-| HISTORY sessions (capped at 10) | 10 |
-| FUTURE sessions | 215 |
-| HISTORY agent-mode sessions | 4 |
-| HISTORY human-interactive sessions | 6 |
-| FUTURE sessions scanned for labels | 20 (cap) |
-| FUTURE agent-mode (first 20) | 7 |
-| FUTURE human-interactive (first 20) | 13 |
+| Total sessions | 225 |
+| HISTORY (cap 25, spec allows ~30) | 25 |
+| FUTURE | 200 |
+| FUTURE scanned for labels | 20 (cap) |
+| Verified labels | 37 |
+| Label authority split | 16 explicit / 21 implicit |
 
-HISTORY cap: 10 (spec allows ~30; reduced to bound cost and wall time; noted here).
+Store B: 342 claims across 192 clusters, 27 wiki guides. Store A: 23 wiki guides
+(built independently, no claim tap).
 
-Store build times: Store B (claim tap ON) 406s; Store A (wiki only) 459s.
+### Frozen label set — examples
 
----
+1. `[explicit]` *Subscriptions should be aggregated/batched (like NDK does, ~100ms intervals) to prevent many small subscriptions.*
+   future prompt: "yes, this should follow the same subscription aggregation logic that we build to prevent sending tons of small…"
+   history evidence: "outbox model"
+2. `[explicit]` *No specific relay (including the damus relay) should be hardcoded; routing must use the outbox model.*
+   future prompt: "we are supposed to be using outbox, so we are supposed to be connecting to the relays the user actually uses…"
+3. `[implicit]` *DiagnosticsView is the home for all diagnostic UI in Chirp.*
+   future prompt: "on chirp, in diagnostics, I want to be able to tap a subscription and see what's inside the subscription…"
 
-## Store contents after HISTORY replay
+(Full set: `labels.jsonl`, 37 rows.)
 
-### Store B (claim log)
-- **Claims:** 79 total across 10 sessions (`claims.jsonl`: 79 lines)
-- **Wiki guides built (also):** 13 content guides
-- **Guide names:** actor-backpressure-wiring, builder-guide-conventions, codex-exec-large-prompts, kernel-async-stack-drift, lmdb-event-store-stub, milestone-hardening-gates, nmp-desktop-shell, nmp-library-api, outbox-routing-hardcode, snapshot-pressure-gates, stress-harness-scenarios, uniffi-stub-ffi, writer-agent-rules
+### Probe 1 — Restatement recall (recall = contained + partial)
 
-### Store A (wiki only, no claim tap)
-- **Wiki guides built:** 8 content guides
-- **Guide names:** android-architecture, builder-guide, coding-standards, codex-exec-stdin, desktop-shell, git-push-rules, milestone-gates, nmp-architecture
+| Cohort | Store A (wiki) | Store B (claims) |
+|--------|---------------|------------------|
+| **All (n=37)** | contained 8 / partial 15 / absent 14 → **62.2%** | contained 7 / partial 17 / absent 13 → **64.9%** |
+| **Explicit / user-direction (n=16)** — the sin meter | contained 3 / partial 7 / absent 6 → **62.5%** | contained 3 / partial 10 / absent 3 → **81.2%** |
+| **Implicit (n=21)** | contained 5 / partial 8 / absent 8 → **61.9%** | contained 4 / partial 7 / absent 10 → **52.4%** |
 
-Note: Store A and B built the same 10 HISTORY sessions in two independent passes. The guide names diverged slightly because routing LLM calls are non-deterministic. This is a methodology limitation — the spec intended the claim tap to be a tap on the *same* single pass, but the implementation runs two separate passes, doubling EXTRACT cost and introducing routing variation.
+**The kill criterion is user-direction recall: Store B 81.2% ≥ Store A 62.5% — B wins by ~19 points.**
+On the absolute-sin cohort B leaves only 3/16 facts absent vs A's 6/16. B trades some
+implicit-fact recall (52.4% vs 61.9%) for a large gain on explicit user direction — the
+exact priority the project's failure hierarchy demands.
 
----
+### Probe 2 — Direction-change fidelity (SHOULD HAVE)
 
-## Probe 1 — Restatement recall
+**N/A on this corpus / window.** Store B's 192 clusters are overwhelmingly co-occurring
+topical facts from the same session/date; the 25-session HISTORY window contains no clean
+temporal reversal (user established X on date 1, overrode with Y on date 2) with differing
+timestamps to score X→Y trajectory + stale-leak. The one observed supersession (file-length
+limit 300→500 LOC) appeared as a single in-place wiki revise, not a multi-version claim
+cluster. Probe 2 is left unscored rather than fabricated; it needs a corpus with explicit
+documented reversals (or a longer window) to exercise.
 
-**Result: 0 verified labels. Probe 1 cannot be scored.**
+### Probe 3 — Operational metrics (n=37 inject runs per store)
 
-| | |
-|---|---|
-| Total candidates proposed by judge | 0 |
-| Verified by grep-match in HISTORY | 0 |
+| Metric | Store A (wiki) | Store B (claims) | Δ |
+|--------|---------------|------------------|---|
+| p50 latency | 7140 ms | 3968 ms | **−44%** |
+| p95 latency | 13195 ms | 7450 ms | −44% |
+| total tokens in | 143,250 | 55,770 | **−61%** |
+| total tokens out | 8,057 | 4,940 | −39% |
+| incoherent / fact-confetti briefings | — | 0 / 37 | — |
 
-The label miner sent 20 FUTURE sessions (one LLM call per session) to the judge model with a HISTORY summary. The judge proposed 0 restatement candidates.
-
----
-
-## Probe 3 — Operational metrics
-
-Not measured (no probe runs executed due to 0 labels).
-
----
-
-## Pre-registered read (§5)
-
-The pre-registered criteria from the spec:
-
-- **P1: User-direction recall ≥ Store A** — N/A: no labels generated
-- **P3: Latency reduction ≥ 30%** — N/A: no probe runs
-- **Coherence: incoherent rate < 20%** — N/A: no B briefings generated
-
-**Pre-registered verdict: INCONCLUSIVE — harness failed to generate labels; the pre-registered criteria cannot be evaluated.**
-
-(The auto-generated verdict in the raw report file shows "FAILS" due to a code path that maps the null case to the failure branch. That is a code bug, not a real finding. The correct characterization is INCONCLUSIVE.)
+Store B is materially cheaper and faster: roughly half the latency and ~40% of the input
+tokens, because claim retrieval feeds the compile model pre-ranked atomic facts instead of
+whole prose guides.
 
 ---
 
-## Narrative — what happened and why
+## §5 Pre-registered read (applied verbatim)
 
-### Label mining returned 0 candidates
+Store B is *promising* if, on the frozen label set:
+- **Probe 1 recall on user-direction labels ≥ Store A** — **PASS** (81.2% vs 62.5%; a loss here would kill the proposal).
+- **Probe 2: strictly fewer stale-assertion leaks than Store A** — **N/A** (no reversals in this corpus/window; not scored).
+- **Probe 3: ≥30% latency reduction** — **PASS** (44% faster at p50).
+- **Briefing coherence: judge flags incoherent/fact-confetti on <20% of B briefings** — **PASS** (0%).
 
-The label miner works as follows: for each of the first 20 FUTURE sessions, it calls the judge LLM with (a) a "HISTORY summary" built from raw transcript text of up to 10 HISTORY sessions (first 800 chars each, ~8,000 chars total) and (b) the FUTURE session transcript (first 3,000 chars). The judge is asked to propose restatement candidates — facts the user re-explained in the FUTURE session that were already established in HISTORY.
-
-**Root cause:** The `build_history_summary` function concatenates raw transcript text. For the `nostr-multi-platform` corpus, the 10 HISTORY sessions contain mostly:
-- Terse one-line user commands ("commit logical commits and push", "run codex exec with hello as the prompt")
-- Large agent-mode sessions where user turns are tool-notification XML blobs
-
-Only ~4,000 chars of substantive, intelligible HISTORY content was presented to the judge. With a history summary of that quality, the judge correctly found nothing worth matching.
-
-The FUTURE sessions (7 agent-mode, 13 human-interactive out of the first 20) were richer in substantive content, but the judge had no history context to match against.
-
-**This is a harness bug in the label miner, not a finding about the architecture under test.** The fix is straightforward: instead of building the history summary from raw transcript text, use the *wiki guide content* of Store A (or Store B) as the history summary. The wiki is precisely the distilled, intelligible representation of what was established — exactly what the judge needs to identify restatements.
-
-### What the claim tap produced (positive signal)
-
-Despite the label mining failure, the claim tap worked correctly:
-
-- 79 claims logged across 10 sessions, with authority tagging (mix of explicit/implicit per session)
-- sqlite-vec embedding table populated in `claims.db`
-- Claim clustering at tau=0.55 functional (multiple clusters formed)
-- Store B and Store A both produced coherent wiki guides from the same sessions
-
-The infrastructure for claims-first injection is in place and functional.
-
-### Methodology limitations (documented per spec §7)
-
-1. **Two EXTRACT passes, not one:** The spec intended the claim tap to sit on the same pipeline run that builds the wiki, so one EXTRACT spend builds both stores. The implementation runs Store B (tap ON) then Store A (tap OFF) as independent passes. This doubles LLM cost for store building and introduces routing variance between stores.
-
-2. **HISTORY cap at 10:** Spec allows ~30. Reduced for cost/time. The 10-session HISTORY produced coherent wiki guides (8-13 guides respectively) so the store contents are reasonable, but a deeper history would give the judge more signal.
-
-3. **Label mining uses raw transcript, not wiki:** As described above, this is the primary harness bug that prevented any labels from being mined. Fix: use wiki guide content as history context.
-
-4. **Corpus skew toward agent-mode sessions:** The `nostr-multi-platform` project uses concurrent agent sessions heavily. Most FUTURE sessions are agent-initiated task specs + tool notifications, not organic human restatements. A more suitable corpus for this probe would be one with long interactive sessions where the user repeatedly explains domain context.
-
-### What to do next
-
-The experiment was a **dry run that proved the infrastructure** but failed to generate labels due to the `build_history_summary` bug. Recommended next steps in priority order:
-
-1. Fix `build_history_summary` to use wiki guide content from Store A instead of raw transcript text.
-2. Re-run label mining only (`--score-only` flag available) against the already-built stores.
-3. Optionally try a different corpus (one with more interactive sessions, less agent-mode).
-4. Once labels are generated, Probe 1 and Probe 3 can be scored on the existing stores without rebuilding.
-
-The claim store infrastructure (claims.rs, claims tap in capture.rs, claims inject path in eval.rs) is committed and correct. The 79 claims and both wiki stores from this run are preserved at:
-- Store B: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/store-b/`
-- Store A: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/store-a/`
+**Overall verdict: PROMISING — all evaluable criteria pass; the kill criterion (user-direction
+recall) is cleared with margin.** The one unmet item (Probe 2) is unmet because the corpus
+lacks the phenomenon, not because Store B failed it.
 
 ---
+
+## Honest caveats
+
+- **Single corpus, single judge, n=37.** This is a directional signal, not proof. The judge
+  is one strong model with the verdict prompt logged; no multi-judge panel (deferred to v2).
+- **Two EXTRACT passes, not one.** The spec intended the claim tap to ride the same pass that
+  builds the wiki (one EXTRACT spend, two stores). The implementation builds Store B then
+  Store A as separate passes — doubling build cost and letting routing non-determinism
+  slightly diverge the two stores' guide sets. The stores are still built from the *same 25
+  HISTORY sessions*, so the comparison is fair, but a true single-pass tap would tighten it.
+- **Label miner is generous by design.** It counts oblique references/questions as
+  restatements; verification is store-representation token-overlap (≥60%) or a 6-word phrase
+  match, which can admit loosely-related facts. Labels are frozen in `labels.jsonl` for audit.
+- **Implicit recall regressed.** B underperforms A on implicit facts (52.4% vs 61.9%). Worth
+  understanding before any rollout — claims retrieval may under-surface inferred-but-unstated
+  observations that prose guides capture in passing.
 
 ## Raw artifacts
 
-- Labels: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/labels.jsonl` (empty — 0 candidates)
-- Probe results: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/probe_results.jsonl` (empty)
-- Store A wiki: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/store-a/`
-- Store B claims: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/store-b/`
-- Split manifest: `/Users/pablofernandez/.proactive-context/experiments/cfv2-20260610-173322/split_manifest.json`
-- Eval log: `/tmp/eval-v2.log`
+- Results (machine copy): `~/.proactive-context/experiments/cfv3-20260610-175752/claims-first-validation-results.md`
+- Frozen labels (37): `…/cfv3-20260610-175752/labels.jsonl`
+- Probe results (per-label briefings + verdicts + timings): `…/cfv3-20260610-175752/probe_results.jsonl`
+- Judge HISTORY context (115 KB): `…/cfv3-20260610-175752/history_context.txt`
+- Store A wiki (23 guides): `…/cfv3-20260610-175752/store-a/`
+- Store B claims (342) + wiki (27 guides): `…/cfv3-20260610-175752/store-b/`
+- Split manifest: `…/cfv3-20260610-175752/split_manifest.json`
+- Run 1 store: `~/.proactive-context/experiments/cfv2-20260610-173322/` (10-session, 0 labels)
+- Eval logs: `/tmp/eval-run3.log` (build), `/tmp/eval-score3.log` (frozen-label scoring)

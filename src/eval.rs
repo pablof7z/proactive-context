@@ -154,19 +154,34 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
     let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
     // Cap future sessions used for label mining to bound LLM cost.
     // Use first 20 FUTURE sessions (chronologically earliest after the split).
-    let future_for_mining = &future_sessions[..future_sessions.len().min(20)];
-    println!("\neval: === MINING LABELS FROM FUTURE ({}/{} sessions, capped at 20) ===", future_for_mining.len(), future_sessions.len());
-    let labels = mine_labels(future_for_mining, history_sessions, &corpus_root, &store_a_dir, &store_b_dir, &judge_model, &exp_dir)?;
-    println!("eval: mined {} verified label(s)", labels.iter().filter(|l| l.verified).count());
-
     let labels_path = exp_dir.join("labels.jsonl");
-    {
+    // Frozen-label reuse: in --score-only mode, if a non-empty labels.jsonl already exists,
+    // load it instead of re-mining.  Mining is the slow phase (~20 judge calls); freezing the
+    // label set also matches the spec's requirement to "freeze the label set before scoring".
+    let reuse_existing = args.score_only && labels_path.exists()
+        && fs::read_to_string(&labels_path).map(|s| !s.trim().is_empty()).unwrap_or(false);
+
+    let labels: Vec<Label> = if reuse_existing {
+        let raw = fs::read_to_string(&labels_path)?;
+        let loaded: Vec<Label> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Label>(l).ok())
+            .collect();
+        println!("\neval: === REUSING FROZEN LABELS ({} from {}) ===", loaded.len(), labels_path.display());
+        loaded
+    } else {
+        let future_for_mining = &future_sessions[..future_sessions.len().min(20)];
+        println!("\neval: === MINING LABELS FROM FUTURE ({}/{} sessions, capped at 20) ===", future_for_mining.len(), future_sessions.len());
+        let mined = mine_labels(future_for_mining, history_sessions, &corpus_root, &store_a_dir, &store_b_dir, &judge_model, &exp_dir)?;
+        println!("eval: mined {} verified label(s)", mined.iter().filter(|l| l.verified).count());
         let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&labels_path)?;
-        for l in &labels {
+        for l in &mined {
             writeln!(f, "{}", serde_json::to_string(l)?)?;
         }
-    }
-    println!("eval: labels written → {}", labels_path.display());
+        println!("eval: labels written → {}", labels_path.display());
+        mined
+    };
 
     // ── SCORE BOTH STORES (Probe 1 + Probe 3 metrics) ─────────────────────
     let verified_labels: Vec<&Label> = labels.iter().filter(|l| l.verified).collect();
@@ -426,47 +441,55 @@ fn mine_labels(
             .unwrap_or("unknown")
             .to_string();
 
-        // Parse the future session.
-        let raw = match fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let turns = match crate::transcript::parse_transcript(&raw) {
+        // Parse the future session.  NOTE: parse_transcript takes a FILE PATH (it reads + parses
+        // the JSONL itself), not raw content.  Passing content here was a bug that silently made
+        // every future session error out and skip — the root cause of the 0-candidate runs.
+        let path_str = path.to_string_lossy().to_string();
+        let turns = match crate::transcript::parse_transcript(&path_str) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let transcript_text = crate::transcript::build_transcript_string(&turns);
-        if transcript_text.len() < 200 {
+        // Extract the user (human) turns specifically.  These sessions often open with a huge
+        // system-style first prompt followed by tool-notification blobs; raw transcript-head
+        // truncation would cut off the actual back-and-forth.  We collect the human turns,
+        // dropping the giant first directive and any tool-notification / command XML.
+        let human_turns = extract_human_turns(&turns);
+        if human_turns.is_empty() {
+            continue;
+        }
+        let future_human = human_turns.join("\n---\n");
+        if future_human.len() < 80 {
             continue;
         }
 
         // Ask the judge to propose restatement candidates.
         let system = format!(
             "You are a label-mining assistant for an evaluation of a context-injection system.\n\
-             Your job: read a FUTURE session transcript and identify RESTATEMENTS — places where \
-             the user re-explains, re-states, or re-corrects something that was already established \
-             in the HISTORY (shown below). These are evidence of missing context injection.\n\n\
+             You are given (1) a HISTORY SUMMARY of facts/decisions already established for a project, \
+             and (2) the USER TURNS from a later FUTURE session.\n\n\
+             Find RESTATEMENTS: any place where a USER TURN relies on, re-asserts, re-explains, \
+             re-corrects, or ASKS ABOUT a fact/decision that the HISTORY SUMMARY already establishes. \
+             Oblique references count — e.g. 'didn't we decide to use outbox?', 'this should follow \
+             the aggregation logic we built', 'use rust-nostr's nip44, don't reimplement'. These are \
+             evidence the user had to re-supply context that good injection would have surfaced.\n\n\
              HISTORY SUMMARY:\n{}\n\n\
-             Output a JSON array of candidates (empty array [] if none found):\n\
+             Output a JSON array (use [] only if you truly find none):\n\
              [\n\
                {{\n\
-                 \"restated_fact\": \"one-sentence description of what the user re-explained\",\n\
-                 \"future_prompt\": \"the exact user prompt just before the restatement\",\n\
-                 \"history_evidence\": \"short quote from history that shows this was already known\",\n\
-                 \"authority\": \"explicit|implicit|unknown\"\n\
+                 \"restated_fact\": \"one sentence: the established fact the user leaned on\",\n\
+                 \"future_prompt\": \"the user turn (verbatim) that did the restating\",\n\
+                 \"history_evidence\": \"a short phrase from the HISTORY SUMMARY proving it was known\",\n\
+                 \"authority\": \"explicit if the user themselves set it; implicit if it emerged from work\"\n\
                }}\n\
              ]\n\
-             Only include candidates where BOTH: (a) the fact is verifiably in HISTORY, AND \
-             (b) the user appears to re-explain it in the FUTURE session.\n\
-             The history_evidence field MUST be a short verbatim quote copied from the HISTORY \
-             SUMMARY above (so it can be machine-verified).\n\
-             Output ONLY the JSON array, nothing else.",
-            history_text.chars().take(12000).collect::<String>()
+             Be generous: a relevant question or assumption about established context IS a restatement. \
+             Output ONLY the JSON array.",
+            history_text.chars().take(14000).collect::<String>()
         );
         let user = format!(
-            "FUTURE SESSION ({}):\n{}\n\nPropose restatement candidates:",
+            "FUTURE SESSION USER TURNS ({}):\n{}\n\nPropose restatement candidates:",
             session_id,
-            transcript_text.chars().take(3000).collect::<String>()
+            future_human.chars().take(4000).collect::<String>()
         );
 
         let raw_response = crate::capture::call_model_blocking(
@@ -518,11 +541,49 @@ fn mine_labels(
     }
 
     println!(
-        "eval: label mining: {} candidates, {} verified (grep-matched in HISTORY)",
+        "eval: label mining: {} candidates, {} verified (matched in store representation)",
         candidate_count,
         labels.iter().filter(|l| l.verified).count()
     );
     Ok(labels)
+}
+
+/// Extract human (user) conversational turns from a parsed transcript.
+///
+/// Filters out: assistant turns, tool-notification / command XML blobs, and the giant
+/// system-style first directive that opens agent-driven sessions.  Keeps the genuine
+/// back-and-forth the human typed — this is where restatements live.
+fn extract_human_turns(turns: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, (role, text)) in turns.iter().enumerate() {
+        if role != "user" {
+            continue;
+        }
+        let t = text.trim();
+        if t.len() < 25 {
+            continue;
+        }
+        // Skip tool-notification / command / caveat XML and image placeholders.
+        let head = t.chars().take(40).collect::<String>().to_lowercase();
+        if head.starts_with('<')
+            || head.contains("<task-notification>")
+            || head.contains("<command-")
+            || head.contains("<local-command")
+            || head.contains("caveat:")
+            || head.starts_with("[image")
+            || head.starts_with("[request interrupted")
+            || t.contains("This session is being continued from a previous conversation")
+        {
+            continue;
+        }
+        // Skip the very first turn if it's a large directive (>1200 chars) — that's the
+        // session bootstrap prompt, not a restatement.
+        if idx == 0 && t.len() > 1200 {
+            continue;
+        }
+        out.push(t.chars().take(600).collect::<String>());
+    }
+    out
 }
 
 /// Build the HISTORY context for the judge from the *captured stores*, not raw transcripts.
