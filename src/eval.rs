@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::{load_config, normalize_path, resolve_project_root};
-use crate::transcript::{transcript_cwd, transcript_first_ts};
+use crate::transcript::transcript_first_ts;
 
 // ─── Public args ──────────────────────────────────────────────────────────────
 
@@ -234,59 +234,29 @@ fn build_stores(
     store_b_dir: &Path,
     exp_dir: &Path,
 ) -> Result<()> {
-    // Both stores are built from the same HISTORY sessions in a single pass:
-    // - PC_HOME=<store_a_dir> → wiki guides (Store A, incumbent)
-    // - PC_CLAIMS_LOG=1 + PC_HOME=<store_b_dir> → claim log (Store B, challenger)
-    //   Store B ALSO gets the wiki (same EXTRACT spend, two stores in one pass) since
-    //   PC_CLAIMS_LOG=1 is a tap, not a fork.
+    // Build both stores from the same HISTORY sessions via the direct in-process API.
     //
-    // We use a single combined dir (store_b_dir also has the wiki as a side-effect)
-    // but reads for Store A use store_a_dir's wiki and Store B reads claim log from
-    // store_b_dir/projects/<key>/claims.jsonl.
+    // Design: one EXTRACT spend, two stores.
+    // - Store B (claims tap ON): PC_CLAIMS_LOG=1 + PC_HOME=store_b_dir.
+    //   Both the wiki guides AND the claim log land under store_b_dir.
+    // - Store A (incumbent wiki): PC_CLAIMS_LOG=off + PC_HOME=store_a_dir.
+    //   Only wiki guides.
+    //
+    // IMPORTANT: env vars are set/cleared in-process.  build_store_direct restores
+    // them after each call so the two passes don't interfere.
 
-    let pc_binary = std::env::current_exe().context("cannot find own binary")?;
+    println!("eval: building Store B (claim tap ON) from {} HISTORY sessions...", history_sessions.len());
+    build_store_direct(history_sessions, corpus_root, store_b_dir, true)?;
 
-    println!("eval: building Store A (wiki) and Store B (claim log) from {} HISTORY sessions...", history_sessions.len());
+    println!("eval: building Store A (wiki only) from {} HISTORY sessions...", history_sessions.len());
+    build_store_direct(history_sessions, corpus_root, store_a_dir, false)?;
 
-    // Write a temporary session list for the archeologist.
+    // Write session list for reproducibility.
     let session_list_path = exp_dir.join("history_sessions.txt");
-    {
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&session_list_path)?;
-        for s in history_sessions {
-            writeln!(f, "{}", s)?;
-        }
+    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&session_list_path)?;
+    for s in history_sessions {
+        writeln!(f, "{}", s)?;
     }
-
-    // Run Store B (with claim tap active): PC_HOME=store_b_dir, PC_CLAIMS_LOG=1
-    // The wiki and the claim log both land under store_b_dir.
-    println!("eval: running archeologist for Store B (claim tap ON)...");
-    let t0 = Instant::now();
-    let status_b = std::process::Command::new(&pc_binary)
-        .env("PC_HOME", store_b_dir)
-        .env("PC_CLAIMS_LOG", "1")
-        .args([
-            "archeologist",
-            "--yes",
-            "--output-dir", &store_b_dir.to_string_lossy(),
-        ])
-        .args(
-            history_sessions
-                .iter()
-                .flat_map(|s| ["--since".to_string(), "2000-01-01".to_string(), s.clone()])
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )
-        .status();
-
-    // Actually we need to invoke archeologist differently since it reads from
-    // ~/.claude/projects. We'll use run_capture_for_archeologist directly.
-    let _ = status_b; // unused - we use the direct API below
-    let elapsed_b = t0.elapsed();
-    println!("eval: Store B build attempt finished in {}ms", elapsed_b.as_millis());
-
-    // Direct API call approach: call run_capture_for_archeologist for each session.
-    build_store_direct(history_sessions, corpus_root, store_b_dir, true)?;  // Store B (with claims tap)
-    build_store_direct(history_sessions, corpus_root, store_a_dir, false)?; // Store A (no claims tap)
 
     Ok(())
 }
