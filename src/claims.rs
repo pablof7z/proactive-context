@@ -57,6 +57,10 @@ pub struct ClaimRecord {
     /// Cluster this claim was assigned to (deterministic cosine matching).
     #[serde(default)]
     pub cluster_id: String,
+    /// Run 6: ids of earlier claims this claim CONTRADICTS/REPLACES (capture-time supersedes
+    /// edges, set by an LLM contradiction-linking pass). Empty if none / edges disabled.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,9 +153,32 @@ fn init_claims_schema(conn: &Connection, dim: usize) -> Result<()> {
 
 // ─── Append a claim ───────────────────────────────────────────────────────────
 
+/// Run 6: capture-time supersedes-edge linker. Holds everything `append_claim` needs to make
+/// ONE small LLM contradiction-linking call. `call` is injected (avoids a claims→capture cycle):
+/// `(system, user) -> model_response`. The closure should call the configured small model.
+pub struct EdgeLinker<'a> {
+    /// `(system_prompt, user_prompt) -> Result<response>`
+    pub call: &'a mut dyn FnMut(&str, &str) -> Result<String>,
+    /// How many similarity candidates to retrieve (suggest 8).
+    pub top_k: usize,
+}
+
+/// True when capture-time supersedes-edge recording is enabled (`PC_CLAIMS_EDGES=1`).
+pub fn claims_edges_enabled() -> bool {
+    std::env::var("PC_CLAIMS_EDGES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Append one claim to the project's claims.jsonl and embed it into claims.db.
 /// Assigns or creates a cluster.  `project_dir` should be the experiment-scoped
 /// project directory (already created by the caller).
+///
+/// When `linker` is `Some`, after writing the claim we retrieve its most similar EXISTING claims
+/// (dual channel: embedding similarity + recency window) and make ONE LLM call asking which, if
+/// any, the new claim CONTRADICTS/REPLACES. Those ids are recorded as `supersedes` edges. This is
+/// a slimmed RECONCILE over the log — contradiction linking only, no prose, no ops.
+#[allow(clippy::too_many_arguments)]
 pub fn append_claim(
     project_dir: &Path,
     embedder: &mut dyn Embedder,
@@ -162,6 +189,7 @@ pub fn append_claim(
     authority: &str,
     evidence_text: &str,
     evidence: &[EvidenceRange],
+    linker: Option<&mut EdgeLinker>,
 ) -> Result<()> {
     let dim = embedder.dimension();
     let db_path = claims_db_path(project_dir);
@@ -172,6 +200,14 @@ pub fn append_claim(
         .embed(&[assertion.to_string()])
         .context("embedding claim assertion failed")?;
     let emb = embs.into_iter().next().context("embedder returned no vectors")?;
+
+    // ── Supersedes-edge detection (Run 6) — BEFORE writing the new claim, so candidates are
+    // strictly EARLIER claims. ─────────────────────────────────────────────────────────────
+    let supersedes: Vec<String> = if let Some(linker) = linker {
+        detect_supersedes(project_dir, &emb, assertion, ts, linker).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // Assign to a cluster (or create a new one).
     let tau: f32 = std::env::var("PC_CLAIMS_TAU")
@@ -190,6 +226,7 @@ pub fn append_claim(
         evidence_text: evidence_text.to_string(),
         evidence: evidence.to_vec(),
         cluster_id: cluster_id.clone(),
+        supersedes,
     };
     let jsonl_path = claims_jsonl_path(project_dir);
     let mut f = OpenOptions::new()
@@ -215,6 +252,139 @@ pub fn append_claim(
     )?;
 
     Ok(())
+}
+
+/// Dual-channel candidate retrieval + LLM contradiction judgment for one new claim.
+/// Returns the ids of earlier claims the new claim supersedes (possibly empty).
+///
+/// Channels (the Run 5 lesson: similarity alone may miss a re-phrased X):
+///   A) embedding similarity — top-K earlier claims by cosine to the new assertion.
+///   B) recency window — the most recent earlier claims regardless of similarity.
+/// The union is judged by the LLM. We also tag which channel surfaced each candidate so the eval
+/// can report edge-recall by channel.
+fn detect_supersedes(
+    project_dir: &Path,
+    new_emb: &[f32],
+    new_assertion: &str,
+    new_ts: &str,
+    linker: &mut EdgeLinker,
+) -> Result<Vec<String>> {
+    let jsonl_path = claims_jsonl_path(project_dir);
+    if !jsonl_path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(&jsonl_path)?;
+    let existing: Vec<ClaimRecord> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<ClaimRecord>(l).ok())
+        .collect();
+    if existing.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Channel A: embedding similarity. We need each existing claim's embedding; recompute from the
+    // db vec store via rowid. Simpler + robust: re-embed is unavailable here (no embedder), so use
+    // the claims.db vec_claims table.
+    let db_path = claims_db_path(project_dir);
+    let conn = open_claims_db(&db_path, new_emb.len())?;
+    let mut sim_scored: Vec<(f32, usize)> = Vec::new();
+    for (idx, c) in existing.iter().enumerate() {
+        let rowid = claim_id_to_rowid(&c.id);
+        let emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM vec_claims WHERE rowid = ?1",
+                params![rowid],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(bytes) = emb {
+            let v = bytes_to_floats(&bytes);
+            if v.len() == new_emb.len() {
+                sim_scored.push((cosine(new_emb, &v), idx));
+            }
+        }
+    }
+    sim_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cand_idx: Vec<usize> = Vec::new();
+    let mut from_sim: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (_, idx) in sim_scored.iter().take(linker.top_k) {
+        cand_idx.push(*idx);
+        from_sim.insert(*idx);
+    }
+
+    // Channel B: recency window — most recent earlier claims by ts (then file order). Add up to
+    // top_k that aren't already present.
+    let mut by_recency: Vec<usize> = (0..existing.len()).collect();
+    by_recency.sort_by(|&a, &b| existing[b].ts.cmp(&existing[a].ts).then(b.cmp(&a)));
+    let mut from_recency: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for idx in by_recency.into_iter().take(linker.top_k) {
+        if !cand_idx.contains(&idx) {
+            cand_idx.push(idx);
+        }
+        from_recency.insert(idx);
+    }
+    if cand_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build the LLM prompt: numbered candidates, ask which the new claim contradicts/replaces.
+    let mut numbered = String::new();
+    for (n, &idx) in cand_idx.iter().enumerate() {
+        let ch = match (from_sim.contains(&idx), from_recency.contains(&idx)) {
+            (true, true) => "sim+recency",
+            (true, false) => "sim",
+            (false, true) => "recency",
+            _ => "?",
+        };
+        numbered.push_str(&format!(
+            "[{}] (id={}, {}, via {}) {}\n",
+            n + 1,
+            existing[idx].id,
+            existing[idx].ts,
+            ch,
+            existing[idx].assertion.chars().take(220).collect::<String>()
+        ));
+    }
+    let system = "You link CONTRADICTIONS between project facts captured over time. You are given a \
+                  NEW claim and a numbered list of EARLIER claims. Identify which earlier claims the \
+                  NEW claim CONTRADICTS or REPLACES — i.e. they describe the SAME fact/decision/config \
+                  but assert a DIFFERENT or now-incorrect value (a reversal). Do NOT mark claims that \
+                  are merely related, adjacent, or about a different aspect. Output ONLY a JSON array \
+                  of the bracket numbers you are confident are superseded, e.g. [2] or [1,4] or [].";
+    let user = format!(
+        "NEW claim ({}): {}\n\nEARLIER claims:\n{}\n\nWhich earlier claims does the NEW claim contradict/replace? JSON array of numbers:",
+        new_ts,
+        new_assertion.chars().take(300).collect::<String>(),
+        numbered
+    );
+
+    let resp = (linker.call)(system, &user)?;
+    // Parse a JSON array of 1-based indices.
+    let picks: Vec<usize> = parse_index_array(&resp);
+    let mut out = Vec::new();
+    for p in picks {
+        if p >= 1 && p <= cand_idx.len() {
+            out.push(existing[cand_idx[p - 1]].id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a JSON-ish array of 1-based integers from a model response, tolerating prose around it.
+fn parse_index_array(resp: &str) -> Vec<usize> {
+    let start = resp.find('[');
+    let end = resp.rfind(']');
+    if let (Some(s), Some(e)) = (start, end) {
+        if e > s {
+            let inner = &resp[s + 1..e];
+            return inner
+                .split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// Deterministic rowid from a UUID-style claim id: take first 15 hex digits → i64.
@@ -475,6 +645,114 @@ pub fn render_clusters_with_supersession(
             let current_emb = embs.first().cloned().unwrap_or_default();
 
             for (idx, old) in cluster.claims[1..].iter().enumerate() {
+                let sim = embs
+                    .get(idx + 1)
+                    .map(|e| cosine(&current_emb, e))
+                    .unwrap_or(0.0);
+                let is_supersession =
+                    sim >= tau_supersede && old.assertion.trim() != current.assertion.trim();
+                let label = if is_supersession { "SUPERSEDED" } else { "RELATED" };
+                out.push_str(&format!(
+                    "   {} ({}): {}\n",
+                    label,
+                    old.ts,
+                    old.assertion.trim()
+                ));
+            }
+        }
+
+        if !current.evidence_text.is_empty() {
+            let snippet: String = current.evidence_text.chars().take(120).collect();
+            out.push_str(&format!("   evidence: \"{}\"\n", snippet.trim()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Edge-aware supersession rendering (Run 6 / proposal §5).
+///
+/// Like `render_clusters_with_supersession`, but SUPERSEDED status comes from the explicit
+/// capture-time `supersedes` edges on the current claim — which cross cluster boundaries, fixing
+/// Run 5's blindspot (7/8 reversals had X and Y in different clusters). For each retrieved
+/// cluster's current claim, any earlier claim it `supersedes` (resolved by id from the whole log,
+/// even if it lives in another cluster) is rendered SUPERSEDED. Within-cluster claims that are NOT
+/// edge-targets fall back to the cosine contradiction gate (SUPERSEDED if highly similar, else
+/// RELATED).
+pub fn render_clusters_with_edges(
+    clusters: &[ClaimCluster],
+    project_dir: &Path,
+    embedder: &mut dyn Embedder,
+    tau_supersede: f32,
+) -> String {
+    if clusters.is_empty() {
+        return String::new();
+    }
+    // Load the whole log once to resolve edge targets by id.
+    let by_id: std::collections::HashMap<String, ClaimRecord> = {
+        let jsonl_path = claims_jsonl_path(project_dir);
+        let content = fs::read_to_string(&jsonl_path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<ClaimRecord>(l).ok())
+            .map(|c| (c.id.clone(), c))
+            .collect()
+    };
+
+    let mut out = String::from(
+        "## CLAIM STORE — supersession-aware timeline\n\n\
+         Each numbered item is one fact's history. The line marked CURRENT is the present truth. \
+         Lines marked SUPERSEDED are earlier versions of that SAME fact that were overridden — when \
+         a fact has SUPERSEDED history, state it as \"current Y (previously X, <date>)\" so the \
+         reader sees both the current truth and what it replaced. Lines marked RELATED are \
+         co-occurring facts in the same topic, not supersessions — present them normally. Never \
+         present a SUPERSEDED line as if it were current.\n\n",
+    );
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        let current = &cluster.claims[0];
+        let authority_tag = if current.authority == "explicit" {
+            "[user direction]"
+        } else {
+            "[agent-inferred]"
+        };
+        out.push_str(&format!(
+            "{}. CURRENT ({}) {}: {}\n",
+            i + 1,
+            current.ts,
+            authority_tag,
+            current.assertion.trim()
+        ));
+
+        // 1) Explicit edges from the current claim (cross-cluster).
+        let mut rendered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sid in &current.supersedes {
+            if let Some(old) = by_id.get(sid) {
+                if old.assertion.trim() != current.assertion.trim() {
+                    out.push_str(&format!(
+                        "   SUPERSEDED ({}): {}\n",
+                        old.ts,
+                        old.assertion.trim()
+                    ));
+                    rendered_ids.insert(sid.clone());
+                }
+            }
+        }
+
+        // 2) Within-cluster fallback (cosine gate) for older claims not already covered by edges.
+        if cluster.claims.len() > 1 {
+            let mut texts: Vec<String> = Vec::with_capacity(cluster.claims.len());
+            texts.push(current.assertion.clone());
+            for old in &cluster.claims[1..] {
+                texts.push(old.assertion.clone());
+            }
+            let embs = embedder.embed(&texts).unwrap_or_default();
+            let current_emb = embs.first().cloned().unwrap_or_default();
+            for (idx, old) in cluster.claims[1..].iter().enumerate() {
+                if rendered_ids.contains(&old.id) {
+                    continue; // already rendered as an explicit edge
+                }
                 let sim = embs
                     .get(idx + 1)
                     .map(|e| cosine(&current_emb, e))

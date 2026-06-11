@@ -1045,19 +1045,27 @@ fn run_claims_inject_for_eval(
     }
 
     // Render clusters as a single "guide" for the compile model.
-    // Run 5: supersession-aware timeline rendering (proposal §5). Toggle off via
-    // PC_CLAIMS_RENDER=legacy to reproduce the Run 4 (Phase-0) flat rendering.
-    let legacy_render = std::env::var("PC_CLAIMS_RENDER")
-        .map(|v| v.eq_ignore_ascii_case("legacy"))
-        .unwrap_or(false);
-    let rendered = if legacy_render {
-        crate::claims::render_clusters_for_compile(&clusters)
-    } else {
-        let tau_supersede = std::env::var("PC_CLAIMS_SUPERSEDE_TAU")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.55);
-        crate::claims::render_clusters_with_supersession(&clusters, embedder.as_mut(), tau_supersede)
+    // Rendering mode (PC_CLAIMS_RENDER):
+    //   legacy      → Run 4 flat "(was: X)" rendering
+    //   supersede   → Run 5 within-cluster cosine contradiction gate
+    //   edges (default) → Run 6 edge-aware (explicit capture-time supersedes edges, cross-cluster,
+    //                     falling back to the within-cluster gate)
+    let render_mode = std::env::var("PC_CLAIMS_RENDER").unwrap_or_else(|_| "edges".to_string());
+    let tau_supersede = std::env::var("PC_CLAIMS_SUPERSEDE_TAU")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.55);
+    let rendered = match render_mode.to_ascii_lowercase().as_str() {
+        "legacy" => crate::claims::render_clusters_for_compile(&clusters),
+        "supersede" => {
+            crate::claims::render_clusters_with_supersession(&clusters, embedder.as_mut(), tau_supersede)
+        }
+        _ => crate::claims::render_clusters_with_edges(
+            &clusters,
+            claims_dir,
+            embedder.as_mut(),
+            tau_supersede,
+        ),
     };
     let tokens_in = rendered.len() / 4 + prompt.len() / 4;
 

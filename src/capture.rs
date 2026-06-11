@@ -1088,6 +1088,14 @@ async fn run_staged_capture(
                         if let Err(e) = std::fs::create_dir_all(cd) {
                             eprintln!("claims: failed to create dir {}: {}", cd.display(), e);
                         } else {
+                            // Run 6: capture-time supersedes-edge linking (PC_CLAIMS_EDGES=1).
+                            let edges_on = claims::claims_edges_enabled();
+                            let edge_spec = crate::provider::ModelSpec::parse(&cfg.capture_model);
+                            let edge_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+                            let edge_ollama_url = cfg.ollama_base_url.clone();
+                            let edge_ollama_key = cfg.ollama_api_key.clone();
+                            let mut edge_calls = 0usize;
+                            let edge_t0 = std::time::Instant::now();
                             for c in &admitted {
                                 let id = format!("{}-{}", ctx.session_id.chars().take(8).collect::<String>(),
                                     sha2_short(&c.assertion));
@@ -1096,6 +1104,26 @@ async fn run_staged_capture(
                                 let ev: Vec<claims::EvidenceRange> = c.evidence.iter()
                                     .map(|r| claims::EvidenceRange { start: r.start, end: r.end })
                                     .collect();
+                                // Build a one-shot LLM-call closure for edge detection.
+                                // This tap runs INSIDE a tokio runtime (run_staged_capture is
+                                // async); call_model_blocking uses reqwest::blocking, which would
+                                // panic ("cannot drop a runtime in an async context"). Wrap it in
+                                // block_in_place so blocking is permitted on the multi-threaded rt.
+                                let mut call = |system: &str, user: &str| -> anyhow::Result<String> {
+                                    edge_calls += 1;
+                                    tokio::task::block_in_place(|| {
+                                        call_model_blocking(
+                                            &edge_spec,
+                                            &edge_api_key,
+                                            &edge_ollama_url,
+                                            edge_ollama_key.as_deref(),
+                                            system,
+                                            user,
+                                        )
+                                    })
+                                };
+                                let mut linker = claims::EdgeLinker { call: &mut call, top_k: 8 };
+                                let linker_opt = if edges_on { Some(&mut linker) } else { None };
                                 if let Err(e) = claims::append_claim(
                                     cd,
                                     embedder.as_mut(),
@@ -1106,11 +1134,19 @@ async fn run_staged_capture(
                                     c.authority,
                                     &evidence_text,
                                     &ev,
+                                    linker_opt,
                                 ) {
                                     eprintln!("claims: failed to append claim: {}", e);
                                 }
                             }
-                            eprintln!("claims: tapped {} claim(s) → {}", admitted.len(), cd.display());
+                            if edges_on {
+                                eprintln!(
+                                    "claims: tapped {} claim(s), {} edge-link call(s) in {}ms → {}",
+                                    admitted.len(), edge_calls, edge_t0.elapsed().as_millis(), cd.display()
+                                );
+                            } else {
+                                eprintln!("claims: tapped {} claim(s) → {}", admitted.len(), cd.display());
+                            }
                         }
                     }
                     Err(e) => eprintln!("claims: could not build embedder: {}", e),

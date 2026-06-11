@@ -1,5 +1,163 @@
 # Claims-First Validation Results
 
+**Runs 3–6 carry the signal.** Run 3 = nostr corpus (claims-first PROMISING). Run 4 =
+proactive-context design corpus (claims-first FAILS; Probe 2 decisive). Run 5 = within-cluster
+supersession rendering (PARTIAL; bottleneck = cross-cluster reversals). **Run 6 = capture-time
+`supersedes` edges** — a slimmed contradiction-linking RECONCILE over the claim log, so reversals
+are linked regardless of cluster. Runs 1–2 were null harness-bug runs.
+**Judge / capture / compile / edge-linker:** `ollama:glm-5.1:cloud`. **Embedder:** local fastembed.
+**Total OpenRouter spend across all six runs: $0.00.**
+
+## Run 6 verdict at a glance
+
+| Probe 2 (8 reversals) | B Run4 (flat) | B Run5 (cluster) | B Run6 (edges) | bar |
+|---|---|---|---|---|
+| asserts current Y | 6/8 | 7/8 | 4/8* | — |
+| leaks stale X (sin) | 2/8 | 1/8 | 2/8* | ≤1/8 |
+| **trajectory X→Y recoverable** | 3/8 | 4/8 | **2/8*** | ≥7/8 |
+
+\* **Run 6's Store A also collapsed** (trajectory 7/8→2/8, current 8/8→3/8) because Store A was
+rebuilt from a corpus that grew by 2 sessions and re-scored by a fresh (non-deterministic) judge
+pass. When BOTH stores move together by ±5/8, the n=8 topline is dominated by store-rebuild + judge
+variance, not the edge mechanism. **The topline is therefore inconclusive; the edge-recall
+diagnostic below is the real result** — and it isolates the failure to edge *detection at EXTRACT
+time*, not rendering.
+
+**Run 6 verdict: FAILS the pre-registered bar (trajectory 2/8 ≪ 7/8), but for a newly-localized
+reason** — the capture-time edge machinery works, yet the canonical reversals were never *captured*
+as contradictions to link.
+
+---
+
+# Run 6 — capture-time supersedes edges
+
+## Edge-detection design (what was built)
+
+At the claim-log tap, after embedding each admitted claim, BEFORE writing it (so candidates are
+strictly earlier), `detect_supersedes` runs:
+1. **Dual-channel candidate retrieval** (the Run-5 lesson — similarity alone can miss a re-phrased
+   X): **(A) embedding similarity** — top-8 earlier claims by cosine to the new assertion;
+   **(B) recency window** — the 8 most recent earlier claims regardless of similarity. The union is
+   judged. Each candidate is tagged with the channel that surfaced it.
+2. **One small LLM call** (the `capture_model`, `block_in_place`-wrapped so the blocking client
+   doesn't panic inside the async capture runtime): "which of these earlier claims does the NEW
+   claim CONTRADICT/REPLACE (same fact, different value), vs merely relate to?" → JSON array of ids.
+3. **Record `supersedes: [ids]`** on the new claim. No prose, no wiki ops — contradiction linking
+   only.
+The renderer (`render_clusters_with_edges`) consumes these explicit edges: a retrieved cluster's
+current claim renders any claim it `supersedes` (resolved by id across the whole log, cross-cluster)
+as SUPERSEDED, falling back to Run 5's within-cluster cosine gate for non-edge older claims.
+
+## Edge-recall diagnostic (the result that matters)
+
+Store B (30 HISTORY sessions): **260 claims, 113 with edges, 167 total edges.** The linker is
+actively recording contradictions across sessions (e.g. "stats is thin" → "stats shows colorized
+daemon status"; "generate uses sonnet" → "inject uses a Haiku/Sonnet two-model split"). But on the
+8 *named* reversals:
+
+| Reversal | X-claims | Y-claims | Edge Y→X? |
+|---|---|---|---|
+| Primary command (generate → inject) | 7 | 1 | **YES** |
+| Capture pipeline (3-step → tool-loop) | 5 | 2 | partial (edge in set) |
+| Inject models (Haiku/Sonnet → Ollama) | 7 | 1 | partial (edge in set) |
+| Capture evidence (free-form → line-ranges) | 0 | 8 | partial (edge in set) |
+| Agent max_tokens (.method → additional_params) | 1 | 1 | NO |
+| Embedding provider (OpenRouter → local) | 4 | 1 | NO |
+| inject_model field (single → split fields) | 1 | 2 | NO |
+| Injection hook (TypeScript → Rust) | 1 | 1 | NO |
+
+**Clean Y→X edges: 1/8; partial 3/8; none 4/8.** The mechanism fires for genuinely contradictory
+reversals (generate removed) but misses 4/8 — and inspecting them reveals WHY:
+
+**The bottleneck moved one layer deeper, from clustering to EXTRACT phrasing.** The decisive
+example is the embedding-provider reversal. The current claim, as EXTRACT captured it, is
+*"Embedding **can** use a local provider (all-MiniLM-L6-v2…)"* — phrased as an **additive
+capability**, alongside an earlier *"OpenRouter embeddings **are supported**"*. Both can be true at
+once, so the edge-linker correctly found **no contradiction** — there is none, as captured. The
+real reversal (the **default** flipped from OpenRouter to local) was flattened by EXTRACT into two
+co-existing capability claims. The TS→Rust hook reversal fails the same way: "hook is in Rust" and
+"hook was in TypeScript" were captured as separate facts whose candidate retrieval / phrasing
+didn't trigger a contradiction verdict. **No amount of edge-linking or rendering can recover a
+reversal that was never captured as one.**
+
+## Probe 2 — full table
+
+| Metric | Store A (Run 6) | Store B (Run 6) | Store A (Run 4 ref) |
+|---|---|---|---|
+| asserts current Y | 3/8 | 4/8 | 8/8 |
+| leaks stale X (sin) | 2/8 | 2/8 | 1/8 |
+| trajectory recoverable | 2/8 | 2/8 | 7/8 |
+
+Store B edges B *ahead of* the rebuilt Store A on current-assertion (4 vs 3) and ties on the rest —
+but both are far below Run 4's Store A, confirming the rebuilt-store + judge-variance confound. The
+edge briefings did surface SUPERSEDED lines for the reversals that HAD edges (generate→inject), but
+not for the 4 that EXTRACT flattened.
+
+## Probe 1 — recall (regression check)
+
+| Cohort | Store A | Store B (Run 6) | Store B (Run 5) |
+|---|---|---|---|
+| ALL (n=42) | 73.8% | 66.7% | 73.8% |
+| Explicit (n=3) | 100% | 66.7% | 33.3% |
+| Implicit (n=39) | 71.8% | 66.7% | 76.9% |
+
+B's overall recall is 66.7% vs Run 5 B's 73.8% — a ~7-point drop, at the edge of the judge-noise
+band (Store A also moved). No catastrophic regression, but the edge timeline did not help recall
+and may slightly crowd the briefing. Treat as "within noise, no gain."
+
+## Probe 3 — operational, including capture-side cost
+
+| Metric | Store A | Store B (Run 6) |
+|---|---|---|
+| inject p50 latency | 3438 ms | 2991 ms |
+| inject p95 latency | 8488 ms | 5880 ms (−31%) |
+| inject tokens in | 182,225 | 69,912 (−62%) |
+
+**Capture-side cost of edges (the new number):** **259 edge-link LLM calls adding 3,898 s
+(65 min) on top of capture** for 30 sessions — roughly **+130 s/session amortized**, but
+front-loaded onto the big design sessions (one 54-claim session spent ~9 min on edge-linking
+alone; a 44-claim session ~9 min). Store B total build went from ~26 min (Run 4, no edges) to
+~82 min (Run 6, with edges) — a **3.1× capture-time cost**. One LLM call per admitted claim is
+expensive at the tail.
+
+## §5 / Run-6 pre-registered bar (applied verbatim)
+
+Run 6 SUCCEEDS iff ALL of:
+- **B trajectory-recoverable ≥ 7/8** — **FAIL** (2/8; topline confounded by store rebuild, but even
+  generously it did not clear the bar).
+- **B stale-leaks ≤ 1/8** — **FAIL** (2/8).
+- **B Probe 1 within judge-noise of Run 5 B (73.8%)** — **MARGINAL** (66.7%, ~7pt down, edge of band).
+- **B p95 latency ≥30% better than A** — **PASS** (31%).
+
+**Run 6 verdict: FAILS the bar.** But the failure mode is now precisely localized and is NOT the
+edge machinery (which works — 167 edges recorded, generate→inject linked and rendered). It is that
+**4/8 canonical reversals were never captured as contradictions**: EXTRACT records the new state as
+an additive capability rather than a replacement, so there is no contradiction for the linker to
+find. The claims-first supersession problem is, at root, an **EXTRACT problem**, not a
+clustering, retrieval, or rendering problem.
+
+## Where this leaves claims-first (Runs 4→5→6 arc)
+
+Three escalating fixes, each localizing the bottleneck one layer deeper:
+- Run 4: flat rendering → trajectory 3/8. Bottleneck hypothesis: rendering.
+- Run 5: within-cluster supersession rendering → 4/8. Found: 7/8 reversals are **cross-cluster**.
+- Run 6: capture-time cross-cluster edges → edges DO form (1 clean + 3 partial of 8), but 4/8
+  reversals were **captured as additive, non-contradictory claims**. Found: the residual failure is
+  **EXTRACT phrasing**.
+
+To actually win Probe 2, claims-first needs EXTRACT to emit *replacement-aware* claims ("the default
+embedder is now X, previously Y") — i.e. supersession awareness must start at extraction, not be
+bolted on after. That is a capture-redesign, beyond this validation's scope. Net: on a
+reversal-heavy design corpus, claims-first does not yet match prose guides on direction-change
+fidelity, and the prose pipeline's reconciliation (which rewrites a guide in place as "current Y,
+was X") remains the stronger substrate for evolving decisions — while claims-first keeps its Run-3
+edge on recurring atomic user direction and its consistent token/latency savings.
+
+---
+
+# Runs 1-5 — prior history
+
+
 **Runs 3–5 carry the signal.** Run 3 = `nostr-multi-platform` (orchestration corpus, claims-first
 PROMISING). Run 4 = `proactive-context` (this repo, design corpus with real reversals; claims-first
 FAILS, Probe 2 the decisive reason). **Run 5 = the fix attempt:** cluster-aware supersession
