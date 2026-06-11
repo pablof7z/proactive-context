@@ -47,6 +47,13 @@ pub struct Config {
     #[serde(default = "default_capture_research")]
     pub capture_research: bool,
 
+    /// Enable the episode-card capture stage: after the normal capture pass, a recognition
+    /// pass generates session-level product movement arc cards under <wiki>/episodes/.
+    /// Default OFF — when off, capture behavior is unchanged.
+    /// See docs/product-spec/session-episode-cards.md for spec details.
+    #[serde(default = "default_capture_episode_cards")]
+    pub capture_episode_cards: bool,
+
     /// Model used for lesson distillation and synthesis (a reasoning task — use a capable model).
     #[serde(default = "default_capture_model")]
     pub capture_model: String,
@@ -207,6 +214,10 @@ fn default_chunk_overlap() -> usize {
 
 fn default_capture_enabled() -> bool {
     true
+}
+
+fn default_capture_episode_cards() -> bool {
+    false // Default OFF — must be validated before enabling
 }
 
 fn default_capture_research() -> bool {
@@ -463,6 +474,7 @@ impl Default for Config {
             chunk_overlap: default_chunk_overlap(),
             capture_enabled: default_capture_enabled(),
             capture_research: default_capture_research(),
+            capture_episode_cards: default_capture_episode_cards(),
             capture_model: default_capture_model(),
             capture_triage_model: default_capture_triage_model(),
             // Observability
