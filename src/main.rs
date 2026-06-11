@@ -9,6 +9,7 @@ mod awareness;
 mod capture;
 mod claims;
 mod eval;
+mod eval_run7;
 mod session_start;
 mod chunker;
 mod config;
@@ -377,6 +378,12 @@ enum Commands {
         #[arg(long)]
         probe3_only: bool,
 
+        /// Run 7: score five inject sources (A wiki+SELECT, B claims, C raw-transcript RAG,
+        /// D projection-from-log wiki, E SELECT-less wiki) within one run against the frozen
+        /// labels/reversals in --experiment-dir. Builds Stores C and D in place; reuses A/B.
+        #[arg(long)]
+        run7: bool,
+
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
@@ -717,6 +724,7 @@ fn main() -> Result<()> {
             experiment_dir,
             score_only,
             probe3_only,
+            run7,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -726,6 +734,7 @@ fn main() -> Result<()> {
                 experiment_dir,
                 score_only,
                 probe3_only,
+                run7,
                 judge_model,
             })?;
         }

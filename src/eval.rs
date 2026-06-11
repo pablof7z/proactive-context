@@ -29,19 +29,20 @@ pub struct EvalArgs {
     pub experiment_dir: Option<PathBuf>,
     pub score_only: bool,
     pub probe3_only: bool,
+    pub run7: bool,
     pub judge_model: Option<String>,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Label {
-    future_session: String,
-    future_prompt: String,
-    restated_fact: String,
-    history_evidence: String,
-    authority: String, // "explicit" | "implicit" | "unknown"
-    verified: bool,
+pub(crate) struct Label {
+    pub(crate) future_session: String,
+    pub(crate) future_prompt: String,
+    pub(crate) restated_fact: String,
+    pub(crate) history_evidence: String,
+    pub(crate) authority: String, // "explicit" | "implicit" | "unknown"
+    pub(crate) verified: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,12 +64,12 @@ struct ProbeResult {
 /// A mined direction reversal: the user/work established `old_direction` (X), then later
 /// overrode it with `new_direction` (Y). `query` is an on-topic prompt to probe both stores.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Reversal {
-    topic: String,
-    old_direction: String, // X — the superseded decision
-    new_direction: String, // Y — the current truth
-    query: String,         // on-topic probe prompt
-    verified: bool,        // both X and Y findable in the store representation
+pub(crate) struct Reversal {
+    pub(crate) topic: String,
+    pub(crate) old_direction: String, // X — the superseded decision
+    pub(crate) new_direction: String, // Y — the current truth
+    pub(crate) query: String,         // on-topic probe prompt
+    pub(crate) verified: bool,        // both X and Y findable in the store representation
 }
 
 /// Probe 2 scoring for one reversal against one store.
@@ -112,6 +113,13 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
     fs::create_dir_all(&exp_dir)
         .with_context(|| format!("failed to create experiment dir {}", exp_dir.display()))?;
     println!("eval: experiment dir = {}", exp_dir.display());
+
+    // Run 7: five-source within-run comparison over the frozen labels/reversals in exp_dir.
+    if args.run7 {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        return crate::eval_run7::run_run7(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg);
+    }
 
     // Dirs for each store's output under the experiment dir.
     let store_a_dir = exp_dir.join("store-a");  // wiki guides (incumbent)
@@ -693,7 +701,7 @@ fn extract_human_turns(turns: &[(String, String)]) -> Vec<String> {
 ///
 /// We concatenate BOTH so that a mined label's fact is, by construction, present in the
 /// representation of at least one store — making the label fair to score against both stores.
-fn build_history_context_from_stores(
+pub(crate) fn build_history_context_from_stores(
     store_a_dir: &Path,
     store_b_dir: &Path,
     project_key: &str,
@@ -911,7 +919,7 @@ fn score_probes(
 
 /// Run the wiki-guide inject path for a single prompt.
 /// Returns (briefing_text, tokens_in, tokens_out).
-fn run_wiki_inject(
+pub(crate) fn run_wiki_inject(
     prompt: &str,
     wiki_dir: &Path,
     compile_spec: &crate::provider::ModelSpec,
@@ -1006,7 +1014,7 @@ fn run_wiki_inject(
 
 /// Run the claims-inject path for a single prompt.
 /// Returns (briefing_text, tokens_in, tokens_out).
-fn run_claims_inject_for_eval(
+pub(crate) fn run_claims_inject_for_eval(
     prompt: &str,
     claims_dir: &Path,
     compile_spec: &crate::provider::ModelSpec,
@@ -1102,7 +1110,7 @@ fn run_claims_inject_for_eval(
 
 /// Ask the judge model: does `briefing` contain `fact`?
 /// Returns "contained" | "partial" | "absent".
-fn judge_briefing(
+pub(crate) fn judge_briefing(
     briefing: &str,
     fact: &str,
     judge_spec: &crate::provider::ModelSpec,
@@ -1301,7 +1309,7 @@ fn score_probe2(
 }
 
 /// Judge one briefing against one reversal. Returns (asserts_current_Y, leaks_stale_X, trajectory_recoverable).
-fn judge_probe2(
+pub(crate) fn judge_probe2(
     briefing: &str,
     rev: &Reversal,
     judge_spec: &crate::provider::ModelSpec,
@@ -1617,7 +1625,7 @@ fn count_verdicts_refs(results: &[&ProbeResult], is_a: bool) -> (usize, usize, u
     count_verdicts(&owned, is_a)
 }
 
-fn percentiles(vals: &[u64]) -> (u64, u64) {
+pub(crate) fn percentiles(vals: &[u64]) -> (u64, u64) {
     if vals.is_empty() {
         return (0, 0);
     }

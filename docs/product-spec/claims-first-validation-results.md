@@ -1,5 +1,176 @@
 # Claims-First Validation Results
 
+**Run 7 completes the design space.** Runs 3–6 compared two sources (A wiki vs B claims). Run 7
+adds the three baselines never tested — **C raw-transcript RAG** (the null hypothesis: no
+distillation), **D projection-from-log wiki** (the untested original proposal: offline-compile a
+wiki from the claim log seeing all of a topic's claims at once), **E SELECT-less wiki** (does the
+SELECT call earn its cost?) — and scores all five WITHIN ONE RUN per corpus against the SAME frozen
+labels with the SAME judge (the P4 fix: no cross-run number comparisons). Headline surprise: on
+recall, **raw-transcript RAG (C) ties or beats every distilled source** on both corpora, and the
+**projection wiki (D) is the worst source** — distillation's recall value-add is, on these corpora,
+unproven. Capture/inject/judge/projection model: `ollama:glm-5.1:cloud`. Embedder: local fastembed.
+**Total OpenRouter spend across all seven runs: $0.00.**
+
+---
+
+# Run 7 — five-source within-run comparison
+
+## What each source is
+
+| Src | Source | Build LLM cost | Inject path |
+|---|---|---|---|
+| A | wiki + SELECT (live incumbent) | reuses Store A | catalog → 1 fast SELECT call → load picked guides → COMPILE |
+| B | claims (Run-6 store, edge-aware) | reuses Store B | retrieve top clusters → edge-aware render → COMPILE |
+| C | raw-transcript RAG (NULL) | **0 calls** | chunk HISTORY transcripts, embed, retrieve top-N chunks → COMPILE |
+| D | projection-from-log wiki | 1 call / topic group | group Store-B claims by cluster, offline-compile a guide per group ("current Y, was X") → SELECT-less wiki inject |
+| E | wiki, SELECT-less | reuses Store A | top-N guides by vector similarity (NO SELECT call) → COMPILE |
+
+**Method (P4 judge-noise fix):** A,B,C,D,E are scored in ONE pass per corpus, same judge, same
+frozen labels/reversals. All comparisons below are WITHIN-RUN. Two benchmark corpora:
+**pc** (proactive-context, 30 HISTORY sessions, 42 frozen labels, 8 frozen reversals) and
+**wallet** (nostr-multi-platform, 25 HISTORY sessions, 37 frozen labels incl. 16-explicit cohort,
+no reversals). Code: `src/eval_run7.rs` (`pc eval --run7`), reusing the Run-6 inject building blocks.
+
+## Probe 1 — recall (the decisive table)
+
+**pc corpus (n=42; 3 explicit / 39 implicit):**
+
+| Src | ALL | EXPLICIT (n=3) | IMPLICIT (n=39) |
+|---|---|---|---|
+| A wiki+SELECT | 61.9% | 66.7% | 61.5% |
+| B claims | 76.2% | 66.7% | 76.9% |
+| **C raw RAG** | **81.0%** | **100%** | **79.5%** |
+| D projection | 54.8% | 66.7% | 53.8% |
+| E wiki SELECT-less | 73.8% | 100% | 71.8% |
+
+**wallet corpus (n=37; 16 explicit / 21 implicit):**
+
+| Src | ALL | EXPLICIT (n=16) | IMPLICIT (n=21) |
+|---|---|---|---|
+| A wiki+SELECT | 67.6% | 81.2% | 57.1% |
+| B claims | 73.0% | **93.8%** | 57.1% |
+| **C raw RAG** | **73.0%** | 81.2% | **66.7%** |
+| D projection | 54.1% | 62.5% | 47.6% |
+| E wiki SELECT-less | 64.9% | 75.0% | 57.1% |
+
+Reads:
+- **C (raw RAG) is the best or tied-best recall source on BOTH corpora** (pc 81.0% sole best;
+  wallet 73.0% tied with B). No compile errors; C's edge sits mostly in the *partial* bucket
+  (pc: 22 partial / 12 contained) — it surfaces more facts but more loosely than B (18/14).
+- **B (claims) owns the explicit cohort** — wallet 93.8% vs everyone else ≤81% — confirming the
+  Run-3 finding that the claim log is strongest on recurring, atomic, user-stated direction.
+- **D (projection) is the WORST source on both corpora** (54.8% / 54.1%).
+
+## Probe 2 — direction-change fidelity (pc corpus, 8 reversals)
+
+| Src | asserts current Y | leaks stale X (sin) | trajectory X→Y |
+|---|---|---|---|
+| A wiki+SELECT | 3/8 | 1/8 | 1/8 |
+| B claims | 5/8 | 1/8 | **3/8** |
+| C raw RAG | 5/8 | 3/8 | 2/8 |
+| D projection | 4/8 | 4/8 | 2/8 |
+| E wiki SELECT-less | 4/8 | 3/8 | 2/8 |
+
+Trajectory is low and noisy across all five (best = B at 3/8; pre-registered bar was ≥7/8). **No
+source recovers direction-change reliably** — consistent with Run 6's diagnosis that the reversals
+were never *captured* as contradictions. C and D *leak stale X* most (3/8, 4/8): raw chunks and
+fragmented projected guides both re-state superseded values as current. B leaks least (1/8) and
+leads trajectory — the edge-aware claim store remains the least-bad on direction change, but still
+far below the bar.
+
+## Operational (per-inject, within-run)
+
+**pc:**
+
+| Src | p50 ms | p95 ms | tok_in (Σ) | tok_out (Σ) | build |
+|---|---|---|---|---|---|
+| A | 5326 | 12380 | 108,681 | 8,691 | reuses A |
+| B | 2181 | 13283 | 69,912 | 9,125 | reuses B |
+| C | 2661 | 14406 | 62,404 | 9,458 | 986 chunks, **0 LLM**, 29s |
+| D | 3499 | 10102 | 70,851 | 11,330 | 151 guides, **151 LLM**, 780s |
+| E | 2602 | 12580 | 182,225 | 11,227 | reuses A |
+
+**wallet:**
+
+| Src | p50 ms | p95 ms | tok_in (Σ) | tok_out (Σ) | build |
+|---|---|---|---|---|---|
+| A | 5350 | 11421 | 151,995 | 6,796 | reuses A |
+| B | 1873 | 6159 | 61,999 | 5,232 | reuses B |
+| C | 3142 | 14718 | 58,938 | 9,901 | 2247 chunks, **0 LLM**, 109s |
+| D | 3998 | 6722 | 69,993 | 8,048 | 192 guides, **192 LLM**, 453s |
+| E | 2588 | 6385 | 143,250 | 8,102 | reuses A |
+
+Coherence: zero `(compile error)`/empty-placeholder briefings on any source, either corpus.
+
+## The three pre-registered verdicts (applied verbatim)
+
+**C — null hypothesis.** Pre-read: *if C is within 5pt of the best store on within-run P1,
+distillation's value-add is in question — report loudly either way.*
+→ **C IS the best (pc) or tied-best (wallet).** This fires the loud-report clause: **on recall,
+zero-LLM raw-transcript RAG matches or beats every distilled source on both corpora.** Distillation
+(wiki OR claims) does not buy recall here; its only defensible advantages are (a) B's explicit-cohort
+dominance and lower stale-leak on Probe 2, and (b) much smaller, auditable artifacts. **C P2 fails as
+expected** (trajectory 2/8, leaks stale 3/8) — raw chunks have no supersession mechanism and re-assert
+old values. So: raw RAG is a genuine, cheap recall baseline that distillation must beat on
+*fidelity/freshness*, not recall — and only B (claims) clears even that, and only marginally.
+
+**D — projection-from-log wiki.** SUCCEEDS iff trajectory(D) ≥ trajectory(A)−1 AND P1(D) within
+noise of P1(B).
+→ Trajectory half PASSES (D 2/8 ≥ A 1/8 − 1). **P1 half FAILS decisively** (D 54.8% vs B 76.2% on
+pc; 54.1% vs 73.0% on wallet — ~20pt gaps, far outside noise). **D FAILS on both corpora.** Root
+cause (diagnosed from briefings): projection inherits the claim store's **over-fragmentation** — pc
+Store B has 151 clusters of which **102 are singletons**, so D emits 151 mostly-single-claim guides;
+SELECT-less vector retrieval then picks ONE narrow guide and COMPILE sees only that, starving recall.
+The original proposal's premise (coherent topic groups seen side-by-side) doesn't hold because the
+clustering is too granular. Projection does NOT reopen with losslessness intact — it would first
+need topic consolidation (doctor-style clustering) before projection.
+
+**E — SELECT-less wiki.** SUCCEEDS iff p95(E) ≥ 30% better than A's SELECT path AND P1(E) within
+noise of P1(A).
+→ **Corpus-dependent — FAILS on pc, PASSES on wallet.** pc: E p95 12580 vs A 12380 = **−2%** (tied,
+fails the latency bar) — and E's tok_in is HIGHER than A's (182k vs 109k) because SELECT-less loads
+more/bigger guides, so the SELECT call was doing useful pruning. wallet: E p95 6385 vs A 11421 =
+**44% faster** AND P1 within noise (64.9% vs 67.6%) → **E PASSES on wallet.** The split is structural:
+when Store A has few large guides (pc), dropping SELECT just dumps more tokens into COMPILE (no p95
+win); when it has many guides (wallet, more catalog entries), SELECT's pruning saves a call AND
+tokens, so SELECT-less is both faster and competitive. **Verdict: the SELECT call earns its cost
+only on small/few-guide wikis; on large multi-guide wikis it is removable for a real latency win.**
+
+## What surprised me
+
+1. **The null hypothesis won recall.** I expected raw-transcript RAG to be a floor; it's the
+   ceiling for recall on both corpora. Distillation's job, empirically, is fidelity/freshness and
+   compactness — NOT recall. That reframes the whole program: stop optimizing distilled-recall vs
+   raw; optimize the thing raw can't do (supersession), where everything still fails the bar.
+2. **Projection was the worst, for a structural reason no one had measured:** the claim store is
+   ~2/3 singleton clusters, so "group by cluster" yields a shattered wiki. The proposal implicitly
+   assumed clustering produced topics; it produces fragments.
+3. **E's verdict flipped by corpus** — the SELECT call is dead weight on pc but valuable on wallet.
+   A single-corpus eval would have given the wrong answer; the within-run, two-corpus design caught it.
+4. **Probe 2 is a wall for every architecture tested.** Best trajectory across all five sources and
+   both the cluster-render and projection approaches is 3/8 (B). Direction-change fidelity is not a
+   rendering or projection problem — it is, as Run 6 found, an EXTRACT problem, and Run 7 confirms no
+   downstream source recovers what EXTRACT flattened.
+
+## Net for the program (Runs 3→7)
+
+- **Recall:** raw RAG ≥ claims ≥ SELECT-less wiki ≥ wiki+SELECT ≫ projection. Distillation does not
+  improve recall on these corpora.
+- **Explicit/recurring user direction:** claims (B) win clearly (wallet 93.8%).
+- **Direction-change fidelity:** everyone fails the bar; B is least-bad; the fix is upstream at EXTRACT.
+- **Operational:** B and C are the cheapest to serve; C is free to build; SELECT is removable on
+  large wikis (E) but not small ones.
+- **Recommendation:** keep the claim log (B) for explicit-direction recall and lowest stale-leak;
+  treat raw-transcript RAG (C) as the recall baseline any distillation must beat on *fidelity*, not
+  recall; **shelve projection-from-log (D) until topic consolidation precedes it**; make the SELECT
+  call conditional on wiki size (drop it when guide-count is small). Direction-change remains the
+  open problem and must be attacked at EXTRACT (replacement-aware extraction), per Run 6.
+
+---
+
+# Runs 1-6 — prior history
+
+
 **Runs 3–6 carry the signal.** Run 3 = nostr corpus (claims-first PROMISING). Run 4 =
 proactive-context design corpus (claims-first FAILS; Probe 2 decisive). Run 5 = within-cluster
 supersession rendering (PARTIAL; bottleneck = cross-cluster reversals). **Run 6 = capture-time
