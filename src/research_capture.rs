@@ -388,10 +388,20 @@ fn call_recognition(
     // Strategy: pass full transcript up to a generous limit; if it exceeds that, take the
     // first 10K (for session framing/method) and the last 80K (where reports usually land).
     let transcript_excerpt = if numbered_transcript.len() > 90000 {
+        // Clamp both cut points to char boundaries — byte slicing panics inside
+        // multi-byte chars (hit in production on a '✓' at the tail cut).
+        let mut head_end = 10000;
+        while !numbered_transcript.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = numbered_transcript.len() - 80000;
+        while !numbered_transcript.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
         format!(
             "{}\n\n[... early middle truncated for length, resuming below ...]\n\n{}",
-            &numbered_transcript[..10000],
-            &numbered_transcript[numbered_transcript.len() - 80000..]
+            &numbered_transcript[..head_end],
+            &numbered_transcript[tail_start..]
         )
     } else {
         numbered_transcript.to_string()
