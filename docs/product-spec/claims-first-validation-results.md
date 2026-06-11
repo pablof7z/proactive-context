@@ -1,5 +1,199 @@
 # Claims-First Validation Results
 
+**Run 9 — the big swing — lands two breakthroughs.** (1) **delta-EXTRACT** moves contradiction
+judgment INTO extraction (with the transcript in view), and it captures **6/8 frozen reversals as
+correct-target `supersedes` edges** — where Run 6's post-hoc blind linker got 1/8 clean — lifting
+the claim store's Probe-2 trajectory from 2/8 to **5/8**. (2) **Episode cards** (the merged
+`pc episodes` source) are the **best direction-change source in the whole program: 6/8 trajectory
+and 0/8 stale-leaks**. Both are real wins against the problem Runs 5-8 could not crack. The costs:
+delta-EXTRACT's build is 2.19× plain-B (over the 1.3× budget), its supersedes precision is 0.79 (at
+the bar, 3/14 over-mints), it does NOT improve recall or correction-prediction, and the wiki+cards
+combo does not dominate both parents on recall. Within-run only (P4), pc corpus, frozen labels/
+reversals reused. All Ollama (glm-5.1:cloud). **Total OpenRouter spend across all nine runs: $0.00.**
+
+---
+
+# Run 9 — delta-EXTRACT + episode cards
+
+Code: `src/capture.rs` (delta-EXTRACT, flagged `PC_DELTA_EXTRACT`), `src/claims.rs`
+(`build_digest`, `append_claim_typed`, `confirm_claim`, `ClaimRecord.confirmed_ts`),
+`src/eval_run9.rs` (`pc eval --run9`). Six sources scored in one within-run sweep:
+A (wiki SELECT-less), B (plain claims, Run-6 edges), **Bd (B-delta)**, C (raw RAG),
+**F (episode cards-only)**, **AF (wiki+cards)**. Pre-registered criteria written and persisted
+before scoring (`run9-preregistered-reads.md`).
+
+## Phase A — what delta-EXTRACT does
+
+Before EXTRACT, `build_digest` recalls the top-relevant EXISTING claims (dual channel: embedding
+similarity ∪ recency, capped at a 24-claim attention budget) WITH their ids — the store-state at
+that point in the chronological replay. delta-EXTRACT then emits **typed ops**
+`{assertion, type: new|confirms|supersedes|refines, target, evidence}`, judging the relationship to
+the digest **with the transcript in view** — the structural difference from Run 6's linker, which
+judged contradictions post-hoc, blind to the conversation. Rust enforces integrity-by-construction:
+a target must be a digest id, else the op demotes to `new` (never dropped). `supersedes` records a
+Run-6-schema edge directly (renderer already consumes it); `confirms` bumps a new `confirmed_ts`.
+Over the 30-session replay: **172 claims, 14 supersedes edges, 0 demoted (perfect target
+integrity), 1 confirmed.** Contrast Run 6's post-hoc linker: 167 edges — delta-EXTRACT mints **12×
+fewer** edges, far more selectively.
+
+## Phase B — the 8-reversal op diagnostic (CRITERION 1)
+
+Per frozen reversal, did a delta `supersedes` op fire with the CORRECT target (the prior claim X it
+replaced)? Matched by bidirectional keyword overlap of the actual edge's (new, old) assertions to
+the reversal's (new_direction, old_direction).
+
+| reversal | delta op | target |
+|---|---|---|
+| Embedding provider | **supersedes** | correct (→ "OpenRouter embeddings are implemented") |
+| Primary command architecture | **supersedes** | correct (→ inject_model deprecated / generate removed) |
+| Capture pipeline architecture | **supersedes** | correct (→ "staged EXTRACT→AUTHORITY→ROUTE→RECONCILE") |
+| Inject model config fields | **supersedes** | correct (→ "inject_model field has been REMOVED") |
+| Inject pipeline models | **supersedes** | correct (→ "config roles are inject_select_model…") |
+| Capture evidence format | **supersedes** | correct (→ "evidence uses relevant_transcript…") |
+| Agent max_tokens configuration | new (no edge) | missing — prior X not in digest that session |
+| Injection hook impl language (TS→Rust) | new (no edge) | missing — prior X not in digest that session |
+
+**→ 6/8 correct-target supersedes → CRITERION 1 PASSES (≥6/8).** This is the headline. The same
+reversals that defeated the Run-6 post-hoc linker (1/8 clean) are captured correctly when the
+judgment happens inside extraction with the transcript present. The 2 misses are **digest-recall**
+failures (the prior X wasn't surfaced in that session's 24-claim digest), not extraction failures —
+pointing at digest budget/recall as the next lever, not the op mechanism.
+
+*(Implementation note: the in-Rust diagnostic's first matcher under-counted (one-sided best-match
+picked wrong claims, reported 0/8); fixed to score the ACTUAL edges bidirectionally, which credits
+the real 6/8. The corrected matcher is in `diagnose_reversal_ops`; artifact `run9_op_diagnostic.json`.)*
+
+## Phase B — anchoring guardrail (CRITERION 2)
+
+**2a — recall not suppressed:** Probe 1 (within-run): plain-B 73.8%, **B-delta 71.4%** (−2.4pt, within
+judge noise) → **PASS.** Anchoring the extractor to the digest did NOT make it suppress real new
+facts.
+
+**2b — supersedes precision:** sampled all 14 edges, LLM-verified each against the assertions:
+**11 genuine / 14 → precision 0.79** (over-mint 0.21) → **MARGINAL** (bar 0.80; one sample short).
+The 3 over-mints link vaguely-related-but-distinct subjects (e.g. "wiki model replaces
+PRODUCT_MODEL.md" mis-targeting a "schema_version" claim). Honest read: precision is at the bar, not
+comfortably above it — delta-EXTRACT is far more precise than Run 6's linker but still over-links
+~1-in-5.
+
+## Phase B — Probe 2 end-to-end (CRITERION 3) & the full Probe 2 table
+
+| source | asserts_current | leaks_stale (sin) | **trajectory** |
+|---|---|---|---|
+| A wiki | 2/8 | 2/8 | 1/8 |
+| B claims (Run-6 edges) | 5/8 | 2/8 | 2/8 |
+| **Bd (delta-EXTRACT)** | **6/8** | 3/8 | **5/8** |
+| C raw RAG | 5/8 | 2/8 | 2/8 |
+| **F cards** | **6/8** | **0/8** | **6/8** |
+| AF wiki+cards | 5/8 | 1/8 | 5/8 |
+
+**B-delta trajectory 5/8 vs plain-B 2/8** — a 2.5× lift; delta-EXTRACT's edges flow through the
+renderer and let a reader recover X→Y. But **leaks_stale 3/8 > plain-B's 2/8** (one extra leak), so
+the conjunctive criterion ("trajectory↑ AND leak≤") technically **FAILS by one leak** — even though
+the trajectory gain is the largest the claim store has ever shown. The extra leak comes from the
+3 over-mint edges surfacing a stale value as if current.
+
+## Phase C — episode cards (CRITERIA 6 & 7)
+
+Generated 52 cards from the 30 HISTORY sessions (9 routine no-ops, as expected). Cards-only (F) and
+wiki+cards (AF) injected like any wiki source (top-N by title/salience cosine → COMPILE).
+
+**CRITERION 6 — cards improve Probe 2 without stale regression:** F trajectory **6/8 > plain-B 2/8**
+AND F leaks_stale **0/8 ≤ A's 2/8** → **PASS, emphatically.** Episode cards are the single best
+direction-change source in the program: highest trajectory (6/8) and the ONLY source that never
+leaks a stale value (0/8). Cards narrate an arc ("we changed X to Y because…"), so supersession is
+intrinsic to the form — recognition already recovered 3/3 fixtures; this shows the benefit survives
+through INJECTION.
+
+**CRITERION 7 — wiki+cards as product config:** AF must beat BOTH parents on P1 recall AND P2
+trajectory. P1: AF 76.2% < wiki-A 78.6% (loses recall to the wiki parent); P2 trajectory: AF 5/8 ≫
+A 1/8 and ≈ F 6/8. → **FAILS** the "dominates both parents" bar: combining dilutes wiki's recall
+(half the guide budget goes to cards) while inheriting most of cards' trajectory. AF is a
+*trajectory-strong, recall-slightly-weaker* blend, not a strict improvement on both axes.
+
+## Predict-the-correction (CRITERION 4) — 25 frozen Run-8 corrections, A vs B vs Bd
+
+| source | predicted | partial | missed | weighted |
+|---|---|---|---|---|
+| A wiki | 1/25 | 5/25 | 19/25 | 3.5 |
+| B plain claims | 2/25 | 5/25 | 18/25 | **4.5** |
+| Bd delta | 0/25 | 7/25 | 18/25 | 3.5 |
+
+**B-delta does NOT improve principal-modeling — it slightly regresses** (3.5 vs plain-B 4.5) →
+**CRITERION 4 FAILS.** Freshness edges + confirms timestamps help direction-change *recovery* but
+not *prediction* of the next correction; the leaner delta store (172 vs plain-B's denser log) may
+carry marginally less raw preference signal. Predicting corrections remains hard for all (~72%
+missed), consistent with Run 8.
+
+## Cost (CRITERION 5)
+
+| build | wall-time (30 sessions) |
+|---|---|
+| B-delta (delta-EXTRACT, claims-only) | **1963 s** |
+| plain-B claims-only reference (same run) | 897 s |
+| ratio | **2.19×** |
+| episode cards | 494 s |
+
+**CRITERION 5 FAILS (2.19× > 1.3×).** Even after skipping the redundant regular EXTRACT and the
+wiki pipeline (claims-only short-circuit), delta-EXTRACT is 2.19× plain-B. The overhead is NOT a
+per-claim LLM call (there is none) — it is (a) the per-session digest embedding pass (embeds ALL
+existing assertions, growing to 172) and (b) the larger delta-EXTRACT prompt (digest block +
+transcript) running slower on the cloud model. Both are optimizable (cache assertion embeddings;
+cap digest tokens harder), but as built it misses the budget.
+
+## The pre-registered verdicts (verbatim)
+
+1. **Op diagnostic ≥6/8 correct supersedes → PASS (6/8).** delta-EXTRACT solves the reversal-capture
+   problem that the post-hoc linker (Run 6) could not.
+2. **Anchoring guardrail.** 2a recall-within-noise → **PASS** (−2.4pt). 2b precision ≥0.80 →
+   **MARGINAL** (0.79; 3/14 over-mints).
+3. **Probe 2 (trajectory↑ AND leak≤) → FAIL by one leak** — trajectory 5/8 vs 2/8 (huge win) but
+   leaks 3/8 vs 2/8 (one worse), so the conjunction fails. The trajectory result is the substantive
+   finding.
+4. **Predict-the-correction Bd≥plain-B → FAIL** (3.5 vs 4.5).
+5. **Cost ≤1.3× → FAIL** (2.19×).
+6. **Cards trajectory>plain-B AND leak≤A → PASS** (6/8 vs 2/8; 0/8 ≤ 2/8) — emphatic.
+7. **wiki+cards dominates both parents → FAIL** (loses P1 recall to wiki-A: 76.2 vs 78.6).
+
+## What surprised me
+
+1. **Moving the judgment into EXTRACT changed everything for supersedes.** Same model, same
+   reversals: post-hoc blind linking got 1/8; in-context typed ops got 6/8. The transcript context
+   at judgment time is the active ingredient — the store can't reconstruct "the user changed their
+   mind here" after the fact, but it's obvious while reading the turn. This is the program's
+   clearest mechanism result.
+2. **delta-EXTRACT mints 12× FEWER edges than the post-hoc linker (14 vs 167) yet recovers MORE
+   reversals.** Run 6's linker was firing constantly and mostly wrong; delta is sparse and mostly
+   right. Precision and recall moved together, against my expectation that fewer edges = lower recall.
+3. **Episode cards beat every claims architecture on direction change — and never leak stale.** The
+   narrative card form encodes supersession for free (0/8 leaks is unique). The whole Runs 5-9 arc
+   chased supersession inside the claim store; the card, which narrates the arc, gets it structurally.
+4. **The two wins don't compose into a free lunch.** B-delta wins trajectory but adds a leak and
+   costs 2.19×; cards win trajectory cleanly but the wiki+cards blend trades away recall. The
+   product question isn't "which one" but "cards for direction-change + something else for recall,"
+   and the naive 50/50 blend isn't it.
+
+## Net for the program (Runs 3→9)
+
+- **Recall:** raw-RAG (C, 83%) ≥ wiki-A (79%) ≥ plain-B (74%) ≈ B-delta (71%) > cards-F (62%). Cards
+  are weak at flat-fact recall (they narrate arcs, not facts).
+- **Direction-change (the long-unsolved problem):** **cards-F (6/8 traj, 0 leak) > B-delta (5/8) >
+  everything prior (≤2/8).** Two independent fixes finally clear it — one inside the claim store
+  (delta-EXTRACT), one outside it (narrative cards).
+- **Principal-modeling (predict-the-correction):** plain-B still best (4.5); delta did not help.
+- **Recommendation:** ship **episode cards as the direction-change/supersession substrate** (cleanest
+  Probe 2, recognition+injection both validated). Adopt **delta-EXTRACT for the claim store** IF the
+  2.19× build cost is brought under budget (cache assertion embeddings; tighten digest) and the
+  over-mint rate is driven below 0.20 (stricter supersedes rule) — it's the right capture-time
+  mechanism but not yet cheap or precise enough to default-on. For the product config, pair cards
+  (direction) with a recall-strong source (raw-RAG or wiki) rather than the diluting 50/50 wiki+cards
+  blend. Keep plain-B for explicit-direction recall and correction-prediction.
+
+---
+
+# Runs 1-8 — prior history
+
+
 **Run 8 opens the reframed program (Move 1).** Runs 3–7 treated inject as "recall the right fact"
 and the store as "a knowledge base." Run 8 tests the REFRAME with two falsification-capable
 instruments: **inject = counterfactual attention allocation** (surface only what the model would

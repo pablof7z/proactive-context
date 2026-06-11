@@ -152,15 +152,12 @@ fn compute_bare(
 // ═══════════════════════════ 8b: correction mining ═══════════════════════════
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Correction {
-    session: String,
-    /// The conversational context immediately before the correction (assistant proposal + prior user).
-    context_before: String,
-    /// The user turn that overruled/redirected (verbatim, injection-stripped).
-    correction_turn: String,
-    /// One-sentence substance of the correction (what the user told the agent to do differently).
-    substance: String,
-    verified: bool,
+pub(crate) struct Correction {
+    pub(crate) session: String,
+    pub(crate) context_before: String,
+    pub(crate) correction_turn: String,
+    pub(crate) substance: String,
+    pub(crate) verified: bool,
 }
 
 /// Heuristic signals that a user turn is a CORRECTION (overruling the agent), not a new task or a
@@ -323,7 +320,7 @@ fn score_predictions(
 }
 
 /// Ask the model to predict the user's correction from a store briefing + pre-correction context.
-fn predict(
+pub(crate) fn predict(
     store_briefing: &str, context_before: &str,
     compile_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>,
@@ -344,7 +341,7 @@ fn predict(
 }
 
 /// Judge a prediction against the actual correction substance.
-fn judge_prediction(
+pub(crate) fn judge_prediction(
     prediction: &str, actual_substance: &str,
     judge_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>,

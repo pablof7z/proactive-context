@@ -15,6 +15,7 @@ mod claims;
 mod eval;
 mod eval_run7;
 mod eval_run8;
+mod eval_run9;
 mod session_start;
 mod chunker;
 mod config;
@@ -434,6 +435,12 @@ enum Commands {
         #[arg(long)]
         run8: bool,
 
+        /// Run 9 (big swing): build Store B-delta (delta-EXTRACT) + episode-card source, score
+        /// ~6 sources in one within-run sweep (Probe 1/2 + predict-the-correction), plus the
+        /// 8-reversal op diagnostic and supersedes precision audit. Reuses preserved A/B/C stores.
+        #[arg(long)]
+        run9: bool,
+
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
@@ -816,6 +823,7 @@ fn main() -> Result<()> {
             probe3_only,
             run7,
             run8,
+            run9,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -827,6 +835,7 @@ fn main() -> Result<()> {
                 probe3_only,
                 run7,
                 run8,
+                run9,
                 judge_model,
             })?;
         }
