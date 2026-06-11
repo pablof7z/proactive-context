@@ -48,7 +48,8 @@ pub fn run_research_capture(
         &numbered,
     )?;
 
-    eprintln!("[research-capture] recognition response (first 500 chars):\n{}", &recognition_response[..recognition_response.len().min(500)]);
+    let preview: String = recognition_response.chars().take(500).collect();
+    eprintln!("[research-capture] recognition response (first 500 chars):\n{preview}");
 
     let artifacts = parse_recognition_response(&recognition_response)?;
     eprintln!("[research-capture] artifacts found: {}", artifacts.len());
