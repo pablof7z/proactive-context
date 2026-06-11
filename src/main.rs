@@ -239,21 +239,6 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         output_dir: Option<std::path::PathBuf>,
 
-        /// Also scan TENEX conversation databases (~/.tenex/projects/) as a source.
-        /// Only conversations where the user participated are included.
-        /// Requires a valid ~/.tenex/config.json.
-        #[arg(long)]
-        tenex: bool,
-
-        /// Also scan Codex session files (~/.codex/sessions/, ~/.codex/archived_sessions/).
-        /// Processes rollout-*.jsonl files; legacy rollout-*.json files (no cwd) are skipped.
-        #[arg(long)]
-        codex: bool,
-
-        /// Also scan opencode sessions from ~/.local/share/opencode/opencode.db.
-        #[arg(long)]
-        opencode: bool,
-
         /// Forget capture markers so sessions count as new again — use after deleting the
         /// wiki to start over. Scope with --project (one project) or none (all projects,
         /// plus pending/lock state). Respects --output-dir for isolated ledgers. Prompts
@@ -682,9 +667,6 @@ fn main() -> Result<()> {
             yes,
             include_sidechains,
             output_dir,
-            tenex,
-            codex,
-            opencode,
             reset,
         } => {
             crate::archeologist::run_archeologist(crate::archeologist::ArcheologistArgs {
@@ -696,9 +678,6 @@ fn main() -> Result<()> {
                 yes,
                 include_sidechains,
                 output_dir,
-                include_tenex: tenex,
-                include_codex: codex,
-                include_opencode: opencode,
                 reset,
             })?;
         }
