@@ -1,7 +1,19 @@
 # Claims-First: Make the Claim Log the System of Record, the Wiki a Regenerable Projection
 
-**Status:** Revision 3 — results from a second, adversarial corpus (2026-06-10). Verdict across corpora: **SPLIT — and the split is diagnostic.**
+**Status:** Revision 4 — **FINAL VERDICT (2026-06-11): the strong form of this proposal is REJECTED by the evidence; a hybrid landed in the product.**
 **Scope:** proactive-context core architecture (capture store, inject source, wiki's role).
+
+## Rev 4 — The verdict and what landed
+
+Six runs across two corpora (full record: `claims-first-validation-results.md`; distilled: `claims-first-learnings.md`). The strong claim — replace prose reconciliation with read-time projection over a claim log — failed its decisive test three times, each failure one layer deeper: supersession rendering (Run 5: trajectory 4/8, reversals split across clusters), capture-time supersedes edges (Run 6: 2/8, edges work but 4/8 reversals were never *extracted* as contradictions — EXTRACT flattens "the default flipped" into co-existing capability claims), leaving the root blocker at **EXTRACT phrasing** — a capture redesign this proposal did not scope, while edge detection alone cost 3.1× capture time. Write-time prose reconciliation empirically earns its keep: RECONCILE seeing the contradiction side by side is load-bearing semantic work (wiki trajectory ~7/8).
+
+What the proposal got RIGHT, and what landed on master (2026-06-11, defaults ON):
+- **The claim log as always-on lossless substrate** (`PC_CLAIMS_LOG`, zero-LLM tap): storage was proven lossless in every run — all reversal history present in-store. The wiki remains the write-path projection of record; the log preserves what prose edits cannot, and makes future re-projection, eval regression, and inject.miss detection possible.
+- **Task-result visibility** (`PC_INCLUDE_TASK_RESULTS`): capture was blind to 100% of subagent reports (0/11 visible) — discovered by the research-capture validation, fixed, default ON.
+- **Research-capture** (`capture_research`): the third capture type, validated 4/4 pre-registered bars, default ON.
+- Claims-inject keeps its real, measured wins (−62% tokens, −31..51% p95, +19pt user-direction recall on the orchestration corpus) **behind a flag**, pending replacement-aware extraction — the named, scoped future experiment.
+
+The sections below are preserved as the Rev 3 record (the state of belief before Run 6).
 
 ## 0. Results: two corpora, two verdicts, one diagnosis
 
