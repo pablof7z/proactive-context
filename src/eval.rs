@@ -31,6 +31,7 @@ pub struct EvalArgs {
     pub probe3_only: bool,
     pub run7: bool,
     pub run8: bool,
+    pub run9: bool,
     pub judge_model: Option<String>,
 }
 
@@ -133,6 +134,12 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
             corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
             judge_model: &judge_model, cfg: &cfg, corpus_label,
         });
+    }
+
+    if args.run9 {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        return crate::eval_run9::run_run9(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg);
     }
 
     // Dirs for each store's output under the experiment dir.
@@ -384,7 +391,7 @@ fn build_stores(
 }
 
 /// Build a store by calling the capture pipeline directly for each session.
-fn build_store_direct(
+pub(crate) fn build_store_direct(
     sessions: &[String],
     corpus_root: &Path,
     output_dir: &Path,

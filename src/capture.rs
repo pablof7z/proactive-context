@@ -610,6 +610,46 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
+/// Run 9 — delta-EXTRACT preamble. Same atomic-cited-spec contract as EXTRACT_PREAMBLE, but the
+/// question becomes "given what the store ALREADY believes (the DIGEST), what did THIS session
+/// CHANGE?" Each claim is a TYPED OP whose target (when not new) must be a digest claim id. The
+/// judgment is made WITH the transcript in view — the structural difference from Run 6's post-hoc
+/// linker, which judged contradictions blind to the conversation that produced them.
+const DELTA_EXTRACT_PREAMBLE: &str = "\
+You are the delta-EXTRACT stage of a knowledge-capture pipeline. You are given (1) a DIGEST of what \
+the project store ALREADY believes (existing claims, each with an id), and (2) a line-numbered \
+conversation transcript. Emit ATOMIC, CITED claims as TYPED OPS describing what THIS session \
+established RELATIVE to the digest.\n\n\
+## Output: STRICT JSON ARRAY, nothing else\n\
+[{\"assertion\": \"<one atomic spec fact>\", \
+\"type\": \"new\"|\"confirms\"|\"supersedes\"|\"refines\", \
+\"target\": \"<digest claim id>\"|null, \
+\"evidence\": [{\"start\": N, \"end\": M}], \
+\"ratified\": true|false}]\n\n\
+- `assertion`: one self-contained statement of how the product SHOULD work (positive spec, not an \
+event log).\n\
+- `type`:\n\
+  - `new` — a fact the digest does NOT already cover. `target` MUST be null.\n\
+  - `confirms` — this session re-affirms an existing digest claim UNCHANGED. `target` = that id; \
+    `assertion` restates it.\n\
+  - `supersedes` — this session REPLACES an existing digest claim with a different value/decision \
+    on the SAME subject (the user changed their mind, or a new approach replaced the old). \
+    `target` = the id of the claim being replaced; `assertion` = the NEW decision.\n\
+  - `refines` — this session adds detail/qualification to an existing claim without reversing it. \
+    `target` = that id.\n\
+- `target`: for confirms/supersedes/refines it MUST be one of the ids shown in the DIGEST. If no \
+  digest claim matches, use type `new` with target null — never invent an id.\n\
+- `evidence`: 1+ transcript line ranges (1-based, inclusive) that literally support the assertion.\n\
+- `ratified`: TRUE when the USER is the authority (stated it, or endorsed an assistant proposal); \
+  FALSE for unendorsed assistant proposals. Authorship is determined mechanically downstream.\n\n\
+## Rules\n\
+- Be conservative with `supersedes`: emit it ONLY for a genuine replacement of the SAME subject \
+  (same knob/decision, different value). A new fact about a related-but-different subject is `new`, \
+  NOT supersedes. Over-calling supersedes corrupts the store.\n\
+- Sweep the WHOLE transcript; capture load-bearing facts from later turns too.\n\
+- Skip transient one-off debugging with no lasting spec implication.\n\
+- Emit [] only if the session genuinely changed/established nothing.\n";
+
 /// Sweep-completeness nudge, appended to EXTRACT_PREAMBLE by `build_extract_system`.
 /// Kept as a separate constant so it can be toggled off (PC_EXTRACT_NO_GRANULARITY=1) for
 /// A/B comparison against the original prompt.
@@ -944,6 +984,29 @@ struct AdmittedClaim {
     authority: &'static str, // "explicit" (user) | "implicit" (agent-inferred, provisional)
 }
 
+/// Run 9 — a typed delta-EXTRACT op (assertion + relationship to an existing digest claim).
+#[derive(Debug, Deserialize)]
+struct DeltaOp {
+    assertion: String,
+    #[serde(default = "default_op_type")]
+    #[serde(rename = "type")]
+    op_type: String, // new | confirms | supersedes | refines
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    evidence: Vec<EvidenceRange>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ratified: bool,
+}
+fn default_op_type() -> String { "new".to_string() }
+
+/// Run 9: delta-EXTRACT feature flag (PC_DELTA_EXTRACT=1). Off by default — the live capture path
+/// and all prior runs are byte-identical when unset.
+fn delta_extract_enabled() -> bool {
+    std::env::var("PC_DELTA_EXTRACT").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
 #[derive(Debug, Deserialize)]
 struct RouteDecision {
     claim_index: usize,
@@ -994,35 +1057,36 @@ async fn run_staged_capture(
     // reachable only via `pc debug extract --wiki-dir <dir>` for experimentation.
     let index_rows = read_index_live(&ctx.wiki_path);
 
+    // Run 9: when building a claims-only store with delta-EXTRACT, the regular EXTRACT (whose
+    // output feeds only the wiki pipeline + the Run-6 tap) is pure waste — the delta path runs its
+    // OWN digest-aware EXTRACT. Skip it so the delta build is ~1 EXTRACT/session, comparable to
+    // plain-B. (Only when BOTH flags are set; the live path is unchanged.)
+    let delta_only = delta_extract_enabled()
+        && std::env::var("PC_CLAIMS_ONLY").map(|v| v == "1").unwrap_or(false);
+
     // ── STAGE 1: EXTRACT ────────────────────────────────────────────────────────
     // EXTRACT runs WITHOUT the wiki index (pass &[]); see rationale above.
-    let extract_user = format!(
-        "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
-        numbered_transcript
-    );
-    let extract_raw = run_stage(
-        spec,
-        openrouter_api_key,
-        ollama_base_url,
-        ollama_api_key,
-        EXTRACT_PREAMBLE,
-        &extract_user,
-        6000,
-    )
-    .await?;
-
-    let extracted: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
-        Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-        None => Vec::new(),
+    let extracted: Vec<ExtractedClaim> = if delta_only {
+        Vec::new() // delta path does its own extraction; skip the redundant call
+    } else {
+        let extract_user = format!(
+            "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
+            numbered_transcript
+        );
+        let extract_raw = run_stage(
+            spec, openrouter_api_key, ollama_base_url, ollama_api_key,
+            EXTRACT_PREAMBLE, &extract_user, 6000,
+        ).await?;
+        let parsed: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
+            Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        eprintln!("capture: EXTRACT → {} raw claim(s)", parsed.len());
+        log_event("capture.extract", None, serde_json::json!({ "claims": parsed.len() }));
+        parsed
     };
-    eprintln!("capture: EXTRACT → {} raw claim(s)", extracted.len());
-    log_event(
-        "capture.extract",
-        None,
-        serde_json::json!({ "claims": extracted.len() }),
-    );
 
-    if extracted.is_empty() {
+    if extracted.is_empty() && !delta_only {
         return Ok("EXTRACT produced no claims.".to_string());
     }
 
@@ -1072,7 +1136,7 @@ async fn run_staged_capture(
             "explicit": n_explicit, "implicit": n_implicit
         }),
     );
-    if admitted.is_empty() {
+    if admitted.is_empty() && !delta_only {
         return Ok("No evidence-verified claims to capture.".to_string());
     }
 
@@ -1087,6 +1151,109 @@ async fn run_staged_capture(
                     Ok(mut embedder) => {
                         if let Err(e) = std::fs::create_dir_all(cd) {
                             eprintln!("claims: failed to create dir {}: {}", cd.display(), e);
+                        } else if delta_extract_enabled() {
+                            // ── Run 9: delta-EXTRACT typed-op path (PC_DELTA_EXTRACT=1) ──────────
+                            // Build a digest of what the store ALREADY believes at THIS point in the
+                            // chronological replay, run a digest-aware EXTRACT that emits TYPED OPS
+                            // (new/confirms/supersedes/refines + target), verify targets in Rust
+                            // (invalid → demote to new, never drop), and append via the typed path.
+                            let delta_spec = crate::provider::ModelSpec::parse(&cfg.capture_model);
+                            let delta_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+                            let delta_ollama_url = cfg.ollama_base_url.clone();
+                            let delta_ollama_key = cfg.ollama_api_key.clone();
+                            let budget: usize = std::env::var("PC_DELTA_DIGEST_BUDGET").ok()
+                                .and_then(|v| v.parse().ok()).unwrap_or(24);
+
+                            // 1. Digest (one recall pass — NOT per-claim). Session content = the
+                            //    numbered transcript (what this session is about).
+                            let digest = claims::build_digest(cd, embedder.as_mut(), numbered_transcript, budget)
+                                .unwrap_or_default();
+                            let by_id: std::collections::HashMap<String, &claims::DigestClaim> =
+                                digest.iter().map(|d| (d.id.clone(), d)).collect();
+                            let sim_ct = digest.iter().filter(|d| d.channel == "similarity").count();
+                            let rec_ct = digest.iter().filter(|d| d.channel == "recency").count();
+                            eprintln!("delta: digest = {} claims ({} similarity, {} recency)", digest.len(), sim_ct, rec_ct);
+                            log_event("delta.digest", None, serde_json::json!({
+                                "digest": digest.len(), "similarity": sim_ct, "recency": rec_ct }));
+
+                            // 2. delta-EXTRACT LLM call (digest + transcript, transcript in view).
+                            let mut digest_block = String::from("## DIGEST — what the store already believes (id | assertion)\n");
+                            if digest.is_empty() {
+                                digest_block.push_str("(empty — this is an early session; everything is `new`)\n");
+                            } else {
+                                for d in &digest {
+                                    digest_block.push_str(&format!("{} | {}\n", d.id, d.assertion.chars().take(160).collect::<String>()));
+                                }
+                            }
+                            let delta_user = format!(
+                                "{}\n\n## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of typed ops now.",
+                                digest_block, numbered_transcript
+                            );
+                            let delta_raw = tokio::task::block_in_place(|| {
+                                call_model_blocking_with_timeout(
+                                    &delta_spec, &delta_api_key, &delta_ollama_url, delta_ollama_key.as_deref(),
+                                    DELTA_EXTRACT_PREAMBLE, &delta_user, 240,
+                                )
+                            }).unwrap_or_default();
+                            let ops: Vec<DeltaOp> = match extract_json_blob(&delta_raw) {
+                                Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+                                None => Vec::new(),
+                            };
+                            eprintln!("delta: EXTRACT → {} typed op(s)", ops.len());
+
+                            // 3+4. Verify (evidence + target-in-digest) and append typed.
+                            let (mut n_new, mut n_conf, mut n_sup, mut n_ref, mut n_demoted) = (0,0,0,0,0);
+                            for op in &ops {
+                                if !ctx.evidence_is_valid(&op.evidence) { continue; }
+                                let author = ctx.author_for_ranges(&op.evidence);
+                                let authority = if author == "user" { "explicit" } else { "implicit" };
+                                let id = format!("{}-{}", ctx.session_id.chars().take(8).collect::<String>(), sha2_short(&op.assertion));
+                                let evidence_text = slice_transcript_ranges(&ctx.transcript_lines, &op.evidence);
+                                let ev: Vec<claims::EvidenceRange> = op.evidence.iter()
+                                    .map(|r| claims::EvidenceRange { start: r.start, end: r.end }).collect();
+
+                                // Integrity-by-construction: target must be a digest id, else demote to new.
+                                let typ = op.op_type.to_ascii_lowercase();
+                                let valid_target = op.target.as_ref().filter(|t| by_id.contains_key(*t)).cloned();
+                                let effective = if (typ == "supersedes" || typ == "confirms" || typ == "refines")
+                                    && valid_target.is_none() { n_demoted += 1; "new".to_string() } else { typ };
+
+                                match effective.as_str() {
+                                    "confirms" => {
+                                        let t = valid_target.unwrap();
+                                        let _ = claims::confirm_claim(cd, &t, &ctx.today);
+                                        n_conf += 1;
+                                    }
+                                    "supersedes" => {
+                                        let t = valid_target.unwrap();
+                                        if let Err(e) = claims::append_claim_typed(cd, embedder.as_mut(), &id, &ctx.today,
+                                            &ctx.session_id, &op.assertion, authority, &evidence_text, &ev, vec![t]) {
+                                            eprintln!("delta: append supersedes failed: {}", e);
+                                        }
+                                        n_sup += 1;
+                                    }
+                                    "refines" => {
+                                        // Refine: append as a normal claim (no edge); kept distinct for the diagnostic.
+                                        if let Err(e) = claims::append_claim_typed(cd, embedder.as_mut(), &id, &ctx.today,
+                                            &ctx.session_id, &op.assertion, authority, &evidence_text, &ev, vec![]) {
+                                            eprintln!("delta: append refines failed: {}", e);
+                                        }
+                                        n_ref += 1;
+                                    }
+                                    _ => {
+                                        if let Err(e) = claims::append_claim_typed(cd, embedder.as_mut(), &id, &ctx.today,
+                                            &ctx.session_id, &op.assertion, authority, &evidence_text, &ev, vec![]) {
+                                            eprintln!("delta: append new failed: {}", e);
+                                        }
+                                        n_new += 1;
+                                    }
+                                }
+                            }
+                            eprintln!("delta: applied ops — new={} confirms={} supersedes={} refines={} (demoted={})",
+                                n_new, n_conf, n_sup, n_ref, n_demoted);
+                            log_event("delta.applied", None, serde_json::json!({
+                                "new": n_new, "confirms": n_conf, "supersedes": n_sup, "refines": n_ref,
+                                "demoted": n_demoted, "digest": digest.len() }));
                         } else {
                             // Run 6: capture-time supersedes-edge linking (PC_CLAIMS_EDGES=1).
                             let edges_on = claims::claims_edges_enabled();
@@ -1153,6 +1320,15 @@ async fn run_staged_capture(
                 }
             }
         }
+    }
+
+    // Run 9: claims-only short-circuit (PC_CLAIMS_ONLY=1). When building a claims-only store
+    // (e.g. Store B-delta), the wiki pipeline (ROUTE/RECONCILE/INDEX) is pure waste — skip it.
+    // This makes the delta build ~3x faster (one fewer heavy LLM stage per session) and keeps the
+    // cost comparison to plain-B fair (plain-B for the eval also only needs claims, but Run 6 ran
+    // the wiki too; the cost criterion compares the claims-relevant work).
+    if std::env::var("PC_CLAIMS_ONLY").map(|v| v == "1").unwrap_or(false) {
+        return Ok("Claims-only capture complete (wiki pipeline skipped).".to_string());
     }
 
     // ── STAGE 3: ROUTE — retrieve-then-rerank ─────────────────────────────────────
