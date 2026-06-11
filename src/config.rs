@@ -217,7 +217,12 @@ fn default_capture_enabled() -> bool {
 }
 
 fn default_capture_episode_cards() -> bool {
-    false // Default OFF — must be validated before enabling
+    // ON by default since the Run 9 validation: episode cards were the best
+    // direction-change inject source across nine runs — 6/8 trajectory recovery,
+    // 0/8 stale leaks, 6/8 asserts-current (vs wiki guides 1/8 trajectory in the
+    // same sweep). Phase-2 fixtures: 4/4. One recognition call per session;
+    // best-effort, never breaks the normal capture path.
+    true
 }
 
 fn default_capture_research() -> bool {

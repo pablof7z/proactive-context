@@ -2276,6 +2276,34 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
+    // Episode-card stage (feature-flagged via `capture_episode_cards`, default ON since
+    // the Run 9 validation: 6/8 trajectory recovery, 0/8 stale leaks, best direction-change
+    // source across nine runs). Runs AFTER the normal pass and is fully independent of it:
+    // recognizes session-level product movement arcs and persists immutable episode cards
+    // under <wiki>/episodes/. Best-effort — a failure here never breaks the normal capture
+    // path. `today_str` honors `today_override`, so archeologist replay produces
+    // historically-dated cards. When the flag is false this block is a no-op.
+    if cfg.capture_episode_cards {
+        match crate::episode_capture::run_episode_stage(
+            &wiki_path,
+            &input.transcript_path,
+            &input.session_id,
+            Some(&today_str),
+        ) {
+            Ok(cards) if !cards.is_empty() => {
+                log_event(
+                    "capture.episodes",
+                    None,
+                    serde_json::json!({ "cards": cards.len() }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("capture: episode stage failed: {}", e);
+            }
+        }
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
