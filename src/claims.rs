@@ -64,6 +64,10 @@ pub struct ClaimRecord {
     /// edges, set by an LLM contradiction-linking pass). Empty if none / edges disabled.
     #[serde(default)]
     pub supersedes: Vec<String>,
+    /// Run 9 (delta-EXTRACT): most recent date a later session CONFIRMED this claim still holds
+    /// (a `confirms` op bumps this). Empty = never re-confirmed since creation.
+    #[serde(default)]
+    pub confirmed_ts: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +234,7 @@ pub fn append_claim(
         evidence: evidence.to_vec(),
         cluster_id: cluster_id.clone(),
         supersedes,
+        confirmed_ts: String::new(),
     };
     let jsonl_path = claims_jsonl_path(project_dir);
     let mut f = OpenOptions::new()
@@ -255,6 +260,145 @@ pub fn append_claim(
     )?;
 
     Ok(())
+}
+
+// ─── Run 9: delta-EXTRACT typed append ─────────────────────────────────────────
+
+/// A lightweight digest entry: an existing claim shown to delta-EXTRACT as a candidate target.
+#[derive(Debug, Clone)]
+pub struct DigestClaim {
+    pub id: String,
+    pub assertion: String,
+    pub ts: String,
+    /// Which channel surfaced it: "similarity" | "recency".
+    pub channel: String,
+}
+
+/// Build the pre-EXTRACT digest: the top relevant EXISTING claims (with IDs) for a session, via two
+/// channels — (A) embedding similarity of the session content to existing assertions, (B) the most
+/// recent existing claims. Deduped, capped at `budget`. Returns [] when the store is empty (the very
+/// first session in a chronological replay). This is the store-state-at-this-point-in-history view.
+pub fn build_digest(
+    project_dir: &Path,
+    embedder: &mut dyn Embedder,
+    session_content: &str,
+    budget: usize,
+) -> Result<Vec<DigestClaim>> {
+    let jsonl_path = claims_jsonl_path(project_dir);
+    if !jsonl_path.exists() {
+        return Ok(vec![]);
+    }
+    let content = fs::read_to_string(&jsonl_path)?;
+    let all: Vec<ClaimRecord> = content.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if all.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Channel A: similarity. Embed the session content (truncated) + all existing assertions.
+    let half = budget / 2;
+    let mut out: Vec<DigestClaim> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let query = session_content.chars().take(6000).collect::<String>();
+    if let Ok(qv) = embedder.embed(&[query]) {
+        if let Some(qv) = qv.into_iter().next() {
+            let assertions: Vec<String> = all.iter().map(|c| c.assertion.clone()).collect();
+            if let Ok(avs) = embedder.embed(&assertions) {
+                let mut scored: Vec<(f32, &ClaimRecord)> = all.iter().zip(avs.iter())
+                    .map(|(c, av)| (cosine(&qv, av), c)).collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                for (_, c) in scored.into_iter().take(half) {
+                    if seen.insert(c.id.clone()) {
+                        out.push(DigestClaim { id: c.id.clone(), assertion: c.assertion.clone(), ts: c.ts.clone(), channel: "similarity".into() });
+                    }
+                }
+            }
+        }
+    }
+
+    // Channel B: recency — most recent existing claims regardless of similarity.
+    let mut by_recency: Vec<&ClaimRecord> = all.iter().collect();
+    by_recency.sort_by(|a, b| b.ts.cmp(&a.ts));
+    for c in by_recency.into_iter() {
+        if out.len() >= budget { break; }
+        if seen.insert(c.id.clone()) {
+            out.push(DigestClaim { id: c.id.clone(), assertion: c.assertion.clone(), ts: c.ts.clone(), channel: "recency".into() });
+        }
+    }
+    out.truncate(budget);
+    Ok(out)
+}
+
+/// Run 9 typed append. Like `append_claim` but records EXPLICIT `supersedes` edges (already judged
+/// by delta-EXTRACT with the transcript in view — no post-hoc linker call) and, for a `confirms` op,
+/// bumps the target claim's `confirmed_ts`. Integrity-by-construction is enforced by the CALLER
+/// (capture.rs): every target id here is guaranteed to exist in the digest.
+#[allow(clippy::too_many_arguments)]
+pub fn append_claim_typed(
+    project_dir: &Path,
+    embedder: &mut dyn Embedder,
+    id: &str,
+    ts: &str,
+    session: &str,
+    assertion: &str,
+    authority: &str,
+    evidence_text: &str,
+    evidence: &[EvidenceRange],
+    supersedes: Vec<String>,
+) -> Result<()> {
+    let dim = embedder.dimension();
+    let db_path = claims_db_path(project_dir);
+    let conn = open_claims_db(&db_path, dim)?;
+
+    let embs = embedder.embed(&[assertion.to_string()]).context("embedding claim assertion failed")?;
+    let emb = embs.into_iter().next().context("embedder returned no vectors")?;
+
+    let tau: f32 = std::env::var("PC_CLAIMS_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(0.55);
+    let cluster_id = find_or_create_cluster(&conn, id, &emb, tau)?;
+
+    let rec = ClaimRecord {
+        id: id.to_string(), ts: ts.to_string(), session: session.to_string(),
+        assertion: assertion.to_string(), authority: authority.to_string(),
+        evidence_text: evidence_text.to_string(), evidence: evidence.to_vec(),
+        cluster_id: cluster_id.clone(), supersedes, confirmed_ts: String::new(),
+    };
+    let jsonl_path = claims_jsonl_path(project_dir);
+    let mut f = OpenOptions::new().create(true).append(true).open(&jsonl_path)
+        .with_context(|| format!("failed to open {}", jsonl_path.display()))?;
+    writeln!(f, "{}", serde_json::to_string(&rec)?)?;
+
+    let rowid = claim_id_to_rowid(id);
+    let emb_bytes = floats_to_bytes(&emb);
+    let _ = conn.execute("INSERT OR REPLACE INTO vec_claims(rowid, embedding) VALUES (?1, ?2)", params![rowid, emb_bytes]);
+    conn.execute("INSERT OR REPLACE INTO claim_cluster_map(claim_id, cluster_id) VALUES (?1, ?2)", params![id, cluster_id])?;
+    Ok(())
+}
+
+/// Bump the `confirmed_ts` of an existing claim (a `confirms` op). Rewrites claims.jsonl in place;
+/// cheap at these sizes (hundreds of lines). No-op if the target id is absent.
+pub fn confirm_claim(project_dir: &Path, target_id: &str, ts: &str) -> Result<bool> {
+    let jsonl_path = claims_jsonl_path(project_dir);
+    if !jsonl_path.exists() { return Ok(false); }
+    let content = fs::read_to_string(&jsonl_path)?;
+    let mut found = false;
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        if line.trim().is_empty() { continue; }
+        match serde_json::from_str::<ClaimRecord>(line) {
+            Ok(mut rec) if rec.id == target_id => {
+                rec.confirmed_ts = ts.to_string();
+                found = true;
+                out.push_str(&serde_json::to_string(&rec)?);
+                out.push('\n');
+            }
+            _ => { out.push_str(line); out.push('\n'); }
+        }
+    }
+    if found {
+        fs::write(&jsonl_path, out)?;
+    }
+    Ok(found)
 }
 
 /// Dual-channel candidate retrieval + LLM contradiction judgment for one new claim.
