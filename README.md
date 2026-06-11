@@ -1,182 +1,104 @@
 # proactive-context
 
-*It shows its work.*
+**Every project has a spec. Yours is scattered across months of conversations with your coding agent.**
 
-Every tool that remembers things for an AI does the same thing under the hood: it reads your conversations, has a model extract "facts," and stores the model's *summary* of what you said. Then it feeds that summary back later. Somewhere in that round-trip — the rewrite, the compression, the paraphrase — the specific thing that actually mattered gets sanded down into something that sounds right and isn't.
+Every decision you've made, every correction you've issued, every time you changed your mind — you said it once, to Claude Code, and it scrolled away. The spec exists; it was just never written down in one place.
 
-`proactive-context` doesn't summarize your knowledge back at you. It keeps the actual words, and when it hands a passage to an assistant it quotes it **verbatim, with a citation back to the source**. The assistant sees what you really said and where it came from — not a confident restatement it has no way to audit.
+`pc` writes it down. A single local Rust binary hooks into your coding agents' native lifecycle — Claude Code, Codex, opencode, Hermes, TENEX. When a session ends, off the hot path, it distills what you settled into a per-project wiki of small interlinked guides: current truth on top, the history of how it got there preserved underneath, and every claim cited to the exact transcript lines where it was said. Rust slices the quoted evidence itself — the model only points at line numbers — so a fabricated citation is unrepresentable, not merely caught.
 
-That's the whole idea, and most of what follows is consequences of it.
+What a captured guide looks like (illustrative project; real format):
 
-It runs entirely on your machine: a single Rust binary, local embeddings, a SQLite file. No account, no corpus uploaded anywhere.
+```
+## Message delivery
 
----
+Delivery goes through a transactional outbox; publishing directly from request
+handlers was explicitly rejected. [^a41f2-3] The drain worker batches by
+aggregate id — ordering across aggregates is not guaranteed and consumers must
+not assume it. [^a41f2-7]
 
-## Why "show your work" is the whole game
+(Previously: a Kafka relay, until 2026-04-02 — dropped for operational overhead.)
+```
 
-A summary is a lossy compression with no error term. Store *"prefers primary sources"* and you can no longer tell whether you said "always use primary sources" or "primary sources for the core argument, but blog posts are fine for color" — the qualifier that was the entire point is gone, and nothing flags that it's gone. The system sounds equally confident either way. And the qualifier is the small loss; the larger one is the *perspective* underneath it — the particular way you see this thing, the reason it mattered to you — which a paraphrase has no slot for at all.
+And the receipt behind `[^a41f2-3]`, in the citation log:
 
-The fix isn't a better summarizer. It's to not summarize. `proactive-context` stores knowledge as prose you can read, and surfaces it by **selecting line ranges and slicing them out verbatim** — the model that does the selecting never gets to rewrite the text, only point at it. What lands in the assistant's context is the real passage with a `guide.md:40-58` citation riding along. If something looks wrong, you open the line and check. Knowledge you can audit beats knowledge you have to trust.
+```
+a41f2-3 | 2026-03-14T09:12:44Z | session:9c2e41… | User: "no direct publishes
+from handlers — everything goes through the outbox. we got burned by this in v1"
+```
 
-This is a quiet philosophical stance as much as a technical one: **provenance over fluency.** A memory system's job is not to sound like it knows you — it's to stay faithful to the words you actually chose, because those words carry a perspective worth more than any restatement of them.
+That's the artifact: a spec you can read, audit line by line, and keep. It survives the harness, the model, and the hype cycle.
 
----
+## And your agent stops forgetting
 
-## Two motions
+Because the spec exists, `pc` covers what people usually reach for "memory" tools to do — except what gets handed back is cited, not paraphrased. Before each prompt, a hook finds the guides that bear on what you're about to ask and injects a dense briefing:
 
-The system has a slow half and a fast half, and they stay out of each other's way.
+```
+Message delivery uses a transactional outbox; publishing directly from request
+handlers was explicitly rejected (docs/wiki/message-delivery.md:12-15). The
+drain worker batches by aggregate id — ordering across aggregates is not
+guaranteed and consumers must not assume it (docs/wiki/message-delivery.md:22-26).
+```
 
-**Capture — when a session ends.** Off the hot path, with no one waiting, it reads the finished transcript and distills what was *durable*: the corrections you gave, the things you settled, the non-obvious facts you established. Not a log of what happened — a few high-signal entries about what's now true. The founding bias:
+Every sentence carries a `(path:line)` citation into a guide you can open; every guide statement carries a receipt into the verbatim conversation behind it. This is the end of *"no — we use the outbox pattern, I told you this three weeks ago."*
 
-> Every time you correct, choose, or overrule the assistant, you're doing the one thing it can't do for itself: deciding what actually matters. A model's fluent defaults are endless and free. Your sense of which one is *right* is the scarce input — so never spend it twice.
+## You already own the data
 
-A correction, a preference, an overruled suggestion — these are the moments your taste and perspective enter the work, and they're irreplaceable precisely because no model generates them; they're what you bring that it doesn't have. A summary keeps the decision and quietly discards the discernment that produced it. This keeps the discernment.
+Months of your direction are already sitting on disk — every past session, verbatim, in `~/.claude/projects/`. `pc` doesn't start collecting at signup; it mints the asset from history you already have:
 
-**Inject — before each prompt.** On the hot path, in milliseconds, it reads what you're about to ask, finds the relevant guides, and quotes the passages that bear on it — cited, verbatim — before the assistant starts to answer.
+```bash
+pc archeologist            # interactive picker: replay past sessions into the spec
+pc archeologist --dry-run  # estimate scope and cost first, no LLM calls
+```
 
-Capture is allowed to be slow and careful. Inject is required to be fast and quiet. Keeping them apart is what lets each be good at its one job.
+Day one, the spec reflects months of decisions — no cold start, no waiting for the system to learn you.
 
----
+## Why a spec and not a summary
 
-## Why a wiki, and not a pile of facts
-
-The naive store is a flat list of remembered facts, or one ever-growing summary doc. Both flatten. Everything competes for room in one generic space, and the specific, hard-edged detail dilutes into a paragraph that helps no one.
-
-So the knowledge is a **wiki**: many small, deep guides, each about one bounded thing, cross-linked to its neighbors (links are kept bidirectional automatically, with a derived `_index.md` for fast navigation). A single subject you've worked out in detail gets to be its own richly specific entry, not a sentence in a catch-all. Capture **grows** the wiki — anchoring a new fact to the right guide or starting a new one. Inject **navigates** it — recognizing which guides the question touches, following their links, and pulling the dense, specific detail forward.
-
-The unit and the discipline are borrowed from [llm-wiki](https://github.com/nvk/llm-wiki): one bounded concept per guide, and separate the *fix* from the *rule*. What you did once is a fix — true only here. The principle that generalizes is the rule — the thing worth carrying into a situation that looks nothing like the one it came from. The verbatim-citation idea only earns its keep *because* the guides are deep: shallow facts don't need quoting, but a precise, qualified, hard-won passage does — that's exactly the kind of content a paraphrase ruins.
-
----
+Most tools that remember things for an AI store a model's paraphrase of what you said, in a vector store only an agent ever reads. A summary is lossy compression with no error term: store "prefers primary sources" and the qualifier that was the entire point is gone — and nothing flags that it's gone. `pc` treats your direction — every correction, decision, and change of mind — as the most precious signal in the system: kept permanently with verbatim receipts, superseded but never silently overwritten, and written into a document worth reading even with no agent attached.
 
 ## Quick start
 
 ```bash
-# Build and install (macOS; see justfile — it codesigns the binary)
-just install
-# …or plain cargo
-cargo build --release
+git clone https://github.com/pablof7z/proactive-context
+cd proactive-context
+cargo install --path .   # installs the `pc` binary
+
+pc configure      # pick your LLM provider: an OpenRouter key, or local Ollama
+pc install        # detect installed agent harnesses and wire the hooks
+pc archeologist   # optional, recommended: build the spec from your history
 ```
 
-Point the daemon at a directory of markdown and let it index in the background:
+That's it. Sessions update the spec when they end; prompts get cited briefings before the model answers. `pc install` is idempotent and reversible (`--uninstall` removes only what it added; `--dry-run` shows exactly what would be written).
+
+Watch it work from any terminal:
 
 ```bash
-proactive-context init              # watches the current directory
-proactive-context -d ~/notes init   # …or a specific one
+pc tail   # live event view: hits, guides read, per-stage latency
 ```
 
-Use it directly — the engine stands on its own, no assistant required:
+## Local-first
 
-```bash
-proactive-context query "what did I decide about the rewrite?"
-proactive-context query "favorite color" --rerank      # cross-encoder reranking
-proactive-context generate "summarize my thinking on the trade-offs"
-proactive-context stats --watch                          # live index health
-```
-
-`generate` synthesizes an answer through an LLM (via OpenRouter) that can read your full source files when a snippet isn't enough:
-
-```bash
-proactive-context config set-key sk-or-...
-```
-
-Global config lives at `~/.proactive-context/config.json`. Per-project state (index, daemon lock) lives in `.proactive-context/` inside the watched directory; the wiki lives under `~/.proactive-context/projects/<project>/wiki/`.
-
----
-
-## The assistant integration
-
-The engine is standalone, but the two motions come alive when they hook into an assistant's lifecycle. The original host is [Claude Code](https://claude.com/claude-code), via its hooks:
-
-- **`UserPromptSubmit` → `inject`** — compiles the cited briefing and prepends it to your prompt. Fast, synchronous, and degrades to a free raw-hits fallback (or silence) before it would ever block a turn.
-- **`SessionEnd` (or a debounced `Stop`) → `capture`** — distills the finished session into the wiki, off the hot path. The debounce survives the hook process dying, so capture runs after you've actually stopped, not on every turn.
-- **`statusLine` → `statusline`** — a sub-10ms, no-network indicator of what the system did this turn.
-
-Nothing about capture-then-inject is specific to Claude Code, or to code — it's the lifecycle of any assistant that has a beginning and end of turn.
-
-### `pc install` — wire up your harnesses
-
-Most agent harnesses speak the same Claude-style hook protocol pc was built for. `pc install` detects the ones on your machine and wires them up — pick from an interactive checklist, or pass `--all` / `--harness claude,codex`:
-
-```bash
-pc install            # interactive: pick from detected harnesses
-pc install --status   # what's detected / installed, per harness
-pc install --dry-run --all   # show exactly what would be written
-pc install --all      # wire every detected harness
-pc install --uninstall --all # cleanly remove everything pc added
-```
-
-Each integration is **idempotent** (safe to re-run) and **reversible** (`--uninstall` strips only pc's managed blocks). Hooks call the absolute path of the running binary, so they work regardless of `$PATH`.
-
-| Harness | Inject | Capture | Config written | Notes |
-|---|---|---|---|---|
-| **Claude Code** | `UserPromptSubmit` | `SessionEnd` + debounced `Stop` | `~/.claude/settings.json` | also `session_start`, `PostToolUse` awareness, `statusLine` |
-| **Codex** | `UserPromptSubmit` | `Stop` | `~/.codex/config.toml` | run `/hooks` in Codex to trust the new hooks |
-| **opencode** | `messages.transform` | `session.idle` | `~/.config/opencode/plugin/` | drops a self-contained plugin (see [`integrations/opencode`](integrations/opencode/)) |
-| **Hermes** | `pre_llm_call` | `on_session_end` | `~/.hermes/config.yaml` | first-use consent prompt (or `--accept-hooks`) |
-| **TENEX** | `UserPromptSubmit` | `Stop` | `.tenex-hooks.json` (per-project) | config is written and ready; activates once TENEX ships its hook loader ([tenex-chat/tenex#126](https://github.com/tenex-chat/tenex/issues/126)) |
-
-Under the hood, every hook command carries a `--harness <id>` flag. pc translates that harness's stdin shape and transcript format into its canonical pipeline and formats the reply in the harness's dialect — so the retrieval/capture core stays harness-agnostic and **adding a new harness is one declarative spec in `src/harness/`**, not changes scattered across the codebase.
-
-To watch it think, in any terminal:
-
-```bash
-proactive-context tail            # follow the live event log
-proactive-context tail -v         # sub-queries, hits, per-stage latency
-```
-
----
+Local embeddings (fastembed/ONNX), a SQLite file, no account, no telemetry, no server. The spec itself is plain markdown on your disk. Nothing leaves your machine except the LLM calls capture and inject make through *your* configured provider — OpenRouter, or Ollama for fully local operation.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `init` | Start the background watcher/indexer for a directory. Idempotent — safe on boot or in a loop. |
-| `query` | Semantic search over the index, with optional `--rerank`. |
-| `generate` | LLM-synthesized answer with a `read_file` tool for full-document retrieval. |
-| `capture` | Distill a finished session into the wiki (SessionEnd / debounced Stop hook). |
-| `inject` | Compile a cited, verbatim briefing for the current prompt (UserPromptSubmit hook). |
-| `install` | Detect local agent harnesses (Claude Code, Codex, opencode, Hermes, TENEX) and wire pc's hooks into each. `--status`, `--dry-run`, `--all`, `--harness`, `--uninstall`. |
-| `statusline` | One-line status indicator. |
-| `tail` | Follow the live event log. |
-| `stats` | Index health: files, chunks, model, daemon status. `--watch` to live-update. |
-| `ps` / `stop` | List / stop running daemons. |
-| `config` | Show or edit configuration. |
-
----
-
-## How it's built
-
-Deliberately small parts, each one boring on its own:
-
-- **Daemon** — `notify` for filesystem events, `ignore` for gitignore semantics, incremental re-index on change.
-- **Embeddings** — `fastembed` (ONNX), fully local after the first model download. No GPU, no API.
-- **Storage** — one `sqlite-vec` virtual table per project. No server, no Docker, no managed vector DB.
-- **The librarian** — inject runs two cheap model turns that emit *only* selections (which guides, then which line ranges); Rust does the slicing and attaches the citation. The model never reproduces the text, so it can't drift from it.
-- **Synthesis** — `rig-core` + OpenRouter, used only by `generate` and `capture`, only when you've supplied a key. The local index never phones home.
-
-The only network calls the system makes: model downloads on first use, and LLM calls during `generate`/`capture` if you've opted in. No telemetry. The whole index is a file you can delete.
-
----
-
-## Where this is going
-
-The shipped system captures sessions into a wiki and injects verbatim from it. What's **being built right now** turns the "show your work" thesis all the way around — onto capture itself:
-
-- **Integrity by construction.** The same trick the librarian uses to inject — *point, don't rewrite* — applied to writing the wiki. Every stored assertion anchored to the exact transcript lines that justify it, sliced by the tool rather than typed by the model. A requirement the model invented becomes an *unreachable state*, not something to catch after the fact: the model supplies line numbers, never prose, so a citation can only ever be text that was really said.
-- **The wiki as a regenerable spec.** Once every statement is anchored to its evidence, the wiki stops being notes and becomes a *living specification* — a complete, organized account of how you want something to be, reverse-engineered continuously from how you actually work, losing none of the nuance you supplied. The test: hand the wiki to a fresh model, ask it to build from there, and you should get your intent back at full fidelity.
-- **Evidence with decay.** Each guide already carries a volatility tier and a verified date; the next step is making injection *reason* about them — flagging when it leans on a fact that's old and fast-moving, and surfacing contradictions instead of silently overwriting your past.
-
-The design notes live in [`docs/product-spec/`](docs/product-spec/) — `citation-anchored-capture.md` is the one to read if you want the argument in full. It is, deliberately, its own worked example: a spec that cites the conversation that produced it.
-
----
+| `pc install` | detect harnesses, wire/unwire hooks (`--status`, `--dry-run`, `--all`, `--uninstall`) |
+| `pc inject` / `pc capture` | the two hook entry points (you rarely run these by hand) |
+| `pc query "..."` | semantic search over the captured knowledge |
+| `pc archeologist` | replay historical transcripts into the spec |
+| `pc tail` | follow the live event log (TUI) |
+| `pc wiki doctor` / `pc wiki tidy` | off-hot-path maintenance: consolidation, publish-ready cleanup |
+| `pc agents` | cross-agent standup board: what every concurrent agent in a repo is doing |
+| `pc statusline` | sub-10ms status bar indicator — no LLM, no network |
+| `pc configure` | model and provider picker |
 
 ## Status
 
-The local engine (`init`, `query`, `generate`, `stats`, the daemon) is solid. The capture→wiki→inject loop — deep guides, bidirectional links, the verbatim line-range librarian — is built and is the active frontier. The citation-anchored capture and regenerable-spec work in "where this is going" is under construction, not yet landed. A hermetic smoke test lives at [`scripts/smoke-test.sh`](scripts/smoke-test.sh).
+Experimental, moving fast. The capture → spec → inject loop is built and is the active frontier. The design is being validated empirically against real failure cases — actual moments, mined from session history, where a user had to repeat something they'd already established — with criteria written down before the runs. The north star: thousands of sessions of human direction, distilled into the best-known current spec of your product. Design notes live in [`docs/product-spec/`](docs/product-spec/).
 
-This is research-grade — not something to trust with anything you can't afford to re-derive. But the idea underneath is durable, and that's the part worth having.
-
----
+Requirements: Rust to build, and an LLM provider — an OpenRouter key, or Ollama running locally.
 
 ## License
 
