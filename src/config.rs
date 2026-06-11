@@ -499,6 +499,11 @@ impl Default for Config {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
+    // PC_HOME lets the eval harness use an isolated base directory without touching
+    // the user's live ~/.proactive-context state.  Byte-identical behaviour when unset.
+    if let Ok(pc_home) = std::env::var("PC_HOME") {
+        return Ok(PathBuf::from(pc_home));
+    }
     let home = dirs::home_dir().context("Could not find home directory")?;
     Ok(home.join(".proactive-context"))
 }
@@ -510,6 +515,20 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
+        // When PC_HOME is set (experiment mode) but no config exists there, fall back
+        // to the real ~/.proactive-context/config.json so API keys and models are
+        // available without having to copy the config into the experiment dir.
+        if std::env::var("PC_HOME").is_ok() {
+            let home = dirs::home_dir().context("Could not find home directory")?;
+            let real = home.join(".proactive-context/config.json");
+            if real.exists() {
+                let data = fs::read_to_string(&real)
+                    .with_context(|| format!("Failed to read config at {}", real.display()))?;
+                let cfg: Config = serde_json::from_str(&data)
+                    .with_context(|| format!("Failed to parse config at {}", real.display()))?;
+                return Ok(sanitize_logging(sanitize_inject(cfg)));
+            }
+        }
         // Create default config on first run
         let cfg = sanitize_logging(sanitize_inject(Config::default()));
         save_config(&cfg)?;

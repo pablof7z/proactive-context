@@ -6,6 +6,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+// ── Claims-log tap (Phase 0 experiment; feature-flagged via PC_CLAIMS_LOG=1) ─
+use crate::claims;
+
 use rig_core::client::CompletionClient;
 use rig_core::completion::Prompt;
 use tokio::runtime::Runtime;
@@ -855,6 +858,16 @@ async fn run_stage(
     }
 }
 
+/// Short deterministic id suffix derived from a string (8 hex chars of SHA-256).
+/// Used to build claim ids in the claim-log tap.
+fn sha2_short(s: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(s.as_bytes());
+    let digest = h.finalize();
+    format!("{:02x}{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2], digest[3])
+}
+
 /// Extract the first balanced JSON array/object from a model response, tolerating
 /// ```json fences and surrounding prose. Returns the raw JSON substring.
 fn extract_json_blob(raw: &str) -> Option<String> {
@@ -958,6 +971,11 @@ struct ReconcileOp {
 /// The staged capture pipeline. Replaces the old free-edit agent loop. `max_turns`
 /// is retained for config compatibility but ignored because the pipeline is a fixed
 /// number of single-shot calls, not an agentic loop.
+///
+/// `claims_dir`: when `Some`, the claim-log tap writes every admitted claim to
+/// `<claims_dir>/claims.jsonl` and `<claims_dir>/claims.db`.  When `None` (default),
+/// the tap is a no-op and behavior is byte-identical to the pre-experiment code.
+/// Controlled by the `PC_CLAIMS_LOG=1` feature flag.
 async fn run_staged_capture(
     spec: &ModelSpec,
     openrouter_api_key: &str,
@@ -966,6 +984,7 @@ async fn run_staged_capture(
     _max_turns: usize,
     ctx: Arc<WikiAgentCtx>,
     numbered_transcript: &str,
+    claims_dir: Option<PathBuf>,
 ) -> Result<String> {
     // Live on-disk wiki index — embedded fresh (read_index_live), not the stale index.db.
     // Used by ROUTE recall below. NOT fed to EXTRACT by default: an A/B over real transcripts
@@ -1055,6 +1074,85 @@ async fn run_staged_capture(
     );
     if admitted.is_empty() {
         return Ok("No evidence-verified claims to capture.".to_string());
+    }
+
+    // ── CLAIM-LOG TAP (after authority tagging, before ROUTE) ─────────────────────
+    // Feature flag: PC_CLAIMS_LOG=1.  When set, persist every admitted claim to
+    // claims.jsonl + claims.db under `claims_dir`.  The wiki pipeline (ROUTE/RECONCILE)
+    // continues unchanged — this is a tap, not a fork.  Both stores build in one pass.
+    if let Some(ref cd) = claims_dir {
+        if claims::claims_log_enabled() {
+            if let Ok(cfg) = crate::config::load_config() {
+                match crate::embed::build_embedder(&cfg) {
+                    Ok(mut embedder) => {
+                        if let Err(e) = std::fs::create_dir_all(cd) {
+                            eprintln!("claims: failed to create dir {}: {}", cd.display(), e);
+                        } else {
+                            // Run 6: capture-time supersedes-edge linking (PC_CLAIMS_EDGES=1).
+                            let edges_on = claims::claims_edges_enabled();
+                            let edge_spec = crate::provider::ModelSpec::parse(&cfg.capture_model);
+                            let edge_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+                            let edge_ollama_url = cfg.ollama_base_url.clone();
+                            let edge_ollama_key = cfg.ollama_api_key.clone();
+                            let mut edge_calls = 0usize;
+                            let edge_t0 = std::time::Instant::now();
+                            for c in &admitted {
+                                let id = format!("{}-{}", ctx.session_id.chars().take(8).collect::<String>(),
+                                    sha2_short(&c.assertion));
+                                let ts = ctx.today.clone();
+                                let evidence_text = slice_transcript_ranges(&ctx.transcript_lines, &c.evidence);
+                                let ev: Vec<claims::EvidenceRange> = c.evidence.iter()
+                                    .map(|r| claims::EvidenceRange { start: r.start, end: r.end })
+                                    .collect();
+                                // Build a one-shot LLM-call closure for edge detection.
+                                // This tap runs INSIDE a tokio runtime (run_staged_capture is
+                                // async); call_model_blocking uses reqwest::blocking, which would
+                                // panic ("cannot drop a runtime in an async context"). Wrap it in
+                                // block_in_place so blocking is permitted on the multi-threaded rt.
+                                let mut call = |system: &str, user: &str| -> anyhow::Result<String> {
+                                    edge_calls += 1;
+                                    tokio::task::block_in_place(|| {
+                                        call_model_blocking(
+                                            &edge_spec,
+                                            &edge_api_key,
+                                            &edge_ollama_url,
+                                            edge_ollama_key.as_deref(),
+                                            system,
+                                            user,
+                                        )
+                                    })
+                                };
+                                let mut linker = claims::EdgeLinker { call: &mut call, top_k: 8 };
+                                let linker_opt = if edges_on { Some(&mut linker) } else { None };
+                                if let Err(e) = claims::append_claim(
+                                    cd,
+                                    embedder.as_mut(),
+                                    &id,
+                                    &ts,
+                                    &ctx.session_id,
+                                    &c.assertion,
+                                    c.authority,
+                                    &evidence_text,
+                                    &ev,
+                                    linker_opt,
+                                ) {
+                                    eprintln!("claims: failed to append claim: {}", e);
+                                }
+                            }
+                            if edges_on {
+                                eprintln!(
+                                    "claims: tapped {} claim(s), {} edge-link call(s) in {}ms → {}",
+                                    admitted.len(), edge_calls, edge_t0.elapsed().as_millis(), cd.display()
+                                );
+                            } else {
+                                eprintln!("claims: tapped {} claim(s) → {}", admitted.len(), cd.display());
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("claims: could not build embedder: {}", e),
+                }
+            }
+        }
     }
 
     // ── STAGE 3: ROUTE — retrieve-then-rerank ─────────────────────────────────────
@@ -1892,6 +1990,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     let rt =
         Runtime::new().map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
 
+    // Compute the claims-dir for the tap.  PC_CLAIMS_LOG=1 activates it; the dir is
+    // proj_dir (already resolved above) so experiment-scoped runs use the experiment home.
+    let claims_tap_dir: Option<PathBuf> = if claims::claims_log_enabled() {
+        Some(proj_dir.clone())
+    } else {
+        None
+    };
+
     let agent_result = rt.block_on(async {
         let timeout = std::time::Duration::from_secs(300); // 5 min max
         tokio::time::timeout(
@@ -1904,6 +2010,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
                 max_turns,
                 Arc::clone(&ctx),
                 &truncated_numbered,
+                claims_tap_dir,
             ),
         )
         .await
@@ -2887,5 +2994,37 @@ pub(crate) fn run_debug_extract_all(
         eprintln!("\n[{}/{}] {}", i + 1, matches.len(), path.display());
         run_debug_extract(path, wiki_dir_arg, no_wiki)?;
     }
+    Ok(())
+}
+
+// ─── Eval harness helpers (pub wrappers) ──────────────────────────────────────
+
+/// Public wrapper so `eval.rs` can extract JSON blobs from judge responses.
+pub(crate) fn extract_json_blob_pub(raw: &str) -> Option<String> {
+    extract_json_blob(raw)
+}
+
+/// Public wrapper so `eval.rs` can format dates for reports.
+pub(crate) fn civil_date_from_days_pub(days: i64) -> String {
+    civil_date_from_days(days)
+}
+
+/// Public wrapper for run_structural_maintenance so eval.rs can call it with
+/// the simpler (cwd, output_dir) interface used by the archeologist.
+pub(crate) fn run_structural_maintenance_for_eval(
+    cwd: &str,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    let cwd_path = resolve_project_root(&PathBuf::from(cwd));
+    let (wiki_path, proj_dir) = if let Some(ref out) = output_dir {
+        let normalized = normalize_path(&cwd_path);
+        let pd = out.join("projects").join(&normalized);
+        let wp = pd.join("docs").join("wiki");
+        (wp, pd)
+    } else {
+        (wiki_dir(&cwd_path), project_dir_from_cwd(cwd))
+    };
+    let today = today();
+    run_structural_maintenance(&wiki_path, &proj_dir, &today);
     Ok(())
 }

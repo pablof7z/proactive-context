@@ -1144,6 +1144,41 @@ fn render_hits_librarian(hits: &[QueryResult]) -> String {
     format!("TITLE: relevant project files\n{}", body)
 }
 
+// ─── Eval harness public wrappers ────────────────────────────────────────────
+
+/// Public async wrapper for `compile_briefing`, callable from the eval runner.
+/// Signature mirrors the private function exactly so the eval can call it via
+/// `tokio::runtime::Runtime::block_on`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compile_briefing_pub(
+    api_key: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    spec: &crate::provider::ModelSpec,
+    current_prompt: &str,
+    recent: &str,
+    already_injected: &str,
+    guides: &[(String, String)],
+    wiki_dir: &std::path::Path,
+    root: &std::path::Path,
+    max_tokens: usize,
+) -> anyhow::Result<String> {
+    compile_briefing(
+        api_key,
+        ollama_api_key,
+        ollama_base_url,
+        spec,
+        current_prompt,
+        recent,
+        already_injected,
+        guides,
+        wiki_dir,
+        root,
+        max_tokens,
+    )
+    .await
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn recent_context_text(
