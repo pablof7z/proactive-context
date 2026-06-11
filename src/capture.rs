@@ -1057,35 +1057,36 @@ async fn run_staged_capture(
     // reachable only via `pc debug extract --wiki-dir <dir>` for experimentation.
     let index_rows = read_index_live(&ctx.wiki_path);
 
+    // Run 9: when building a claims-only store with delta-EXTRACT, the regular EXTRACT (whose
+    // output feeds only the wiki pipeline + the Run-6 tap) is pure waste — the delta path runs its
+    // OWN digest-aware EXTRACT. Skip it so the delta build is ~1 EXTRACT/session, comparable to
+    // plain-B. (Only when BOTH flags are set; the live path is unchanged.)
+    let delta_only = delta_extract_enabled()
+        && std::env::var("PC_CLAIMS_ONLY").map(|v| v == "1").unwrap_or(false);
+
     // ── STAGE 1: EXTRACT ────────────────────────────────────────────────────────
     // EXTRACT runs WITHOUT the wiki index (pass &[]); see rationale above.
-    let extract_user = format!(
-        "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
-        numbered_transcript
-    );
-    let extract_raw = run_stage(
-        spec,
-        openrouter_api_key,
-        ollama_base_url,
-        ollama_api_key,
-        EXTRACT_PREAMBLE,
-        &extract_user,
-        6000,
-    )
-    .await?;
-
-    let extracted: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
-        Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-        None => Vec::new(),
+    let extracted: Vec<ExtractedClaim> = if delta_only {
+        Vec::new() // delta path does its own extraction; skip the redundant call
+    } else {
+        let extract_user = format!(
+            "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
+            numbered_transcript
+        );
+        let extract_raw = run_stage(
+            spec, openrouter_api_key, ollama_base_url, ollama_api_key,
+            EXTRACT_PREAMBLE, &extract_user, 6000,
+        ).await?;
+        let parsed: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
+            Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        eprintln!("capture: EXTRACT → {} raw claim(s)", parsed.len());
+        log_event("capture.extract", None, serde_json::json!({ "claims": parsed.len() }));
+        parsed
     };
-    eprintln!("capture: EXTRACT → {} raw claim(s)", extracted.len());
-    log_event(
-        "capture.extract",
-        None,
-        serde_json::json!({ "claims": extracted.len() }),
-    );
 
-    if extracted.is_empty() {
+    if extracted.is_empty() && !delta_only {
         return Ok("EXTRACT produced no claims.".to_string());
     }
 
@@ -1135,7 +1136,7 @@ async fn run_staged_capture(
             "explicit": n_explicit, "implicit": n_implicit
         }),
     );
-    if admitted.is_empty() {
+    if admitted.is_empty() && !delta_only {
         return Ok("No evidence-verified claims to capture.".to_string());
     }
 
@@ -1319,6 +1320,15 @@ async fn run_staged_capture(
                 }
             }
         }
+    }
+
+    // Run 9: claims-only short-circuit (PC_CLAIMS_ONLY=1). When building a claims-only store
+    // (e.g. Store B-delta), the wiki pipeline (ROUTE/RECONCILE/INDEX) is pure waste — skip it.
+    // This makes the delta build ~3x faster (one fewer heavy LLM stage per session) and keeps the
+    // cost comparison to plain-B fair (plain-B for the eval also only needs claims, but Run 6 ran
+    // the wiki too; the cost criterion compares the claims-relevant work).
+    if std::env::var("PC_CLAIMS_ONLY").map(|v| v == "1").unwrap_or(false) {
+        return Ok("Claims-only capture complete (wiki pipeline skipped).".to_string());
     }
 
     // ── STAGE 3: ROUTE — retrieve-then-rerank ─────────────────────────────────────
