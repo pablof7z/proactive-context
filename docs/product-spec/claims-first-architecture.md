@@ -1,7 +1,11 @@
 # Claims-First: Make the Claim Log the System of Record, the Wiki a Regenerable Projection
 
-**Status:** Revision 4 — **FINAL VERDICT (2026-06-11): the strong form of this proposal is REJECTED by the evidence; a hybrid landed in the product.**
+**Status:** Revision 5 — **CLOSED (2026-06-12). The hybrid is extended by the validated direction-change substrate: session episode cards.**
 **Scope:** proactive-context core architecture (capture store, inject source, wiki's role).
+
+## Rev 5 — The settled configuration
+
+Runs 7–9 completed the picture Rev 4 left open. The landed, validated configuration: **wiki guides (RECONCILE write path) for current truth · claim log as always-on lossless substrate · EPISODE CARDS for direction-change/trajectory (capture + inject, default ON — best Probe-2 source ever measured: 6/8 trajectory, 0/8 stale leaks; validated end-to-end on two re-created real-project histories) · research records for investigations · composition at SELECT via typed catalog rows, never by retrieval blending (F16).** Delta-EXTRACT's mechanism is proven (6/8 supersedes diagnostic, F14) and remains flagged off pending cost/precision work; predict-the-correction (F13) is the standing North-Star metric. Full evidence: `claims-first-validation-results.md` (Runs 1–9), `claims-first-learnings.md` (F1–F16), and the night-2 report on the fabric (`night2-report-2026-06-12`).
 
 ## Rev 4 — The verdict and what landed
 
