@@ -78,13 +78,15 @@ const MESSAGE_DECODERS: &[MessageDecoder] = &[
 /// The standard rule skips any string starting with `<` (harness-injected XML).
 /// But agent/subagent final reports arrive as `<task-notification>…<result>…</result>…`
 /// blocks in user turns — so the default rule makes EXTRACT blind to every subagent
-/// report in agentic sessions. When `PC_INCLUDE_TASK_RESULTS=1`, the `<result>` body
-/// of a task-notification is surfaced (HTML-unescaped) instead of dropped. Default
-/// off → behavior unchanged.
+/// report in agentic sessions. The `<result>` body of a task-notification is
+/// surfaced (HTML-unescaped) instead of dropped. ON by default since the
+/// 2026-06-11 validation: with it off, capture saw ZERO of the 11 agent reports
+/// in a real agentic session — a systematic capture-coverage hole. Set
+/// `PC_INCLUDE_TASK_RESULTS=0` to restore the old behavior.
 fn include_task_results() -> bool {
     std::env::var("PC_INCLUDE_TASK_RESULTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Extract plain text from a message `content` value (string or block array).
@@ -743,14 +745,17 @@ mod tests {
 <result>## Report\nA multi-line finding body that exceeds one hundred characters so it is not treated as trivial.</result>\n\
 </task-notification>".to_string(),
         );
-        // Flag OFF (default): the block is dropped (starts with '<').
+        // Default (unset): ON since 2026-06-11 — the <result> body surfaces.
         std::env::remove_var("PC_INCLUDE_TASK_RESULTS");
-        assert_eq!(extract_text(&content), "");
-        // Flag ON: the <result> body surfaces.
-        std::env::set_var("PC_INCLUDE_TASK_RESULTS", "1");
         let out = extract_text(&content);
         assert!(out.contains("## Report"), "expected surfaced result, got: {out:?}");
         assert!(out.contains("[Agent task result: Agent done]"));
+        // Explicit opt-out: the block is dropped (starts with '<').
+        std::env::set_var("PC_INCLUDE_TASK_RESULTS", "0");
+        assert_eq!(extract_text(&content), "");
+        // Explicit ON still works.
+        std::env::set_var("PC_INCLUDE_TASK_RESULTS", "1");
+        assert!(extract_text(&content).contains("## Report"));
         std::env::remove_var("PC_INCLUDE_TASK_RESULTS");
     }
 }

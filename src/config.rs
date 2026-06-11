@@ -210,7 +210,10 @@ fn default_capture_enabled() -> bool {
 }
 
 fn default_capture_research() -> bool {
-    false
+    // ON by default since the 2026-06-11 validation: all four pre-registered
+    // bars passed (recognition 3/3, provenance 100%, coverage 88%, precision
+    // 0/3 false positives). One recognition call per session; best-effort.
+    true
 }
 
 fn default_capture_model() -> String {

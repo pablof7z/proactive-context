@@ -34,12 +34,15 @@ use std::path::{Path, PathBuf};
 
 // ─── Feature flag ─────────────────────────────────────────────────────────────
 
-/// True when the claims-log tap is active.  Check before every write so the
-/// production path is byte-identical when the flag is off.
+/// True when the claims-log tap is active.  ON by default since the 2026-06-11
+/// validation arc: the tap is a zero-LLM, append-only persist of EXTRACT output
+/// (claims.jsonl + local embeddings) and proved to be a lossless substrate —
+/// every direction reversal's full history was present in-store across all six
+/// eval runs.  Set `PC_CLAIMS_LOG=0` to disable.
 pub fn claims_log_enabled() -> bool {
     std::env::var("PC_CLAIMS_LOG")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
