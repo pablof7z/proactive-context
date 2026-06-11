@@ -10,6 +10,7 @@ mod capture;
 mod claims;
 mod eval;
 mod eval_run7;
+mod eval_run8;
 mod session_start;
 mod chunker;
 mod config;
@@ -384,6 +385,12 @@ enum Commands {
         #[arg(long)]
         run7: bool,
 
+        /// Run 8 (Move 1): 8a attention-efficiency (bare-model load-bearing test + Run-7 re-rank)
+        /// and 8b predict-the-correction (mine FUTURE corrections, score A/B/C prediction) over the
+        /// frozen assets in --experiment-dir. Reuses preserved stores; no rebuilds.
+        #[arg(long)]
+        run8: bool,
+
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
@@ -725,6 +732,7 @@ fn main() -> Result<()> {
             score_only,
             probe3_only,
             run7,
+            run8,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -735,6 +743,7 @@ fn main() -> Result<()> {
                 score_only,
                 probe3_only,
                 run7,
+                run8,
                 judge_model,
             })?;
         }

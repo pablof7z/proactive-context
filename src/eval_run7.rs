@@ -222,7 +222,7 @@ struct BuildCost {
 // ─────────────────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, serde::Deserialize, Clone)]
-struct RawChunk {
+pub(crate) struct RawChunk {
     session: String,
     index: usize,
     text: String,
@@ -296,7 +296,7 @@ fn transcript_to_text(path: &str) -> Option<String> {
 
 /// Inject for Store C: retrieve top-N chunks by cosine over the query, COMPILE.
 /// Returns (briefing, tokens_in, tokens_out, latency_ms).
-fn inject_raw_rag(
+pub(crate) fn inject_raw_rag(
     prompt: &str,
     store_c_dir: &Path,
     compile_spec: &crate::provider::ModelSpec,
@@ -453,7 +453,7 @@ fn build_store_d(
 // ─────────────────────────────────────────────────────────────────────────────────
 
 /// E / D path: SELECT-less wiki inject (vector retrieval → COMPILE). Reuses eval::run_wiki_inject.
-fn inject_wiki_selectless(
+pub(crate) fn inject_wiki_selectless(
     prompt: &str, wiki_dir: &Path, compile_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
 ) -> (String, usize, usize, u64) {
@@ -463,7 +463,7 @@ fn inject_wiki_selectless(
 }
 
 /// B path: claims inject. Reuses eval::run_claims_inject_for_eval.
-fn inject_claims(
+pub(crate) fn inject_claims(
     prompt: &str, claims_dir: &Path, compile_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
 ) -> (String, usize, usize, u64) {
@@ -475,7 +475,7 @@ fn inject_claims(
 /// A path: wiki + SELECT. Catalog (title+summary per guide) → ONE fast-model SELECT call to pick
 /// slugs → load those guides → COMPILE. Models the live two-stage incumbent path; the only delta
 /// vs E is the extra SELECT LLM call.
-fn inject_wiki_select(
+pub(crate) fn inject_wiki_select(
     prompt: &str, wiki_dir: &Path, select_spec: &crate::provider::ModelSpec,
     compile_spec: &crate::provider::ModelSpec, api_key: &str, ollama_base_url: &str,
     ollama_api_key: Option<&str>, cfg: &crate::config::Config,

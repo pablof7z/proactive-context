@@ -1,5 +1,191 @@
 # Claims-First Validation Results
 
+**Run 8 opens the reframed program (Move 1).** Runs 3–7 treated inject as "recall the right fact"
+and the store as "a knowledge base." Run 8 tests the REFRAME with two falsification-capable
+instruments: **inject = counterfactual attention allocation** (surface only what the model would
+otherwise get wrong) and **store = a model of the principal** (predicts how the user will redirect
+the agent). Findings: (8a) **most labels are genuinely load-bearing** (pc 73.8%, wallet 62.2% — the
+bare model fails them), so the counterfactual frame buys less headroom than hoped, BUT Run-7's
+raw-RAG win HOLDS on the facts-that-mattered (pc); (8b) **a distilled claim store (B) beats raw-RAG
+(C) at predicting user corrections on both corpora** — weak but real support for the principal-model
+framing — though every source misses ~70-85% of corrections, so prediction is far from solved.
+Within-run only (P4). Bare/predict use the inject-target model `ollama:glm-5.1:cloud`; judged
+separately, same model. Frozen labels (pc 42, wallet 37) and frozen stores reused; no rebuilds.
+**Total OpenRouter spend across all eight runs: $0.00.**
+
+---
+
+# Run 8 — Move 1: attention-efficiency + predict-the-correction
+
+Code: `src/eval_run8.rs` (`pc eval --run8`), reusing Run-7 inject building blocks. Two corpora:
+**pc** (proactive-context) and **wallet** (nostr-multi-platform). Pre-registered reads were written
+and persisted to both experiment dirs (`run8-preregistered-reads.md`) BEFORE any scoring.
+
+## 8a — Attention-efficiency (is injection counterfactually load-bearing?)
+
+For each frozen P1 label, the BARE inject-target model answers the `future_prompt` with NO store and
+NO injection; the same judge then checks whether that bare answer already conveys `restated_fact`.
+**Load-bearing = bare model did NOT already convey it** (verdict ≠ "contained"); those are the facts
+injection could actually change. (Conservative: "partial" counts as load-bearing.)
+
+| cohort | pc load-bearing | wallet load-bearing |
+|---|---|---|
+| ALL | **31/42 = 73.8%** | **23/37 = 62.2%** |
+| EXPLICIT | 0/3 = 0.0% | 5/16 = 31.2% |
+| IMPLICIT | 31/39 = 79.5% | 18/21 = 85.7% |
+
+Reads:
+- **Both corpora are >60% load-bearing → the pre-registered "frame adds little headroom" clause
+  fires.** Most labeled facts genuinely needed injecting; the bare model does not already know them.
+  Divergence-filtering (inject only the load-bearing minority) is NOT the dominant opportunity here —
+  the minority of already-known facts is small (~26-38%). Said loudly: **on these corpora the
+  counterfactual reframe does not unlock a large "stop wasting attention" win** — the briefings are
+  mostly carrying facts the model lacks.
+- **The split is entirely along the explicit/implicit axis.** EXPLICIT facts are largely already
+  known to the bare model (pc 0/3 load-bearing; wallet 31%) — they tend to be generic/conventional.
+  IMPLICIT facts — the project-specific, idiosyncratic decisions — are 79-86% load-bearing. So the
+  real injectable value is concentrated in implicit, project-specific knowledge, exactly where a
+  bare model is blind. This refines the reframe: counterfactual value ≈ implicit-knowledge value.
+
+### Run-7 five-source P1, re-ranked on the LOAD-BEARING subset (the falsification test for raw-RAG)
+
+Does raw-RAG's Run-7 recall win survive when only facts-the-model-needed count?
+
+**pc (load-bearing n=31):**
+
+| src | FULL | LOAD-BEARING |
+|---|---|---|
+| A | 61.9% | 64.5% |
+| B | 76.2% | 77.4% |
+| **C** | **81.0%** | **83.9%** |
+| D | 54.8% | 58.1% |
+| E | 73.8% | 71.0% |
+
+**wallet (load-bearing n=23):**
+
+| src | FULL | LOAD-BEARING |
+|---|---|---|
+| A | 67.6% | 56.5% |
+| **B** | 73.0% | **65.2%** |
+| C | 73.0% | 60.9% |
+| D | 54.1% | 47.8% |
+| E | 64.9% | 56.5% |
+
+- **pc: C's win HOLDS and widens** (81.0%→83.9%, still #1). Raw-RAG was winning on facts that
+  actually mattered, not cheap already-known wins → **the Run-7 raw-RAG result stands and is
+  stronger.**
+- **wallet: the ranking FLIPS on the load-bearing subset** — B (65.2%) overtakes C (60.9%). On the
+  facts the model genuinely lacked, the distilled claim store edges out raw retrieval. So raw-RAG's
+  Run-7 parity on wallet was partly inflated by already-known facts; on the load-bearing core, B is
+  best. **Net: raw-RAG's recall dominance is real but corpus-dependent once you control for
+  counterfactual load** — it dominates on pc, loses to claims on wallet's load-bearing core.
+
+## 8b — Predict-the-correction (is the store a model of the principal?)
+
+Mined held-out FUTURE sessions for CORRECTION events — the user OVERRULING/REDIRECTING the agent's
+just-proposed approach ("no, do it this way instead"), not restatements of old facts. Each candidate
+(found by a redirection-signal heuristic over user turns that follow an assistant proposal,
+injection-stripped) was LLM-verified as a genuine correction and reduced to a one-sentence
+substance, then frozen. Scoring: given ONLY a prior store briefing (A wiki / B claims / C raw-RAG)
++ the pre-correction conversation, a model predicts the correction's substance; judged
+predicted / partial / missed.
+
+**Label counts (meaningfulness gate ≥10/corpus):** pc **25 verified** (across 13 sessions),
+wallet **32 verified** (across 16 sessions). **Both clear the gate** — the metric is meaningful;
+corrections are well-distributed, not concentrated in one session.
+
+**Three real corrections (wallet) + B's prediction:**
+1. [predicted] *substance:* "The agent should do the device build/install itself via Xcode, not
+   leave it to the user." — *B predicted:* "the device build infrastructure already exists
+   (SDK-conditional paths, DEVELOPMENT_TEAM 456SHKPP26, wildcard profile)…" → correctly anticipated.
+2. [partial] *substance:* "all platform code (Rust/iOS/Kotlin) consolidated under apps/podcast/,
+   not split." — *B predicted:* "the podcast app should follow Chirp's single-crate pattern, not
+   invent a family of crates" → right shape, partial.
+3. [partial] *substance:* "the damus relay must not be hardcoded; batch the 37 REQs." — *B
+   predicted:* "batch all 37 authors into one kinds:[0] request" → got the batching, missed
+   the hardcoding ban.
+
+**Prediction results (predicted / partial / missed):**
+
+| corpus | source | predicted | partial | missed | any-signal | weighted (pred=1, partial=.5) |
+|---|---|---|---|---|---|---|
+| pc (n=25) | A wiki | 0 | 7 | 18 | 28% | 3.5 |
+| pc (n=25) | **B claims** | **3** | 4 | 18 | 28% | **5.0** |
+| pc (n=25) | C rawRAG | 1 | 6 | 18 | 28% | 4.0 |
+| wallet (n=32) | A wiki | 3 | 2 | 27 | 16% | 4.0 |
+| wallet (n=32) | **B claims** | 3 | **7** | 22 | **31%** | **6.5** |
+| wallet (n=32) | C rawRAG | 4 | 1 | 27 | 16% | 4.5 |
+
+Reads (the falsification test was: *if C predicts corrections as well as A/B, the principal-model
+framing is weakened — report loudly*):
+- **C does NOT match B.** B (claims) has the highest weighted score on BOTH corpora (pc 5.0 vs C 4.0;
+  wallet 6.5 vs C 4.5) and on wallet doubles C's any-signal rate (31% vs 16%). A distilled store
+  beats raw retrieval at anticipating how the user redirects → **the principal-model framing is
+  SUPPORTED, not falsified.** The support is weak-but-consistent: B wins both corpora, but by a
+  modest margin and with exact-"predicted" counts in low single digits.
+- **The miss floor is high and shared (~70-85% missed) across all sources.** Predicting the
+  *substance* of a correction from prior notes + context is genuinely hard; today's stores capture
+  enough of the principal to beat raw retrieval but not enough to predict most redirections. This is
+  the real frontier the reframe points at — and it's measurable now.
+- **A (wiki) is the weakest predictor** (pc weighted 3.5, 0 exact hits). Prose guides, optimized for
+  topic recall, carry the principal's *preferences* less legibly than the atomic claim log (B). That
+  is consistent with the reframe: a "model of the principal" wants atomic, attributable preference
+  claims, not synthesized topic prose.
+
+## The two pre-registered verdicts (applied verbatim)
+
+1. **8a — counterfactual frame.** Pre-read: ≥60% load-bearing → "frame adds little, say so loudly."
+   → **BOTH corpora ≥60% (pc 73.8%, wallet 62.2%) → FIRES.** Most briefed facts are genuinely needed;
+   the counterfactual reframe does not unlock a large attention-savings win on these corpora.
+   Divergence-filtering is a minor optimization here, not the top priority. The nuance worth keeping:
+   the load is almost all in IMPLICIT/project-specific facts (explicit facts are mostly already
+   known), so the actionable version of the reframe is "spend attention on implicit, idiosyncratic
+   decisions; explicit/conventional facts can be dropped."
+
+2. **8b — principal-model framing.** Pre-read: C (raw-RAG) matching A/B → framing weakened, report
+   loudly; framing supported only if a distilled store beats C by a clear margin. → **B beats C on
+   both corpora** (weighted, and 2× any-signal on wallet) → **framing SUPPORTED (not falsified),**
+   but weakly — B's absolute prediction rate is low and the shared miss floor is ~75%. Gate met
+   (≥10/corpus), so this is a real result, not label scarcity.
+
+## What surprised me
+
+1. **The load-bearing test cut cleanly along explicit/implicit, not by corpus.** I expected a fuzzy
+   percentage; instead the bare model already knew ~all explicit facts (pc 0/3 load-bearing) and
+   almost none of the implicit ones (79-86% load-bearing). The reframe's real content is "inject
+   implicit/idiosyncratic knowledge," which is also exactly where claims (B) and the principal-model
+   live.
+2. **The Run-7 raw-RAG win is partly a load artifact — on wallet.** Controlling for counterfactual
+   load flipped wallet's #1 from C to B. A reviewer taking Run 7 at face value would have over-
+   credited raw retrieval; the load-bearing re-rank is the correction. On pc the win was genuine.
+3. **B actually predicted some corrections it had no business getting** (the device-build example):
+   the claim log had captured enough of the user's standing preferences that a model could
+   extrapolate the next redirection. Weak signal, but it's the first evidence in this program that a
+   store can act as a forward model of the principal, not just a backward record.
+4. **Predicting corrections is hard for everyone (~75% missed).** The reframe is measurable and
+   directionally supported, but the headroom is enormous — which makes "predict-the-correction" a
+   good North-Star metric for Move 2+ precisely because no source is near ceiling.
+
+## Net for the program (Runs 3→8)
+
+- **Recall:** raw-RAG (C) ≥ claims (B) on full sets, but once you restrict to counterfactually
+  load-bearing facts, B overtakes C on wallet and C only keeps its lead on pc. Distillation's recall
+  value shows up specifically on the implicit, model-lacks-it facts.
+- **Direction-change fidelity (Probe 2, Runs 5-7):** still unsolved; an EXTRACT problem.
+- **Principal modeling (new, 8b):** B > C > A at predicting user corrections on both corpora — first,
+  weak, falsification-surviving evidence that an atomic claim store models the principal better than
+  raw retrieval or prose guides. Frontier metric: ~75% of corrections still missed.
+- **Recommendation:** keep the claim log (B) — it is the best principal-model substrate (8b) and the
+  best load-bearing recall source on wallet; treat raw-RAG (C) as the recall baseline for already-
+  /easily-known facts. Make injection implicit-knowledge-biased (drop explicit/conventional facts the
+  model already has — the only place 8a found wasted attention). Pursue predict-the-correction as the
+  Move-2 objective; the measurement instrument now exists and shows large headroom.
+
+---
+
+# Runs 1-7 — prior history
+
+
 **Run 7 completes the design space.** Runs 3–6 compared two sources (A wiki vs B claims). Run 7
 adds the three baselines never tested — **C raw-transcript RAG** (the null hypothesis: no
 distillation), **D projection-from-log wiki** (the untested original proposal: offline-compile a
