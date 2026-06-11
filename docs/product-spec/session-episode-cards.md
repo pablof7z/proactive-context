@@ -393,3 +393,38 @@ Implementation: `src/episode_capture.rs` + `pc episodes` command. Commits: `90ad
 - The `routine-command-only` exclusion path was exercised via the empty array `[]` return (also correct).
 - One recognition call per session; total latency was under 30 seconds for the 2.6 MB session.
 - The spec's `routine-command-only` JSON object (`{"exclude_reason": "..."}`) was never returned in practice; models returned `[]` for no-arc sessions. Both are handled correctly.
+
+## Phases 3–4 Shipped (2026-06-12)
+
+Following Run 9 — which scored episode cards as the **best direction-change inject source across nine runs** (6/8 trajectory recovery, 0/8 stale leaks, 6/8 asserts-current; wiki guides 1/8 trajectory in the same sweep) — Phases 3 and 4 are implemented and the feature is default-on.
+
+### Phase 3 — capture integration
+
+- `run_episode_stage` runs after the normal capture pass, gated by `capture_episode_cards`, best-effort (errors logged and swallowed — never breaks capture), mirroring research-capture's call site in `capture.rs`. Cards persist to `<wiki>/episodes/`; the existing structural-maintenance index rebuild then lists them.
+- `default_capture_episode_cards()` flipped to **true**, citing the Run 9 validation — same evidence-based defaults convention as `capture_research`.
+- **Transcript-date stamping:** `run_episode_stage` takes a `date_override` threaded from capture's `today_str` (which honors `today_override`). `render_episode_card_dated` decouples the frontmatter `date:` / filename (the historical session date) from `captured_at:` (real processing time), so archeologist replay produces historically-dated cards. This is stricter than research-capture, which stamps wall-clock date even in replay (a latent backfill bug there; episode cards do it right).
+
+### Phase 4 — inject integration
+
+Design constraint from Run 9 finding #7: the 50/50 wiki+cards retrieval **blend diluted recall** (76.2 vs wiki's 78.6). We therefore do **not** blend retrieval. Instead episode cards ride the existing catalog/SELECT mechanism:
+
+- **Catalog typing:** episode cards appear as typed rows keyed `episode:<stem>`, title prefixed `[episode <date> · <salience>]`, summary = the card's Decision (falling back to Prior State). SELECT picks them when the prompt needs trajectory / rationale / history; they compete with guides on relevance, not by blending scores.
+- **Resolution:** `read_catalog_content` and `compile_briefing`'s path labeller resolve `episode:` keys to `<wiki>/episodes/<stem>.md`, so the compiler cites openable absolute paths with line numbers like any other source.
+- **Currentness contract:** `COMPILE_PREAMBLE` gained a paragraph instructing the compiler to treat episode cards as HISTORICAL provenance — assert a card's decision as current only when a guide/claim corroborates it; label conflicts historical (`previously …` / `as of <date> …`); prefer guides for present-tense behavior, cards for trajectory and why.
+- **No new model calls:** catalog rows + one preamble paragraph + reading `episodes/*.md` when selected. Same two-call (SELECT + COMPILE) budget as before.
+
+### Phase 3–4 smoke test
+
+Generated 4 cards from the `658f4c79` fixture into a temp project's `<wiki>/episodes/`, indexed it, then ran inject with prompt *"why did we switch from openrouter to local embeddings and what broke?"*:
+
+- SELECT picked `episode:2026-06-11-4-embedding-dimension-mismatch-self-heals-from` (the typed episode row).
+- COMPILE surfaced the card's content with per-fact citations to `./docs/wiki/episodes/…md:25` and `:29`.
+- The currentness contract held: the briefing explicitly noted *"The episode card does not state the reason for switching … it only records that the user performed the switch and then encountered the dimension mismatch errors"* — careful historical framing rather than asserting it as current truth.
+
+Flags-off behavior is byte-identical: the capture call-site is fully inside `if cfg.capture_episode_cards`; the inject additions are inert when `<wiki>/episodes/` is absent (`scan_episode_cards` returns empty).
+
+### Phase-4 ambiguities resolved
+
+1. **Catalog summary source.** The spec lists a `summary` frontmatter field but the rendered card has no `summary:` key. Resolved by deriving the catalog summary from the card body's **Decision** section (what changed — the most selection-relevant line), falling back to Prior State.
+2. **Key namespace.** Catalog keys are bare slugs (guides) or paths (committed md). Episode cards needed a third namespace that the SELECT key-validation, `read_catalog_content`, and the compile path-labeller all agree on. Resolved with the `episode:` prefix, handled at all three sites.
+3. **Currentness without a live claim/guide cross-check.** The spec's currentness model wants resolution against newer claims/guides at inject time. Phase 4 keeps it small (no graph walk): the contract is delivered as a COMPILE instruction, and corroboration is judged by the compiler from the co-selected sources already in its context, not by a separate resolution pass. A future phase can add explicit supersedes-link resolution if needed.

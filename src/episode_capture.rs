@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::capture::{call_model_blocking, rfc3339_now};
 use crate::config::load_config;
 use crate::provider::ModelSpec;
-use crate::research_capture::{build_research_transcript_with_spans, TurnSpan};
+use crate::research_capture::build_research_transcript_with_spans;
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
@@ -124,12 +124,18 @@ pub fn run_episode_capture(
 /// Episode-capture stage for the main capture pipeline, gated by `capture_episode_cards`
 /// (default OFF).  Persists immutable episode cards under `<wiki_dir>/episodes/`.
 ///
+/// `date_override` is the session's historical date (YYYY-MM-DD); when `Some` it stamps
+/// both the filename and the frontmatter `date:` so archeologist replay produces cards
+/// dated when the session happened, not when the backfill ran. When `None` (live hook)
+/// today's date is used. In both cases `captured_at:` records the real processing time.
+///
 /// Best-effort: errors are logged and swallowed by the caller so this stage never
 /// breaks the normal capture path.  Idempotent: a card file is never overwritten.
 pub fn run_episode_stage(
     wiki_dir: &Path,
     transcript_path: &str,
     session_id: &str,
+    date_override: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let episodes_dir = wiki_dir.join("episodes");
     let cfg = load_config()?;
@@ -156,7 +162,11 @@ pub fn run_episode_stage(
 
     fs::create_dir_all(&episodes_dir)?;
     let captured_at = rfc3339_now();
-    let date = captured_at[..captured_at.len().min(10)].to_string();
+    // The card date is the historical session date when replaying (archeologist),
+    // else the processing date. captured_at always records real wall-clock time.
+    let date = date_override
+        .map(str::to_string)
+        .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
     let mut persisted = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
@@ -172,7 +182,14 @@ pub fn run_episode_stage(
             persisted.push(card_path);
             continue;
         }
-        let content = render_episode_card(session_id, transcript_path, arc, &verified_evidence, &captured_at);
+        let content = render_episode_card_dated(
+            session_id,
+            transcript_path,
+            arc,
+            &verified_evidence,
+            &date,
+            &captured_at,
+        );
         fs::write(&card_path, content)?;
         persisted.push(card_path);
     }
@@ -499,7 +516,29 @@ pub fn render_episode_card(
     verified_evidence: &[EvidenceRange],
     captured_at: &str,
 ) -> String {
-    let date = &captured_at[..captured_at.len().min(10)];
+    render_episode_card_dated(
+        session_id,
+        transcript_path,
+        arc,
+        verified_evidence,
+        &captured_at[..captured_at.len().min(10)],
+        captured_at,
+    )
+}
+
+/// Like [`render_episode_card`] but with an explicit `date` (the historical session
+/// date — frontmatter `date:` and filename) decoupled from `captured_at` (the real
+/// wall-clock processing time — frontmatter `captured_at:`). Archeologist replay sets
+/// `date` to the session's historical date so cards are dated when the session happened,
+/// not when the backfill ran. The live hook passes today for both.
+pub fn render_episode_card_dated(
+    session_id: &str,
+    transcript_path: &str,
+    arc: &RecognizedArc,
+    verified_evidence: &[EvidenceRange],
+    date: &str,
+    captured_at: &str,
+) -> String {
 
     // Build subjects YAML list
     let subjects_yaml = if arc.subjects.is_empty() {
@@ -597,7 +636,7 @@ captured_at: {ts}\n\
 
 // ─── Index support (episode cards section in _index.md) ──────────────────────
 
-/// A row for the episode-cards section of `_index.md`.
+/// A row for the episode-cards section of `_index.md` and the inject catalog.
 #[derive(Debug, Clone)]
 pub struct EpisodeRow {
     pub filename: String,
@@ -605,6 +644,40 @@ pub struct EpisodeRow {
     pub title: String,
     pub salience: String,
     pub session: String,
+    /// One-line gist for the inject catalog: the card's Decision (what changed),
+    /// falling back to Prior State. Empty if neither section has content.
+    pub summary: String,
+}
+
+/// Extract the first non-blank paragraph under a `## <heading>` section in a card body.
+/// Returns empty string if the section is missing or blank.
+fn extract_card_section(content: &str, heading: &str) -> String {
+    let marker = format!("## {}", heading);
+    let mut in_section = false;
+    let mut collected = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            if in_section {
+                break; // next section — stop
+            }
+            in_section = trimmed == marker;
+            continue;
+        }
+        if in_section {
+            if trimmed.is_empty() {
+                if collected.is_empty() {
+                    continue; // skip leading blanks
+                }
+                break; // end of first paragraph
+            }
+            if !collected.is_empty() {
+                collected.push(' ');
+            }
+            collected.push_str(trimmed.trim_start_matches("- ").trim_start_matches('*'));
+        }
+    }
+    collected.trim().to_string()
 }
 
 /// Scan `<wiki>/episodes/*.md` for episode cards (frontmatter `type: episode-card`).
@@ -652,6 +725,13 @@ pub fn scan_episode_cards(wiki_dir: &Path) -> Vec<EpisodeRow> {
             }
             String::new()
         };
+        // Catalog summary: prefer the Decision (what changed), fall back to Prior State.
+        let decision = extract_card_section(&content, "Decision");
+        let summary = if decision.is_empty() {
+            extract_card_section(&content, "Prior State")
+        } else {
+            decision
+        };
         rows.push(EpisodeRow {
             filename,
             date: fm("date"),
@@ -668,6 +748,7 @@ pub fn scan_episode_cards(wiki_dir: &Path) -> Vec<EpisodeRow> {
             },
             salience: fm("salience"),
             session: fm("session"),
+            summary,
         });
     }
     rows.sort_by(|a, b| a.filename.cmp(&b.filename));
@@ -878,6 +959,38 @@ body
         assert!(rendered.contains("OpenRouter/OpenAI embeddings were the expected"), "missing prior_state text");
     }
 
+    #[test]
+    fn render_episode_card_dated_uses_historical_date_not_captured_at() {
+        // Archeologist replay: the session happened on 2026-05-29 but the backfill
+        // runs on 2026-06-12. The frontmatter `date:` must be the historical session
+        // date; `captured_at:` records the real processing time.
+        let arc = RecognizedArc {
+            title: "Test arc".to_string(),
+            salience: "reversal".to_string(),
+            subjects: vec!["x".to_string()],
+            prior_state: "before".to_string(),
+            trigger: "cause".to_string(),
+            decision: "after".to_string(),
+            consequences: vec!["c".to_string()],
+            open_tail: vec![],
+            evidence: vec![EvidenceRange { start: 1, end: 2 }],
+        };
+        let evidence = vec![EvidenceRange { start: 1, end: 2 }];
+        let rendered = render_episode_card_dated(
+            "sess-old",
+            "/t.jsonl",
+            &arc,
+            &evidence,
+            "2026-05-29",               // historical session date
+            "2026-06-12T09:00:00Z",     // real processing time
+        );
+        assert!(rendered.contains("date: 2026-05-29"), "frontmatter date must be historical:\n{}", rendered);
+        assert!(rendered.contains("captured_at: 2026-06-12T09:00:00Z"), "captured_at must be processing time");
+        // The plain render must keep date == captured_at's date portion.
+        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, "2026-06-12T09:00:00Z");
+        assert!(live.contains("date: 2026-06-12"), "live render derives date from captured_at");
+    }
+
     // ─── Evidence verification ────────────────────────────────────────────────
 
     #[test]
@@ -978,6 +1091,59 @@ OpenRouter was used.
         assert_eq!(rows.len(), 1, "should find exactly 1 card");
         assert_eq!(rows[0].salience, "reversal");
         assert_eq!(rows[0].session, "sess-abc");
+        // No Decision section here → summary falls back to Prior State.
+        assert_eq!(rows[0].summary, "OpenRouter was used.");
+    }
+
+    #[test]
+    fn scan_episode_cards_summary_prefers_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let episodes_dir = wiki.join("episodes");
+        fs::create_dir_all(&episodes_dir).unwrap();
+        let card = "\
+---
+type: episode-card
+date: 2026-06-11
+session: s
+transcript: /t.jsonl
+salience: reversal
+status: active
+subjects:
+  - x
+supersedes: []
+related_claims: []
+source_lines:
+  - 1-2
+captured_at: 2026-06-11T10:00:00Z
+---
+
+# Episode: Title
+
+## Prior State
+
+The old way.
+
+## Decision
+
+The new way is adopted.
+
+## Consequences
+
+- c
+";
+        fs::write(episodes_dir.join("2026-06-11-1-x.md"), card).unwrap();
+        let rows = scan_episode_cards(wiki);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary, "The new way is adopted.", "summary must prefer Decision over Prior State");
+    }
+
+    #[test]
+    fn extract_card_section_grabs_first_paragraph_only() {
+        let body = "# Episode: T\n\n## Prior State\n\nFirst para.\n\n## Decision\n\nThe decision line.\n\nTrailing.\n";
+        assert_eq!(extract_card_section(body, "Prior State"), "First para.");
+        assert_eq!(extract_card_section(body, "Decision"), "The decision line.");
+        assert_eq!(extract_card_section(body, "Nonexistent"), "");
     }
 
     #[test]
@@ -1086,5 +1252,29 @@ Z adopted.
             "episode card leaked into guide rows: {:?}",
             slugs
         );
+    }
+
+    // ─── Capture call-site no-op / best-effort contract ───────────────────────
+
+    #[test]
+    fn run_episode_stage_empty_transcript_is_no_op() {
+        // An empty transcript file → parsing yields zero lines → Ok(empty), no cards,
+        // no episodes/ dir created. This is the path the capture call-site relies on
+        // to stay byte-identical when a session has nothing to recognize.
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let transcript = tmp.path().join("empty.jsonl");
+        fs::write(&transcript, "").unwrap();
+
+        let result = run_episode_stage(
+            &wiki,
+            transcript.to_str().unwrap(),
+            "sess-empty",
+            None,
+        );
+        assert!(result.is_ok(), "empty transcript must be a clean no-op");
+        assert!(result.unwrap().is_empty(), "no cards from empty transcript");
+        // No episodes dir is created when there is nothing to persist.
+        assert!(!wiki.join("episodes").exists(), "must not create episodes/ on no-op");
     }
 }

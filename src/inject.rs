@@ -59,6 +59,15 @@ citation in the form (path:line) or (path:start-end), using the EXACT path from 
 source header and the line numbers shown by the `N|` prefix. A claim with no citation is invalid. \
 Never invent paths or line numbers — cite only what is shown. Synthesize in your own words; do not \
 paste whole sections verbatim.\n\n\
+EPISODE CARDS (historical provenance): a source whose path contains `/episodes/` is a session \
+episode card — a HISTORICAL record of a decision a past session made (Prior State → Trigger → \
+Decision → Consequences). Treat it as trajectory and rationale, NOT as current truth:\n\
+- Prefer wiki guides and committed docs for present-tense behavior; use episode cards to explain \
+WHY something changed or whether a prior approach was tried/replaced.\n\
+- State an episode card's decision as current ONLY when a guide or committed doc corroborates it. \
+If a card conflicts with newer material, surface the card's claim explicitly labeled as historical \
+(e.g. \"previously …\" or \"as of <card date> …\"), and surface the current fact from the guide.\n\
+- Always cite the card with its (path:line) like any other source.\n\n\
 Output EXACTLY this shape:\n\
 TITLE: <2-8 words naming the topic, or the single word none if nothing is relevant>\n\
 <cited facts from the sources, one claim per sentence, each followed by its (path:line) citation>\n\n\
@@ -726,8 +735,15 @@ fn read_head(path: &Path, cap: usize) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-/// Full content of a catalog source by key (wiki slug → wiki_dir; repo path → root).
+/// Full content of a catalog source by key. Resolution by key shape:
+///   - `episode:<stem>`  → `<wiki_dir>/episodes/<stem>.md` (historical episode card)
+///   - `<path>` containing '/' or ending '.md' → `<root>/<path>` (committed project doc)
+///   - bare slug → `<wiki_dir>/<slug>.md` (wiki guide)
 fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<String> {
+    if let Some(stem) = key.strip_prefix(EPISODE_KEY_PREFIX) {
+        let path = wiki_dir.join("episodes").join(format!("{}.md", stem));
+        return std::fs::read_to_string(path).ok();
+    }
     let path = if key.ends_with(".md") || key.contains('/') {
         root.join(key)
     } else {
@@ -736,12 +752,17 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<Strin
     std::fs::read_to_string(path).ok()
 }
 
+/// Catalog key prefix marking an episode card (historical provenance source).
+/// SELECT picks these for trajectory/rationale/history prompts; COMPILE treats them
+/// as historical per the currentness contract in COMPILE_PREAMBLE.
+const EPISODE_KEY_PREFIX: &str = "episode:";
+
 /// Build the candidate catalog: wiki guides (free title/summary from the index) ∪ committed
 /// project markdown, annotated with vector-preselect scores, capped at CATALOG_MAX. File
 /// heads are read ONLY for post-cap survivors so a big repo never pays hundreds of opens.
 fn build_catalog(
     root: &Path,
-    _wiki_dir: &Path,
+    wiki_dir: &Path,
     index_rows: &[IndexRow],
     hits: &[QueryResult],
     max: usize,
@@ -771,6 +792,21 @@ fn build_catalog(
             title: r.title.clone(),
             summary: r.summary.clone(),
             score: hit_score.get(&r.slug).copied(),
+        });
+    }
+
+    // Episode cards: typed catalog rows keyed `episode:<stem>`. SELECT picks them when
+    // the prompt needs trajectory/rationale/history; COMPILE treats them as historical
+    // provenance (see COMPILE_PREAMBLE). The title is prefixed `[episode <date>]` so the
+    // selector can tell a historical arc from a current guide at a glance.
+    for ep in crate::episode_capture::scan_episode_cards(wiki_dir) {
+        let stem = ep.filename.strip_suffix(".md").unwrap_or(&ep.filename).to_string();
+        let title = format!("[episode {} · {}] {}", ep.date, ep.salience, ep.title);
+        items.push(CatalogItem {
+            key: format!("{}{}", EPISODE_KEY_PREFIX, stem),
+            title,
+            summary: ep.summary,
+            score: hit_score.get(&stem).copied(),
         });
     }
 
@@ -1035,7 +1071,9 @@ async fn compile_briefing(
     let sources: Vec<(String, String)> = guides
         .iter()
         .map(|(slug, content)| {
-            let abs = if slug.ends_with(".md") || slug.contains('/') {
+            let abs = if let Some(stem) = slug.strip_prefix(EPISODE_KEY_PREFIX) {
+                wiki_dir.join("episodes").join(format!("{}.md", stem))
+            } else if slug.ends_with(".md") || slug.contains('/') {
                 root.join(slug)
             } else {
                 guide_path(wiki_dir, slug)
@@ -1247,6 +1285,70 @@ fn format_guides(guides: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_query_line;
+    use super::{build_catalog, read_catalog_content, EPISODE_KEY_PREFIX};
+    use std::fs;
+
+    /// Write a minimal episode card into `<wiki>/episodes/<name>.md`.
+    fn write_episode_card(wiki: &std::path::Path, name: &str, title: &str, decision: &str) {
+        let dir = wiki.join("episodes");
+        fs::create_dir_all(&dir).unwrap();
+        let card = format!(
+            "---\ntype: episode-card\ndate: 2026-05-29\nsession: sess-x\ntranscript: /t.jsonl\n\
+salience: reversal\nstatus: active\nsubjects:\n  - embedding-provider\nsupersedes: []\n\
+related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n---\n\n\
+# Episode: {title}\n\n## Prior State\n\nBefore.\n\n## Trigger\n\nCause.\n\n## Decision\n\n{decision}\n\n\
+## Consequences\n\n- c\n\n## Open Tail\n\n*(none)*\n\n## Evidence\n\n- transcript lines 1-2\n",
+            title = title,
+            decision = decision
+        );
+        fs::write(dir.join(format!("{}.md", name)), card).unwrap();
+    }
+
+    #[test]
+    fn catalog_includes_episode_cards_as_typed_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        write_episode_card(
+            &wiki,
+            "2026-05-29-1-local-embeddings-default",
+            "Local embeddings become the default",
+            "The default embedder is local MiniLM; OpenRouter is no longer the default.",
+        );
+
+        // No wiki guides, no RAG hits — only the episode card should surface.
+        let catalog = build_catalog(root, &wiki, &[], &[], 150);
+        let episode_rows: Vec<_> = catalog
+            .iter()
+            .filter(|c| c.key.starts_with(EPISODE_KEY_PREFIX))
+            .collect();
+        assert_eq!(episode_rows.len(), 1, "expected one episode catalog row");
+        let row = episode_rows[0];
+        assert_eq!(row.key, "episode:2026-05-29-1-local-embeddings-default");
+        // Title is prefixed so the selector can tell history from current guides.
+        assert!(row.title.contains("[episode 2026-05-29"), "title missing episode tag: {}", row.title);
+        assert!(row.title.contains("Local embeddings become the default"));
+        // Summary is the Decision line.
+        assert!(row.summary.contains("local MiniLM"), "summary should carry the Decision: {}", row.summary);
+    }
+
+    #[test]
+    fn read_catalog_content_resolves_episode_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        write_episode_card(&wiki, "2026-05-29-1-test", "Test arc", "Adopted Z.");
+
+        let content = read_catalog_content(root, &wiki, "episode:2026-05-29-1-test")
+            .expect("episode key must resolve to its file");
+        assert!(content.contains("type: episode-card"));
+        assert!(content.contains("# Episode: Test arc"));
+
+        // A missing episode key resolves to None, not a panic or wrong file.
+        assert!(read_catalog_content(root, &wiki, "episode:does-not-exist").is_none());
+    }
 
     #[test]
     fn parse_query_line_handles_model_formatting() {
