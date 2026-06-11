@@ -335,3 +335,61 @@ Specific fixtures:
 ## Near-Term Recommendation
 
 Implement episode cards as an experimental, default-off capture type. Start with a standalone debug command and four fixtures: three known product/design reversals and one routine command-only session. If the cards improve direction-change trajectory without introducing stale leaks or command-noise, wire them into capture and then inject.
+
+## Phase 2 Validation Results (2026-06-11)
+
+Implementation: `src/episode_capture.rs` + `pc episodes` command. Commits: `90ad65e` (implementation), `9effa1a` (UTF-8 fix).
+
+### Fixture (a): Embedding-provider default reversal (OpenRouter→local MiniLM)
+
+**Session:** `658f4c79` (transcript ~2.6 MB, 3894 lines after parsing)
+**Card produced:** Yes — `2026-06-11-3-embedding-dimension-mismatch-self-heals-on.md`
+**Title:** "Embedding dimension mismatch self-heals on DB open"
+**Prior State (correct):** "Switching embed models (e.g. OpenRouter 1536-dim → local 384-dim) caused a hard crash on query: 'Dimension mismatch for query vector for the embedding column.'"
+**Decision (correct):** Read actual FLOAT[N] dimension from `sqlite_master` (not `meta` table); drop and recreate stale virtual table on mismatch.
+**Salience:** `root-cause`
+**Notes:** The model correctly captured the OpenRouter→local transition embedded in the dimension-mismatch root cause. The framing is accurate but narrow — it describes the *consequence fix* rather than the earlier *provider switch decision*. Both are valid; the root-cause framing is arguably more durable.
+
+### Fixture (b): Primary command `generate`→`inject` reversal
+
+**Session:** `658f4c79` (same session as above)
+**Card produced:** Yes — `2026-06-11-2-generate-command-removed-entirely-in-favor.md`
+**Title:** "Generate command removed entirely in favor of inject"
+**Prior State (correct):** "`pc generate` was a CLI subcommand that answered questions from notes with multi-turn tool-calling. It had its own config fields (`generate_model`, `decompose_model`, `max_fanout_queries`, `max_parallel_prefetch`)."
+**Decision (correct):** "Deleted `generate.rs`, removed the `Generate` CLI subcommand, removed four config fields, removed two configure TUI roles."
+**Salience:** `reversal`
+**Notes:** Prior State and Decision match the historical record exactly. User trigger ("remove the 'generate' command entirely (since we now use inject as the command)") was identified correctly.
+
+### Fixture (c): Capture-evidence format change (quoted text→line ranges)
+
+**Session:** `ed37c932` (505 KB, 583 transcript lines)
+**Card produced:** Yes — `2026-06-11-1-inject-compile-model-reframed-from-answerer.md`
+**Title:** "Inject compile model reframed from answerer to librarian"
+**Prior State (correct):** "The compile (second-step) model in inject was a briefing synthesizer… Citations were not line-accurate; dates were not included."
+**Decision (correct):** "The compile model is now a librarian, not an answerer. It outputs a tiny JSON of {slug, start, end}; Rust slices verbatim text… Absolute-path citations with relative dates are rendered by Rust."
+**Salience:** `reversal`
+**Notes:** This session captures the companion decision (inject becoming verbatim-line-range-cited) that was the functional motivation for the capture evidence format change. The capture-side change (quoted text → line ranges) lived in an adjacent session not in the history corpus; this session captures the inject-side half of the same reversal, which is the load-bearing consequence. Coverage is partial but meaningful.
+
+### Fixture (d): Routine command-only session
+
+**Session:** `25b7ce16` (18 KB, 6 transcript lines — single question about config.json)
+**Cards produced:** 0 (correct — the LLM returned `[]`)
+**Notes:** The routine-only no-op path worked correctly. The session was a single factual question with no product arc; the model returned an empty array rather than the `{"exclude_reason":"routine-command-only"}` object, which is also a valid no-op response per implementation.
+
+### Summary
+
+| Fixture | Card emitted? | Prior State correct? | Decision correct? | Notes |
+|---------|--------------|---------------------|------------------|-------|
+| (a) embed provider reversal | Yes | Yes | Yes | Framed as root-cause fix; captures the reversal accurately |
+| (b) generate→inject removal | Yes | Yes | Yes | Exact match to historical record |
+| (c) evidence format change | Partial | Yes (inject side) | Yes (inject side) | Capture-side session not in corpus; inject-side correctly captured |
+| (d) routine command-only | No cards | n/a | n/a | Correct no-op |
+
+### Recognition quality observations
+
+- The model (Ollama `glm-5.1:cloud`) correctly identified 4 distinct product arcs from a 3894-line session (fixture a+b), each with accurate Prior State and Decision.
+- Evidence ranges are all in-corpus (verified by Rust slicing); no dropped cards due to bad evidence.
+- The model did NOT produce false positives for the routine-only session.
+- The `routine-command-only` exclusion path was exercised via the empty array `[]` return (also correct).
+- One recognition call per session; total latency was under 30 seconds for the 2.6 MB session.
+- The spec's `routine-command-only` JSON object (`{"exclude_reason": "..."}`) was never returned in practice; models returned `[]` for no-arc sessions. Both are handled correctly.

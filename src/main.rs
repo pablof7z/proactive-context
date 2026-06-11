@@ -9,6 +9,7 @@ mod codex;
 mod opencode;
 mod awareness;
 mod capture;
+mod episode_capture;
 mod research_capture;
 mod claims;
 mod eval;
@@ -359,6 +360,29 @@ enum Commands {
 
         /// Print the research-aware transcript (with task-notification results included)
         /// instead of running recognition. Useful for R3 inspection.
+        #[arg(long)]
+        dump_transcript: bool,
+    },
+
+    /// Episode-card debug command (spec Phases 1–2). Recognizes product movement arcs in
+    /// a session transcript and emits episode cards into an output directory.
+    /// Feature-flagged: does NOT touch the live capture pipeline or wiki state.
+    /// Gated by `capture_episode_cards` config flag (default OFF) in live capture.
+    Episodes {
+        /// Path to the .jsonl transcript file to analyze.
+        #[arg(long, value_name = "FILE")]
+        transcript: PathBuf,
+
+        /// Directory to write episode card files (default: /tmp/episode-capture-experiment).
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+
+        /// Override the session ID (default: derived from transcript filename).
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+
+        /// Print the line-numbered transcript (task-results visible) and exit without
+        /// running recognition. Useful for inspecting what the LLM will see.
         #[arg(long)]
         dump_transcript: bool,
     },
@@ -738,6 +762,29 @@ fn main() -> Result<()> {
                 println!("Research capture complete. {} record(s) persisted:", records.len());
                 for r in &records {
                     println!("  {}", r.display());
+                }
+            }
+        }
+
+        Commands::Episodes { transcript, out_dir, session_id, dump_transcript } => {
+            let out_dir = out_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/episode-capture-experiment"));
+            let transcript_str = transcript.to_string_lossy().to_string();
+            if dump_transcript {
+                let (numbered, _lines) = crate::research_capture::build_research_transcript(&transcript_str)?;
+                print!("{}", numbered);
+            } else {
+                let cards = crate::episode_capture::run_episode_capture(
+                    &transcript_str,
+                    &out_dir,
+                    session_id.as_deref(),
+                )?;
+                if cards.is_empty() {
+                    println!("Episode capture complete. No product episode cards emitted (routine-command-only or no salient arcs).");
+                } else {
+                    println!("Episode capture complete. {} card(s) persisted:", cards.len());
+                    for c in &cards {
+                        println!("  {}", c.display());
+                    }
                 }
             }
         }

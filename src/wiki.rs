@@ -540,7 +540,8 @@ pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
     rows.sort_by(|a, b| a.topic.cmp(&b.topic).then_with(|| a.slug.cmp(&b.slug)));
 
     let research = scan_research_records(wiki_dir);
-    write_index_file_with_research(wiki_dir, today, &rows, &research)?;
+    let episodes = crate::episode_capture::scan_episode_cards(wiki_dir);
+    write_index_file_with_research(wiki_dir, today, &rows, &research, &episodes)?;
     Ok(rows)
 }
 
@@ -603,7 +604,7 @@ pub fn scan_research_records(wiki_dir: &Path) -> Vec<ResearchRow> {
 }
 
 fn write_index_file(wiki_dir: &Path, today: &str, rows: &[IndexRow]) -> Result<()> {
-    write_index_file_with_research(wiki_dir, today, rows, &[])
+    write_index_file_with_research(wiki_dir, today, rows, &[], &[])
 }
 
 fn write_index_file_with_research(
@@ -611,6 +612,7 @@ fn write_index_file_with_research(
     today: &str,
     rows: &[IndexRow],
     research: &[ResearchRow],
+    episodes: &[crate::episode_capture::EpisodeRow],
 ) -> Result<()> {
     fs::create_dir_all(wiki_dir)?;
     let path = wiki_dir.join("_index.md");
@@ -620,7 +622,7 @@ fn write_index_file_with_research(
     out.push_str("> Derived cache — do not hand-edit. Rebuilt by proactive-context after each capture.\n\n");
     out.push_str(&format!("Last updated: {}\n\n", today));
 
-    if rows.is_empty() && research.is_empty() {
+    if rows.is_empty() && research.is_empty() && episodes.is_empty() {
         out.push_str("*(no guides yet)*\n");
         fs::write(&path, out)?;
         return Ok(());
@@ -666,6 +668,26 @@ fn write_index_file_with_research(
             out.push_str(&format!(
                 "| [{}](research/{}) | {} | {} | {} |\n",
                 stem, r.filename, r.date, finding, r.agent_attribution
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Episode cards (immutable, session-level product arcs) — listed but never reconciled.
+    if !episodes.is_empty() {
+        out.push_str(&format!(
+            "## Episode Cards ({} card{})\n\n",
+            episodes.len(),
+            if episodes.len() == 1 { "" } else { "s" }
+        ));
+        out.push_str("| Card | Date | Title | Salience |\n");
+        out.push_str("|------|------|-------|----------|\n");
+        for ep in episodes {
+            let stem = ep.filename.strip_suffix(".md").unwrap_or(&ep.filename);
+            let title = ep.title.replace('|', "\\|");
+            out.push_str(&format!(
+                "| [{}](episodes/{}) | {} | {} | {} |\n",
+                stem, ep.filename, ep.date, title, ep.salience
             ));
         }
         out.push('\n');
