@@ -30,6 +30,7 @@ pub struct EvalArgs {
     pub score_only: bool,
     pub probe3_only: bool,
     pub run7: bool,
+    pub run8: bool,
     pub judge_model: Option<String>,
 }
 
@@ -119,6 +120,19 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
         let cfg = load_config().unwrap_or_default();
         let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
         return crate::eval_run7::run_run7(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg);
+    }
+
+    if args.run8 {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        // Corpus label: pc vs wallet, derived from the project key.
+        let corpus_label = if project_key.contains("proactive-context") { "pc" }
+            else if project_key.contains("nostr") { "wallet" }
+            else { "corpus" };
+        return crate::eval_run8::run_run8(crate::eval_run8::Run8Args {
+            corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
+            judge_model: &judge_model, cfg: &cfg, corpus_label,
+        });
     }
 
     // Dirs for each store's output under the experiment dir.
@@ -614,7 +628,7 @@ fn mine_labels(
 /// pasted wiki-index dumps. A "restatement" mined from pc's OWN injection would be circular —
 /// it is assistant-side machine output, not human direction. We remove those spans here so the
 /// judge only ever sees what the human actually typed.
-fn strip_injected_context(text: &str) -> String {
+pub(crate) fn strip_injected_context(text: &str) -> String {
     let mut s = text.to_string();
     // Remove <system-reminder>…</system-reminder> blocks (both raw and HTML-escaped forms).
     for (open, close) in [
@@ -639,7 +653,7 @@ fn strip_injected_context(text: &str) -> String {
 
 /// True if a turn is dominated by pc's own injected/derived artifacts (briefing header, wiki
 /// index cache, citation log) rather than human text — these must never become labels.
-fn is_pc_self_referential(t: &str) -> bool {
+pub(crate) fn is_pc_self_referential(t: &str) -> bool {
     let lower = t.to_lowercase();
     lower.contains("relevant project context (")
         || lower.contains("derived cache — do not hand-edit")
