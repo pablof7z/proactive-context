@@ -876,6 +876,11 @@ available context sources (committed project docs and distilled wiki guides), ea
 below is background to interpret it — do NOT answer anything.\n\n\
 Decide which sources (if any) contain context DIRECTLY relevant to what the user now needs. You \
 may decide from the titles and summaries alone — you have no tools and read nothing here.\n\n\
+Source types: keys prefixed `episode:` are SESSION EPISODE CARDS — historical records of a \
+decision, reversal, or root-cause arc (prior state -> what changed -> why). When the prompt asks \
+WHY something changed, what was there BEFORE, whether something was tried, or for the history of \
+a decision, episode cards are the PRIMARY source — select the relevant ones (alongside any \
+current-truth guide). For purely present-tense behavior questions, prefer guides.\n\n\
 Output rules:\n\
 - Output the keys of directly-relevant sources, ONE PER LINE, exactly as shown in the catalog (the \
 part before the first ' — '), and nothing else on those lines.\n\
