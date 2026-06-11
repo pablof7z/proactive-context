@@ -299,7 +299,8 @@ fn extract_research_text(content: &Value) -> Option<String> {
                         if let Some(Value::String(s)) = inner {
                             let s = s.trim();
                             if !s.is_empty() && !s.starts_with('<') {
-                                parts.push(format!("[Tool result]: {}", &s[..s.len().min(1000)]));
+                                let cap = char_safe_truncate(s, 1000);
+                                parts.push(format!("[Tool result]: {}", cap));
                             }
                         } else if let Some(Value::Array(inner_blocks)) = inner {
                             for ib in inner_blocks {
@@ -307,7 +308,8 @@ fn extract_research_text(content: &Value) -> Option<String> {
                                     if let Some(t) = ib.get("text").and_then(|v| v.as_str()) {
                                         let t = t.trim();
                                         if !t.is_empty() {
-                                            parts.push(format!("[Tool result]: {}", &t[..t.len().min(1000)]));
+                                            let cap = char_safe_truncate(t, 1000);
+                                            parts.push(format!("[Tool result]: {}", cap));
                                         }
                                     }
                                 }
@@ -638,6 +640,19 @@ pub fn snap_range_to_blocks(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Truncate a string to at most `max_bytes` bytes while preserving valid UTF-8 char
+/// boundaries. Returns a &str slice safe for printing.
+fn char_safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 fn derive_session_id(transcript_path: &str) -> String {
     Path::new(transcript_path)
