@@ -485,6 +485,24 @@ enum DebugAction {
         #[arg(long)]
         all: bool,
     },
+
+    /// Run the REAL triage gate on a transcript (same model, config, caps, prompt, and
+    /// wiki index as live capture) and print the verdict + the model's raw first line.
+    /// Makes every triage skip reproducible and auditable.
+    Triage {
+        /// Path to a `.jsonl` transcript (same format as ~/.claude/projects/**/*.jsonl).
+        #[arg(long, value_name = "FILE")]
+        transcript: PathBuf,
+
+        /// Feed triage the wiki index from this dir (for the 'already specified' check).
+        /// Defaults to the discovered project wiki for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// Baseline: run triage with NO wiki index, ignoring discovery.
+        #[arg(long)]
+        no_wiki: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -700,6 +718,9 @@ fn main() -> Result<()> {
                 } else {
                     anyhow::bail!("provide a transcript file path or pass --all");
                 }
+            }
+            DebugAction::Triage { transcript, wiki_dir, no_wiki } => {
+                crate::capture::run_debug_triage(&transcript, wiki_dir.as_deref(), no_wiki)?;
             }
         },
 
