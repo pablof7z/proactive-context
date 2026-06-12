@@ -280,6 +280,29 @@ fn triage_transcript(
     transcript: &str,
     wiki_index: &str,
 ) -> Result<bool> {
+    let (verdict, _raw) = triage_transcript_raw(
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        transcript,
+        wiki_index,
+    )?;
+    Ok(verdict)
+}
+
+/// The shared triage call: returns `(verdict, raw_first_line)`. The live gate
+/// ([`triage_transcript`]) discards the raw line; `pc debug triage` surfaces it so the
+/// gate is auditable. This is the SINGLE source of truth for the triage prompt — the
+/// live path and the debug path are guaranteed identical because they call this.
+fn triage_transcript_raw(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    transcript: &str,
+    wiki_index: &str,
+) -> Result<(bool, String)> {
     let system = "You scan AI coding assistant conversations for durable lessons worth capturing.";
     let wiki_note = if !wiki_index.is_empty() {
         format!(
@@ -297,10 +320,17 @@ fn triage_transcript(
         - A surprising constraint, pitfall, or config detail that will matter again\n\
         - A user preference explicitly stated\n\
         - A product requirement, spec decision, or desired behavior the assistant should know\n\n\
+        If the conversation contains ANY explicit user statement about how things should work, \
+        what they want changed, or a correction of the assistant's approach or understanding — \
+        even in a short or mostly-agent-driven session — answer YES. Long agent-driven sessions \
+        whose user turns look like short commands often still contain such statements mid-session; \
+        weigh the WHOLE conversation, not the apparent thinness of the user's side.\n\n\
         Reply with ONLY 'YES' or 'NO' on the first line.\n\
-        'NO' is ONLY for: purely transient operations (git pull, file moved) OR already fully \
-        specified in the wiki above.{wiki_note}\n\n\
-        TRANSCRIPT:\n{transcript}"
+        'NO' is ONLY for: purely transient operations (git pull, file moved, commit/push with no \
+        complications) OR already fully specified in the wiki above.{wiki_note}\n\n\
+        TRANSCRIPT:\n{transcript}\n\n\
+        END OF TRANSCRIPT. Now answer the question above. Do NOT continue the transcript or \
+        produce any other text — output ONLY 'YES' or 'NO' on the first line."
     );
     let raw = call_model_blocking(
         spec,
@@ -310,8 +340,9 @@ fn triage_transcript(
         system,
         &user_msg,
     )?;
-    let answer = raw.trim().lines().next().unwrap_or("").to_uppercase();
-    Ok(answer.starts_with("YES"))
+    let first_line = raw.trim().lines().next().unwrap_or("").to_string();
+    let verdict = first_line.to_uppercase().starts_with("YES");
+    Ok((verdict, first_line))
 }
 
 // ─── Line-numbered transcript rendering ──────────────────────────────────────
@@ -3139,6 +3170,100 @@ pub(crate) fn run_debug_extract(
             writeln!(o, "{}", paint(use_color, TC_DIM, d))?;
         }
     }
+    Ok(())
+}
+
+/// `pc debug triage --transcript <path>` — run the REAL triage gate (same model, config,
+/// caps, prompt, and wiki index as live capture) and print the verdict plus the model's
+/// raw first line. Makes the gate auditable: every triage skip can be reproduced and
+/// inspected. Mirrors the live triage block in `run_capture_inner`:
+///   - plain transcript = reduce_turns_to_fit(200_000, false) → build_transcript_string
+///     → tail_capped(200_000)
+///   - wiki index = read_index(<project wiki>) formatted "  slug | title | summary"
+///   - model/spec = capture_triage_model
+pub(crate) fn run_debug_triage(
+    file: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let cfg = load_config()?;
+
+    if cfg.capture_triage_model.is_empty() {
+        anyhow::bail!(
+            "capture_triage_model is empty — live capture would run with NO triage gate (always proceed). \
+Nothing to audit."
+        );
+    }
+    let triage_spec = ModelSpec::parse(&cfg.capture_triage_model);
+    let openrouter_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+
+    if !Path::new(&path).exists() {
+        anyhow::bail!("transcript not found: {}", path);
+    }
+
+    // Build the PLAIN transcript exactly as the live triage path does.
+    let turns = parse_transcript(&path)?;
+    let user_turns = turns.iter().filter(|t| t.0 == "user").count();
+    let reduced_plain = reduce_turns_to_fit(&turns, 200_000, false);
+    let plain_ts = build_transcript_string(&reduced_plain);
+    let plain_ts = tail_capped(&plain_ts, 200_000);
+
+    // Resolve + format the wiki index exactly as live triage does (read_index cache).
+    let resolved_wiki = debug_resolve_wiki_dir(wiki_dir_arg, no_wiki);
+    let index_rows: Vec<wiki::IndexRow> = match &resolved_wiki {
+        Some(d) if d.exists() => read_index(d),
+        _ => vec![],
+    };
+    let wiki_index_text = if index_rows.is_empty() {
+        String::new()
+    } else {
+        index_rows
+            .iter()
+            .map(|r| format!("  {} | {} | {}", r.slug, r.title, r.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let use_color = debug_use_color();
+    let bar = "════════════════════════════════════════════════════════════════";
+    let stdout = io::stdout();
+    let mut o = stdout.lock();
+
+    writeln!(o, "{}", paint(use_color, TC_HEADER, bar))?;
+    writeln!(o, "{}", paint(use_color, TC_HEADER, " pc debug triage"))?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "transcript "), path)?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "model      "), cfg.capture_triage_model)?;
+    writeln!(o, "   {} : {} user turns, {} transcript chars (after caps)",
+        paint(use_color, TC_DIM, "input      "), user_turns, plain_ts.len())?;
+    match &resolved_wiki {
+        Some(d) if !index_rows.is_empty() =>
+            writeln!(o, "   {} : {} ({} guides)", paint(use_color, TC_DIM, "wiki index "), d.display(), index_rows.len())?,
+        _ =>
+            writeln!(o, "   {} : (none — --no-wiki or no project wiki/index)", paint(use_color, TC_DIM, "wiki index "))?,
+    }
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, bar))?;
+    o.flush()?;
+
+    let (verdict, raw_first_line) = triage_transcript_raw(
+        &triage_spec,
+        &openrouter_api_key,
+        &ollama_base_url,
+        ollama_api_key.as_deref(),
+        &plain_ts,
+        &wiki_index_text,
+    )?;
+
+    let (verdict_color, verdict_word) = if verdict {
+        (TC_GREEN, "YES — capture proceeds")
+    } else {
+        (TC_RED, "NO — session skipped")
+    };
+    writeln!(o, "  {} : {}", paint(use_color, TC_DIM, "verdict       "), paint(use_color, verdict_color, verdict_word))?;
+    writeln!(o, "  {} : {:?}", paint(use_color, TC_DIM, "raw first line"), raw_first_line)?;
+    o.flush()?;
     Ok(())
 }
 
