@@ -240,10 +240,20 @@ pub(crate) fn call_recognition(
     // For long transcripts: take first 10K (for session framing) and last 70K (where
     // decisions usually appear). Same strategy as research_capture.
     let transcript_excerpt = if numbered_transcript.len() > 80000 {
+        // Clamp cut points to char boundaries — byte slicing panics inside
+        // multi-byte chars (same bug class as research_capture's excerpt cuts).
+        let mut head_end = 10000;
+        while !numbered_transcript.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = numbered_transcript.len() - 70000;
+        while !numbered_transcript.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
         format!(
             "{}\n\n[... middle truncated for length ...]\n\n{}",
-            &numbered_transcript[..10000],
-            &numbered_transcript[numbered_transcript.len() - 70000..]
+            &numbered_transcript[..head_end],
+            &numbered_transcript[tail_start..]
         )
     } else {
         numbered_transcript.to_string()
