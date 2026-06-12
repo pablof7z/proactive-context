@@ -328,7 +328,9 @@ fn triage_transcript_raw(
         Reply with ONLY 'YES' or 'NO' on the first line.\n\
         'NO' is ONLY for: purely transient operations (git pull, file moved, commit/push with no \
         complications) OR already fully specified in the wiki above.{wiki_note}\n\n\
-        TRANSCRIPT:\n{transcript}"
+        TRANSCRIPT:\n{transcript}\n\n\
+        END OF TRANSCRIPT. Now answer the question above. Do NOT continue the transcript or \
+        produce any other text — output ONLY 'YES' or 'NO' on the first line."
     );
     let raw = call_model_blocking(
         spec,
