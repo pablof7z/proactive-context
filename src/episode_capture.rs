@@ -270,6 +270,14 @@ DO NOT emit cards for:\n\
 - Routine implementation work without a prior-state reversal or doctrine decision\n\
 - One-shot commands that establish no reusable policy\n\
 \n\
+ONE CARD PER DECISION SURFACE (critical — avoid fan-out):\n\
+A single session often refines one decision across several steps. If multiple candidate \
+arcs share the SAME decision surface (the same component/behavior/contract being decided) \
+and converge on the SAME terminal outcome, emit ONE card capturing the FINAL state — fold \
+the intermediate steps into Consequences or Open Tail. NEVER emit separate cards for stages \
+of the same decision (e.g. three cards for one tombstone-contract decision, or two cards for \
+one actor-stall fix). Only emit distinct cards for genuinely DIFFERENT decision surfaces.\n\
+\n\
 If the ENTIRE session is dominated by routine operational commands with no product arc:\n\
 Return ONLY this JSON object (not an array): {{\"exclude_reason\": \"routine-command-only\"}}\n\
 \n\
@@ -996,6 +1004,9 @@ pub struct ExistingCard {
     pub subjects: Vec<String>,
     pub title: String,
     pub decision: String,
+    /// Session id this card was captured from. Same-session cards are always considered
+    /// supersession candidates (intra-session fan-out repair), even without subject overlap.
+    pub session: String,
 }
 
 /// Tokenize a list of kebab-case subject slugs into a lowercase token set,
@@ -1020,19 +1031,32 @@ fn subject_tokens(subjects: &[String]) -> std::collections::HashSet<String> {
 /// match is required because the model phrases the same surface differently across
 /// sessions (`podcast-navigation` vs `sidebar-podcasts-navigation`).
 pub fn subjects_overlap(a: &[String], b: &[String]) -> bool {
-    let ta = subject_tokens(a);
-    if ta.is_empty() {
-        return false;
-    }
-    let tb = subject_tokens(b);
-    ta.intersection(&tb).next().is_some()
+    subject_token_overlap(a, b) > 0
 }
 
-/// Select supersession candidates for a new card: ACTIVE existing cards (skip the
-/// new card itself and any already-superseded) whose subjects share a token with the
-/// new card's subjects. Sorted most-recent-first and capped at `cap`.
+/// Count how many salient subject tokens two lists share (similarity score).
+fn subject_token_overlap(a: &[String], b: &[String]) -> usize {
+    let ta = subject_tokens(a);
+    if ta.is_empty() {
+        return 0;
+    }
+    let tb = subject_tokens(b);
+    ta.intersection(&tb).count()
+}
+
+/// Select supersession candidates for a new card. A candidate is any ACTIVE existing
+/// card (not the new card itself, not already superseded) that is EITHER:
+///   - from the SAME session as the new card (always included — repairs intra-session
+///     fan-out where the model emits several cards for one decision with differing
+///     phrasing that the cross-session subject gate would miss), OR
+///   - subject-token-overlapping with the new card (the cross-session gate).
+///
+/// Ranked most-similar-first (by shared subject-token count) then most-recent-first,
+/// and capped at `cap`. Same-session ties still sort by token similarity so the most
+/// likely duplicate is offered first within the cap.
 pub fn find_supersede_candidates<'a>(
     new_id: &str,
+    new_session: &str,
     new_subjects: &[String],
     existing: &'a [ExistingCard],
     cap: usize,
@@ -1041,10 +1065,17 @@ pub fn find_supersede_candidates<'a>(
         .iter()
         .filter(|c| c.id != new_id)
         .filter(|c| c.status != "superseded")
-        .filter(|c| subjects_overlap(new_subjects, &c.subjects))
+        .filter(|c| {
+            let same_session = !new_session.is_empty() && c.session == new_session;
+            same_session || subjects_overlap(new_subjects, &c.subjects)
+        })
         .collect();
-    // Most recent first — a reversal most likely supersedes the latest prior decision.
-    cands.sort_by(|x, y| y.date.cmp(&x.date));
+    // Most-similar-first (shared token count desc), then most-recent-first.
+    cands.sort_by(|x, y| {
+        let ox = subject_token_overlap(new_subjects, &x.subjects);
+        let oy = subject_token_overlap(new_subjects, &y.subjects);
+        oy.cmp(&ox).then_with(|| y.date.cmp(&x.date))
+    });
     cands.truncate(cap);
     cands
 }
@@ -1084,6 +1115,7 @@ pub fn load_existing_cards(wiki_dir: &Path) -> Vec<ExistingCard> {
             subjects: fm.subjects,
             title,
             decision,
+            session: fm.session,
         });
     }
     cards
@@ -1204,16 +1236,20 @@ pub fn ask_supersession(
             c.decision.trim()
         ));
     }
-    let system = "You decide whether a new decision REPLACES an earlier one. Be strict: \
-two cards must concern the SAME decision surface (the same component/behavior being \
-decided) AND the new one must REVERSE or REPLACE the earlier outcome. Sharing a topic \
-is NOT enough. When in doubt, say it does not supersede.";
+    let system = "You decide whether a new episode card SUPERSEDES an earlier one. Both \
+must concern the SAME decision surface (the same component/behavior/contract being \
+decided). The new card supersedes the earlier one when EITHER: (a) it REVERSES or \
+REPLACES the earlier outcome, OR (b) it captures the SAME decision's final/more-complete \
+state and the earlier card is a redundant EARLIER STAGE of that same decision (common \
+when several cards came from one session refining one decision). Sharing only a topic is \
+NOT enough — the decision surface must be the same. When in doubt, say it does not supersede.";
     let user = format!(
         "NEW CARD\n  title: {title}\n  decision: {decision}\n\n\
 EARLIER CANDIDATE CARDS:\n{cands}\n\
-For each candidate, does the NEW card's decision SUPERSEDE it (same decision surface, \
-opposite/replacing outcome)? Output ONLY a JSON array of the ids that are superseded, \
-e.g. [\"2026-06-02-2-foo\"]. If none, output []. No prose.",
+For each candidate, does the NEW card SUPERSEDE it — same decision surface, AND either an \
+opposite/replacing outcome OR a redundant earlier stage of the same decision the new card \
+now states more completely? Output ONLY a JSON array of the superseded ids, e.g. \
+[\"2026-06-02-2-foo\"]. If none, output []. No prose.",
         title = new_title,
         decision = new_decision.trim(),
         cands = cand_block,
@@ -1268,9 +1304,10 @@ pub fn link_card(
     let new_title = card_title(&new_content).unwrap_or_else(|| new_id.clone());
     let new_decision = extract_card_section(&new_content, "Decision");
 
-    let candidates = find_supersede_candidates(&new_id, &new_fm.subjects, existing, 5);
+    let candidates =
+        find_supersede_candidates(&new_id, &new_fm.session, &new_fm.subjects, existing, 5);
     if candidates.is_empty() {
-        return Ok(Vec::new()); // no overlap → no LLM call (cheap gate)
+        return Ok(Vec::new()); // no overlap and no same-session prior → no LLM call (cheap gate)
     }
 
     let decision = ask_supersession(
@@ -1330,6 +1367,7 @@ pub fn backfill_link_episodes(wiki_dir: &Path) -> Result<usize> {
                         subjects: fm.subjects,
                         title: card_title(&content).unwrap_or_else(|| c.id.clone()),
                         decision: extract_card_section(&content, "Decision"),
+                        session: fm.session,
                     })
                 })
             })
@@ -1923,22 +1961,34 @@ related_claims: []\nsource_lines:\n  - 10-20\ncaptured_at: 2026-06-02T10:00:00Z\
         assert_eq!(patch_supersedes_field(&card, &[]), card);
     }
 
+    fn existing_card(id: &str, date: &str, status: &str, subjects: &[&str], session: &str) -> ExistingCard {
+        ExistingCard {
+            id: id.to_string(),
+            path: PathBuf::from(format!("/x/{}.md", id)),
+            date: date.to_string(),
+            status: status.to_string(),
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            title: "t".to_string(),
+            decision: "d".to_string(),
+            session: session.to_string(),
+        }
+    }
+
     #[test]
     fn find_candidates_skips_superseded_and_self_and_caps() {
         let mut existing = Vec::new();
         for i in 0..8 {
-            existing.push(ExistingCard {
-                id: format!("card-{}", i),
-                path: PathBuf::from(format!("/x/card-{}.md", i)),
-                date: format!("2026-06-0{}", i + 1),
-                status: if i == 0 { "superseded".to_string() } else { "active".to_string() },
-                subjects: vec!["sidebar-podcasts".to_string()],
-                title: "t".to_string(),
-                decision: "d".to_string(),
-            });
+            existing.push(existing_card(
+                &format!("card-{}", i),
+                &format!("2026-06-0{}", i + 1),
+                if i == 0 { "superseded" } else { "active" },
+                &["sidebar-podcasts"],
+                "sess-other",
+            ));
         }
         let cands = find_supersede_candidates(
             "card-9",
+            "sess-new",
             &["podcasts-sidebar".to_string()],
             &existing,
             5,
@@ -1946,8 +1996,49 @@ related_claims: []\nsource_lines:\n  - 10-20\ncaptured_at: 2026-06-02T10:00:00Z\
         assert_eq!(cands.len(), 5, "must cap at 5");
         assert!(!cands.iter().any(|c| c.status == "superseded"), "superseded excluded");
         assert!(!cands.iter().any(|c| c.id == "card-9"), "self excluded");
-        // Sorted most-recent-first.
+        // Equal token overlap → recency tiebreak → most-recent-first.
         assert_eq!(cands[0].id, "card-7");
+    }
+
+    #[test]
+    fn same_session_cards_are_candidates_even_without_subject_overlap() {
+        // Two cards from the SAME session whose subjects DON'T token-overlap. The
+        // cross-session gate would skip them, but same-session must include them
+        // (intra-session fan-out repair).
+        let existing = vec![
+            existing_card("a", "2026-06-12", "active", &["tombstone-contract"], "sess-12"),
+            // unrelated, different session, no overlap → must be skipped
+            existing_card("b", "2026-06-12", "active", &["android-cross-compile"], "sess-other"),
+        ];
+        let cands = find_supersede_candidates(
+            "new",
+            "sess-12",
+            &["actor-stall-recovery".to_string()], // no token overlap with "tombstone-contract"
+            &existing,
+            5,
+        );
+        let ids: Vec<&str> = cands.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"a"), "same-session card must be a candidate: {:?}", ids);
+        assert!(!ids.contains(&"b"), "different-session non-overlapping card must be skipped: {:?}", ids);
+    }
+
+    #[test]
+    fn candidates_rank_most_similar_first_then_recent() {
+        // Cross-session candidates with differing token overlap; highest overlap wins,
+        // even if older. Then recency breaks ties.
+        let existing = vec![
+            existing_card("low", "2026-06-12", "active", &["sidebar"], "s1"), // 1 token overlap, newest
+            existing_card("high", "2026-06-01", "active", &["sidebar", "podcasts", "navigation"], "s2"), // 3 overlap, oldest
+        ];
+        let cands = find_supersede_candidates(
+            "new",
+            "s-new",
+            &["sidebar".to_string(), "podcasts".to_string(), "navigation".to_string()],
+            &existing,
+            5,
+        );
+        assert_eq!(cands[0].id, "high", "most-similar must rank first despite being older");
+        assert_eq!(cands[1].id, "low");
     }
 
     #[test]
