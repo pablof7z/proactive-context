@@ -171,6 +171,7 @@ pub fn run_episode_stage(
         .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
     let mut persisted = Vec::new();
+    let mut newly_written: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
         let anchored = anchor_evidence_ranges(&raw_lines, &spans, &arc.decision, &arc.evidence);
         let verified_evidence = verify_evidence_ranges(&raw_lines, &anchored);
@@ -194,7 +195,27 @@ pub fn run_episode_stage(
             &captured_at,
         );
         fs::write(&card_path, content)?;
+        newly_written.push(card_path.clone());
         persisted.push(card_path);
+    }
+
+    // Cross-card supersedes linker: for each NEW card, check whether it supersedes any
+    // existing subject-overlapping card. Best-effort and cheap — at most one LLM call
+    // per new card, and only when a subject token overlaps a prior card. Errors are
+    // logged and swallowed so linking never breaks the capture path.
+    let spec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    for new_path in &newly_written {
+        let new_id = new_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        // Re-load the corpus fresh each time so a status patch from an earlier new card
+        // in this same session is respected.
+        let existing: Vec<ExistingCard> = load_existing_cards(wiki_dir)
+            .into_iter()
+            .filter(|c| c.id != new_id)
+            .collect();
+        if let Err(e) = link_card(&spec, openrouter_key, ollama_base, ollama_key, new_path, &existing) {
+            eprintln!("[episode-capture] supersedes-link failed for {}: {}", new_id, e);
+        }
     }
 
     Ok(persisted)
@@ -762,6 +783,9 @@ pub struct EpisodeRow {
     pub title: String,
     pub salience: String,
     pub session: String,
+    /// Lifecycle status: "active" or "superseded". Shown in _index.md so a reader can
+    /// see at a glance which cards are current vs. historically replaced.
+    pub status: String,
     /// One-line gist for the inject catalog: the card's Decision (what changed),
     /// falling back to Prior State. Empty if neither section has content.
     pub summary: String,
@@ -866,6 +890,10 @@ pub fn scan_episode_cards(wiki_dir: &Path) -> Vec<EpisodeRow> {
             },
             salience: fm("salience"),
             session: fm("session"),
+            status: {
+                let s = fm("status");
+                if s.is_empty() { "active".to_string() } else { s }
+            },
             summary,
         });
     }
@@ -943,6 +971,379 @@ pub struct EpisodeCardFrontmatter {
     pub status: String,
     pub subjects: Vec<String>,
     pub captured_at: String,
+}
+
+// ─── Cross-card supersedes linker ─────────────────────────────────────────────
+//
+// When a new episode card lands, an earlier card may describe the SAME decision
+// surface with the now-replaced outcome (e.g. "podcasts open as a sheet" vs the
+// later "podcasts navigate via push"). The spec (§Currentness) keeps card bodies
+// immutable; supersession is recorded by (a) writing `supersedes: [old-ids]` in the
+// NEW card's frontmatter and (b) patching the OLD card's frontmatter `status:
+// superseded`. The id of a card is its filename stem.
+//
+// This is gated to stay cheap: we only make the ONE LLM call when an existing card
+// shares a SUBJECT TOKEN with the new card, and we cap candidates at 5.
+
+/// A minimal view of an episode card on disk, for the linker.
+#[derive(Debug, Clone)]
+pub struct ExistingCard {
+    /// Filename stem (the card id used in `supersedes:`).
+    pub id: String,
+    pub path: PathBuf,
+    pub date: String,
+    pub status: String,
+    pub subjects: Vec<String>,
+    pub title: String,
+    pub decision: String,
+}
+
+/// Tokenize a list of kebab-case subject slugs into a lowercase token set,
+/// dropping very short/common tokens. `sidebar-podcasts-navigation` → {sidebar,
+/// podcasts, navigation}. Singular/plural are folded by stripping a trailing 's'.
+fn subject_tokens(subjects: &[String]) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for s in subjects {
+        for tok in s.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+            if tok.len() < 4 {
+                continue; // skip "all", "the", "ui", etc.
+            }
+            // Fold a trailing plural 's' so "podcasts" matches "podcast".
+            let folded = tok.strip_suffix('s').filter(|t| t.len() >= 4).unwrap_or(tok);
+            set.insert(folded.to_string());
+        }
+    }
+    set
+}
+
+/// Do two subject lists share at least one salient token? Token-level (not exact set)
+/// match is required because the model phrases the same surface differently across
+/// sessions (`podcast-navigation` vs `sidebar-podcasts-navigation`).
+pub fn subjects_overlap(a: &[String], b: &[String]) -> bool {
+    let ta = subject_tokens(a);
+    if ta.is_empty() {
+        return false;
+    }
+    let tb = subject_tokens(b);
+    ta.intersection(&tb).next().is_some()
+}
+
+/// Select supersession candidates for a new card: ACTIVE existing cards (skip the
+/// new card itself and any already-superseded) whose subjects share a token with the
+/// new card's subjects. Sorted most-recent-first and capped at `cap`.
+pub fn find_supersede_candidates<'a>(
+    new_id: &str,
+    new_subjects: &[String],
+    existing: &'a [ExistingCard],
+    cap: usize,
+) -> Vec<&'a ExistingCard> {
+    let mut cands: Vec<&ExistingCard> = existing
+        .iter()
+        .filter(|c| c.id != new_id)
+        .filter(|c| c.status != "superseded")
+        .filter(|c| subjects_overlap(new_subjects, &c.subjects))
+        .collect();
+    // Most recent first — a reversal most likely supersedes the latest prior decision.
+    cands.sort_by(|x, y| y.date.cmp(&x.date));
+    cands.truncate(cap);
+    cands
+}
+
+/// Load every episode card under `<wiki>/episodes/` as an [`ExistingCard`].
+pub fn load_existing_cards(wiki_dir: &Path) -> Vec<ExistingCard> {
+    let episodes_dir = wiki_dir.join("episodes");
+    let entries = match fs::read_dir(&episodes_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut cards = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let fm = match parse_episode_card_frontmatter(&content) {
+            Some(f) => f,
+            None => continue,
+        };
+        let title = card_title(&content).unwrap_or_else(|| id.clone());
+        let decision = extract_card_section(&content, "Decision");
+        cards.push(ExistingCard {
+            id,
+            path,
+            date: fm.date,
+            status: fm.status,
+            subjects: fm.subjects,
+            title,
+            decision,
+        });
+    }
+    cards
+}
+
+/// Extract the `# Episode: <title>` line from a card body.
+fn card_title(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("# Episode: ").map(|t| t.trim().to_string()))
+}
+
+/// Patch a card's frontmatter `supersedes:` field to the given ids (block-list form).
+/// Replaces an existing `supersedes:` scalar/inline/block; preserves everything else.
+/// If `ids` is empty the card is returned unchanged.
+pub fn patch_supersedes_field(content: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return content.to_string();
+    }
+    let block = {
+        let mut b = String::from("supersedes:\n");
+        for id in ids {
+            b.push_str(&format!("  - {}\n", id));
+        }
+        b.pop(); // drop trailing newline; the line-join re-adds it
+        b
+    };
+    replace_frontmatter_field(content, "supersedes", &block)
+}
+
+/// Patch a card's frontmatter `status:` to `superseded` (idempotent). Body untouched.
+pub fn patch_status_superseded(content: &str) -> String {
+    replace_frontmatter_field(content, "status", "status: superseded")
+}
+
+/// Replace the frontmatter field `key` (and any block-list continuation lines that
+/// belong to it) with `replacement` (which must itself start with `key:` and may span
+/// multiple lines). Operates ONLY within the leading `---`…`---` frontmatter; the body
+/// is never touched. If the field is absent, `replacement` is appended just before the
+/// closing `---`.
+fn replace_frontmatter_field(content: &str, key: &str, replacement: &str) -> String {
+    if !content.starts_with("---") {
+        return content.to_string();
+    }
+    let after_open = &content[3..];
+    let Some(close_rel) = after_open.find("\n---") else {
+        return content.to_string();
+    };
+    let fm = &after_open[..close_rel]; // frontmatter text (without the leading "---")
+    let body = &after_open[close_rel..]; // starts with "\n---" … rest
+
+    let key_prefix = format!("{}:", key);
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut skipping_block = false;
+    for line in fm.lines() {
+        if skipping_block {
+            // Continue skipping block-list/continuation lines (indented "- " or deeper).
+            let t = line.trim_start();
+            let indented = line.starts_with(' ') || line.starts_with('\t');
+            if t.starts_with("- ") || (indented && !t.is_empty()) {
+                continue;
+            }
+            skipping_block = false;
+        }
+        let trimmed = line.trim_start();
+        if !replaced && (trimmed == key_prefix || trimmed.starts_with(&format!("{} ", key_prefix))) {
+            out_lines.push(replacement.to_string());
+            replaced = true;
+            // If the old field was a block list (`key:` with nothing after), skip its items.
+            if trimmed == key_prefix {
+                skipping_block = true;
+            }
+            continue;
+        }
+        out_lines.push(line.to_string());
+    }
+    let mut new_fm = out_lines.join("\n");
+    if !replaced {
+        // Field absent — append before the closing delimiter.
+        if !new_fm.ends_with('\n') {
+            new_fm.push('\n');
+        }
+        new_fm.push_str(replacement);
+    }
+    format!("---{}{}", new_fm, body)
+}
+
+/// Result of the supersession LLM judgement.
+#[derive(Debug, Clone)]
+pub struct SupersedeDecision {
+    /// ids of candidate cards the new card supersedes.
+    pub superseded_ids: Vec<String>,
+}
+
+/// Ask the model — in ONE call — which (if any) of the candidate cards the new card's
+/// Decision supersedes. Criteria are stated strictly: SAME decision surface AND an
+/// opposite/replacing outcome — NOT merely the same topic. Returns the subset of
+/// candidate ids judged superseded.
+pub fn ask_supersession(
+    spec: &ModelSpec,
+    openrouter_key: &str,
+    ollama_base: &str,
+    ollama_key: Option<&str>,
+    new_title: &str,
+    new_decision: &str,
+    candidates: &[&ExistingCard],
+) -> Result<SupersedeDecision> {
+    if candidates.is_empty() {
+        return Ok(SupersedeDecision { superseded_ids: Vec::new() });
+    }
+    let mut cand_block = String::new();
+    for c in candidates {
+        cand_block.push_str(&format!(
+            "- id: {}\n  title: {}\n  decision: {}\n",
+            c.id,
+            c.title,
+            c.decision.trim()
+        ));
+    }
+    let system = "You decide whether a new decision REPLACES an earlier one. Be strict: \
+two cards must concern the SAME decision surface (the same component/behavior being \
+decided) AND the new one must REVERSE or REPLACE the earlier outcome. Sharing a topic \
+is NOT enough. When in doubt, say it does not supersede.";
+    let user = format!(
+        "NEW CARD\n  title: {title}\n  decision: {decision}\n\n\
+EARLIER CANDIDATE CARDS:\n{cands}\n\
+For each candidate, does the NEW card's decision SUPERSEDE it (same decision surface, \
+opposite/replacing outcome)? Output ONLY a JSON array of the ids that are superseded, \
+e.g. [\"2026-06-02-2-foo\"]. If none, output []. No prose.",
+        title = new_title,
+        decision = new_decision.trim(),
+        cands = cand_block,
+    );
+    let raw = call_model_blocking(spec, openrouter_key, ollama_base, ollama_key, system, &user)?;
+    let ids = parse_id_array(&raw, candidates);
+    Ok(SupersedeDecision { superseded_ids: ids })
+}
+
+/// Parse the model's JSON id array, keeping only ids that match a real candidate.
+fn parse_id_array(raw: &str, candidates: &[&ExistingCard]) -> Vec<String> {
+    let valid: std::collections::HashSet<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+    let json = extract_json_value(raw);
+    let mut out = Vec::new();
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&json) {
+        for it in items {
+            if let Some(s) = it.as_str() {
+                if valid.contains(s) && !out.contains(&s.to_string()) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Link a single newly-persisted card against the existing corpus: find subject-
+/// overlapping active candidates (cap 5), ask the model whether any are superseded,
+/// then write `supersedes:` into the new card and `status: superseded` into each old
+/// one. Best-effort: returns the list of superseded ids (empty if none / on no overlap).
+///
+/// `existing` should EXCLUDE the new card (or it is filtered by id anyway). At most one
+/// LLM call is made, and only when there is at least one subject-overlapping candidate.
+pub fn link_card(
+    spec: &ModelSpec,
+    openrouter_key: &str,
+    ollama_base: &str,
+    ollama_key: Option<&str>,
+    new_card_path: &Path,
+    existing: &[ExistingCard],
+) -> Result<Vec<String>> {
+    let new_content = fs::read_to_string(new_card_path)?;
+    let new_id = new_card_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let new_fm = match parse_episode_card_frontmatter(&new_content) {
+        Some(f) => f,
+        None => return Ok(Vec::new()),
+    };
+    let new_title = card_title(&new_content).unwrap_or_else(|| new_id.clone());
+    let new_decision = extract_card_section(&new_content, "Decision");
+
+    let candidates = find_supersede_candidates(&new_id, &new_fm.subjects, existing, 5);
+    if candidates.is_empty() {
+        return Ok(Vec::new()); // no overlap → no LLM call (cheap gate)
+    }
+
+    let decision = ask_supersession(
+        spec, openrouter_key, ollama_base, ollama_key, &new_title, &new_decision, &candidates,
+    )?;
+    if decision.superseded_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // (a) write supersedes: into the new card
+    let patched_new = patch_supersedes_field(&new_content, &decision.superseded_ids);
+    fs::write(new_card_path, patched_new)?;
+
+    // (b) patch each old card's status → superseded (body immutable)
+    for id in &decision.superseded_ids {
+        if let Some(c) = existing.iter().find(|c| &c.id == id) {
+            if let Ok(old) = fs::read_to_string(&c.path) {
+                let patched = patch_status_superseded(&old);
+                let _ = fs::write(&c.path, patched);
+            }
+        }
+    }
+    Ok(decision.superseded_ids)
+}
+
+/// Backfill the linker over an EXISTING corpus chronologically: process cards oldest→
+/// newest, linking each against the cards already processed (so a later card supersedes
+/// the earlier one, never the reverse). Returns the number of supersession links written.
+///
+/// One LLM call per card that has a subject-overlapping prior candidate; cards with no
+/// overlap cost nothing.
+pub fn backfill_link_episodes(wiki_dir: &Path) -> Result<usize> {
+    let cfg = load_config()?;
+    let spec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    let ollama_base = cfg.ollama_base_url.as_str();
+    let ollama_key = cfg.ollama_api_key.as_deref();
+
+    // Snapshot all cards, sorted oldest-first (by date, then id for determinism).
+    let mut all = load_existing_cards(wiki_dir);
+    all.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.id.cmp(&b.id)));
+
+    let mut links_written = 0usize;
+    // Process chronologically; each card is linked against the ones BEFORE it.
+    for i in 0..all.len() {
+        // The "already processed" prior corpus is all[..i]; re-read each from disk so
+        // status patches written in earlier iterations are honored.
+        let prior: Vec<ExistingCard> = all[..i]
+            .iter()
+            .filter_map(|c| {
+                fs::read_to_string(&c.path).ok().and_then(|content| {
+                    parse_episode_card_frontmatter(&content).map(|fm| ExistingCard {
+                        id: c.id.clone(),
+                        path: c.path.clone(),
+                        date: fm.date,
+                        status: fm.status,
+                        subjects: fm.subjects,
+                        title: card_title(&content).unwrap_or_else(|| c.id.clone()),
+                        decision: extract_card_section(&content, "Decision"),
+                    })
+                })
+            })
+            .collect();
+        if prior.is_empty() {
+            continue;
+        }
+        let new_path = all[i].path.clone();
+        match link_card(&spec, openrouter_key, ollama_base, ollama_key, &new_path, &prior) {
+            Ok(ids) => links_written += ids.len(),
+            Err(e) => eprintln!("[link-episodes] {} failed: {}", all[i].id, e),
+        }
+    }
+    Ok(links_written)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1460,6 +1861,121 @@ Z adopted.
         assert!(result.unwrap().is_empty(), "no cards from empty transcript");
         // No episodes dir is created when there is nothing to persist.
         assert!(!wiki.join("episodes").exists(), "must not create episodes/ on no-op");
+    }
+
+    // ─── Fix #1: cross-card supersedes linker ─────────────────────────────────
+
+    fn card_with(subjects: &[&str], status: &str, supersedes: &str, decision: &str) -> String {
+        let subj = subjects
+            .iter()
+            .map(|s| format!("  - {}", s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "---\ntype: episode-card\ndate: 2026-06-02\nsession: s\ntranscript: /t.jsonl\n\
+salience: product\nstatus: {status}\nsubjects:\n{subj}\nsupersedes: {supersedes}\n\
+related_claims: []\nsource_lines:\n  - 10-20\ncaptured_at: 2026-06-02T10:00:00Z\n---\n\n\
+# Episode: Test card\n\n## Prior State\n\nbefore\n\n## Decision\n\n{decision}\n\n## Evidence\n\n- transcript lines 10-20\n",
+            status = status, subj = subj, supersedes = supersedes, decision = decision
+        )
+    }
+
+    #[test]
+    fn subjects_overlap_is_token_level_not_exact() {
+        // The real sidebar pair: no exact subject matches, but tokens overlap.
+        let older = vec![
+            "app-sidebar-view".to_string(),
+            "root-view".to_string(),
+            "podcast-navigation".to_string(),
+        ];
+        let newer = vec![
+            "sidebar-podcasts-navigation".to_string(),
+            "all-podcasts-list".to_string(),
+        ];
+        assert!(subjects_overlap(&older, &newer), "sidebar/podcast/navigation tokens must overlap");
+        // A genuinely unrelated pair must NOT overlap.
+        let unrelated = vec!["embedding-provider".to_string(), "sqlite-vec".to_string()];
+        assert!(!subjects_overlap(&older, &unrelated));
+    }
+
+    #[test]
+    fn patch_status_superseded_only_touches_frontmatter() {
+        let card = card_with(&["app-sidebar-view"], "active", "[]", "Old sheet approach");
+        let patched = patch_status_superseded(&card);
+        assert!(patched.contains("status: superseded"), "status must flip:\n{}", patched);
+        assert!(!patched.contains("status: active"), "old status must be gone");
+        // Body is immutable — the Decision text survives verbatim.
+        assert!(patched.contains("## Decision\n\nOld sheet approach"), "body must be untouched");
+        // Idempotent.
+        assert_eq!(patch_status_superseded(&patched), patched);
+    }
+
+    #[test]
+    fn patch_supersedes_field_writes_block_list() {
+        let card = card_with(&["sidebar-podcasts-navigation"], "active", "[]", "New nav push");
+        let patched = patch_supersedes_field(&card, &["2026-06-02-2-old".to_string()]);
+        assert!(patched.contains("supersedes:\n  - 2026-06-02-2-old"), "block list expected:\n{}", patched);
+        assert!(!patched.contains("supersedes: []"), "empty marker must be replaced");
+        // Other frontmatter and body preserved.
+        assert!(patched.contains("status: active"));
+        assert!(patched.contains("## Decision\n\nNew nav push"));
+        // Empty ids list is a no-op.
+        assert_eq!(patch_supersedes_field(&card, &[]), card);
+    }
+
+    #[test]
+    fn find_candidates_skips_superseded_and_self_and_caps() {
+        let mut existing = Vec::new();
+        for i in 0..8 {
+            existing.push(ExistingCard {
+                id: format!("card-{}", i),
+                path: PathBuf::from(format!("/x/card-{}.md", i)),
+                date: format!("2026-06-0{}", i + 1),
+                status: if i == 0 { "superseded".to_string() } else { "active".to_string() },
+                subjects: vec!["sidebar-podcasts".to_string()],
+                title: "t".to_string(),
+                decision: "d".to_string(),
+            });
+        }
+        let cands = find_supersede_candidates(
+            "card-9",
+            &["podcasts-sidebar".to_string()],
+            &existing,
+            5,
+        );
+        assert_eq!(cands.len(), 5, "must cap at 5");
+        assert!(!cands.iter().any(|c| c.status == "superseded"), "superseded excluded");
+        assert!(!cands.iter().any(|c| c.id == "card-9"), "self excluded");
+        // Sorted most-recent-first.
+        assert_eq!(cands[0].id, "card-7");
+    }
+
+    #[test]
+    fn scan_episode_cards_reports_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let ep = wiki.join("episodes");
+        fs::create_dir_all(&ep).unwrap();
+        fs::write(ep.join("2026-06-02-1-a.md"), card_with(&["x-view"], "superseded", "[]", "d")).unwrap();
+        fs::write(ep.join("2026-06-11-1-b.md"), card_with(&["x-view"], "active", "[]", "d")).unwrap();
+        let rows = scan_episode_cards(wiki);
+        let a = rows.iter().find(|r| r.filename.contains("-a")).unwrap();
+        let b = rows.iter().find(|r| r.filename.contains("-b")).unwrap();
+        assert_eq!(a.status, "superseded");
+        assert_eq!(b.status, "active");
+    }
+
+    #[test]
+    fn index_renders_status_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let ep = wiki.join("episodes");
+        fs::create_dir_all(&ep).unwrap();
+        fs::write(ep.join("2026-06-02-1-old.md"), card_with(&["sidebar"], "superseded", "[]", "old")).unwrap();
+        crate::wiki::rebuild_index(wiki, "2026-06-12").unwrap();
+        let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
+        assert!(index.contains("| Card | Date | Title | Salience | Status |"), "status header missing:\n{}", index);
+        assert!(index.contains("superseded"), "status value must render:\n{}", index);
     }
 }
 

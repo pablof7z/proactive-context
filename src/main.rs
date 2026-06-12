@@ -558,6 +558,18 @@ enum WikiAction {
         #[arg(long)]
         write: bool,
     },
+
+    /// Backfill the cross-card supersedes linker over an EXISTING episode-card corpus.
+    /// Processes cards oldest→newest; for each card that shares a subject token with a
+    /// prior card, makes ONE LLM call asking whether it supersedes any of them, then
+    /// writes `supersedes:` into the newer card and `status: superseded` into the older.
+    /// Use after a full-history replay that ran without the live linker.
+    LinkEpisodes {
+        /// Wiki directory whose `episodes/` subdir holds the cards. Defaults to the
+        /// discovered project wiki for the current repo (docs/wiki).
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -939,6 +951,21 @@ fn main() -> Result<()> {
                         "wiki tidy (dry-run): {} guide(s) scanned, {} would change. Re-run with --write.",
                         scanned, changed
                     );
+                }
+            }
+            WikiAction::LinkEpisodes { wiki_dir } => {
+                let wp = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                let episodes = wp.join("episodes");
+                if !episodes.exists() {
+                    println!("link-episodes: no episodes/ dir at {} — nothing to do", wp.display());
+                } else {
+                    println!("link-episodes: scanning {} …", episodes.display());
+                    let n = crate::episode_capture::backfill_link_episodes(&wp)?;
+                    // Rebuild the index so the new statuses surface in _index.md.
+                    let now = crate::capture::rfc3339_now();
+                    let today = &now[..now.len().min(10)];
+                    let _ = crate::wiki::rebuild_index(&wp, today);
+                    println!("link-episodes: {} supersession link(s) written; index rebuilt", n);
                 }
             }
         },
