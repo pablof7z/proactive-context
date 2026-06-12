@@ -582,12 +582,24 @@ pub fn scan_research_records(wiki_dir: &Path) -> Vec<ResearchRow> {
             continue;
         }
         let fm = |key: &str| -> String {
+            // Scan only the frontmatter block: between the opening '---' and the
+            // closing '---'. (A previous version broke out of the loop based on
+            // the OUTER rows collection being non-empty — which made every record
+            // after the first parse as empty.)
+            let mut in_frontmatter = false;
             for line in content.lines() {
+                if line.trim() == "---" {
+                    if in_frontmatter {
+                        break; // closing fence — key not found
+                    }
+                    in_frontmatter = true;
+                    continue;
+                }
+                if !in_frontmatter {
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
                     return rest.trim().trim_matches('"').to_string();
-                }
-                if line.trim() == "---" && !rows.is_empty() {
-                    break;
                 }
             }
             String::new()
@@ -680,14 +692,15 @@ fn write_index_file_with_research(
             episodes.len(),
             if episodes.len() == 1 { "" } else { "s" }
         ));
-        out.push_str("| Card | Date | Title | Salience |\n");
-        out.push_str("|------|------|-------|----------|\n");
+        out.push_str("| Card | Date | Title | Salience | Status |\n");
+        out.push_str("|------|------|-------|----------|--------|\n");
         for ep in episodes {
             let stem = ep.filename.strip_suffix(".md").unwrap_or(&ep.filename);
             let title = ep.title.replace('|', "\\|");
+            let status = if ep.status.is_empty() { "active" } else { ep.status.as_str() };
             out.push_str(&format!(
-                "| [{}](episodes/{}) | {} | {} | {} |\n",
-                stem, ep.filename, ep.date, title, ep.salience
+                "| [{}](episodes/{}) | {} | {} | {} | {} |\n",
+                stem, ep.filename, ep.date, title, ep.salience, status
             ));
         }
         out.push('\n');
@@ -1566,5 +1579,30 @@ More info.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].filename, "rec.md");
         assert_eq!(rows[0].date, "2026-06-10");
+    }
+
+    #[test]
+    fn scan_research_records_parses_every_record_not_just_the_first() {
+        // Regression: a previous fm() helper broke at the OPENING '---' whenever the
+        // outer rows vec was non-empty, so records after the first parsed as empty
+        // (observed in production as 5/6 blank index rows).
+        let tmp = tempfile::tempdir().unwrap();
+        let research_dir = tmp.path().join("research");
+        fs::create_dir_all(&research_dir).unwrap();
+        for i in 1..=3 {
+            fs::write(
+                research_dir.join(format!("rec{i}.md")),
+                format!("---\ntype: research-record\ndate: 2026-06-1{i}\ncharacterization: \"finding {i}\"\nagent_attribution: agent-{i}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let rows = scan_research_records(tmp.path());
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            let n = i + 1;
+            assert_eq!(row.date, format!("2026-06-1{n}"), "record {n} date empty/wrong");
+            assert_eq!(row.characterization, format!("finding {n}"), "record {n} characterization empty/wrong");
+            assert_eq!(row.agent_attribution, format!("agent-{n}"), "record {n} attribution empty/wrong");
+        }
     }
 }

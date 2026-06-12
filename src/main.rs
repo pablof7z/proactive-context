@@ -497,6 +497,24 @@ enum DebugAction {
         #[arg(long)]
         all: bool,
     },
+
+    /// Run the REAL triage gate on a transcript (same model, config, caps, prompt, and
+    /// wiki index as live capture) and print the verdict + the model's raw first line.
+    /// Makes every triage skip reproducible and auditable.
+    Triage {
+        /// Path to a `.jsonl` transcript (same format as ~/.claude/projects/**/*.jsonl).
+        #[arg(long, value_name = "FILE")]
+        transcript: PathBuf,
+
+        /// Feed triage the wiki index from this dir (for the 'already specified' check).
+        /// Defaults to the discovered project wiki for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// Baseline: run triage with NO wiki index, ignoring discovery.
+        #[arg(long)]
+        no_wiki: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -544,6 +562,18 @@ enum WikiAction {
         /// Apply changes in place (default is a dry-run summary only)
         #[arg(long)]
         write: bool,
+    },
+
+    /// Backfill the cross-card supersedes linker over an EXISTING episode-card corpus.
+    /// Processes cards oldest→newest; for each card that shares a subject token with a
+    /// prior card, makes ONE LLM call asking whether it supersedes any of them, then
+    /// writes `supersedes:` into the newer card and `status: superseded` into the older.
+    /// Use after a full-history replay that ran without the live linker.
+    LinkEpisodes {
+        /// Wiki directory whose `episodes/` subdir holds the cards. Defaults to the
+        /// discovered project wiki for the current repo (docs/wiki).
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
     },
 }
 
@@ -712,6 +742,9 @@ fn main() -> Result<()> {
                 } else {
                     anyhow::bail!("provide a transcript file path or pass --all");
                 }
+            }
+            DebugAction::Triage { transcript, wiki_dir, no_wiki } => {
+                crate::capture::run_debug_triage(&transcript, wiki_dir.as_deref(), no_wiki)?;
             }
         },
 
@@ -925,6 +958,21 @@ fn main() -> Result<()> {
                         "wiki tidy (dry-run): {} guide(s) scanned, {} would change. Re-run with --write.",
                         scanned, changed
                     );
+                }
+            }
+            WikiAction::LinkEpisodes { wiki_dir } => {
+                let wp = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                let episodes = wp.join("episodes");
+                if !episodes.exists() {
+                    println!("link-episodes: no episodes/ dir at {} — nothing to do", wp.display());
+                } else {
+                    println!("link-episodes: scanning {} …", episodes.display());
+                    let n = crate::episode_capture::backfill_link_episodes(&wp)?;
+                    // Rebuild the index so the new statuses surface in _index.md.
+                    let now = crate::capture::rfc3339_now();
+                    let today = &now[..now.len().min(10)];
+                    let _ = crate::wiki::rebuild_index(&wp, today);
+                    println!("link-episodes: {} supersession link(s) written; index rebuilt", n);
                 }
             }
         },

@@ -280,6 +280,29 @@ fn triage_transcript(
     transcript: &str,
     wiki_index: &str,
 ) -> Result<bool> {
+    let (verdict, _raw) = triage_transcript_raw(
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+        transcript,
+        wiki_index,
+    )?;
+    Ok(verdict)
+}
+
+/// The shared triage call: returns `(verdict, raw_first_line)`. The live gate
+/// ([`triage_transcript`]) discards the raw line; `pc debug triage` surfaces it so the
+/// gate is auditable. This is the SINGLE source of truth for the triage prompt — the
+/// live path and the debug path are guaranteed identical because they call this.
+fn triage_transcript_raw(
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+    transcript: &str,
+    wiki_index: &str,
+) -> Result<(bool, String)> {
     let system = "You scan AI coding assistant conversations for durable lessons worth capturing.";
     let wiki_note = if !wiki_index.is_empty() {
         format!(
@@ -297,10 +320,17 @@ fn triage_transcript(
         - A surprising constraint, pitfall, or config detail that will matter again\n\
         - A user preference explicitly stated\n\
         - A product requirement, spec decision, or desired behavior the assistant should know\n\n\
+        If the conversation contains ANY explicit user statement about how things should work, \
+        what they want changed, or a correction of the assistant's approach or understanding — \
+        even in a short or mostly-agent-driven session — answer YES. Long agent-driven sessions \
+        whose user turns look like short commands often still contain such statements mid-session; \
+        weigh the WHOLE conversation, not the apparent thinness of the user's side.\n\n\
         Reply with ONLY 'YES' or 'NO' on the first line.\n\
-        'NO' is ONLY for: purely transient operations (git pull, file moved) OR already fully \
-        specified in the wiki above.{wiki_note}\n\n\
-        TRANSCRIPT:\n{transcript}"
+        'NO' is ONLY for: purely transient operations (git pull, file moved, commit/push with no \
+        complications) OR already fully specified in the wiki above.{wiki_note}\n\n\
+        TRANSCRIPT:\n{transcript}\n\n\
+        END OF TRANSCRIPT. Now answer the question above. Do NOT continue the transcript or \
+        produce any other text — output ONLY 'YES' or 'NO' on the first line."
     );
     let raw = call_model_blocking(
         spec,
@@ -310,8 +340,9 @@ fn triage_transcript(
         system,
         &user_msg,
     )?;
-    let answer = raw.trim().lines().next().unwrap_or("").to_uppercase();
-    Ok(answer.starts_with("YES"))
+    let first_line = raw.trim().lines().next().unwrap_or("").to_string();
+    let verdict = first_line.to_uppercase().starts_with("YES");
+    Ok((verdict, first_line))
 }
 
 // ─── Line-numbered transcript rendering ──────────────────────────────────────
@@ -606,6 +637,13 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Decisions, requirements, behaviors, constraints, gotchas — capture them.\n\
 - When the user REVERSES or CHANGES an earlier decision, emit the NEW decision as a claim \
 (cite the lines where they changed their mind). Do not also re-assert the old one.\n\
+- TERMINAL STATE: when a fact EVOLVES within the transcript (broken -> fixed, \
+unverified -> verified, default X -> default Y), extract its TERMINAL state as the claim, \
+citing the later lines. The earlier state may appear only as explicit history inside the \
+same assertion (e.g. 'X is now verified end-to-end (was failing earlier in the session)'). \
+NEVER emit the earlier state as a standalone present-tense claim when a later line \
+supersedes it — sweep forward before finalizing any claim about something that was \
+being actively worked on.\n\
 - Skip transient one-off debugging steps that resolved with no lasting spec implication.\n\
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
@@ -850,7 +888,12 @@ When a claim CONTRADICTS existing prose, you MUST use `revise` (or `remove`) to 
 statement — never `add` a statement next to a contradictory one. The new decision becomes the live \
 statement; the old one must NOT remain presented as current. This holds regardless of either claim's \
 authority. The guide renders only the CURRENT (live) desired state — superseded statements are \
-replaced, not stacked.\n\n\
+replaced, not stacked.\n\
+WITHIN-SESSION EVOLUTION: claims in this batch cite transcript line ranges. When two claims in the \
+batch describe the SAME fact at different stages of the session (e.g. 'X is unverified' citing early \
+lines and 'X is verified' citing later lines), the claim citing the LATER lines is the terminal \
+truth — write ONLY it (with a '(Previously: ...)' breadcrumb if the flip is user-visible). Never \
+write the earlier-stage state as current when a later-cited claim supersedes it.\n\n\
 ## Supersession history (§6) — render only the live tip, plus user-evolution breadcrumbs\n\
 - When an [explicit] (USER) decision supersedes an earlier [explicit] (USER) decision, keep a terse \
 breadcrumb in the revised text: state the new decision as current, then one short clause like \
@@ -1687,16 +1730,10 @@ fn apply_reconcile_op(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| safe_slug.replace('-', " "));
-    let new_summary = {
-        // Strip the provisional marker (§5) before it can leak into the frontmatter
-        // summary — the summary feeds the ROUTE index the pipeline reads next session,
-        // and a marker there is noise, not a topic descriptor.
-        let s = op.text.replace("⟨provisional, agent-inferred⟩", "");
-        let s = s.trim();
-        let s = s.split(". ").next().unwrap_or(s);
-        let s: String = s.chars().take(160).collect();
-        s.replace('\n', " ").trim().to_string()
-    };
+    // Summary for any NEW guide created here — the first-sentence convention (shared
+    // with the post-revise refresh via `summary_from_text`). Feeds the ROUTE index the
+    // pipeline reads next session, so it must describe what the guide covers.
+    let new_summary = summary_from_text(&op.text);
     let section = if op.section.trim().is_empty() {
         "## Notes".to_string()
     } else {
@@ -1753,7 +1790,7 @@ fn apply_reconcile_op(
                 };
                 guide.body =
                     add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
-                guide.frontmatter.updated = today.clone();
+                stamp_updated(&mut guide.frontmatter, &today);
                 // Back-fill topic on existing guides that predate topic support
                 if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
                     guide.frontmatter.topic = new_topic_c;
@@ -1835,7 +1872,12 @@ fn apply_reconcile_op(
                 match revise_section(&guide.body, &section_c, &text, &marker_clone) {
                     Ok(new_body) => {
                         guide.body = new_body;
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
+                        // Re-derive summary from the revised body: a revise can REVERSE the
+                        // guide's lead fact (auto-skip-ads: "defaults off" → "defaults to
+                        // true"), and SELECT navigates by summary, so a stale summary
+                        // misroutes. Deterministic, no model.
+                        refresh_summary(&mut guide);
                         if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
                             guide.frontmatter.topic = new_topic_c;
                         }
@@ -1854,7 +1896,8 @@ fn apply_reconcile_op(
                             &marker_clone,
                             &today,
                         );
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
+                        refresh_summary(&mut guide);
                         Ok((
                             guide,
                             format!("Revise target missing in '{}'; added instead.", safe_slug),
@@ -1896,7 +1939,10 @@ fn apply_reconcile_op(
                 match wiki::find_full_section_range(&guide.body, &section_c) {
                     Some((start, end)) => {
                         guide.body.replace_range(start..end, "");
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
+                        // Removing a section can drop the lead fact the summary described,
+                        // so re-derive from whatever prose now leads the body.
+                        refresh_summary(&mut guide);
                         Ok((guide, format!("Removed '{}' / '{}'.", safe_slug, section_c)))
                     }
                     None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
@@ -2311,6 +2357,34 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
+    // Episode-card stage (feature-flagged via `capture_episode_cards`, default ON since
+    // the Run 9 validation: 6/8 trajectory recovery, 0/8 stale leaks, best direction-change
+    // source across nine runs). Runs AFTER the normal pass and is fully independent of it:
+    // recognizes session-level product movement arcs and persists immutable episode cards
+    // under <wiki>/episodes/. Best-effort — a failure here never breaks the normal capture
+    // path. `today_str` honors `today_override`, so archeologist replay produces
+    // historically-dated cards. When the flag is false this block is a no-op.
+    if cfg.capture_episode_cards {
+        match crate::episode_capture::run_episode_stage(
+            &wiki_path,
+            &input.transcript_path,
+            &input.session_id,
+            Some(&today_str),
+        ) {
+            Ok(cards) if !cards.is_empty() => {
+                log_event(
+                    "capture.episodes",
+                    None,
+                    serde_json::json!({ "cards": cards.len() }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("capture: episode stage failed: {}", e);
+            }
+        }
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
@@ -2529,6 +2603,102 @@ fn extract_open_questions(
 /// Run the three post-session maintenance passes: bidirectional links, `_index.md`
 /// rebuild, and `index.db` re-embed. Called after every session in the live hook path
 /// and at checkpoints by `archeologist`.
+/// Stamp a guide's `updated` date without ever moving it backward, and keep
+/// `created <= updated` invariant. Multi-source archeologist replays (claude pass
+/// then codex pass) can apply earlier-dated ops onto later-created guides; dates
+/// must stay monotonic regardless of op arrival order.
+fn stamp_updated(fm: &mut crate::wiki::GuideFrontmatter, today: &str) {
+    // YYYY-MM-DD strings compare correctly lexicographically.
+    if fm.updated.is_empty() || today >= fm.updated.as_str() {
+        fm.updated = today.to_string();
+    }
+    if !fm.created.is_empty() && fm.created.as_str() > fm.updated.as_str() {
+        // A guide can't be created after its last update — clamp created down.
+        fm.created = fm.updated.clone();
+    }
+}
+
+/// The canonical guide-`summary` convention, factored out of guide creation so that
+/// creation AND post-revise refresh derive summaries IDENTICALLY: strip the provisional
+/// marker, drop any inline `[^id]` citation markers, take the first sentence, cap at
+/// 160 chars, collapse newlines. Deterministic — no model.
+pub(crate) fn summary_from_text(text: &str) -> String {
+    // 1) strip the provisional/agent-inferred marker (§5) — noise in a topic descriptor.
+    let s = text.replace("⟨provisional, agent-inferred⟩", "");
+    // 2) drop inline citation markers like `[^0f3f2-16]` — they are not prose.
+    let s = strip_inline_citation_markers(&s);
+    let s = s.trim();
+    // 3) first sentence (same "`. `" split convention as creation).
+    let s = s.split(". ").next().unwrap_or(s);
+    // 4) cap at 160 chars, 5) collapse newlines + trim.
+    let s: String = s.chars().take(160).collect();
+    s.replace('\n', " ").trim().to_string()
+}
+
+/// Remove inline `[^id]` footnote-citation markers from a string (leaving surrounding
+/// text intact). Used so a derived summary never carries a raw citation marker.
+fn strip_inline_citation_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+            if let Some(close) = s[i..].find(']') {
+                i += close + 1; // skip the whole [^...] marker
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Re-derive a guide's `summary` from the FIRST SUBSTANTIVE PROSE LINE of its body —
+/// the source of truth after a `revise`/`remove` op rewrote the body. Without this the
+/// frontmatter summary keeps the original creation-time wording even after the body's
+/// lead fact is reversed, and SELECT (which navigates by summaries) misroutes.
+///
+/// "Substantive" = not blank, not a `#`/`##` heading, not an HTML/citation comment
+/// (`<!-- ... -->`), not a `## See Also` link bullet. Returns the [`summary_from_text`]
+/// of that line, or `None` if the body has no substantive prose (leave summary as-is).
+pub(crate) fn derive_summary_from_body(body: &str) -> Option<String> {
+    let mut in_see_also = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            // Track See-Also so its link bullets are skipped as non-prose.
+            in_see_also = line.trim_start_matches('#').trim().eq_ignore_ascii_case("see also");
+            continue;
+        }
+        if in_see_also {
+            continue; // skip link bullets under See Also
+        }
+        if line.starts_with("<!--") {
+            continue; // citation/HTML comment line
+        }
+        // A leftover citation-only line (all markers, no prose) reduces to empty.
+        let candidate = summary_from_text(line);
+        if candidate.is_empty() {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Refresh a guide's frontmatter `summary` in place from its (post-edit) body. No-op if
+/// the body has no derivable prose, so a guide whose summary can't be regenerated keeps
+/// its prior value rather than going blank.
+fn refresh_summary(guide: &mut Guide) {
+    if let Some(s) = derive_summary_from_body(&guide.body) {
+        guide.frontmatter.summary = s;
+    }
+}
+
 pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, today: &str) {
     if !wiki_path.exists() {
         return;
@@ -3149,6 +3319,100 @@ pub(crate) fn run_debug_extract(
     Ok(())
 }
 
+/// `pc debug triage --transcript <path>` — run the REAL triage gate (same model, config,
+/// caps, prompt, and wiki index as live capture) and print the verdict plus the model's
+/// raw first line. Makes the gate auditable: every triage skip can be reproduced and
+/// inspected. Mirrors the live triage block in `run_capture_inner`:
+///   - plain transcript = reduce_turns_to_fit(200_000, false) → build_transcript_string
+///     → tail_capped(200_000)
+///   - wiki index = read_index(<project wiki>) formatted "  slug | title | summary"
+///   - model/spec = capture_triage_model
+pub(crate) fn run_debug_triage(
+    file: &Path,
+    wiki_dir_arg: Option<&Path>,
+    no_wiki: bool,
+) -> Result<()> {
+    let path = file.to_string_lossy().to_string();
+    let cfg = load_config()?;
+
+    if cfg.capture_triage_model.is_empty() {
+        anyhow::bail!(
+            "capture_triage_model is empty — live capture would run with NO triage gate (always proceed). \
+Nothing to audit."
+        );
+    }
+    let triage_spec = ModelSpec::parse(&cfg.capture_triage_model);
+    let openrouter_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+
+    if !Path::new(&path).exists() {
+        anyhow::bail!("transcript not found: {}", path);
+    }
+
+    // Build the PLAIN transcript exactly as the live triage path does.
+    let turns = parse_transcript(&path)?;
+    let user_turns = turns.iter().filter(|t| t.0 == "user").count();
+    let reduced_plain = reduce_turns_to_fit(&turns, 200_000, false);
+    let plain_ts = build_transcript_string(&reduced_plain);
+    let plain_ts = tail_capped(&plain_ts, 200_000);
+
+    // Resolve + format the wiki index exactly as live triage does (read_index cache).
+    let resolved_wiki = debug_resolve_wiki_dir(wiki_dir_arg, no_wiki);
+    let index_rows: Vec<wiki::IndexRow> = match &resolved_wiki {
+        Some(d) if d.exists() => read_index(d),
+        _ => vec![],
+    };
+    let wiki_index_text = if index_rows.is_empty() {
+        String::new()
+    } else {
+        index_rows
+            .iter()
+            .map(|r| format!("  {} | {} | {}", r.slug, r.title, r.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let use_color = debug_use_color();
+    let bar = "════════════════════════════════════════════════════════════════";
+    let stdout = io::stdout();
+    let mut o = stdout.lock();
+
+    writeln!(o, "{}", paint(use_color, TC_HEADER, bar))?;
+    writeln!(o, "{}", paint(use_color, TC_HEADER, " pc debug triage"))?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "transcript "), path)?;
+    writeln!(o, "   {} : {}", paint(use_color, TC_DIM, "model      "), cfg.capture_triage_model)?;
+    writeln!(o, "   {} : {} user turns, {} transcript chars (after caps)",
+        paint(use_color, TC_DIM, "input      "), user_turns, plain_ts.len())?;
+    match &resolved_wiki {
+        Some(d) if !index_rows.is_empty() =>
+            writeln!(o, "   {} : {} ({} guides)", paint(use_color, TC_DIM, "wiki index "), d.display(), index_rows.len())?,
+        _ =>
+            writeln!(o, "   {} : (none — --no-wiki or no project wiki/index)", paint(use_color, TC_DIM, "wiki index "))?,
+    }
+    writeln!(o, "{}\n", paint(use_color, TC_HEADER, bar))?;
+    o.flush()?;
+
+    let (verdict, raw_first_line) = triage_transcript_raw(
+        &triage_spec,
+        &openrouter_api_key,
+        &ollama_base_url,
+        ollama_api_key.as_deref(),
+        &plain_ts,
+        &wiki_index_text,
+    )?;
+
+    let (verdict_color, verdict_word) = if verdict {
+        (TC_GREEN, "YES — capture proceeds")
+    } else {
+        (TC_RED, "NO — session skipped")
+    };
+    writeln!(o, "  {} : {}", paint(use_color, TC_DIM, "verdict       "), paint(use_color, verdict_color, verdict_word))?;
+    writeln!(o, "  {} : {:?}", paint(use_color, TC_DIM, "raw first line"), raw_first_line)?;
+    o.flush()?;
+    Ok(())
+}
+
 /// `pc debug extract --all` — run EXTRACT on every transcript for the current project.
 pub(crate) fn run_debug_extract_all(
     cwd: &Path,
@@ -3238,4 +3502,130 @@ pub(crate) fn run_structural_maintenance_for_eval(
     let today = today();
     run_structural_maintenance(&wiki_path, &proj_dir, &today);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wiki::{parse_guide, revise_section};
+
+    // ─── Fix: summary refresh after RECONCILE revise/remove ───────────────────
+
+    #[test]
+    fn summary_from_text_matches_creation_convention() {
+        // first sentence, marker-stripped, newlines collapsed, 160-char cap.
+        assert_eq!(
+            summary_from_text("auto_skip_ads defaults to true. When enabled, ads are skipped."),
+            "auto_skip_ads defaults to true"
+        );
+        // provisional marker removed
+        assert_eq!(
+            summary_from_text("⟨provisional, agent-inferred⟩ The cache uses an LRU policy"),
+            "The cache uses an LRU policy"
+        );
+        // inline citation markers removed
+        assert_eq!(
+            summary_from_text("Profile updates use optimistic locking [^abc12-3]"),
+            "Profile updates use optimistic locking"
+        );
+    }
+
+    #[test]
+    fn derive_summary_skips_headings_comments_and_see_also() {
+        let body = "# Auto Skip Ads\n\n## Settings\n\nauto_skip_ads defaults to true (Previously: false.) When enabled, ads are skipped.\n\n<!-- citations: [^x-1] -->\n\n## See Also\n\n- [[other|Other]]\n";
+        let s = derive_summary_from_body(body).expect("should derive");
+        assert!(s.starts_with("auto_skip_ads defaults to true"), "got: {s}");
+        assert!(!s.contains('#'));
+        assert!(!s.contains("<!--"));
+    }
+
+    #[test]
+    fn derive_summary_none_when_no_prose() {
+        let body = "# Title\n\n## See Also\n\n- [[a|A]]\n\n<!-- citations: [^x] -->\n";
+        assert!(derive_summary_from_body(body).is_none());
+    }
+
+    /// The real-world defect: auto-skip-ads body was revised to "defaults to true" but
+    /// the frontmatter summary still said "defaults off". A revise op that reverses the
+    /// lead fact must refresh the summary. This drives the actual revise→refresh flow.
+    #[test]
+    fn revise_then_refresh_updates_stale_summary() {
+        // Reconstruct the guide as it was BEFORE the 2026-06-10 revise: body says "off",
+        // summary says "off".
+        let guide_md = "---\n\
+title: Auto Skip Ads\n\
+slug: auto-skip-ads\n\
+topic: playback\n\
+summary: autoSkipAds defaults off pending 'detection quality is proven'.\n\
+tags:\n  - capture\n\
+volatility: warm\n\
+confidence: medium\n\
+created: 2026-05-13\n\
+updated: 2026-05-13\n\
+verified: 2026-05-13\n\
+compiled-from: conversation\n\
+sources:\n  - session:abc\n\
+---\n\n\
+# Auto Skip Ads\n\n\
+## Settings\n\n\
+auto_skip_ads defaults to false pending detection-quality proof. [^seed-1]\n";
+        let mut guide = parse_guide(guide_md).expect("parse");
+        assert!(guide.frontmatter.summary.contains("off"));
+
+        // Apply a revise that reverses the lead fact (mirrors the real RECONCILE op).
+        let new_body = revise_section(
+            &guide.body,
+            "## Settings",
+            "auto_skip_ads defaults to true (Previously: false.) When enabled, properly labeled ads are skipped.",
+            "[^rev-1]",
+        )
+        .expect("revise");
+        guide.body = new_body;
+
+        // The defect: without refresh the summary still says "off".
+        assert!(guide.frontmatter.summary.contains("off"), "precondition");
+
+        // The fix:
+        refresh_summary(&mut guide);
+
+        assert!(
+            guide.frontmatter.summary.starts_with("auto_skip_ads defaults to true"),
+            "summary must be refreshed from the revised body; got: {}",
+            guide.frontmatter.summary
+        );
+        assert!(
+            !guide.frontmatter.summary.contains("off pending"),
+            "stale summary must be gone; got: {}",
+            guide.frontmatter.summary
+        );
+    }
+
+    /// Validation against the REAL auto-skip-ads guide shape (its on-disk body, which
+    /// already reflects the 2026-06-10 revise to "defaults to true" while its summary
+    /// still said "defaults off"). Proves the fix corrects the exact real-world summary.
+    #[test]
+    fn real_auto_skip_ads_body_yields_true_summary() {
+        let real_body = "# Auto Skip Ads\n\n## Settings\n\n\
+auto_skip_ads defaults to true (Previously: false.) When enabled, ads that are properly \
+labeled in the chapter list are automatically skipped during playback. PersistedSettings \
+uses #[serde(default = \"default_true\")] for auto_skip_ads_enabled so JSON files written \
+before the field existed hydrate as true; users who explicitly set false are unaffected \
+since serde only invokes the default when the key is absent.\n\n\
+<!-- citations: [^0f3f2-16] [^dced2-1] -->\n";
+        let s = derive_summary_from_body(real_body).expect("derive");
+        assert!(s.starts_with("auto_skip_ads defaults to true"), "got: {s}");
+        assert!(!s.to_lowercase().contains("defaults off"), "stale wording must be gone: {s}");
+    }
+
+    #[test]
+    fn refresh_summary_noop_when_body_has_no_prose() {
+        let guide_md = "---\n\
+title: T\nslug: t\ntopic: x\nsummary: original summary kept\ntags: []\n\
+volatility: warm\nconfidence: medium\ncreated: 2026-01-01\nupdated: 2026-01-01\n\
+verified: 2026-01-01\ncompiled-from: conversation\nsources: []\n---\n\n\
+# T\n\n## See Also\n\n- [[a|A]]\n";
+        let mut guide = parse_guide(guide_md).expect("parse");
+        refresh_summary(&mut guide);
+        assert_eq!(guide.frontmatter.summary, "original summary kept");
+    }
 }

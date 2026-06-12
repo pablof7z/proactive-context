@@ -189,7 +189,16 @@ pub fn print_results(results: &[QueryResult], root: &Path) {
 
     println!("\nTop {} results:\n", results.len());
     for (i, r) in results.iter().enumerate() {
-        let full_path = root.join(&r.path);
+        // Chunk paths are stored relative to the directory that was indexed (often
+        // docs/wiki), not the project root — resolve to a path that actually exists
+        // so agents can open the result.
+        let mut full_path = root.join(&r.path);
+        if !full_path.exists() {
+            let wiki_rel = root.join("docs").join("wiki").join(&r.path);
+            if wiki_rel.exists() {
+                full_path = wiki_rel;
+            }
+        }
         println!(
             "{}. {} (chunk {})\n   Similarity: {:.2}%\n   {}\n",
             i + 1,
