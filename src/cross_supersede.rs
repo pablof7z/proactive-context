@@ -312,15 +312,53 @@ fn is_rare_token(tok: &str) -> bool {
     false
 }
 
+/// Does a statement assert a NEGATIVE / open status (unverified, untested, missing, broken, a
+/// gap, inert, stub, deferred, "not yet", "zero callers", "no ... yet")? These are the highest-
+/// value supersession TARGETS — a later closure most often invalidates exactly such a claim —
+/// so they earn a wider retrieval net (a content-word channel) to reach their superseder even
+/// when it is lexically divergent and low-cosine.
+pub fn is_negative_status(text: &str) -> bool {
+    let t = strip_inline_markers(text).to_lowercase();
+    const MARKERS: &[&str] = &[
+        "unverified", "untested", "not verified", "not tested", "missing", "is broken",
+        "a gap", "the gap", "inert", "stub", "scaffold-only", "deferred", "not yet",
+        "no longer", "never receive", "zero callers", "zero swift callers", "not implemented",
+        "unimplemented", "dead code", "does not exist", "doesn't exist", "no seam", "post-v1",
+        "must move", "must be renamed", "needs a pr", "needs to", "not wired",
+    ];
+    MARKERS.iter().any(|m| t.contains(m))
+}
+
+/// Significant lowercased content words (len ≥ 4, not a stopword) for the negative-status
+/// content channel. Used only to widen recall for negative-status statements.
+fn content_words(text: &str) -> std::collections::HashSet<String> {
+    const STOP: &[&str] = &[
+        "this", "that", "with", "from", "have", "must", "when", "where", "which", "their",
+        "there", "these", "those", "into", "than", "then", "they", "them", "been", "being",
+        "would", "could", "should", "will", "shall", "does", "done", "also", "only", "such",
+        "each", "both", "some", "more", "most", "other", "over", "under", "after", "before",
+    ];
+    strip_inline_markers(text)
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4 && !STOP.contains(w))
+        .map(|w| w.trim_end_matches('s').to_string()) // fold simple plural
+        .filter(|w| w.len() >= 4)
+        .collect()
+}
+
 /// For statement `i`, retrieve up to TOP_K candidate newer statements from OTHER guides whose
-/// owning guide is strictly newer, via TWO channels merged:
+/// owning guide is strictly newer, via three merged channels:
 ///   (A) EMBEDDING: cosine ≥ `tau` (semantic similarity).
 ///   (B) LEXICAL ENTITY: shares ≥1 rare/distinctive token (issue ref, id, hyphenated term) —
-///       catches the closure that is entity-linked but lexically divergent from the stale claim
-///       (e.g. "cold-start unverified" ↔ "kind:10050 planner trigger ... never receive DMs",
-///       which embed at only ~0.31 but both touch the DM-receive surface).
-/// Ranked by a blended score: embedding similarity plus a boost per shared rare token, so a
-/// strong entity match isn't crowded out by higher-cosine same-topic siblings.
+///       catches an entity-linked but lexically divergent closure.
+///   (C) NEGATIVE-STATUS CONTENT (only when the OLDER statement asserts a negative/open status):
+///       shares ≥3 significant content words with a newer statement. This is the recall budget
+///       spent precisely on the cardinal supersession case ("X is unverified" → "X now works"),
+///       where the superseder embeds far (~0.31) and shares no rare token, yet shares the domain
+///       nouns (DM, receive, cold-start, accounts, …). The strict LLM confirm filters precision.
+/// Ranked by a blended score so a strong entity/content match isn't crowded out by higher-cosine
+/// same-topic siblings.
 pub fn retrieve_candidates(
     i: usize,
     statements: &[Statement],
@@ -331,6 +369,17 @@ pub fn retrieve_candidates(
     let me = &statements[i];
     let my_emb = &embeddings[i];
     let my_toks = &token_sets[i];
+    let neg = is_negative_status(&me.text);
+    // For the negative-status content channel, the older statement's word set is its own content
+    // words UNION its guide-title words — the title supplies the topic nouns (e.g. "NIP-17 DM
+    // Relay Requirement" → nip/dm/relay) that the bare statement omits but its superseder shares.
+    let my_words: std::collections::HashSet<String> = if neg {
+        let mut w = content_words(&me.text);
+        w.extend(content_words(&me.title));
+        w
+    } else {
+        Default::default()
+    };
     let mut scored: Vec<(f32, Candidate)> = Vec::new();
     for (j, other) in statements.iter().enumerate() {
         if j == i || other.slug == me.slug {
@@ -340,15 +389,29 @@ pub fn retrieve_candidates(
             continue; // the candidate must be NEWER than the (possibly stale) statement
         }
         let sim = cosine(my_emb, &embeddings[j]);
-        let shared = my_toks.intersection(&token_sets[j]).count();
-        // Admit if EITHER channel fires.
-        let admit = sim >= tau || shared >= 1;
+        let shared_tok = my_toks.intersection(&token_sets[j]).count();
+        let shared_words = if neg {
+            // Compare against the candidate's content words ∪ its title words too.
+            let mut ow = content_words(&other.text);
+            ow.extend(content_words(&other.title));
+            ow.intersection(&my_words).count()
+        } else {
+            0
+        };
+        // Admit if ANY channel fires. The neg-status content channel needs ≥2 shared domain
+        // words (statement+title nouns) — enough to bridge "receive-side cold-start unverified"
+        // ↔ a closure that shares "receive"+"dm" via titles, while the strict LLM confirm keeps
+        // precision. Only negative-status statements pay this wider net.
+        let admit = sim >= tau || shared_tok >= 1 || (neg && shared_words >= 2);
         if !admit {
             continue;
         }
-        // Blended rank: cosine + 0.25 per shared rare token (a single rare-token match is worth
-        // ~0.25 cosine, enough to lift an entity-linked closure above same-topic siblings).
-        let rank = sim + 0.25 * shared as f32;
+        // Blended rank: cosine + 0.25/shared rare token + (for neg-status) 0.12/shared content
+        // word capped at +0.6. A negative-status claim's true superseder embeds low (~0.31) and
+        // is out-ranked by same-topic siblings; a multi-word domain match must lift it into K.
+        // The cap bounds over-boost; the strict LLM confirm is the precision gate.
+        let word_boost = (0.12 * shared_words as f32).min(0.60);
+        let rank = sim + 0.25 * shared_tok as f32 + word_boost;
         scored.push((rank, Candidate { newer_idx: j, similarity: sim }));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -863,6 +926,25 @@ mod tests {
         assert!(t.contains("cold-start"));
     }
 
+
+    #[test]
+    fn negative_status_detection_and_content_channel() {
+        assert!(is_negative_status("NIP-17 DM receive-side cold-start is unverified."));
+        assert!(is_negative_status("The ledger is scaffold-only with no restart recovery."));
+        assert!(is_negative_status("kind:10050 publish UI has zero Swift callers."));
+        assert!(!is_negative_status("The default embedder is local MiniLM."));
+
+        // Content channel: a negative-status older statement reaches a low-cosine, no-shared-
+        // rare-token closure that shares domain words.
+        let statements = vec![
+            stmt("nip17", "2026-05-26", "NIP-17 DM receive-side cold-start is unverified."), // 0 neg-status
+            stmt("ledger", "2026-06-12", "Fresh accounts could never receive DMs at cold-start until the planner trigger landed; receive now works."), // 1: shares receive/accounts/cold/start/dms words, low cosine, no rare token
+        ];
+        let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0]]; // cosine 0 → only content channel can fire
+        let tset = toks(&statements);
+        let cands = retrieve_candidates(0, &statements, &embeddings, &tset, 0.45);
+        assert!(cands.iter().any(|c| c.newer_idx == 1), "neg-status content channel must reach the closure: {:?}", cands.len());
+    }
 
     #[test]
     fn rare_tokens_extracts_entity_anchors_not_plain_words() {
