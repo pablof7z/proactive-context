@@ -670,20 +670,28 @@ event log).\n\
   - `new` — a fact the digest does NOT already cover. `target` MUST be null.\n\
   - `confirms` — this session re-affirms an existing digest claim UNCHANGED. `target` = that id; \
     `assertion` restates it.\n\
-  - `supersedes` — this session REPLACES an existing digest claim with a different value/decision \
-    on the SAME subject (the user changed their mind, or a new approach replaced the old). \
-    `target` = the id of the claim being replaced; `assertion` = the NEW decision.\n\
-  - `refines` — this session adds detail/qualification to an existing claim without reversing it. \
-    `target` = that id.\n\
+  - `supersedes` — use ONLY when the new claim makes the digest claim FALSE: same subject, and the \
+    old stated value is now WRONG/no-longer-true (the user changed their mind, or a new approach \
+    REPLACED the old). `target` = the id of the now-false claim; `assertion` = the NEW decision. \
+    Test: 'is the old claim now FALSE?' If it is still true but less complete, that is `refines`, \
+    NOT supersedes. An ADDITIVE capability (a new option alongside the old) is `new`, NOT supersedes.\n\
+  - `refines` — the digest claim is still TRUE but this session adds detail/qualification/scope \
+    without reversing it. `target` = that id. (Most within-a-topic follow-ups are refines, not \
+    supersedes.)\n\
 - `target`: for confirms/supersedes/refines it MUST be one of the ids shown in the DIGEST. If no \
   digest claim matches, use type `new` with target null — never invent an id.\n\
 - `evidence`: 1+ transcript line ranges (1-based, inclusive) that literally support the assertion.\n\
 - `ratified`: TRUE when the USER is the authority (stated it, or endorsed an assistant proposal); \
   FALSE for unendorsed assistant proposals. Authorship is determined mechanically downstream.\n\n\
 ## Rules\n\
-- Be conservative with `supersedes`: emit it ONLY for a genuine replacement of the SAME subject \
-  (same knob/decision, different value). A new fact about a related-but-different subject is `new`, \
-  NOT supersedes. Over-calling supersedes corrupts the store.\n\
+- Be conservative with `supersedes` — it must make the old claim FALSE. Negative examples:\n\
+  - Old: 'embeddings support OpenAI provider'. New: 'embeddings also support a local provider'. \
+    → `new` (additive capability — OpenAI is STILL supported, nothing became false).\n\
+  - Old: 'the cache evicts LRU'. New: 'the cache evicts LRU with a 1000-entry cap'. → `refines` \
+    (the old claim is still true, just less complete).\n\
+  - Old: 'the default embedder is OpenAI'. New: 'the default embedder is now local fastembed'. \
+    → `supersedes` (the old DEFAULT is now false). THIS is the only kind that earns supersedes.\n\
+- A new fact about a related-but-different subject is `new`. Over-calling supersedes corrupts the store.\n\
 - Sweep the WHOLE transcript; capture load-bearing facts from later turns too.\n\
 - Skip transient one-off debugging with no lasting spec implication.\n\
 - Emit [] only if the session genuinely changed/established nothing.\n";
@@ -1123,6 +1131,8 @@ async fn run_staged_capture(
             "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
             numbered_transcript
         );
+        // Run 12 cost bar: log input tokens (chars/4) for the plain EXTRACT call (the plain-B arm).
+        eprintln!("delta: extract_tokens_in={}", (EXTRACT_PREAMBLE.len() + extract_user.len()) / 4);
         let extract_raw = run_stage(
             spec, openrouter_api_key, ollama_base_url, ollama_api_key,
             EXTRACT_PREAMBLE, &extract_user, 6000,
@@ -1211,8 +1221,10 @@ async fn run_staged_capture(
                             let delta_api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
                             let delta_ollama_url = cfg.ollama_base_url.clone();
                             let delta_ollama_key = cfg.ollama_api_key.clone();
+                            // Run 12: trimmed digest budget (was 24) — tighter attention budget,
+                            // smaller delta-EXTRACT prompt → lower token cost. Recall stats logged.
                             let budget: usize = std::env::var("PC_DELTA_DIGEST_BUDGET").ok()
-                                .and_then(|v| v.parse().ok()).unwrap_or(24);
+                                .and_then(|v| v.parse().ok()).unwrap_or(16);
 
                             // 1. Digest (one recall pass — NOT per-claim). Session content = the
                             //    numbered transcript (what this session is about).
@@ -1239,6 +1251,8 @@ async fn run_staged_capture(
                                 "{}\n\n## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of typed ops now.",
                                 digest_block, numbered_transcript
                             );
+                            // Run 12 cost bar: log input tokens (chars/4) for the delta-EXTRACT call.
+                            eprintln!("delta: extract_tokens_in={}", (DELTA_EXTRACT_PREAMBLE.len() + delta_user.len()) / 4);
                             let delta_raw = tokio::task::block_in_place(|| {
                                 call_model_blocking_with_timeout(
                                     &delta_spec, &delta_api_key, &delta_ollama_url, delta_ollama_key.as_deref(),

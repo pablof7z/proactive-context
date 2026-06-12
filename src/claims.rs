@@ -295,27 +295,40 @@ pub fn build_digest(
         return Ok(vec![]);
     }
 
-    // Channel A: similarity. Embed the session content (truncated) + all existing assertions.
+    // Channel A: similarity. Run 12 cost fix — read each existing claim's embedding from the
+    // claims.db vec_claims table (already embedded at append time) instead of re-embedding ALL
+    // assertions every session (the Run-9 cost blowup). Only the session query is embedded here.
     let half = budget / 2;
     let mut out: Vec<DigestClaim> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sim_hits = 0usize; // recall stat
 
     let query = session_content.chars().take(6000).collect::<String>();
     if let Ok(qv) = embedder.embed(&[query]) {
         if let Some(qv) = qv.into_iter().next() {
-            let assertions: Vec<String> = all.iter().map(|c| c.assertion.clone()).collect();
-            if let Ok(avs) = embedder.embed(&assertions) {
-                let mut scored: Vec<(f32, &ClaimRecord)> = all.iter().zip(avs.iter())
-                    .map(|(c, av)| (cosine(&qv, av), c)).collect();
+            let db_path = claims_db_path(project_dir);
+            if let Ok(conn) = open_claims_db(&db_path, qv.len()) {
+                let mut scored: Vec<(f32, &ClaimRecord)> = Vec::new();
+                for c in &all {
+                    let rowid = claim_id_to_rowid(&c.id);
+                    let emb: Option<Vec<u8>> = conn.query_row(
+                        "SELECT embedding FROM vec_claims WHERE rowid = ?1", params![rowid], |r| r.get(0)).ok();
+                    if let Some(bytes) = emb {
+                        let v = bytes_to_floats(&bytes);
+                        if v.len() == qv.len() { scored.push((cosine(&qv, &v), c)); }
+                    }
+                }
                 scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 for (_, c) in scored.into_iter().take(half) {
                     if seen.insert(c.id.clone()) {
+                        sim_hits += 1;
                         out.push(DigestClaim { id: c.id.clone(), assertion: c.assertion.clone(), ts: c.ts.clone(), channel: "similarity".into() });
                     }
                 }
             }
         }
     }
+    eprintln!("delta: digest similarity channel filled {}/{} from claims.db vectors (no re-embed)", sim_hits, half);
 
     // Channel B: recency — most recent existing claims regardless of similarity.
     let mut by_recency: Vec<&ClaimRecord> = all.iter().collect();
