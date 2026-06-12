@@ -25,6 +25,7 @@ mod config;
 mod configure;
 mod daemon;
 mod db;
+mod cross_supersede;
 mod doctor;
 mod embed;
 mod events;
@@ -550,6 +551,21 @@ enum WikiAction {
         /// Defaults to capture_model. Useful when capture_model is a slow local model.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+
+        /// Cross-GUIDE supersession mode: find statements made stale by a NEWER fact in a
+        /// DIFFERENT guide and revise them in place with a breadcrumb. Off-hot-path; local
+        /// embeddings propose, one LLM call per guide confirms.
+        #[arg(long)]
+        cross_supersede: bool,
+
+        /// (cross-supersede) Wiki directory to operate on. Defaults to the discovered project
+        /// wiki. Use a temp copy to validate without touching the real wiki.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// (cross-supersede) Print the would-revise list (old + new text) and write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Tidy a wiki directory into its published, human-readable form: hide inline
@@ -897,18 +913,28 @@ fn main() -> Result<()> {
                 tau,
                 retopic,
                 model,
+                cross_supersede,
+                wiki_dir,
+                dry_run,
             } => {
-                crate::doctor::run_doctor(
-                    &root,
-                    crate::doctor::DoctorArgs {
-                        output_dir,
-                        apply,
-                        detect_only,
-                        tau,
-                        retopic,
-                        model,
-                    },
-                )?;
+                if cross_supersede {
+                    crate::cross_supersede::run_cross_supersede(
+                        &root,
+                        crate::cross_supersede::CrossSupersedeArgs { wiki_dir, dry_run, tau },
+                    )?;
+                } else {
+                    crate::doctor::run_doctor(
+                        &root,
+                        crate::doctor::DoctorArgs {
+                            output_dir,
+                            apply,
+                            detect_only,
+                            tau,
+                            retopic,
+                            model,
+                        },
+                    )?;
+                }
             }
             WikiAction::Tidy { dir, write } => {
                 let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
