@@ -34,12 +34,16 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Default similarity floor for proposing a cross-guide supersession candidate. Lower than the
-/// merge tau (0.65) because we compare individual STATEMENTS (shorter, noisier) and the LLM
-/// confirm is the real precision gate. Overridable via `--tau`.
-pub const DEFAULT_CROSS_TAU: f32 = 0.45;
+/// merge tau (0.65) because we compare individual STATEMENTS (shorter, noisier), the lexical
+/// entity channel runs alongside it, and the strict LLM confirm is the real precision gate.
+/// Empirically: the nip17 cold-start ↔ closure pair embeds at only ~0.31 and shares no rare
+/// token, so a 0.45 floor misses it; 0.30 admits it while the confirm step holds precision.
+/// Overridable via `--tau`.
+pub const DEFAULT_CROSS_TAU: f32 = 0.30;
 
-/// Top-K most-similar newer statements retrieved per statement.
-const TOP_K: usize = 5;
+/// Top-K most-similar newer statements retrieved per statement. Wider than the doctor merge's
+/// shortlist so a genuine superseder that ranks below same-topic siblings still reaches the LLM.
+const TOP_K: usize = 8;
 
 // ─── Statement model ──────────────────────────────────────────────────────────
 
@@ -73,15 +77,22 @@ pub fn split_statements(body: &str) -> Vec<(usize, usize, String)> {
 
     let mut flush = |start: Option<usize>, end: usize, out: &mut Vec<(usize, usize, String)>| {
         if let Some(s) = start {
-            // Trim trailing whitespace bytes from the span.
+            // Trim trailing whitespace bytes from the paragraph span.
             let mut e = end;
             while e > s && (bytes[e - 1] == b'\n' || bytes[e - 1] == b' ' || bytes[e - 1] == b'\t') {
                 e -= 1;
             }
             if e > s {
-                let text = body[s..e].to_string();
-                if is_prose_statement(&text) {
-                    out.push((s, e, text));
+                // Split the paragraph into SENTENCES with byte-accurate spans, so a single
+                // dense paragraph that packs several facts (e.g. an action-ledger blob that
+                // ends with the DM cold-start closure) yields one comparable unit per fact —
+                // the embedding of each isn't diluted by its neighbors. The revise machinery
+                // targets the precise sentence span. Sentences too short to be a real fact are
+                // merged forward so a span always covers prose.
+                for (ss, se, text) in split_sentences(body, s, e) {
+                    if is_prose_statement(&text) {
+                        out.push((ss, se, text));
+                    }
                 }
             }
         }
@@ -121,6 +132,91 @@ pub fn split_statements(body: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
+/// Split a paragraph `body[start..end]` into sentence-level spans (byte-accurate against the
+/// FULL body). Boundary heuristic: a period (or `?`/`!`) followed by whitespace and then an
+/// uppercase letter or a backtick begins a new sentence — robust for the wiki's full-sentence
+/// prose while avoiding splits inside decimals/abbreviations (`v0.5`, `e.g.`) which are
+/// lowercase-followed. Sentences shorter than a few words are merged into the next so a span
+/// always covers a real statement. Returns at least the whole paragraph if no boundary is found.
+fn split_sentences(body: &str, start: usize, end: usize) -> Vec<(usize, usize, String)> {
+    let para = &body[start..end];
+    let pbytes = para.as_bytes();
+    let mut spans: Vec<(usize, usize)> = Vec::new(); // relative to `start`
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < pbytes.len() {
+        let c = pbytes[i];
+        if c == b'.' || c == b'?' || c == b'!' {
+            // Look past the terminator + following whitespace run.
+            let mut j = i + 1;
+            // allow a closing ) or " right after the period
+            while j < pbytes.len() && (pbytes[j] == b')' || pbytes[j] == b'"' || pbytes[j] == b'\'') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < pbytes.len() && (pbytes[k] == b' ' || pbytes[k] == b'\n' || pbytes[k] == b'\t') {
+                k += 1;
+            }
+            if k > j && k < pbytes.len() {
+                let next = pbytes[k];
+                let starts_sentence = next.is_ascii_uppercase() || next == b'`';
+                if starts_sentence {
+                    spans.push((seg_start, j)); // sentence text ends after the terminator/quote
+                    seg_start = k;
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if seg_start < pbytes.len() {
+        spans.push((seg_start, pbytes.len()));
+    }
+
+    // Merge segments that are too short (< 4 words) into the following one so every emitted
+    // span covers a real statement; keep byte spans contiguous.
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let mut pending_start: Option<usize> = None;
+    for (s, e) in spans {
+        let seg = para[s..e].trim();
+        let words = strip_inline_markers(seg).split_whitespace().count();
+        let real_start = pending_start.unwrap_or(s);
+        if words < 4 {
+            // too short alone — keep accumulating
+            pending_start = Some(real_start);
+            continue;
+        }
+        merged.push((real_start, e));
+        pending_start = None;
+    }
+    if let Some(s) = pending_start {
+        // trailing short fragment — attach to the previous span if any, else emit alone
+        if let Some(last) = merged.last_mut() {
+            last.1 = end - start; // extend to paragraph end
+            let _ = s;
+        } else {
+            merged.push((s, para.len()));
+        }
+    }
+    if merged.is_empty() {
+        merged.push((0, para.len()));
+    }
+
+    merged
+        .into_iter()
+        .map(|(s, e)| {
+            // Trim trailing whitespace within the relative span.
+            let mut re = e;
+            let pb = para.as_bytes();
+            while re > s && (pb[re - 1] == b' ' || pb[re - 1] == b'\n' || pb[re - 1] == b'\t') {
+                re -= 1;
+            }
+            (start + s, start + re, para[s..re].to_string())
+        })
+        .collect()
+}
+
 /// Is a paragraph substantive prose worth comparing? Rejects empties and pure-marker text.
 fn is_prose_statement(text: &str) -> bool {
     let stripped = strip_inline_markers(text);
@@ -130,19 +226,22 @@ fn is_prose_statement(text: &str) -> bool {
 }
 
 /// Remove inline `[^id]` citation markers from a string (for embedding / prose checks).
+/// UTF-8-safe: iterates by char so multi-byte characters (e.g. `→`, `≤`) survive intact.
 fn strip_inline_markers(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
-            if let Some(close) = s[i..].find(']') {
-                i += close + 1;
+    let mut chars = s.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        if c == '[' && chars.peek().map(|(_, n)| *n == '^').unwrap_or(false) {
+            if let Some(close_rel) = s[idx..].find(']') {
+                // Skip past the closing ']' (advance the char iterator to that byte).
+                let target = idx + close_rel + 1;
+                while chars.peek().map(|(i, _)| *i < target).unwrap_or(false) {
+                    chars.next();
+                }
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        out.push(c);
     }
     out
 }
@@ -165,17 +264,70 @@ pub struct Candidate {
     pub similarity: f32,
 }
 
-/// For statement `i`, retrieve up to TOP_K most-similar statements from OTHER guides whose
-/// owning guide is strictly newer, with cosine ≥ `tau`. Returns most-similar-first.
+/// Extract RARE, distinctive tokens from a statement — issue refs (`#1080`), kinded/colon ids
+/// (`kind:10050`), snake_case / dotted identifiers, and hyphenated domain terms (`cold-start`).
+/// These are the entity anchors that link a stale claim to its closure even when the prose
+/// wording diverges (so embedding similarity alone misses it). Lowercased.
+pub fn rare_tokens(text: &str) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let lower = strip_inline_markers(text).to_lowercase();
+    let is_tokchar =
+        |c: char| c.is_alphanumeric() || c == '#' || c == ':' || c == '_' || c == '-' || c == '.';
+    // Split on any non-token character; UTF-8-safe because we split by `char`, not byte.
+    for raw in lower.split(|c: char| !is_tokchar(c)) {
+        let tok = raw.trim_matches(|c: char| c == '.' || c == '-' || c == ':');
+        if is_rare_token(tok) {
+            set.insert(tok.to_string());
+        }
+    }
+    set
+}
+
+/// A token is "rare/distinctive" if it carries entity identity: an issue/PR ref (`#1080`), a
+/// colon/underscore/dot compound id (`kind:10050`, `swap_dm_inbox_observer`, `actor.rs`), or a
+/// multi-segment hyphenated term (`cold-start`, `receive-side`). Plain English words are not
+/// rare — they would over-link.
+fn is_rare_token(tok: &str) -> bool {
+    if tok.len() < 4 {
+        return false;
+    }
+    if tok.starts_with('#') && tok[1..].chars().any(|c| c.is_ascii_digit()) {
+        return true; // issue/PR ref
+    }
+    if tok.contains(':') || tok.contains('_') {
+        return true; // kind:NNNN, snake_case identifier
+    }
+    // hyphenated multi-word domain term (e.g. cold-start, receive-side) — needs 2+ segments
+    if tok.matches('-').count() >= 1 && tok.split('-').filter(|s| s.len() >= 3).count() >= 2 {
+        return true;
+    }
+    // dotted file/path identifiers (actor.rs, dm.rs) — has a non-numeric dotted segment
+    if tok.contains('.') && tok.split('.').any(|s| s.len() >= 2 && s.chars().any(|c| c.is_alphabetic())) {
+        return true;
+    }
+    false
+}
+
+/// For statement `i`, retrieve up to TOP_K candidate newer statements from OTHER guides whose
+/// owning guide is strictly newer, via TWO channels merged:
+///   (A) EMBEDDING: cosine ≥ `tau` (semantic similarity).
+///   (B) LEXICAL ENTITY: shares ≥1 rare/distinctive token (issue ref, id, hyphenated term) —
+///       catches the closure that is entity-linked but lexically divergent from the stale claim
+///       (e.g. "cold-start unverified" ↔ "kind:10050 planner trigger ... never receive DMs",
+///       which embed at only ~0.31 but both touch the DM-receive surface).
+/// Ranked by a blended score: embedding similarity plus a boost per shared rare token, so a
+/// strong entity match isn't crowded out by higher-cosine same-topic siblings.
 pub fn retrieve_candidates(
     i: usize,
     statements: &[Statement],
     embeddings: &[Vec<f32>],
+    token_sets: &[std::collections::HashSet<String>],
     tau: f32,
 ) -> Vec<Candidate> {
     let me = &statements[i];
     let my_emb = &embeddings[i];
-    let mut scored: Vec<Candidate> = Vec::new();
+    let my_toks = &token_sets[i];
+    let mut scored: Vec<(f32, Candidate)> = Vec::new();
     for (j, other) in statements.iter().enumerate() {
         if j == i || other.slug == me.slug {
             continue; // never compare within the same guide
@@ -184,13 +336,19 @@ pub fn retrieve_candidates(
             continue; // the candidate must be NEWER than the (possibly stale) statement
         }
         let sim = cosine(my_emb, &embeddings[j]);
-        if sim >= tau {
-            scored.push(Candidate { newer_idx: j, similarity: sim });
+        let shared = my_toks.intersection(&token_sets[j]).count();
+        // Admit if EITHER channel fires.
+        let admit = sim >= tau || shared >= 1;
+        if !admit {
+            continue;
         }
+        // Blended rank: cosine + 0.25 per shared rare token (a single rare-token match is worth
+        // ~0.25 cosine, enough to lift an entity-linked closure above same-topic siblings).
+        let rank = sim + 0.25 * shared as f32;
+        scored.push((rank, Candidate { newer_idx: j, similarity: sim }));
     }
-    scored.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(TOP_K);
-    scored
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(TOP_K).map(|(_, c)| c).collect()
 }
 
 // ─── LLM confirm (batched per guide) ──────────────────────────────────────────
@@ -204,48 +362,59 @@ supports YAML output' — this is ADDITIVE (a new capability), the older stateme
 true. Only flag when the newer statement REVERSES, CLOSES, or INVALIDATES the older one \
 (e.g. older 'X is unverified' + newer 'X was verified/closed by PR #N').";
 
-/// Build the per-guide batch confirm prompt. Each pair is numbered so the model can answer
-/// with a compact JSON array referencing pair indices.
-fn confirm_prompt(pairs: &[(usize, usize)], statements: &[Statement]) -> String {
+/// Build the per-guide batch confirm prompt. Each OLDER statement is numbered and shown with
+/// its retrieved CANDIDATE newer statements (also numbered). The model decides, for each older
+/// statement, whether ANY candidate makes it stale — picking the candidate that does.
+fn confirm_prompt(olders: &[(usize, Vec<usize>)], statements: &[Statement]) -> String {
     let mut s = String::from(
-        "For each numbered PAIR below, decide whether the NEWER statement makes the OLDER one \
-stale (false/obsolete/contradicted). If stale, also write the corrected TERMINAL TRUTH — a \
-single sentence stating what is now true, drawn from the newer statement.\n\n",
+        "Each OLDER statement below is followed by CANDIDATE newer statements from other guides. \
+For each OLDER statement, decide whether ANY candidate makes it STALE (false/obsolete/\
+contradicted/closed). If so, pick the single candidate that supersedes it and write the \
+corrected TERMINAL TRUTH — one sentence stating what is now true, drawn from that candidate.\n\n",
     );
-    for (n, (older_idx, newer_idx)) in pairs.iter().enumerate() {
+    for (n, (older_idx, cand_idxs)) in olders.iter().enumerate() {
         let o = &statements[*older_idx];
-        let nw = &statements[*newer_idx];
         s.push_str(&format!(
-            "PAIR {n}:\n  OLDER (guide {oslug}, {odate}): {otext}\n  NEWER (guide {nslug}, {ndate}): {ntext}\n\n",
+            "OLDER {n} (guide {oslug}, {odate}): {otext}\n",
             n = n,
             oslug = o.slug,
             odate = o.date,
             otext = strip_inline_markers(&o.text).trim(),
-            nslug = nw.slug,
-            ndate = nw.date,
-            ntext = strip_inline_markers(&nw.text).trim(),
         ));
+        for (ci, cand_idx) in cand_idxs.iter().enumerate() {
+            let c = &statements[*cand_idx];
+            s.push_str(&format!(
+                "    CANDIDATE {ci} (guide {cslug}, {cdate}): {ctext}\n",
+                ci = ci,
+                cslug = c.slug,
+                cdate = c.date,
+                ctext = strip_inline_markers(&c.text).trim(),
+            ));
+        }
+        s.push('\n');
     }
     s.push_str(
-        "Output ONLY a JSON array, one object per STALE pair (omit non-stale pairs entirely):\n\
-[{\"pair\": <n>, \"terminal_truth\": \"<one corrected sentence>\"}]\n\
+        "Output ONLY a JSON array, one object per STALE older statement (omit non-stale ones):\n\
+[{\"older\": <n>, \"candidate\": <ci>, \"terminal_truth\": \"<one corrected sentence>\"}]\n\
 If none are stale, output []. No prose outside the JSON.",
     );
     s
 }
 
-/// Parse the confirm response into (pair_index, terminal_truth) entries, keeping only valid
-/// pair indices.
-fn parse_confirm(raw: &str, n_pairs: usize) -> Vec<(usize, String)> {
+/// Parse the confirm response into (older_local_idx, chosen_newer_global_idx, terminal_truth),
+/// validating both indices against the prompt's `olders` structure.
+fn parse_confirm(raw: &str, olders: &[(usize, Vec<usize>)]) -> Vec<(usize, usize, String)> {
     let json = extract_json_array(raw);
     let mut out = Vec::new();
     if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&json) {
         for it in items {
-            let pair = it.get("pair").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let older = it.get("older").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let cand = it.get("candidate").and_then(|v| v.as_u64()).map(|n| n as usize);
             let truth = it.get("terminal_truth").and_then(|v| v.as_str()).map(str::to_string);
-            if let (Some(p), Some(t)) = (pair, truth) {
-                if p < n_pairs && !t.trim().is_empty() {
-                    out.push((p, t.trim().to_string()));
+            if let (Some(o), Some(c), Some(t)) = (older, cand, truth) {
+                if o < olders.len() && c < olders[o].1.len() && !t.trim().is_empty() {
+                    let newer_global = olders[o].1[c];
+                    out.push((o, newer_global, t.trim().to_string()));
                 }
             }
         }
@@ -367,31 +536,56 @@ pub fn run_cross_supersede(root: &Path, args: CrossSupersedeArgs) -> Result<()> 
         return Ok(());
     }
 
-    // ── EMBED all statements once (local fastembed). ──
+    // ── EMBED all statements once (local fastembed) + precompute rare-token sets. ──
     let mut embedder = build_embedder(&cfg).context("build embedder")?;
     let texts: Vec<String> = statements.iter().map(|s| strip_inline_markers(&s.text)).collect();
     let embeddings = embedder.embed(&texts).context("embed statements")?;
+    let token_sets: Vec<std::collections::HashSet<String>> =
+        statements.iter().map(|s| rare_tokens(&s.text)).collect();
 
-    // ── RETRIEVE: per statement, gather newer similar candidates. Group by owning guide
-    //    so we can issue ONE confirm call per guide (frugal). ──
-    // guide index -> Vec<(older_global_idx, newer_global_idx)>
-    let mut per_guide_pairs: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+    // ── RETRIEVE: per statement, gather up to TOP_K newer similar candidates. Group by owning
+    //    guide so we can issue ONE confirm call per guide (frugal). Each older statement keeps
+    //    its FULL candidate set — the genuine superseder is often not the single nearest
+    //    neighbour (a stale claim's nearest neighbours are usually its same-topic siblings),
+    //    so the LLM must see all K to find it. ──
+    // guide index -> Vec<(older_global_idx, Vec<newer_global_idx>)>
+    let mut per_guide: std::collections::BTreeMap<usize, Vec<(usize, Vec<usize>)>> =
         std::collections::BTreeMap::new();
+    let mut total_pairs = 0usize;
+    // Per-older best similarity, used to cap a guide's confirm prompt to its strongest cases.
+    let mut best_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
     for (i, _s) in statements.iter().enumerate() {
-        let cands = retrieve_candidates(i, &statements, &embeddings, tau);
+        let cands = retrieve_candidates(i, &statements, &embeddings, &token_sets, tau);
         if cands.is_empty() {
             continue;
         }
+        let top = cands.iter().map(|c| c.similarity).fold(0.0f32, f32::max);
+        best_sim.insert(i, top);
+        let newer: Vec<usize> = cands.iter().map(|c| c.newer_idx).collect();
+        total_pairs += newer.len();
         let gi = stmt_loc[i].0;
-        for c in cands {
-            per_guide_pairs.entry(gi).or_default().push((i, c.newer_idx));
+        per_guide.entry(gi).or_default().push((i, newer));
+    }
+    // Bound each guide's confirm prompt: keep at most MAX_OLDERS_PER_GUIDE older statements,
+    // prioritizing the strongest-similarity candidates (a lower tau widens recall but must not
+    // blow the prompt for a large guide). The lexical-only matches (sim possibly < tau) are
+    // kept too — their best_sim reflects their actual cosine, so a strong entity match with
+    // modest cosine still competes fairly.
+    const MAX_OLDERS_PER_GUIDE: usize = 40;
+    for olders in per_guide.values_mut() {
+        if olders.len() > MAX_OLDERS_PER_GUIDE {
+            olders.sort_by(|a, b| {
+                let sa = best_sim.get(&a.0).copied().unwrap_or(0.0);
+                let sb = best_sim.get(&b.0).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            olders.truncate(MAX_OLDERS_PER_GUIDE);
         }
     }
-    let total_pairs: usize = per_guide_pairs.values().map(|v| v.len()).sum();
     println!(
         "  {} candidate pair(s) across {} guide(s) passed the cosine+date gate",
         total_pairs,
-        per_guide_pairs.len()
+        per_guide.len()
     );
 
     // ── CONFIRM (one LLM call per guide) + plan revisions. ──
@@ -403,19 +597,9 @@ pub fn run_cross_supersede(root: &Path, args: CrossSupersedeArgs) -> Result<()> 
     };
 
     let mut planned: Vec<PlannedRevision> = Vec::new();
-    for (gi, pairs) in &per_guide_pairs {
-        // Deduplicate: keep at most one (best) newer candidate per older statement for the
-        // confirm prompt — the highest-similarity pair is first because retrieve sorts, but
-        // per_guide_pairs interleaves; dedup by older_idx keeping first occurrence.
-        let mut seen_older = std::collections::HashSet::new();
-        let deduped: Vec<(usize, usize)> = pairs
-            .iter()
-            .filter(|(o, _)| seen_older.insert(*o))
-            .copied()
-            .collect();
-
+    for (gi, olders) in &per_guide {
         let slug = &guides[*gi].1.frontmatter.slug;
-        let prompt = confirm_prompt(&deduped, &statements);
+        let prompt = confirm_prompt(olders, &statements);
         let raw = match llm.call(CONFIRM_SYSTEM, &prompt) {
             Ok(r) => r,
             Err(e) => {
@@ -423,9 +607,9 @@ pub fn run_cross_supersede(root: &Path, args: CrossSupersedeArgs) -> Result<()> 
                 continue;
             }
         };
-        let confirmed = parse_confirm(&raw, deduped.len());
-        for (pair_n, terminal) in confirmed {
-            let (older_idx, newer_idx) = deduped[pair_n];
+        // parse_confirm returns (older_local_idx, chosen_newer_global_idx, terminal_truth).
+        for (older_local, newer_idx, terminal) in parse_confirm(&raw, olders) {
+            let older_idx = olders[older_local].0;
             let older = &statements[older_idx];
             let newer = &statements[newer_idx];
             let new_text = build_revision(&older.text, &terminal, &newer.slug);
@@ -559,6 +743,33 @@ mod tests {
     }
 
     #[test]
+    fn split_statements_isolates_sentences_in_dense_paragraph() {
+        // The real failure mode: a dense paragraph that buries the load-bearing closure fact
+        // among unrelated sentences. Sentence-splitting must surface it as its own unit so its
+        // embedding isn't diluted (this is what let the nip17 cold-start match its closure).
+        let body = "## Action Ledger\n\nThe M6 action ledger has PublishAction shapes but no ULID crate and no restart recovery. V-18 fixed PublishOutcome::FailedAfterRetries having no toast. The kind:10050 planner trigger was missing in production (zero callers before #1080), causing fresh accounts to never receive DMs.\n";
+        let stmts = split_statements(body);
+        // The closure sentence must be its own statement.
+        let closure = stmts.iter().find(|(_, _, t)| t.contains("kind:10050 planner trigger"));
+        assert!(closure.is_some(), "closure sentence must be isolated: {:?}", stmts.iter().map(|s| &s.2).collect::<Vec<_>>());
+        let (s, e, t) = closure.unwrap();
+        // Span fidelity + isolation: it must NOT contain the unrelated ULID sentence.
+        assert_eq!(&body[*s..*e], t);
+        assert!(!t.contains("ULID"), "closure unit must not absorb neighbors: {t}");
+        assert!(t.contains("fresh accounts to never receive DMs"));
+    }
+
+    #[test]
+    fn split_sentences_keeps_byte_spans_exact() {
+        let body = "## X\n\nFirst sentence here ok. Second sentence about cold-start verified now.\n";
+        let stmts = split_statements(body);
+        for (s, e, t) in &stmts {
+            assert_eq!(&body[*s..*e], t, "span must reproduce text exactly");
+        }
+        assert!(stmts.len() >= 2, "two sentences expected: {:?}", stmts);
+    }
+
+    #[test]
     fn is_strictly_newer_requires_later_day() {
         assert!(is_strictly_newer("2026-06-12", "2026-05-26"));
         assert!(!is_strictly_newer("2026-05-26", "2026-05-26")); // same day
@@ -568,6 +779,10 @@ mod tests {
 
     fn stmt(slug: &str, date: &str, text: &str) -> Statement {
         Statement { slug: slug.into(), title: slug.into(), date: date.into(), text: text.into(), start: 0, end: text.len() }
+    }
+
+    fn toks(statements: &[Statement]) -> Vec<std::collections::HashSet<String>> {
+        statements.iter().map(|s| rare_tokens(&s.text)).collect()
     }
 
     #[test]
@@ -585,10 +800,59 @@ mod tests {
             vec![0.98, 0.2, 0.0],
             vec![0.97, 0.0, 0.2],
         ];
-        let cands = retrieve_candidates(0, &statements, &embeddings, 0.45);
-        // Only idx 2 qualifies (newer + other guide + above tau). idx1 same guide, idx3 older.
-        assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].newer_idx, 2);
+        let tset = toks(&statements);
+        let cands = retrieve_candidates(0, &statements, &embeddings, &tset, 0.45);
+        // idx 2 qualifies (newer + other guide + above tau). idx1 same guide, idx3 older.
+        assert!(cands.iter().any(|c| c.newer_idx == 2));
+        assert!(!cands.iter().any(|c| c.newer_idx == 1 || c.newer_idx == 3));
+    }
+
+    #[test]
+    fn lexical_channel_catches_entity_linked_low_cosine_pair() {
+        // The real cold-start case: the stale statement and its closure embed at only ~0.31
+        // (below tau), but share the rare token `cold-start`. The lexical channel must admit
+        // the closure even though cosine alone would not.
+        let statements = vec![
+            stmt("nip17", "2026-05-26", "NIP-17 DM receive-side cold-start is unverified."), // 0
+            stmt("ledger", "2026-06-12", "The kind:10050 planner trigger was missing before #1080, so cold-start receive never fired."), // 1 newer, shares cold-start + kind:10050
+            stmt("other", "2026-06-12", "Completely unrelated note about button colors."), // 2 newer, no shared rare token, low cosine
+        ];
+        // Low cosine across the board (orthogonal-ish) so ONLY the lexical channel can fire.
+        let embeddings = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0], // cosine(0,1) = 0 → below tau
+            vec![0.0, 0.0, 1.0], // cosine(0,2) = 0
+        ];
+        let tset = toks(&statements);
+        let cands = retrieve_candidates(0, &statements, &embeddings, &tset, 0.45);
+        assert!(cands.iter().any(|c| c.newer_idx == 1), "lexical channel must admit the closure: {:?}", cands.iter().map(|c| c.newer_idx).collect::<Vec<_>>());
+        assert!(!cands.iter().any(|c| c.newer_idx == 2), "unrelated low-cosine no-shared-token statement must NOT be admitted");
+    }
+
+    #[test]
+    fn strip_markers_and_rare_tokens_are_utf8_safe() {
+        // Real guides contain → ≤ etc.; the old byte-cast mangled them and could panic.
+        let s = "stage 1 → stage 2 ≤ done [^abc-1] with kind:10050 and cold-start.";
+        let stripped = strip_inline_markers(s);
+        assert!(stripped.contains('→') && stripped.contains('≤'), "multibyte must survive: {stripped}");
+        assert!(!stripped.contains("[^abc-1]"));
+        let t = rare_tokens(s); // must not panic on multibyte input
+        assert!(t.contains("kind:10050"));
+        assert!(t.contains("cold-start"));
+    }
+
+
+    #[test]
+    fn rare_tokens_extracts_entity_anchors_not_plain_words() {
+        let t = rare_tokens("NIP-17 DM receive-side cold-start is unverified before #1080 via kind:10050 and swap_dm_inbox_observer.");
+        assert!(t.contains("cold-start"), "{:?}", t);
+        assert!(t.contains("receive-side"));
+        assert!(t.contains("#1080"));
+        assert!(t.contains("kind:10050"));
+        assert!(t.contains("swap_dm_inbox_observer"));
+        // plain words must NOT be rare tokens
+        assert!(!t.contains("unverified"));
+        assert!(!t.contains("before"));
     }
 
     #[test]
@@ -615,24 +879,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_confirm_keeps_valid_pairs_only() {
-        let raw = "Here: [{\"pair\": 0, \"terminal_truth\": \"X is closed\"}, {\"pair\": 9, \"terminal_truth\": \"out of range\"}, {\"pair\": 1, \"terminal_truth\": \"\"}]";
-        let got = parse_confirm(raw, 2);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, 0);
-        assert_eq!(got[0].1, "X is closed");
+    fn parse_confirm_validates_older_and_candidate_indices() {
+        // olders[0] has candidates [global 5, global 7]; olders[1] has [global 9].
+        let olders = vec![(0usize, vec![5usize, 7usize]), (1usize, vec![9usize])];
+        let raw = "Here: [\
+{\"older\": 0, \"candidate\": 1, \"terminal_truth\": \"X is closed\"}, \
+{\"older\": 0, \"candidate\": 9, \"terminal_truth\": \"bad candidate idx\"}, \
+{\"older\": 5, \"candidate\": 0, \"terminal_truth\": \"bad older idx\"}, \
+{\"older\": 1, \"candidate\": 0, \"terminal_truth\": \"\"}]";
+        let got = parse_confirm(raw, &olders);
+        // Only the first is valid; it maps to candidate global index 7.
+        assert_eq!(got.len(), 1, "got: {:?}", got);
+        assert_eq!(got[0].0, 0); // older local
+        assert_eq!(got[0].1, 7); // chosen newer global
+        assert_eq!(got[0].2, "X is closed");
     }
 
+
     #[test]
-    fn confirm_prompt_contains_pairs_and_strips_markers() {
+    fn confirm_prompt_lists_candidates_and_strips_markers() {
         let statements = vec![
             stmt("a", "2026-05-26", "old fact is unverified [^a-1]"),
             stmt("b", "2026-06-12", "new fact verified it [^b-2]"),
+            stmt("c", "2026-06-12", "another candidate fact [^c-3]"),
         ];
-        let p = confirm_prompt(&[(0, 1)], &statements);
-        assert!(p.contains("PAIR 0"));
+        let p = confirm_prompt(&[(0, vec![1, 2])], &statements);
+        assert!(p.contains("OLDER 0"));
+        assert!(p.contains("CANDIDATE 0"));
+        assert!(p.contains("CANDIDATE 1"));
         assert!(p.contains("old fact is unverified"));
-        assert!(!p.contains("[^a-1]"), "markers must be stripped from the prompt");
+        assert!(p.contains("new fact verified it"));
+        assert!(!p.contains("[^a-1]") && !p.contains("[^b-2]"), "markers must be stripped");
         assert!(p.contains("terminal_truth"));
     }
 }
