@@ -103,7 +103,9 @@ fn parse_query_line(line: &str) -> Option<String> {
         .trim_start_matches(['-', '*', '•', ' '])
         .trim_start_matches("**")
         .trim();
-    if t.len() >= 6 && t[..6].eq_ignore_ascii_case("QUERY:") {
+    // Byte-slice only when byte 6 is a char boundary — a response starting with a
+    // multi-byte char would otherwise panic the hot inject path.
+    if t.len() >= 6 && t.is_char_boundary(6) && t[..6].eq_ignore_ascii_case("QUERY:") {
         // Payload may carry the closing `**` of a bolded label, e.g. `**QUERY:** q`.
         let q = t[6..].trim_matches(|c: char| c == '*' || c.is_whitespace());
         (!q.is_empty()).then(|| q.to_string())

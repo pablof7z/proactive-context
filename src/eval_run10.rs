@@ -233,10 +233,10 @@ fn quality_spotcheck(history: &[String], spec: &ModelSpec, api_key: &str, ob: &s
 
 // ─── excerpt helpers (mirror each pass's own strategy for fair token accounting) ─────────
 fn episode_excerpt(n: &str) -> String {
-    if n.len() > 80000 { format!("{}\n\n[... middle truncated for length ...]\n\n{}", &n[..10000], &n[n.len()-70000..]) } else { n.to_string() }
+    if n.len() > 80000 { format!("{}\n\n[... middle truncated for length ...]\n\n{}", &n[..floorb(n, 10000)], &n[ceilb(n, n.len() - 70000)..]) } else { n.to_string() }
 }
 fn research_excerpt(n: &str) -> String {
-    if n.len() > 90000 { format!("{}\n\n[... early middle truncated for length, resuming below ...]\n\n{}", &n[..10000], &n[n.len()-80000..]) } else { n.to_string() }
+    if n.len() > 90000 { format!("{}\n\n[... early middle truncated for length, resuming below ...]\n\n{}", &n[..floorb(n, 10000)], &n[ceilb(n, n.len() - 80000)..]) } else { n.to_string() }
 }
 
 // ─── report ──────────────────────────────────────────────────────────────────────────────
@@ -306,3 +306,6 @@ fn print_report(r: &Run10Report) {
     println!("\n  OVERALL: {}", if all { "ALL 4 PASS — merge adoptable (flag-flip is a separate decision)" }
         else if !bar2 || !r.bar1.pass { "REJECT if gate-dilution (bar 1 miss / bar 2 FP)" } else { "NOT all pass — see per-bar" });
 }
+
+fn floorb(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i -= 1; } i }
+fn ceilb(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i += 1; } i }

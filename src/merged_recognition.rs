@@ -96,8 +96,8 @@ pub fn merged_excerpt(numbered_transcript: &str) -> String {
     if numbered_transcript.len() > 90000 {
         format!(
             "{}\n\n[... early middle truncated for length, resuming below ...]\n\n{}",
-            &numbered_transcript[..10000],
-            &numbered_transcript[numbered_transcript.len() - 80000..]
+            &numbered_transcript[..floorb(numbered_transcript, 10000)],
+            &numbered_transcript[ceilb(numbered_transcript, numbered_transcript.len() - 80000)..]
         )
     } else {
         numbered_transcript.to_string()
@@ -168,3 +168,6 @@ fn extract_json_object(s: &str) -> String {
     }
     s[start..].to_string()
 }
+
+fn floorb(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i -= 1; } i }
+fn ceilb(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i += 1; } i }
