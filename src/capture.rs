@@ -1695,16 +1695,10 @@ fn apply_reconcile_op(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| safe_slug.replace('-', " "));
-    let new_summary = {
-        // Strip the provisional marker (§5) before it can leak into the frontmatter
-        // summary — the summary feeds the ROUTE index the pipeline reads next session,
-        // and a marker there is noise, not a topic descriptor.
-        let s = op.text.replace("⟨provisional, agent-inferred⟩", "");
-        let s = s.trim();
-        let s = s.split(". ").next().unwrap_or(s);
-        let s: String = s.chars().take(160).collect();
-        s.replace('\n', " ").trim().to_string()
-    };
+    // Summary for any NEW guide created here — the first-sentence convention (shared
+    // with the post-revise refresh via `summary_from_text`). Feeds the ROUTE index the
+    // pipeline reads next session, so it must describe what the guide covers.
+    let new_summary = summary_from_text(&op.text);
     let section = if op.section.trim().is_empty() {
         "## Notes".to_string()
     } else {
@@ -1844,6 +1838,11 @@ fn apply_reconcile_op(
                     Ok(new_body) => {
                         guide.body = new_body;
                         stamp_updated(&mut guide.frontmatter, &today);
+                        // Re-derive summary from the revised body: a revise can REVERSE the
+                        // guide's lead fact (auto-skip-ads: "defaults off" → "defaults to
+                        // true"), and SELECT navigates by summary, so a stale summary
+                        // misroutes. Deterministic, no model.
+                        refresh_summary(&mut guide);
                         if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
                             guide.frontmatter.topic = new_topic_c;
                         }
@@ -1863,6 +1862,7 @@ fn apply_reconcile_op(
                             &today,
                         );
                         stamp_updated(&mut guide.frontmatter, &today);
+                        refresh_summary(&mut guide);
                         Ok((
                             guide,
                             format!("Revise target missing in '{}'; added instead.", safe_slug),
@@ -1905,6 +1905,9 @@ fn apply_reconcile_op(
                     Some((start, end)) => {
                         guide.body.replace_range(start..end, "");
                         stamp_updated(&mut guide.frontmatter, &today);
+                        // Removing a section can drop the lead fact the summary described,
+                        // so re-derive from whatever prose now leads the body.
+                        refresh_summary(&mut guide);
                         Ok((guide, format!("Removed '{}' / '{}'.", safe_slug, section_c)))
                     }
                     None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
@@ -2577,6 +2580,87 @@ fn stamp_updated(fm: &mut crate::wiki::GuideFrontmatter, today: &str) {
     if !fm.created.is_empty() && fm.created.as_str() > fm.updated.as_str() {
         // A guide can't be created after its last update — clamp created down.
         fm.created = fm.updated.clone();
+    }
+}
+
+/// The canonical guide-`summary` convention, factored out of guide creation so that
+/// creation AND post-revise refresh derive summaries IDENTICALLY: strip the provisional
+/// marker, drop any inline `[^id]` citation markers, take the first sentence, cap at
+/// 160 chars, collapse newlines. Deterministic — no model.
+pub(crate) fn summary_from_text(text: &str) -> String {
+    // 1) strip the provisional/agent-inferred marker (§5) — noise in a topic descriptor.
+    let s = text.replace("⟨provisional, agent-inferred⟩", "");
+    // 2) drop inline citation markers like `[^0f3f2-16]` — they are not prose.
+    let s = strip_inline_citation_markers(&s);
+    let s = s.trim();
+    // 3) first sentence (same "`. `" split convention as creation).
+    let s = s.split(". ").next().unwrap_or(s);
+    // 4) cap at 160 chars, 5) collapse newlines + trim.
+    let s: String = s.chars().take(160).collect();
+    s.replace('\n', " ").trim().to_string()
+}
+
+/// Remove inline `[^id]` footnote-citation markers from a string (leaving surrounding
+/// text intact). Used so a derived summary never carries a raw citation marker.
+fn strip_inline_citation_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+            if let Some(close) = s[i..].find(']') {
+                i += close + 1; // skip the whole [^...] marker
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Re-derive a guide's `summary` from the FIRST SUBSTANTIVE PROSE LINE of its body —
+/// the source of truth after a `revise`/`remove` op rewrote the body. Without this the
+/// frontmatter summary keeps the original creation-time wording even after the body's
+/// lead fact is reversed, and SELECT (which navigates by summaries) misroutes.
+///
+/// "Substantive" = not blank, not a `#`/`##` heading, not an HTML/citation comment
+/// (`<!-- ... -->`), not a `## See Also` link bullet. Returns the [`summary_from_text`]
+/// of that line, or `None` if the body has no substantive prose (leave summary as-is).
+pub(crate) fn derive_summary_from_body(body: &str) -> Option<String> {
+    let mut in_see_also = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            // Track See-Also so its link bullets are skipped as non-prose.
+            in_see_also = line.trim_start_matches('#').trim().eq_ignore_ascii_case("see also");
+            continue;
+        }
+        if in_see_also {
+            continue; // skip link bullets under See Also
+        }
+        if line.starts_with("<!--") {
+            continue; // citation/HTML comment line
+        }
+        // A leftover citation-only line (all markers, no prose) reduces to empty.
+        let candidate = summary_from_text(line);
+        if candidate.is_empty() {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Refresh a guide's frontmatter `summary` in place from its (post-edit) body. No-op if
+/// the body has no derivable prose, so a guide whose summary can't be regenerated keeps
+/// its prior value rather than going blank.
+fn refresh_summary(guide: &mut Guide) {
+    if let Some(s) = derive_summary_from_body(&guide.body) {
+        guide.frontmatter.summary = s;
     }
 }
 
@@ -3383,4 +3467,130 @@ pub(crate) fn run_structural_maintenance_for_eval(
     let today = today();
     run_structural_maintenance(&wiki_path, &proj_dir, &today);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wiki::{parse_guide, revise_section};
+
+    // ─── Fix: summary refresh after RECONCILE revise/remove ───────────────────
+
+    #[test]
+    fn summary_from_text_matches_creation_convention() {
+        // first sentence, marker-stripped, newlines collapsed, 160-char cap.
+        assert_eq!(
+            summary_from_text("auto_skip_ads defaults to true. When enabled, ads are skipped."),
+            "auto_skip_ads defaults to true"
+        );
+        // provisional marker removed
+        assert_eq!(
+            summary_from_text("⟨provisional, agent-inferred⟩ The cache uses an LRU policy"),
+            "The cache uses an LRU policy"
+        );
+        // inline citation markers removed
+        assert_eq!(
+            summary_from_text("Profile updates use optimistic locking [^abc12-3]"),
+            "Profile updates use optimistic locking"
+        );
+    }
+
+    #[test]
+    fn derive_summary_skips_headings_comments_and_see_also() {
+        let body = "# Auto Skip Ads\n\n## Settings\n\nauto_skip_ads defaults to true (Previously: false.) When enabled, ads are skipped.\n\n<!-- citations: [^x-1] -->\n\n## See Also\n\n- [[other|Other]]\n";
+        let s = derive_summary_from_body(body).expect("should derive");
+        assert!(s.starts_with("auto_skip_ads defaults to true"), "got: {s}");
+        assert!(!s.contains('#'));
+        assert!(!s.contains("<!--"));
+    }
+
+    #[test]
+    fn derive_summary_none_when_no_prose() {
+        let body = "# Title\n\n## See Also\n\n- [[a|A]]\n\n<!-- citations: [^x] -->\n";
+        assert!(derive_summary_from_body(body).is_none());
+    }
+
+    /// The real-world defect: auto-skip-ads body was revised to "defaults to true" but
+    /// the frontmatter summary still said "defaults off". A revise op that reverses the
+    /// lead fact must refresh the summary. This drives the actual revise→refresh flow.
+    #[test]
+    fn revise_then_refresh_updates_stale_summary() {
+        // Reconstruct the guide as it was BEFORE the 2026-06-10 revise: body says "off",
+        // summary says "off".
+        let guide_md = "---\n\
+title: Auto Skip Ads\n\
+slug: auto-skip-ads\n\
+topic: playback\n\
+summary: autoSkipAds defaults off pending 'detection quality is proven'.\n\
+tags:\n  - capture\n\
+volatility: warm\n\
+confidence: medium\n\
+created: 2026-05-13\n\
+updated: 2026-05-13\n\
+verified: 2026-05-13\n\
+compiled-from: conversation\n\
+sources:\n  - session:abc\n\
+---\n\n\
+# Auto Skip Ads\n\n\
+## Settings\n\n\
+auto_skip_ads defaults to false pending detection-quality proof. [^seed-1]\n";
+        let mut guide = parse_guide(guide_md).expect("parse");
+        assert!(guide.frontmatter.summary.contains("off"));
+
+        // Apply a revise that reverses the lead fact (mirrors the real RECONCILE op).
+        let new_body = revise_section(
+            &guide.body,
+            "## Settings",
+            "auto_skip_ads defaults to true (Previously: false.) When enabled, properly labeled ads are skipped.",
+            "[^rev-1]",
+        )
+        .expect("revise");
+        guide.body = new_body;
+
+        // The defect: without refresh the summary still says "off".
+        assert!(guide.frontmatter.summary.contains("off"), "precondition");
+
+        // The fix:
+        refresh_summary(&mut guide);
+
+        assert!(
+            guide.frontmatter.summary.starts_with("auto_skip_ads defaults to true"),
+            "summary must be refreshed from the revised body; got: {}",
+            guide.frontmatter.summary
+        );
+        assert!(
+            !guide.frontmatter.summary.contains("off pending"),
+            "stale summary must be gone; got: {}",
+            guide.frontmatter.summary
+        );
+    }
+
+    /// Validation against the REAL auto-skip-ads guide shape (its on-disk body, which
+    /// already reflects the 2026-06-10 revise to "defaults to true" while its summary
+    /// still said "defaults off"). Proves the fix corrects the exact real-world summary.
+    #[test]
+    fn real_auto_skip_ads_body_yields_true_summary() {
+        let real_body = "# Auto Skip Ads\n\n## Settings\n\n\
+auto_skip_ads defaults to true (Previously: false.) When enabled, ads that are properly \
+labeled in the chapter list are automatically skipped during playback. PersistedSettings \
+uses #[serde(default = \"default_true\")] for auto_skip_ads_enabled so JSON files written \
+before the field existed hydrate as true; users who explicitly set false are unaffected \
+since serde only invokes the default when the key is absent.\n\n\
+<!-- citations: [^0f3f2-16] [^dced2-1] -->\n";
+        let s = derive_summary_from_body(real_body).expect("derive");
+        assert!(s.starts_with("auto_skip_ads defaults to true"), "got: {s}");
+        assert!(!s.to_lowercase().contains("defaults off"), "stale wording must be gone: {s}");
+    }
+
+    #[test]
+    fn refresh_summary_noop_when_body_has_no_prose() {
+        let guide_md = "---\n\
+title: T\nslug: t\ntopic: x\nsummary: original summary kept\ntags: []\n\
+volatility: warm\nconfidence: medium\ncreated: 2026-01-01\nupdated: 2026-01-01\n\
+verified: 2026-01-01\ncompiled-from: conversation\nsources: []\n---\n\n\
+# T\n\n## See Also\n\n- [[a|A]]\n";
+        let mut guide = parse_guide(guide_md).expect("parse");
+        refresh_summary(&mut guide);
+        assert_eq!(guide.frontmatter.summary, "original summary kept");
+    }
 }
