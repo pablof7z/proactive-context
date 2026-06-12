@@ -688,18 +688,6 @@ event log).\n\
 - Skip transient one-off debugging with no lasting spec implication.\n\
 - Emit [] only if the session genuinely changed/established nothing.\n";
 
-/// Run 11 — terminal-state rule (within-session inversion fix). Appended to EXTRACT_PREAMBLE by
-/// `build_extract_system` unless PC_NO_TERMINAL_STATE=1 (the no-fix A/B arm). On by default — this
-/// is a live-path product fix.
-const EXTRACT_TERMINAL_STATE_BLOCK: &str = "\n\
-## Terminal state — capture the END state of a fact that evolves\n\
-When a fact EVOLVES within the transcript (broken→fixed, unverified→verified, X→Y default, \
-issue-open→issue-closed), extract its TERMINAL state as the claim. The earlier state may appear \
-ONLY as explicit history INSIDE the assertion, e.g. 'cold-start DM delivery is verified end-to-end \
-via a live-relay test (was failing until the fix at line N)'. NEVER emit the earlier (broken / \
-unverified / old-default) state as a standalone present-tense claim when a later line supersedes \
-it — that produces a guide that asserts a stale, already-resolved state as current truth.\n";
-
 /// Sweep-completeness nudge, appended to EXTRACT_PREAMBLE by `build_extract_system`.
 /// Kept as a separate constant so it can be toggled off (PC_EXTRACT_NO_GRANULARITY=1) for
 /// A/B comparison against the original prompt.
@@ -771,10 +759,9 @@ fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
     if std::env::var("PC_EXTRACT_NO_GRANULARITY").ok().as_deref() != Some("1") {
         s.push_str(EXTRACT_GRANULARITY_BLOCK);
     }
-    // Run 11 terminal-state rule on by default; PC_NO_TERMINAL_STATE=1 reproduces pre-fix prompt.
-    if std::env::var("PC_NO_TERMINAL_STATE").ok().as_deref() != Some("1") {
-        s.push_str(EXTRACT_TERMINAL_STATE_BLOCK);
-    }
+    // Run 12 merge note: the terminal-state rule is now INLINE in EXTRACT_PREAMBLE (landed on master
+    // in parallel with Run 11's appended block). The Run-11 appended block was redundant and removed;
+    // master's inline rule is canonical and unconditional.
     s.push_str(&build_extract_wiki_index_block(index_rows));
     s
 }
@@ -904,24 +891,9 @@ replaced — no breadcrumb. It isn't user-decision history.\n\
 - Every section addressed by `section` must use an exact '## Heading' style heading.\n\
 - Output [] only if the claims require no change to this guide.\n";
 
-/// Run 11 — within-session terminal-state rule for RECONCILE. Appended unless PC_NO_TERMINAL_STATE=1.
-const RECONCILE_TERMINAL_STATE_BLOCK: &str = "\n\
-## Within-session evolution — write only the terminal state\n\
-Claims from LATER transcript lines supersede claims from EARLIER lines of the SAME session about \
-the same fact. When both arrive in one batch (e.g. 'feature is broken' AND a later 'feature is \
-fixed/verified/closed'), write ONLY the terminal state — `revise` to the terminal value; add a \
-'(Previously: <old>.)' breadcrumb if the flip is user-visible, otherwise just the terminal state. \
-NEVER leave the earlier (broken / unverified / old-default / issue-open) state presented as current.\n";
-
-/// Assemble the RECONCILE system prompt: base preamble + the Run-11 terminal-state rule (default on,
-/// PC_NO_TERMINAL_STATE=1 reproduces the pre-fix prompt for the A/B).
-fn build_reconcile_system() -> String {
-    let mut s = String::from(RECONCILE_PREAMBLE);
-    if std::env::var("PC_NO_TERMINAL_STATE").ok().as_deref() != Some("1") {
-        s.push_str(RECONCILE_TERMINAL_STATE_BLOCK);
-    }
-    s
-}
+// Run 12 merge note: the within-session terminal-state rule is now INLINE in RECONCILE_PREAMBLE
+// (landed on master in parallel with Run 11). The Run-11 appended block + build_reconcile_system
+// helper were redundant and removed; master's inline rule is canonical and unconditional.
 
 /// One staged single-shot model call. Mirrors inject.rs's provider dispatch: OpenRouter via
 /// `chat_once`, Ollama via the rig agent `.preamble().prompt()` pattern. Returns raw content.
@@ -1672,7 +1644,7 @@ async fn run_staged_capture(
             openrouter_api_key,
             ollama_base_url,
             ollama_api_key,
-            &build_reconcile_system(),
+            RECONCILE_PREAMBLE,
             &reconcile_user,
             6000,
         )
