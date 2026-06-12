@@ -637,6 +637,13 @@ Do NOT report an `author` field; authorship is determined mechanically downstrea
 - Decisions, requirements, behaviors, constraints, gotchas — capture them.\n\
 - When the user REVERSES or CHANGES an earlier decision, emit the NEW decision as a claim \
 (cite the lines where they changed their mind). Do not also re-assert the old one.\n\
+- TERMINAL STATE: when a fact EVOLVES within the transcript (broken -> fixed, \
+unverified -> verified, default X -> default Y), extract its TERMINAL state as the claim, \
+citing the later lines. The earlier state may appear only as explicit history inside the \
+same assertion (e.g. 'X is now verified end-to-end (was failing earlier in the session)'). \
+NEVER emit the earlier state as a standalone present-tense claim when a later line \
+supersedes it — sweep forward before finalizing any claim about something that was \
+being actively worked on.\n\
 - Skip transient one-off debugging steps that resolved with no lasting spec implication.\n\
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
@@ -865,7 +872,12 @@ When a claim CONTRADICTS existing prose, you MUST use `revise` (or `remove`) to 
 statement — never `add` a statement next to a contradictory one. The new decision becomes the live \
 statement; the old one must NOT remain presented as current. This holds regardless of either claim's \
 authority. The guide renders only the CURRENT (live) desired state — superseded statements are \
-replaced, not stacked.\n\n\
+replaced, not stacked.\n\
+WITHIN-SESSION EVOLUTION: claims in this batch cite transcript line ranges. When two claims in the \
+batch describe the SAME fact at different stages of the session (e.g. 'X is unverified' citing early \
+lines and 'X is verified' citing later lines), the claim citing the LATER lines is the terminal \
+truth — write ONLY it (with a '(Previously: ...)' breadcrumb if the flip is user-visible). Never \
+write the earlier-stage state as current when a later-cited claim supersedes it.\n\n\
 ## Supersession history (§6) — render only the live tip, plus user-evolution breadcrumbs\n\
 - When an [explicit] (USER) decision supersedes an earlier [explicit] (USER) decision, keep a terse \
 breadcrumb in the revised text: state the new decision as current, then one short clause like \
