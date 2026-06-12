@@ -17,6 +17,7 @@ mod eval_run7;
 mod eval_run8;
 mod eval_run9;
 mod eval_run10;
+mod eval_run11;
 mod merged_recognition;
 mod session_start;
 mod chunker;
@@ -448,6 +449,10 @@ enum Commands {
         #[arg(long)]
         run10: bool,
 
+        /// Run 11: terminal-state inversion fix validation (BAR 1 dm-relay case + BAR 2 sibling flips).
+        #[arg(long)]
+        run11: bool,
+
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
@@ -865,6 +870,7 @@ fn main() -> Result<()> {
             run8,
             run9,
             run10,
+            run11,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -878,6 +884,7 @@ fn main() -> Result<()> {
                 run8,
                 run9,
                 run10,
+                run11,
                 judge_model,
             })?;
         }

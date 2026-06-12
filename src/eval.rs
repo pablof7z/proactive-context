@@ -33,6 +33,7 @@ pub struct EvalArgs {
     pub run8: bool,
     pub run9: bool,
     pub run10: bool,
+    pub run11: bool,
     pub judge_model: Option<String>,
 }
 
@@ -147,6 +148,12 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
         let cfg = load_config().unwrap_or_default();
         let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
         return crate::eval_run10::run_run10(&exp_dir, &judge_model, &cfg);
+    }
+
+    if args.run11 {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        return crate::eval_run11::run_run11(&exp_dir, &judge_model, &cfg);
     }
 
     // Dirs for each store's output under the experiment dir.

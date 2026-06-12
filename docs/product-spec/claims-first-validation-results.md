@@ -1,5 +1,259 @@
 # Claims-First Validation Results
 
+**Run 12 — delta-EXTRACT productionization — 2 of 5 bars pass; the precision fix overshot.** Run 9
+proved the mechanism (6/8 reversal diagnostic) but failed cost (2.19×), supersedes precision (0.79),
+and correction-prediction. Run 12 fixed COST and PREDICT cleanly — **token cost 1.11× (was 2.19×)**
+by reading digest embeddings from the claims.db vec store instead of re-embedding every session, and
+**predict-the-correction recovered to parity** (Bd 4.5 = plain-B 4.5, was a regression). But the
+PRECISION fix (supersedes only when the new claim makes the old FALSE) **overshot**: it cut edges from
+14→7 (precision rose to ~1.0 but the ≥20-op audit sample is now unmet) and, as a side effect,
+**collapsed reversal recall** — the 8-reversal diagnostic fell 6/8→3/8 and Probe-2 trajectory 5/8→4/8,
+both missing their bars. One predicted interplay confirmed: with the Run-11/master terminal-state rule
+collapsing within-session flips, **all 7 delta edges are cross-session (0 within-session smell).** Not
+recommended for flag-on default yet. Within-run, pc corpus, frozen assets. **Total OpenRouter spend
+across all twelve runs: $0.00.**
+
+---
+
+# Run 12 — delta-EXTRACT productionization
+
+`git merge master` first. **Interaction note:** master landed its OWN terminal-state rule inline in
+both EXTRACT_PREAMBLE and RECONCILE_PREAMBLE (parallel to Run 11's appended blocks), duplicating the
+rule. Resolved by removing Run 11's appended blocks + the toggle wiring; master's inline rules are
+canonical and unconditional. Consequence for Run 12: within-session evolution now yields ONE terminal
+claim before delta-EXTRACT sees it, so delta's supersedes edges should be mostly CROSS-session — a
+prediction this run confirms (7/7 cross-session).
+
+## Build fixes
+
+1. **COST** — `build_digest` now reads each existing claim's embedding from the claims.db `vec_claims`
+   table by rowid (already embedded at append) instead of re-embedding ALL assertions every session
+   (the Run-9 blowup). Only the session query is embedded. Digest budget trimmed 24→16. Log confirms:
+   *"digest similarity channel filled 8/8 from claims.db vectors (no re-embed)."*
+2. **PRECISION** — delta-EXTRACT supersedes is now FALSE-test gated: emit ONLY when the new claim makes
+   the digest claim FALSE. Still-true-but-less-complete = `refines`; additive capability = `new`. Three
+   worked examples added (OpenAI+local additive→new; LRU+cap→refines; default OpenAI→local→supersedes).
+3. Token logging added to both delta and plain EXTRACT for the TOKENS cost bar.
+
+## The five pre-registered bars (verbatim)
+
+**BAR 1 — 8-reversal diagnostic ≥6/8 correct-target → FAIL (3/8).** Run 9 got 6/8; Run 12 gets 3/8.
+The precision fix made supersedes so conservative (FALSE-test) that it stopped firing on genuine
+reversals whose new claim *replaces* the old without a hard contradiction in surface wording — e.g.
+the embedding-provider and capture-pipeline reversals now register as `new`/`refines` instead of
+`supersedes`. Edges recovered: embedding provider ✓, primary command ✓, inject pipeline models ✓;
+missed: max_tokens, capture pipeline, inject model config, injection hook, evidence format. **The
+precision fix traded away reversal recall — the exact thing Run 9's diagnostic measured.**
+
+**BAR 2 — supersedes precision ≥0.85 on ≥20 ops → UNMET (too few edges).** The conservative rule
+produced only **7 supersedes edges total** (Run 9: 14), so a ≥20-op audit is impossible on this store.
+Manual inspection of all 7: **7/7 genuine reversals** (librarian→synthesizer, generate-removed,
+tool-loop→staged pipeline, Rule-vs-Fix→generative, etc.) → precision ≈ 1.00, comfortably above 0.85.
+**Precision PASSES on quality but the sample-size bar is structurally unmet** — the fix improved
+precision by producing fewer, cleaner edges, which is also why recall (BAR 1) fell. **Cross-session
+assertion PASSES: 7/7 edges are cross-session, 0 within-session** (the terminal-state rule works as
+predicted — within-session flips never reach delta as separate claims).
+
+**BAR 3 — Probe 2 (A vs plain-B vs B-delta): trajectory ≥5/8 AND leaks ≤1/8 → FAIL.**
+
+| source | asserts_current | leaks_stale | trajectory |
+|---|---|---|---|
+| A wiki | 3/8 | 3/8 | 1/8 |
+| B plain claims | 5/8 | 2/8 | 2/8 |
+| **Bd (Run 12)** | 5/8 | 3/8 | **4/8** |
+
+Bd trajectory 4/8 (bar ≥5/8 — FAIL by one) and leaks 3/8 (bar ≤1/8 — FAIL). Both miss. Bd still beats
+plain-B on trajectory (4 vs 2) — the mechanism still works — but the conservative edge set recovers one
+fewer reversal than Run 9's B-delta (5/8), and the leaks are unchanged. The recall loss from BAR 1
+flows straight into Probe 2.
+
+**BAR 4 — predict-the-correction Bd ≥ plain-B → PASS (Bd 4.5 = plain-B 4.5, weighted).**
+
+| source | predicted | partial | missed | weighted |
+|---|---|---|---|---|
+| A wiki | 0/25 | 8/25 | 17/25 | 4.0 |
+| B plain claims | 1/25 | 7/25 | 17/25 | 4.5 |
+| **Bd** | 1/25 | 7/25 | 17/25 | **4.5** |
+
+Run 9's B-delta regressed here (3.5 < plain-B 4.5). Run 12's B-delta matches plain-B (4.5) — **the
+regression is gone.** Diagnosis of why Run 9 regressed: Run 9's leaner-but-noisier delta store (the
+over-minted edges and aggressive supersedes) carried slightly degraded preference signal; the cleaner
+Run-12 store predicts as well as plain-B. No longer a regression, but no improvement either —
+delta-EXTRACT remains prediction-neutral.
+
+**BAR 5 — token cost ≤1.3× plain-B build TOKENS → PASS (1.11×).** delta EXTRACT input tokens 228,279
+vs plain-B 206,044 = **1.11×** (Run 9 was 2.19×). The fix landed: the digest adds only ~a few hundred
+tokens/session (16 claim lines) on top of the transcript, with zero re-embedding. *(Wall-clock ratio
+was 1.35× but is not the bar this run — it is inflated by the concurrent nostr archeologist replay
+owning Ollama throughput; tokens are the fair, contention-independent measure.)*
+
+## Verdict
+
+**2 of 5 bars pass (COST, PREDICT); 1 unmet-by-construction (PRECISION sample), 2 fail
+(DIAGNOSTIC, PROBE 2).** NOT recommended for flag-on default. The two Run-9 failures the spec targeted
+were genuinely fixed — cost is now 1.11× and prediction is no longer a regression — but the precision
+fix **overshot into recall**: tightening supersedes to a hard FALSE-test made the edges cleaner (7/7
+genuine) yet too sparse, halving reversal recovery (6/8→3/8) and dropping Probe-2 trajectory below the
+bar. The cost and precision objectives were achieved; the reversal-diagnostic objective was sacrificed
+to them.
+
+## What surprised me
+
+1. **Precision and recall are coupled through the supersedes threshold, and Run 9 was near the sweet
+   spot.** Run 9's "loose" rule got 6/8 reversals at 0.79 precision; Run 12's "FALSE-test" rule gets
+   7/7 precision but only 3/8 reversals. The fix didn't move precision *up the same curve* — it moved
+   to a different operating point that trades recall for precision. The right production rule is
+   somewhere between: a FALSE-test with a softer surface-contradiction allowance, not the strict one.
+2. **The cost fix was almost free and clearly correct** — reading pre-computed db vectors instead of
+   re-embedding dropped the token ratio from 2.19× to 1.11× with a one-function change and a logged
+   recall stat. The Run-9 cost failure was pure implementation waste, not an inherent delta cost.
+3. **The terminal-state interplay worked exactly as predicted** — 7/7 cross-session edges, 0
+   within-session. Run 11/master's terminal-state rule and delta-EXTRACT compose cleanly: EXTRACT
+   collapses the within-session flip into one terminal claim, so delta only ever links across sessions.
+   Within-session supersedes is now correctly a non-event.
+4. **delta-EXTRACT is prediction-neutral, not prediction-positive.** Even cleaned up, it matches but
+   never beats plain-B at predicting corrections — freshness edges help direction-change *recovery*
+   (Probe 2) but not *forecasting* the next correction. Consistent across Runs 9 and 12.
+
+## Net / recommendation
+
+Keep iterating on the supersedes threshold before flag-on: the production rule wants Run 9's reversal
+recall (6/8) AND Run 12's precision (≈1.0) — achievable by relaxing the FALSE-test to also accept a
+clear surface-level replacement of the same subject (the reversals BAR 1 missed are real replacements
+the strict test rejected). The cost fix (db-vector digest, 1.11×) and the cross-session property are
+keepers and should land regardless. Until reversal recall is back to ≥6/8 without losing precision,
+delta-EXTRACT stays flagged-off; cost and prediction are no longer blockers.
+
+---
+
+# Runs 1-11 — prior history
+
+
+**Run 11 — within-session terminal-state inversion fix — PASS on the decisive case.** Highest-severity
+content defect: capture recorded the EARLIER state of a fact that evolves within one session as
+current truth. Real case: nostr's dm-relay guide asserted "cold-start DM not verified e2e" when the
+SAME session later closed issue #977 via PR #1080 with a passing live-relay test. The fix (tight
+EXTRACT + RECONCILE prompt rules, live path, default ON) makes capture record the TERMINAL state.
+**The money shot**: re-capturing the producing session now yields the guide line *"F-02 DM cold-start
+transport/projection verification **closes #977** with a live-relay cold-start DM test."* — terminal
+truth, no stale inversion, with a proper `(Previously:)` breadcrumb on the adjacent scope claim
+(BAR 1 PASS). Sibling within-session flips on the pc window: 4/5 terminal-correct (BAR 2 PASS). All
+Ollama; **total OpenRouter spend across all eleven runs: $0.00.**
+
+---
+
+# Run 11 — terminal-state inversion fix
+
+A product fix on the LIVE capture path (not eval-only), gated so the no-fix A/B arm is reproducible
+(`PC_NO_TERMINAL_STATE=1`). Validated under a concurrent full-history nostr archeologist replay that
+owned most Ollama throughput — builds were throttled, so BARs 3/4 (regression guards) were scoped
+frugally.
+
+## Prompt diffs (the surgery)
+
+**EXTRACT** — appended a terminal-state rule (`build_extract_system`, default on):
+> ## Terminal state — capture the END state of a fact that evolves
+> When a fact EVOLVES within the transcript (broken→fixed, unverified→verified, X→Y default,
+> issue-open→issue-closed), extract its TERMINAL state as the claim. The earlier state may appear
+> ONLY as explicit history INSIDE the assertion, e.g. 'cold-start DM delivery is verified end-to-end
+> via a live-relay test (was failing until the fix at line N)'. NEVER emit the earlier (broken /
+> unverified / old-default) state as a standalone present-tense claim when a later line supersedes it.
+
+**RECONCILE** — appended a within-session-evolution rule (`build_reconcile_system`, default on):
+> ## Within-session evolution — write only the terminal state
+> Claims from LATER transcript lines supersede claims from EARLIER lines of the SAME session about
+> the same fact. When both arrive in one batch (e.g. 'feature is broken' AND a later 'feature is
+> fixed/verified/closed'), write ONLY the terminal state — `revise` to the terminal value; add a
+> '(Previously: <old>.)' breadcrumb if the flip is user-visible, otherwise just the terminal state.
+> NEVER leave the earlier (broken / unverified / old-default / issue-open) state presented as current.
+
+Rest of both prompts untouched.
+
+## BAR 1 — THE CASE (the money shot) → PASS
+
+Re-ran the staged capture pipeline (isolated `PC_HOME`, temp wiki) on the producing nostr session
+`da6b1d73` (found via the inverted guide's `[^da6b1-*]` citation prefix; the `f1b74` session
+contributed no dm-relay content). The regenerated guide (`scope-and-releases.md`, the topic the
+claim routed to) renders:
+
+```
+## Scope & Releases
+Web is out of v1 scope and is labeled as preview only. Zap receipt nostrPubkey verification is
+deferred to post-v1 per owner decision. (Previously: No explicit scope exclusion.) [^da6b1-20]
+PD-033-A (#975) is closed with podcast-player as the qualifying second-app consumer. [^da6b1-21]
+F-02 DM cold-start transport/projection verification closes #977 with a live-relay cold-start DM
+test. [^da6b1-22]
+```
+
+The cold-start DM fact is now recorded as its **terminal truth** — *verification done, #977 closed,
+live-relay test* — exactly where the session ended, instead of the earlier "not verified e2e" state.
+A correct `(Previously: …)` breadcrumb appears on the adjacent scope claim. Judge verdict:
+asserts_terminal=true, asserts_stale_as_current=false. **BAR 1 PASS** — the exact inversion that
+motivated the run is fixed.
+
+## BAR 2 — SIBLINGS (within-session flips, A/B) → PASS (bar met; no A/B delta on these flips)
+
+Mined the pc 30-session window for within-session fact-flips (cheap LLM pass): 5 verified flips, all
+from one dense session (`5cf47d01`). A/B-captured the affected session fix vs no-fix:
+
+| flip (terminal/after state) | fix-arm | no-fix-arm |
+|---|---|---|
+| sqlite-vec distance metric → explicit cosine | ✓ | ✓ |
+| query relevance filtering → 0.75 max_distance | ✓ | ✓ |
+| score display → similarity percentage | ✓ | ✓ |
+| database schema versioning → schema_version v2 auto-migrate | ✓ | ✓ |
+| log.into_raw_fd() double-move compile error → fixed | ✗ | ✗ |
+
+**fix-arm 4/5 terminal-correct → meets the ≥4/5 bar (PASS).** Honest caveat: the no-fix arm ALSO
+scored 4/5 — the fix showed NO A/B delta on *these* flips, because they are additive/refinement
+flips that the existing "never accrete a contradiction" RECONCILE rule already handled. The 5th
+(a transient compile-error fix) is correctly NOT captured by either arm (it's a debugging step with
+no lasting spec). **The fix's differentiating power is on the severe BAR-1 inversion** (verification
+state flipping open→closed), which the no-fix behavior got wrong in production; the pc-window flips
+happened not to be of that severe inversion type.
+
+## BAR 3 — REGRESSION (P1 recall) & BAR 4 — Probe 2 → scoped under Ollama contention
+
+The fix-arm claims store (30 sessions) and scoring were running under the concurrent nostr
+archeologist replay (45/234 of its sessions done at this point), which owned most Ollama throughput
+and throttled the build to ~1 session per ~10 min. The no-fix reference reuses the pre-terminal-rule
+cfv6 store-b. **Status: DEFERRED.** With the archeologist owning Ollama, the fix-arm 30-session build ran at
+~1 session / ~10 min (≈5h projected) — not completable in this window without starving the user's
+running replay. BARs 3/4 are NOT a pass/fail blocker for the fix (BAR 1 is the decisive correctness
+case; BAR 2 confirms no sibling regression), and the harness (`pc eval --run11 PC_RUN11_PHASE=bar34`)
+is committed and will run cleanly once throughput frees. No regression evidence either way is claimed
+here — reported as deferred, not passed.
+
+Over-suppression guard (the rule must not delete genuinely-current claims that merely resemble an
+earlier state): the terminal-state rule only fires on a *later line superseding an earlier one about
+the same fact*, and the BAR-1 guide retains all four current scope/release claims with no spurious
+deletions — no evidence of over-suppression in the captured output.
+
+## What surprised me
+
+1. **The fix routed the terminal claim to a *different* guide** (`scope-and-releases.md`, not the old
+   `dm-relay-ingest.md`) — because capturing the END state ("closes #977") frames it as a release/
+   scope fact, whereas the inverted version framed it as an unresolved ingest problem. Fixing the
+   tense changed the topic. The content is what matters and it is correct.
+2. **The existing RECONCILE contradiction rule already handles the *easy* within-session flips** (the
+   pc-window 4/5 with no A/B delta). The terminal-state rule earns its keep specifically on the hard
+   case where the earlier state is a plausible standalone claim (an unverified feature reads as a
+   real spec fact until you see it was later verified) — exactly the dm-relay inversion.
+3. **The fix is cheap** — two short appended prose blocks, no new pipeline stage, no measurable
+   capture-cost change. A prompt-surgery product fix, not an architecture change.
+
+## Net
+
+The highest-severity inversion is fixed on the live path with conclusive evidence on its own case
+(BAR 1) and the sibling bar met (BAR 2). The rule is tight, default-on, reproducibly A/B-toggleable,
+and shows no over-suppression in the captured output. Regression guards (BARs 3/4) were scoped under
+heavy Ollama contention from the concurrent archeologist; the harness is committed and re-runnable.
+
+---
+
+# Runs 1-10 — prior history
+
+
 **Run 10 — merged-recognition A/B — REJECTED on gate-dilution.** The question: can ONE strong-model
 recognition call replace the two separate passes (episode cards + research records) for a token
 saving, without degrading either? **No.** The merge saves 43% input tokens (B/A = 57%, beating the
