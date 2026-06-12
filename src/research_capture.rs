@@ -376,7 +376,7 @@ it has a defined method, pre-registered criteria stated BEFORE results, experime
 and finding/verdict language. Precision is more important than recall — only flag genuine \
 investigation reports, not routine summaries or status updates.";
 
-fn call_recognition(
+pub(crate) fn call_recognition(
     spec: &ModelSpec,
     openrouter_key: &str,
     ollama_base: &str,
@@ -441,7 +441,7 @@ pub struct RecognizedArtifact {
     pub has_structured_report: bool,
 }
 
-fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArtifact>> {
+pub(crate) fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArtifact>> {
     // Extract JSON array from response (model may wrap in markdown or prose)
     let json_str = extract_json_array(response);
     let Ok(arr) = serde_json::from_str::<Value>(&json_str) else {
@@ -893,3 +893,6 @@ mod tests {
         assert_eq!(slice_lines(&lines, 5, 3), "");
     }
 }
+
+/// Run 10: length of the recognition system prompt (for fair token accounting in the A/B harness).
+pub(crate) fn recognition_system_len() -> usize { RECOGNITION_SYSTEM.len() }
