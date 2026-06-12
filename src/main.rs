@@ -16,6 +16,8 @@ mod eval;
 mod eval_run7;
 mod eval_run8;
 mod eval_run9;
+mod eval_run10;
+mod merged_recognition;
 mod session_start;
 mod chunker;
 mod config;
@@ -441,6 +443,11 @@ enum Commands {
         #[arg(long)]
         run9: bool,
 
+        /// Run 10: merged episode+research recognition A/B over the pc HISTORY window (recognition
+        /// only). Arm A separate passes, Arm B one merged call; reports the 4 pre-registered bars.
+        #[arg(long)]
+        run10: bool,
+
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
@@ -845,6 +852,7 @@ fn main() -> Result<()> {
             run7,
             run8,
             run9,
+            run10,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -857,6 +865,7 @@ fn main() -> Result<()> {
                 run7,
                 run8,
                 run9,
+                run10,
                 judge_model,
             })?;
         }

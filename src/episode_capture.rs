@@ -206,7 +206,7 @@ challenged, examined, and resolved — producing a decision with consequences. \
 Precision is more important than recall — only flag genuine product/spec/architecture movement, \
 not operational workflow or routine commands.";
 
-fn call_recognition(
+pub(crate) fn call_recognition(
     spec: &ModelSpec,
     openrouter_key: &str,
     ollama_base: &str,
@@ -333,7 +333,7 @@ pub struct EvidenceRange {
     pub end: usize,
 }
 
-fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArc>> {
+pub(crate) fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArc>> {
     let json_str = extract_json_value(response);
     let Ok(val) = serde_json::from_str::<Value>(&json_str) else {
         eprintln!(
@@ -1278,3 +1278,6 @@ Z adopted.
         assert!(!wiki.join("episodes").exists(), "must not create episodes/ on no-op");
     }
 }
+
+/// Run 10: length of the recognition system prompt (for fair token accounting in the A/B harness).
+pub(crate) fn recognition_system_len() -> usize { RECOGNITION_SYSTEM.len() }
