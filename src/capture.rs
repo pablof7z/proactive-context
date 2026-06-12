@@ -1761,7 +1761,7 @@ fn apply_reconcile_op(
                 };
                 guide.body =
                     add_statement_to_section(&guide.body, &section_c, &text, &marker_clone, &today);
-                guide.frontmatter.updated = today.clone();
+                stamp_updated(&mut guide.frontmatter, &today);
                 // Back-fill topic on existing guides that predate topic support
                 if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
                     guide.frontmatter.topic = new_topic_c;
@@ -1843,7 +1843,7 @@ fn apply_reconcile_op(
                 match revise_section(&guide.body, &section_c, &text, &marker_clone) {
                     Ok(new_body) => {
                         guide.body = new_body;
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
                         if guide.frontmatter.topic.is_empty() && !new_topic_c.is_empty() {
                             guide.frontmatter.topic = new_topic_c;
                         }
@@ -1862,7 +1862,7 @@ fn apply_reconcile_op(
                             &marker_clone,
                             &today,
                         );
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
                         Ok((
                             guide,
                             format!("Revise target missing in '{}'; added instead.", safe_slug),
@@ -1904,7 +1904,7 @@ fn apply_reconcile_op(
                 match wiki::find_full_section_range(&guide.body, &section_c) {
                     Some((start, end)) => {
                         guide.body.replace_range(start..end, "");
-                        guide.frontmatter.updated = today.clone();
+                        stamp_updated(&mut guide.frontmatter, &today);
                         Ok((guide, format!("Removed '{}' / '{}'.", safe_slug, section_c)))
                     }
                     None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
@@ -2565,6 +2565,21 @@ fn extract_open_questions(
 /// Run the three post-session maintenance passes: bidirectional links, `_index.md`
 /// rebuild, and `index.db` re-embed. Called after every session in the live hook path
 /// and at checkpoints by `archeologist`.
+/// Stamp a guide's `updated` date without ever moving it backward, and keep
+/// `created <= updated` invariant. Multi-source archeologist replays (claude pass
+/// then codex pass) can apply earlier-dated ops onto later-created guides; dates
+/// must stay monotonic regardless of op arrival order.
+fn stamp_updated(fm: &mut crate::wiki::GuideFrontmatter, today: &str) {
+    // YYYY-MM-DD strings compare correctly lexicographically.
+    if fm.updated.is_empty() || today >= fm.updated.as_str() {
+        fm.updated = today.to_string();
+    }
+    if !fm.created.is_empty() && fm.created.as_str() > fm.updated.as_str() {
+        // A guide can't be created after its last update — clamp created down.
+        fm.created = fm.updated.clone();
+    }
+}
+
 pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, today: &str) {
     if !wiki_path.exists() {
         return;
