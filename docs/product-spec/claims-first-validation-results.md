@@ -1,5 +1,125 @@
 # Claims-First Validation Results
 
+**Run 10 — merged-recognition A/B — REJECTED on gate-dilution.** The question: can ONE strong-model
+recognition call replace the two separate passes (episode cards + research records) for a token
+saving, without degrading either? **No.** The merge saves 43% input tokens (B/A = 57%, beating the
+25-30% target) but **dilutes BOTH gates' recall: −28% episode arcs (47→34), −25% research records
+(4→3)**, and misses **2 of 3 episode reversal fixtures** that the separate pass recovers. Per the
+pre-registered frame, any gate-dilution → REJECT regardless of savings. The merge is also barely
+faster (walltime B/A = 87%, not ≤75%). The one thing that held: **precision** — 0 research
+false-positives on the 3 ordinary fixtures in both arms, and the routine-command-only no-op fired
+correctly under the merge. So the merge corrupts RECALL via multi-objective attention-splitting, not
+precision. Recognition-only A/B, within-run, same binary/model (glm-5.1:cloud). **Total OpenRouter
+spend across all ten runs: $0.00.**
+
+---
+
+# Run 10 — merged episode + research recognition A/B
+
+Code: `src/merged_recognition.rs` (flagged `PC_MERGED_RECOGNITION`), `src/eval_run10.rs`
+(`pc eval --run10`). Recognition-only over the pc 30-session HISTORY window + 4 precision fixtures.
+**Arm A**: separate episode + research recognition, run FRESH now (not compared to Run-9 artifacts
+from a different binary). **Arm B**: one merged call, strict envelope
+`{"research_artifacts":[...], "episode_arcs":[...]}`, BOTH gates' criteria preserved verbatim
+(research's R7 pre-registration signals 1-4 + DO-NOT list; episode's salience model + HIGH-SALIENCE
+targets + routine-command-only no-op). The envelope is split and each sub-array fed to the EXISTING
+per-type parser unchanged — the merge touches recognition only. TRIAGE (the cheap-model gate) was
+NOT merged (merging it kills the skip economics). Pre-registered bars written before scoring
+(`run10-preregistered-bars.md`).
+
+## Artifact diff (the dilution)
+
+| type | Arm A (separate) | Arm B (merged) | delta |
+|---|---|---|---|
+| episode arcs | 47 | 34 | **−28%** |
+| research records | 4 | 3 | **−25%** |
+
+The merged call recognizes ~¼–⅓ FEWER artifacts of BOTH types. The drop is systematic, not a parse
+artifact: **9 of 30 sessions emit fewer episode arcs under the merge**, concentrated in the
+high-yield design sessions (e.g. 7→5, 5→3, 5→3). Research dropped in 1 session (3→2). When one call
+must hold two recognition objectives, it under-recognizes each — the multi-objective dilution the
+pre-registration named as the hypothesis-at-risk.
+
+## Precision fixtures (what HELD)
+
+| fixture | Arm A | Arm B |
+|---|---|---|
+| ordinary 1886c5b1 | res=0 | res=0 |
+| ordinary b3c7dfbe | res=0 | res=0 |
+| ordinary 11099da8 | res=0 | res=0 |
+| routine 25b7ce16 | — | **routine no-op (0 cards)** |
+
+**Research 0-FP holds in BOTH arms; the routine-command-only no-op fires correctly under the merge.**
+So the merge does NOT corrupt precision — the gates still reject non-artifacts. The damage is purely
+to RECALL. (Episode arcs on ordinary sessions: A=2, B=1 — a separate, broader gate than research's
+0-FP bar, and roughly equal in both arms, so not a merge regression.)
+
+## The four pre-registered bars (verbatim)
+
+**BAR 1 — episode 3-reversal recall → FAIL.** Of the known reversal arcs, the merged pass recovered
+only **evidence_format**; **embedding_provider** and **generate→inject** were NOT among the 35 arcs
+the merge recognized across the window. The same bar Phases 1-2 passed with the separate pass now
+fails under the merge — direct evidence the recall dilution drops load-bearing arcs, not just
+marginal ones.
+
+**BAR 2 — research recall + precision → FAIL (on recall).** Precision is perfect — 0 research
+false-positives on all 3 ordinary fixtures (both arms), 0 cards on the routine fixture. But recall
+is NOT preserved: research total −25% and one session (26c909a1) where merged B finds fewer research
+records than separate A (3→2). The "B finds every record A finds" half fails.
+
+**BAR 3 — parity ±20% + quality → FAIL (on parity).** Both types exceed the ±20% band (episodes
+−28%, research −25%). The quality of the cards the merge DOES emit is fine — **5/5 judged concrete
+and correctly classified** — so the merge isn't producing junk; it's producing too FEW. Quality
+intact, quantity diluted.
+
+**BAR 4 — economics ≤75% → FAIL (on walltime, PASS on tokens).** Input tokens **B/A = 57% (43%
+saving)** — comfortably beats the ≤75% target and the 25-30% hoped-for saving (the merge avoids
+re-sending the transcript a second time). But **walltime B/A = 87%** — the single merged call is
+only 13% faster than two sequential calls, because it is one larger, slower generation (it must
+reason about both objectives), not two cheap ones. Tokens pass; walltime fails.
+
+## Verdict
+
+**MERGE REJECTED.** The pre-registered frame is unambiguous: any gate-dilution (bar 1 miss, bar 2
+recall loss) → reject regardless of savings. Both fired. The diluted objective is **recall of BOTH
+types** (−25 to −28%, 2/3 reversal fixtures missed), via multi-objective attention-splitting in a
+single recognition pass. Precision survives; recall does not. The 43% token saving is real but does
+not redeem a recall regression that drops load-bearing reversal arcs — exactly the arcs Run 9 showed
+are the product's strongest asset (cards' 6/8 Probe-2 trajectory). The flag (`PC_MERGED_RECOGNITION`)
+stays OFF.
+
+## What surprised me
+
+1. **The merge failed on RECALL, not precision — the opposite of my prior.** I expected a merged
+   prompt to over-fire (one model, two "find things" tasks → more flags). Instead it UNDER-fires:
+   holding two recognition gates in one pass makes the model more conservative on each, dropping
+   ~¼ of artifacts. Attention split lowers recall, not precision.
+2. **The token win and the walltime win decoupled.** Avoiding the second transcript send saved 43%
+   of tokens, but the merged generation is slower per call, so walltime barely moved (87%). "One
+   call instead of two" is a token economy, not a latency economy, when the one call is bigger.
+3. **Quality of what survived was perfect (5/5).** The merge doesn't degrade the arcs it emits — it
+   silently omits the harder ones. That's the dangerous failure mode: the output looks clean, the
+   loss is invisible without an A/B against the separate pass (which is exactly why the
+   pre-registered fresh-baseline-A discipline mattered — comparing to last night's artifacts would
+   have hidden it).
+
+## Net for the program
+
+- Keep episode and research recognition as **separate passes**. The ~43% token saving is not worth a
+  25-28% recall regression on the artifact types Run 9 identified as the product's direction-change
+  backbone.
+- If a token saving is still wanted, the lever is NOT merging the strong-model recognition calls —
+  it's the cheap-model TRIAGE gate (left untouched here) deciding which transcripts even reach
+  recognition, or a smaller recognition model per type, evaluated on the same recall bars.
+- Method note reinforced (P4 lineage): the fresh within-run Arm-A baseline was essential — the
+  dilution is only visible relative to a separate pass run under identical conditions; it would have
+  been invisible against historical artifacts.
+
+---
+
+# Runs 1-9 — prior history
+
+
 **Run 9 — the big swing — lands two breakthroughs.** (1) **delta-EXTRACT** moves contradiction
 judgment INTO extraction (with the transcript in view), and it captures **6/8 frozen reversals as
 correct-target `supersedes` edges** — where Run 6's post-hoc blind linker got 1/8 clean — lifting
