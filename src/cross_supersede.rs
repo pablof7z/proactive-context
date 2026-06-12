@@ -42,8 +42,12 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CROSS_TAU: f32 = 0.30;
 
 /// Top-K most-similar newer statements retrieved per statement. Wider than the doctor merge's
-/// shortlist so a genuine superseder that ranks below same-topic siblings still reaches the LLM.
-const TOP_K: usize = 8;
+/// shortlist so a genuine superseder that ranks below same-topic siblings still reaches the LLM
+/// (a stale claim's nearest neighbours are its same-topic siblings, not its superseder). The
+/// strict LLM confirm is the precision gate, so a generous K trades a longer prompt for recall.
+fn top_k() -> usize {
+    std::env::var("PC_CROSS_TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(15)
+}
 
 // ─── Statement model ──────────────────────────────────────────────────────────
 
@@ -348,19 +352,27 @@ pub fn retrieve_candidates(
         scored.push((rank, Candidate { newer_idx: j, similarity: sim }));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.into_iter().take(TOP_K).map(|(_, c)| c).collect()
+    scored.into_iter().take(top_k()).map(|(_, c)| c).collect()
 }
 
 // ─── LLM confirm (batched per guide) ──────────────────────────────────────────
 
 const CONFIRM_SYSTEM: &str = "You are a strict technical-knowledge auditor deciding whether a \
 NEWER statement makes an OLDER statement STALE — i.e. the older statement is now FALSE, \
-obsolete, or contradicted by the newer one. Be conservative: only flag genuine staleness, \
-NOT statements that are merely related or on the same topic.\n\
-NEGATIVE EXAMPLE (do NOT flag): older 'The API supports JSON output'; newer 'The API also \
-supports YAML output' — this is ADDITIVE (a new capability), the older statement is still \
-true. Only flag when the newer statement REVERSES, CLOSES, or INVALIDATES the older one \
-(e.g. older 'X is unverified' + newer 'X was verified/closed by PR #N').";
+obsolete, or contradicted by the newer one. Be conservative about ADDITIVE changes, but DO \
+flag status changes.\n\
+FLAG (stale) when the newer statement REVERSES, CLOSES, FIXES, VERIFIES, or INVALIDATES the \
+older one. In particular, an older statement asserting something is UNVERIFIED / UNTESTED / \
+MISSING / BROKEN / A GAP / NOT YET DONE is made STALE by a newer statement showing that same \
+thing is now VERIFIED, TESTED, IMPLEMENTED, FIXED, WIRED, or CLOSED (by a PR/commit/test) — \
+even if the wording differs, as long as they concern the same feature/behaviour/surface. \
+Example: older 'NIP-17 DM receive-side cold-start is unverified'; newer 'the kind:10050 \
+planner trigger was missing before #1080, causing fresh accounts to never receive DMs (now \
+fixed)' or 'the cache-serve test proves DMs render from store' → STALE (the receive path it \
+flagged as unverified is now implemented/tested).\n\
+DO NOT FLAG purely ADDITIVE changes: older 'The API supports JSON output'; newer 'The API \
+also supports YAML output' — the older statement is still true. Sharing only a topic is NOT \
+enough.";
 
 /// Build the per-guide batch confirm prompt. Each OLDER statement is numbered and shown with
 /// its retrieved CANDIDATE newer statements (also numbered). The model decides, for each older
@@ -554,8 +566,18 @@ pub fn run_cross_supersede(root: &Path, args: CrossSupersedeArgs) -> Result<()> 
     let mut total_pairs = 0usize;
     // Per-older best similarity, used to cap a guide's confirm prompt to its strongest cases.
     let mut best_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    let debug_match = std::env::var("PC_CROSS_DEBUG").ok();
     for (i, _s) in statements.iter().enumerate() {
         let cands = retrieve_candidates(i, &statements, &embeddings, &token_sets, tau);
+        if let Some(ref needle) = debug_match {
+            if statements[i].text.to_lowercase().contains(&needle.to_lowercase()) {
+                eprintln!("[DEBUG] older: {}", statements[i].text);
+                eprintln!("[DEBUG]   {} candidates:", cands.len());
+                for c in &cands {
+                    eprintln!("[DEBUG]     sim={:.3} [{}] {}", c.similarity, statements[c.newer_idx].slug, &statements[c.newer_idx].text[..statements[c.newer_idx].text.len().min(90)]);
+                }
+            }
+        }
         if cands.is_empty() {
             continue;
         }
