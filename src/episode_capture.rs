@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::capture::{call_model_blocking, rfc3339_now};
 use crate::config::load_config;
 use crate::provider::ModelSpec;
-use crate::research_capture::build_research_transcript_with_spans;
+use crate::research_capture::{build_research_transcript_with_spans, TurnSpan};
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ pub fn run_episode_capture(
         .unwrap_or_else(|| derive_session_id(transcript_path));
 
     eprintln!("[episode-capture] parsing transcript: {}", transcript_path);
-    let (numbered, raw_lines, _spans) = build_research_transcript_with_spans(transcript_path)?;
+    let (numbered, raw_lines, spans) = build_research_transcript_with_spans(transcript_path)?;
 
     eprintln!("[episode-capture] transcript lines: {}", raw_lines.len());
     if raw_lines.is_empty() {
@@ -88,9 +88,11 @@ pub fn run_episode_capture(
 
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
-        // Verify every evidence range resolves to non-empty transcript text.
+        // Repair degenerate single-line anchors (e.g. `1-1`) before verification, then
+        // verify every evidence range resolves to non-empty transcript text.
         // Drop arcs with bad evidence (all ranges empty or out of bounds).
-        let verified_evidence = verify_evidence_ranges(&raw_lines, &arc.evidence);
+        let anchored = anchor_evidence_ranges(&raw_lines, &spans, &arc.decision, &arc.evidence);
+        let verified_evidence = verify_evidence_ranges(&raw_lines, &anchored);
         if verified_evidence.is_empty() && !arc.evidence.is_empty() {
             eprintln!(
                 "[episode-capture] WARNING: arc {} '{}' — all evidence ranges empty/invalid, skipping",
@@ -144,7 +146,7 @@ pub fn run_episode_stage(
     let ollama_base = cfg.ollama_base_url.as_str();
     let ollama_key = cfg.ollama_api_key.as_deref();
 
-    let (numbered, raw_lines, _spans) = build_research_transcript_with_spans(transcript_path)?;
+    let (numbered, raw_lines, spans) = build_research_transcript_with_spans(transcript_path)?;
     if raw_lines.is_empty() {
         return Ok(Vec::new());
     }
@@ -170,7 +172,8 @@ pub fn run_episode_stage(
 
     let mut persisted = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
-        let verified_evidence = verify_evidence_ranges(&raw_lines, &arc.evidence);
+        let anchored = anchor_evidence_ranges(&raw_lines, &spans, &arc.decision, &arc.evidence);
+        let verified_evidence = verify_evidence_ranges(&raw_lines, &anchored);
         if verified_evidence.is_empty() && !arc.evidence.is_empty() {
             continue;
         }
@@ -470,6 +473,121 @@ fn extract_json_value(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+// ─── Evidence anchoring (degenerate 1-1 range repair) ────────────────────────
+
+/// Is this evidence range degenerate — i.e. a single-line anchor that carries no
+/// real span of text? The model emits these (most often `1-1`) when it cannot
+/// localize the decision; the resulting card has a useless Evidence section.
+fn is_degenerate_range(ev: &EvidenceRange) -> bool {
+    ev.start == ev.end
+}
+
+/// Repair degenerate single-line evidence ranges in an arc's evidence list.
+///
+/// For each degenerate range (`start == end`), in order:
+///   1. **Snap to the containing turn span** — if the line falls inside a turn
+///      (reusing research-capture's `TurnSpan` machinery), expand to cover the
+///      whole turn so the Evidence section points at the real text.
+///   2. **Re-anchor to the Decision text** — if no turn contains it (e.g. the
+///      line is a blank separator or out of range), find the transcript lines that
+///      best match the arc's `decision` and use that span instead.
+///   3. **Reject** — if neither yields non-empty text, drop the range.
+///
+/// Non-degenerate ranges are passed through untouched. The returned list is
+/// de-duplicated and order-preserving.
+pub fn anchor_evidence_ranges(
+    raw_lines: &[String],
+    spans: &[TurnSpan],
+    decision: &str,
+    evidence: &[EvidenceRange],
+) -> Vec<EvidenceRange> {
+    let mut out: Vec<EvidenceRange> = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    // Compute the decision-text anchor once (it is reused for every degenerate range
+    // that no turn span can repair).
+    let decision_anchor = decision_text_anchor(raw_lines, spans, decision);
+
+    for ev in evidence {
+        let repaired = if is_degenerate_range(ev) {
+            // (1) snap to containing turn span
+            if let Some(turn) = containing_turn_span(spans, ev.start) {
+                let r = EvidenceRange { start: turn.start, end: turn.end };
+                if !slice_lines(raw_lines, r.start, r.end).trim().is_empty() {
+                    Some(r)
+                } else {
+                    decision_anchor.clone()
+                }
+            } else {
+                // (2) fall back to the decision-text anchor
+                decision_anchor.clone()
+            }
+        } else {
+            Some(ev.clone())
+        };
+        if let Some(r) = repaired {
+            if slice_lines(raw_lines, r.start, r.end).trim().is_empty() {
+                continue; // (3) reject — nothing usable
+            }
+            if seen.insert((r.start, r.end)) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// The turn span (1-based inclusive) that contains `line`, if any. Blank separator
+/// lines between turns belong to no span and return None.
+fn containing_turn_span(spans: &[TurnSpan], line: usize) -> Option<TurnSpan> {
+    spans
+        .iter()
+        .find(|s| s.start <= line && line <= s.end)
+        .copied()
+}
+
+/// Find the transcript line range that best matches the arc's Decision text, so a
+/// card whose recognition evidence was useless still cites the lines that justify it.
+/// Strategy: tokenize the decision into salient lowercase words (len >= 4), then pick
+/// the transcript line with the most token hits and return its CONTAINING TURN span
+/// (so the Evidence covers the real surrounding text, not a single line). Returns None
+/// if the decision is empty or no line shares >= 2 tokens.
+fn decision_text_anchor(
+    raw_lines: &[String],
+    spans: &[TurnSpan],
+    decision: &str,
+) -> Option<EvidenceRange> {
+    let tokens: Vec<String> = decision
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .map(|w| w.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut best_idx: Option<usize> = None;
+    let mut best_hits = 0usize;
+    for (i, line) in raw_lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let hits = tokens.iter().filter(|t| lower.contains(t.as_str())).count();
+        if hits > best_hits {
+            best_hits = hits;
+            best_idx = Some(i);
+        }
+    }
+    // Require at least 2 token hits to avoid anchoring on a single common word.
+    if best_hits < 2 {
+        return None;
+    }
+    let line_1based = best_idx? + 1; // 0-based → 1-based
+    // Prefer the containing turn span so the Evidence is a real chunk of text; fall
+    // back to the single matched line if it belongs to no span (e.g. a separator).
+    match containing_turn_span(spans, line_1based) {
+        Some(turn) => Some(EvidenceRange { start: turn.start, end: turn.end }),
+        None => Some(EvidenceRange { start: line_1based, end: line_1based }),
+    }
 }
 
 // ─── Evidence verification ────────────────────────────────────────────────────
@@ -1021,6 +1139,72 @@ body
         let lines: Vec<String> = vec!["line 1".to_string()];
         let verified = verify_evidence_ranges(&lines, &[]);
         assert!(verified.is_empty());
+    }
+
+    // ─── Fix #2: degenerate 1-1 source_lines anchoring ────────────────────────
+
+    fn ts(start: usize, end: usize) -> TurnSpan {
+        TurnSpan { start, end, is_task_result: false }
+    }
+
+    #[test]
+    fn anchor_snaps_degenerate_range_to_containing_turn() {
+        // Lines 1..10; a turn spans lines 3-7. A degenerate `5-5` must expand to 3-7.
+        let lines: Vec<String> = (1..=10).map(|n| format!("content line {}", n)).collect();
+        let spans = vec![ts(1, 2), ts(3, 7), ts(8, 10)];
+        let ev = vec![EvidenceRange { start: 5, end: 5 }];
+        let out = anchor_evidence_ranges(&lines, &spans, "irrelevant decision", &ev);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].start, out[0].end), (3, 7), "degenerate range must snap to its turn");
+    }
+
+    #[test]
+    fn anchor_reanchors_to_decision_text_when_no_turn_contains_line() {
+        // The degenerate range points at line 1 (a separator that belongs to no span).
+        // The decision text matches a distinctive later line, which lives in turn 5-6.
+        let mut lines: Vec<String> = vec!["".to_string()]; // line 1: blank separator (no span)
+        lines.push("User: please change the sidebar".to_string()); // 2
+        lines.push("".to_string()); // 3 separator
+        lines.push("Assistant: working on it".to_string()); // 4
+        lines.push("".to_string()); // 5 separator
+        lines.push("Assistant: Replaced the sheet presentation with a navigation push to fix it".to_string()); // 6
+        lines.push("Assistant: done".to_string()); // 7
+        let spans = vec![ts(2, 2), ts(4, 4), ts(6, 7)];
+        let ev = vec![EvidenceRange { start: 1, end: 1 }];
+        let decision = "Replaced the sheet presentation with a navigation push";
+        let out = anchor_evidence_ranges(&lines, &spans, decision, &ev);
+        assert_eq!(out.len(), 1, "should re-anchor, not drop");
+        // The best-matching line (6) lives in turn 6-7 → that whole turn is the anchor.
+        assert_eq!((out[0].start, out[0].end), (6, 7), "should re-anchor to the decision turn");
+    }
+
+    #[test]
+    fn anchor_rejects_degenerate_range_when_nothing_matches() {
+        // Degenerate range on a separator with no containing turn, and a decision whose
+        // tokens appear nowhere → the range is dropped (rejected).
+        let lines: Vec<String> = vec!["".to_string(), "".to_string(), "".to_string()];
+        let spans: Vec<TurnSpan> = vec![]; // no turns
+        let ev = vec![EvidenceRange { start: 1, end: 1 }];
+        let out = anchor_evidence_ranges(&lines, &spans, "completely absent vocabulary xyzzy", &ev);
+        assert!(out.is_empty(), "unrepairable degenerate range must be rejected");
+    }
+
+    #[test]
+    fn anchor_passes_through_good_ranges_and_dedups() {
+        let lines: Vec<String> = (1..=20).map(|n| format!("line {}", n)).collect();
+        let spans = vec![ts(1, 20)];
+        // One good multi-line range, plus a degenerate that snaps to the same turn (1-20),
+        // which would duplicate — dedup keeps a single 1-20.
+        let ev = vec![
+            EvidenceRange { start: 5, end: 10 }, // good, kept verbatim
+            EvidenceRange { start: 3, end: 3 },  // degenerate → snaps to 1-20
+            EvidenceRange { start: 8, end: 8 },  // degenerate → snaps to 1-20 (dup)
+        ];
+        let out = anchor_evidence_ranges(&lines, &spans, "x", &ev);
+        // Expect: 5-10 (verbatim) and 1-20 (one copy, deduped).
+        assert!(out.iter().any(|r| (r.start, r.end) == (5, 10)));
+        assert!(out.iter().any(|r| (r.start, r.end) == (1, 20)));
+        assert_eq!(out.len(), 2, "duplicate snapped ranges must be deduped: {:?}", out);
     }
 
     // ─── Routine-command-only no-op ───────────────────────────────────────────
