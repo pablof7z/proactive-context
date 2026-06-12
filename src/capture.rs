@@ -2583,6 +2583,12 @@ fn stamp_updated(fm: &mut crate::wiki::GuideFrontmatter, today: &str) {
     }
 }
 
+/// Public wrapper for [`stamp_updated`] so off-hot-path passes (e.g. cross-guide supersession
+/// in doctor) can monotonically bump a guide's `updated` date without reimplementing the rule.
+pub(crate) fn stamp_updated_pub(fm: &mut crate::wiki::GuideFrontmatter, today: &str) {
+    stamp_updated(fm, today);
+}
+
 /// The canonical guide-`summary` convention, factored out of guide creation so that
 /// creation AND post-revise refresh derive summaries IDENTICALLY: strip the provisional
 /// marker, drop any inline `[^id]` citation markers, take the first sentence, cap at
