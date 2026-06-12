@@ -692,14 +692,15 @@ fn write_index_file_with_research(
             episodes.len(),
             if episodes.len() == 1 { "" } else { "s" }
         ));
-        out.push_str("| Card | Date | Title | Salience |\n");
-        out.push_str("|------|------|-------|----------|\n");
+        out.push_str("| Card | Date | Title | Salience | Status |\n");
+        out.push_str("|------|------|-------|----------|--------|\n");
         for ep in episodes {
             let stem = ep.filename.strip_suffix(".md").unwrap_or(&ep.filename);
             let title = ep.title.replace('|', "\\|");
+            let status = if ep.status.is_empty() { "active" } else { ep.status.as_str() };
             out.push_str(&format!(
-                "| [{}](episodes/{}) | {} | {} | {} |\n",
-                stem, ep.filename, ep.date, title, ep.salience
+                "| [{}](episodes/{}) | {} | {} | {} | {} |\n",
+                stem, ep.filename, ep.date, title, ep.salience, status
             ));
         }
         out.push('\n');
