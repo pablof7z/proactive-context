@@ -1200,15 +1200,23 @@ async fn run_staged_capture(
         return Ok("No evidence-verified claims to capture.".to_string());
     }
 
+    // Build the embedder once; reused by both the claims-log tap and ROUTE recall below.
+    // Each build_embedder() call loads the 86 MB ONNX model — ONNX Runtime inflates it to
+    // ~500-800 MB RSS. Building it twice doubled peak RSS to ~1.6 GB unnecessarily.
+    let shared_cfg = load_config().ok();
+    let mut shared_embedder: Option<Box<dyn crate::embed::Embedder>> = shared_cfg
+        .as_ref()
+        .and_then(|cfg| crate::embed::build_embedder(cfg).ok());
+
     // ── CLAIM-LOG TAP (after authority tagging, before ROUTE) ─────────────────────
     // Feature flag: PC_CLAIMS_LOG=1.  When set, persist every admitted claim to
     // claims.jsonl + claims.db under `claims_dir`.  The wiki pipeline (ROUTE/RECONCILE)
     // continues unchanged — this is a tap, not a fork.  Both stores build in one pass.
     if let Some(ref cd) = claims_dir {
         if claims::claims_log_enabled() {
-            if let Ok(cfg) = crate::config::load_config() {
-                match crate::embed::build_embedder(&cfg) {
-                    Ok(mut embedder) => {
+            if let Some(cfg) = shared_cfg.as_ref() {
+                match shared_embedder.as_mut() {
+                    Some(embedder) => {
                         if let Err(e) = std::fs::create_dir_all(cd) {
                             eprintln!("claims: failed to create dir {}: {}", cd.display(), e);
                         } else if delta_extract_enabled() {
@@ -1380,7 +1388,7 @@ async fn run_staged_capture(
                             }
                         }
                     }
-                    Err(e) => eprintln!("claims: could not build embedder: {}", e),
+                    None => eprintln!("claims: could not build embedder"),
                 }
             }
         }
@@ -1424,15 +1432,10 @@ async fn run_staged_capture(
 
     let claim_assertions: Vec<String> = admitted.iter().map(|c| c.assertion.clone()).collect();
 
-    // Build the embedder from config (matches the load_config pattern used elsewhere in
-    // this module; avoids threading Config through the call chain). If the embedder cannot
-    // be built we fall back to recall=none → the reranker sees an empty candidate set for
-    // every claim and routes everything as NEW within-batch convergence still applies.
-    let recalls: Vec<crate::route_recall::ClaimRecall> = match load_config()
-        .ok()
-        .and_then(|cfg| crate::embed::build_embedder(&cfg).ok())
-    {
-        Some(mut embedder) => {
+    // Reuse the embedder built before the claims-log tap (shared_embedder). If it is None
+    // (embedder unavailable), fall back to recall=none as before.
+    let recalls: Vec<crate::route_recall::ClaimRecall> = match shared_embedder.as_mut() {
+        Some(embedder) => {
             match crate::route_recall::recall_candidates(
                 embedder.as_mut(),
                 &index_rows,
