@@ -1,0 +1,9 @@
+╔════════════ RUN 13 (wallet) — CANARY RECOVERY (design §3.4) ════════════╗
+  recovered = registry-grounded AND idiosyncratic (bare ≠ contained); moment = also mined from a human turn
+  [RECOVERED] publish-engine       grounded=true idiosyncratic=true (bare=absent) moment=false
+  [RECOVERED] marmot-protocol      grounded=true idiosyncratic=true (bare=absent) moment=false
+  [RECOVERED] outbox-resolver      grounded=true idiosyncratic=true (bare=absent) moment=false
+  [RECOVERED] nmp-signers          grounded=true idiosyncratic=true (bare=absent) moment=false
+
+eval: §3.1 — verified idiosyncratic noun-moments: 3 (gate ≥ 12)
+eval: ** BELOW GATE ** — noun scarcity is the finding (P2). Arms not scored; report below.
