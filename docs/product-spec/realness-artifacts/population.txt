@@ -1,0 +1,85 @@
+# cfv6 noun population — 27 nouns (entity-filtered)
+
+## kind:1  (2 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+  - [94d06a3c-7fd2-4…] thus far the archeologist is only able to inject content from claude code conversations -- I also want it to support injecting nostr conversations generated in the ~/Work/TENEX-ff... approach, with clear attributions sin
+
+## pc archeologist  (2 refs)
+  - [08870c09-c42d-4…] I think `pc archeologist` doesn't support codex history? it should -- check if it does or not, if it doesn't build it  let's test to make sure it imports properly as expected and that it behaves just like claude code or 
+  - [08870c09-c42d-4…] it shouldn't take --codex and --opencode -- instead it should try to load from all known paths at the same time, so if I run `pc archeologist` it should try to detect claude code, tenex, opencode, codex conversations and
+
+## Configuration Location  (1 refs)
+  - [5cf47d01-7a4e-4…] I tested it out with a completely irrelevant query and it retrieved a bunch of stuff -- why?  ➜  proactive-context git:(master) ✗ ./target/debug/proactive-context query 'nostr is a network'  Top 8 results:  1. /Users/pab
+
+## Hugging Face  (1 refs)
+  - [5cf47d01-7a4e-4…] I tested it out with a completely irrelevant query and it retrieved a bunch of stuff -- why?  ➜  proactive-context git:(master) ✗ ./target/debug/proactive-context query 'nostr is a network'  Top 8 results:  1. /Users/pab
+
+## John Vervaeke  (1 refs)
+  - [105d3450-2ae4-4…] I don't feel like it captures the spirit enough; the concept that every human touchpoint is a worth a lot since it brings the human taste and unique perspective is important. In a John Vervaeke sense. What corrections do
+
+## Modular NostrClient  (1 refs)
+  - [8240399a-f332-4…] now review this: what would be a good list of assertions per the `extract` path? ──── (2) USER MESSAGE (numbered transcript) ───────────────────  ## LINE-NUMBERED TRANSCRIPT     1| User: this will be a nostr project usin
+
+## NIP-60  (1 refs)
+  - [8240399a-f332-4…] now review this: what would be a good list of assertions per the `extract` path? ──── (2) USER MESSAGE (numbered transcript) ───────────────────  ## LINE-NUMBERED TRANSCRIPT     1| User: this will be a nostr project usin
+
+## NIP-61  (1 refs)
+  - [8240399a-f332-4…] now review this: what would be a good list of assertions per the `extract` path? ──── (2) USER MESSAGE (numbered transcript) ───────────────────  ## LINE-NUMBERED TRANSCRIPT     1| User: this will be a nostr project usin
+
+## NostrClient  (1 refs)
+  - [8240399a-f332-4…] now review this: what would be a good list of assertions per the `extract` path? ──── (2) USER MESSAGE (numbered transcript) ───────────────────  ## LINE-NUMBERED TRANSCRIPT     1| User: this will be a nostr project usin
+
+## Project Wiki  (1 refs)
+  - [1fe0f5c6-3cb7-4…] what's "10g"? "10 guides"? Let's make it read "Project Wiki: 10 guides"  is it possible to move focus onto the status line in case the user wants to select something in the status line to like open a modal with the list 
+
+## Security Model  (1 refs)
+  - [5cf47d01-7a4e-4…] I tested it out with a completely irrelevant query and it retrieved a bunch of stuff -- why?  ➜  proactive-context git:(master) ✗ ./target/debug/proactive-context query 'nostr is a network'  Top 8 results:  1. /Users/pab
+
+## TUI Client  (1 refs)
+  - [018a13c7-f1d5-4…] inferring from code is problematic for a few reasons: it creates an ontological definition from implementation, so it would be user+assistant english => code implemented (maybe wrong?) => code reading/extrapolation (mayb
+
+## encode_ask  (1 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+
+## fabric-provider  (1 refs)
+  - [0323ebcf-373e-4…] yes, that's what I fucking meant, a noun becomes real when the user references it, the more the user references, the more real it becomes, for example if the user says "what the fuck is the "fabric-provider"????" or "I n
+
+## handle_thread_event  (1 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+
+## is_tool_use  (1 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+
+## pc autodoc  (1 refs)
+  - [11099da8-f0fc-4…] what is this `pc autodoc` command? it writes some bullshit guide???!
+
+## pc capture  (1 refs)
+  - [39fec889-adb7-4…] both should return immediately, otherwise `pc capture` prevents the harness from exiting for many seconds
+
+## pc debug extract --all  (1 refs)
+  - [8240399a-f332-4…] now go to /Users/pablofernandez/tmp/a123123 and run `pc debug transcript --all` and then tell me what you would generate -- afterwards compare your version with what gets generated with `pc debug extract --all`
+
+## pc debug transcript --all  (1 refs)
+  - [8240399a-f332-4…] now go to /Users/pablofernandez/tmp/a123123 and run `pc debug transcript --all` and then tell me what you would generate -- afterwards compare your version with what gets generated with `pc debug extract --all`
+
+## proactive-context  (1 refs)
+  - [9135070a-d269-4…] warning: `proactive-context` (bin "proactive-context") generated 1 warning     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s      Running `target/debug/proactive-context stats` Error: no such module
+
+## proactive-context archeologist  (1 refs)
+  - [1a347f6b-c39e-4…] you know what I'm thinking? what if we add a command that is like `proactive-context archeologist` and goes through ALL the jsonl conversations in the user's ~/.claude and runs EVERYTHING ever said, carrying forward proj
+
+## proactive-context tail  (1 refs)
+  - [1fe0f5c6-3cb7-4…] a  generate logs so that I can run `proactive-context tail` and it will show an output (colorized) across all projects where proactive-context is running with queries coming in, what the agent is doing to retrieve inform
+
+## q_tags  (1 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+
+## tenex-edge proposal  (1 refs)
+  - [0323ebcf-373e-4…] as work is done and progress is made, keep an updated report via `tenex-edge proposal`
+
+## tool_name  (1 refs)
+  - [4b0b4989-b797-4…] the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki  I asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be in
+
+## wiki-tidy  (1 refs)
+  - [be9ee788-301d-4…] wait- you ust created a `wiki-tidy` that simply fixes it? -- and wait, there's a wiki-doctor branch that's not merged?
+

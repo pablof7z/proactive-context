@@ -17,6 +17,7 @@ mod eval_run8;
 mod eval_run9;
 mod eval_run10;
 mod eval_run11;
+mod eval_realness;
 mod eval_run13;
 mod eval_t0;
 mod merged_recognition;
@@ -394,6 +395,14 @@ enum Commands {
         /// Bars: macro-F1 ≥ 0.80 AND reject-precision ≥ 0.90; falsified if macro-F1 < 0.6.
         #[arg(long)]
         t0: bool,
+
+        /// T-A: realness scorer bake-off. Builds all three flagged noun-realness scorers (A
+        /// signed-delta ledger, B holistic re-judgment, C lifecycle state-machine) + a frequency
+        /// baseline and evals them on cfv6 against a frozen GOLD NOUN SET. Pre-registered bars:
+        /// AUC≥0.85 & beats freq by 0.10, reject-precision≥0.90, recovery, ≤10% flip, cost. Mine
+        /// the population for curation with PC_REALNESS_MINE=1. $0 Ollama (glm cloud, think-ON).
+        #[arg(long)]
+        realness: bool,
 
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
@@ -890,6 +899,7 @@ fn main() -> Result<()> {
             run11,
             run13,
             t0,
+            realness,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -906,6 +916,7 @@ fn main() -> Result<()> {
                 run11,
                 run13,
                 t0,
+                realness,
                 judge_model,
             })?;
         }
