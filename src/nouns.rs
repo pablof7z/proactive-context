@@ -153,14 +153,20 @@ pub fn derive_registry(index_rows: &[IndexRow], claim_subjects: &[(String, Strin
         push_unique(&mut entry.source_refs, &format!("guide:{}", r.slug));
     }
 
-    // 2. Topic clusters — coarse anchors. Only added as a NEW noun if no guide already
-    //    owns that slug (topics are pseudo-nouns per spec §4; keep them thin).
+    // 2. Topic clusters — coarse anchors. A topic is a pseudo-noun (spec §4) but it is NOT
+    //    inherently thin: a topic that groups guides should INHERIT a definition synthesized from
+    //    its constituent guides' summaries (Run-13 finding F: topic anchors landed empty, so every
+    //    arm scored 0 because the most-mined nouns were topics like `identity`/`content-rendering`
+    //    whose rich guides were `identity-model`/`chirp-content-rendering`). Only stays thin when no
+    //    guide under the topic carries a summary. A guide that already owns the topic-slug keeps its
+    //    own (richer, guide-level) definition — we only FILL an empty topic-anchor definition.
     for r in index_rows {
         let topic = r.topic.trim();
         if topic.is_empty() {
             continue;
         }
         let topic_slug = slugify(topic);
+        let topic_def = topic_definition_from_guides(&topic_slug, index_rows);
         let entry = by_slug.entry(topic_slug.clone()).or_insert_with(|| NounEntry {
             slug: topic_slug.clone(),
             name: deslug(&topic_slug),
@@ -168,6 +174,9 @@ pub fn derive_registry(index_rows: &[IndexRow], claim_subjects: &[(String, Strin
             source_refs: Vec::new(),
             origin: "derived".to_string(),
         });
+        if entry.definition.trim().is_empty() && !topic_def.is_empty() {
+            entry.definition = topic_def;
+        }
         push_unique(&mut entry.source_refs, &format!("topic:{}", topic_slug));
     }
 
@@ -192,6 +201,57 @@ pub fn derive_registry(index_rows: &[IndexRow], claim_subjects: &[(String, Strin
     }
 
     by_slug.into_values().collect()
+}
+
+/// Synthesize a topic anchor's definition from the summaries of the guides grouped under it.
+/// Collects the non-empty `summary` of every guide whose `topic` slugifies to `topic_slug`
+/// (skipping any guide whose own slug equals the topic slug — that guide defines itself directly),
+/// joins up to the first three distinct summaries with "; ". Empty when no constituent guide has a
+/// summary (the topic legitimately stays a thin anchor). Pure over `index_rows` — unit-tested.
+fn topic_definition_from_guides(topic_slug: &str, index_rows: &[IndexRow]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for r in index_rows {
+        if slugify(r.topic.trim()) != topic_slug {
+            continue;
+        }
+        if r.slug == topic_slug {
+            continue; // the guide that IS the topic defines the slug directly (handled in step 1)
+        }
+        let s = r.summary.trim();
+        if !s.is_empty() && !parts.iter().any(|p| p == s) {
+            parts.push(s.to_string());
+            if parts.len() >= 3 {
+                break;
+            }
+        }
+    }
+    parts.join("; ")
+}
+
+/// First substantive sentence of a guide body, used as a definition fallback when the guide has no
+/// `summary:` frontmatter. Skips markdown headings/blank lines/HTML-comment citation lines, takes the
+/// first prose line, and trims to its first sentence (up to ~240 chars). Empty when nothing usable.
+/// Pure — unit-tested.
+pub(crate) fn first_body_sentence(body: &str) -> String {
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("<!--") || line.starts_with("---") {
+            continue;
+        }
+        // Strip leading list/quote markers.
+        let line = line.trim_start_matches(|c| c == '-' || c == '*' || c == '>' || c == ' ');
+        if line.len() < 12 {
+            continue;
+        }
+        // First sentence: cut at the first ". " boundary, else take the whole line.
+        let sentence = match line.find(". ") {
+            Some(i) => &line[..=i],
+            None => line,
+        };
+        let sentence = sentence.trim();
+        return sentence.chars().take(240).collect::<String>();
+    }
+    String::new()
 }
 
 /// Read the claim subjects+assertions from a project's claims.jsonl (for C3 source #3).
@@ -220,7 +280,29 @@ pub fn build_registry_from_disk(wiki_dir: &Path, project_dir: &Path) -> Vec<Noun
     // "derive from what already exists, zero re-capture". One directory scan; cheap.
     let index_rows = read_index_live(wiki_dir);
     let subjects = read_claim_subjects(project_dir);
-    derive_registry(&index_rows, &subjects)
+    let mut registry = derive_registry(&index_rows, &subjects);
+
+    // Definition fallback (Run-13 finding F): a guide noun whose `summary:` frontmatter is empty
+    // still has a body — fill its definition from the first substantive body sentence so the primer
+    // is never empty for an actual guide. Disk-level (we need the body, which IndexRow omits); only
+    // touches still-empty guide-origin entries, so it never overwrites a real summary.
+    let guide_slugs: std::collections::HashSet<&str> =
+        index_rows.iter().map(|r| r.slug.as_str()).collect();
+    for e in registry.iter_mut() {
+        if !e.definition.trim().is_empty() {
+            continue;
+        }
+        if !guide_slugs.contains(e.slug.as_str()) {
+            continue; // only guides have a body file at <slug>.md
+        }
+        if let Some(guide) = crate::wiki::load_guide(&crate::wiki::guide_path(wiki_dir, &e.slug)) {
+            let sentence = first_body_sentence(&guide.body);
+            if !sentence.is_empty() {
+                e.definition = sentence;
+            }
+        }
+    }
+    registry
 }
 
 // ─── Registry persistence: <wiki>/nouns/<slug>.md (mirrors research/episode stores) ──
@@ -974,6 +1056,54 @@ mod tests {
         let te = reg.iter().find(|e| e.slug == "token-event").unwrap();
         assert_eq!(te.definition, "Token events are self-encrypted kind:7375.");
         assert!(te.source_refs.contains(&"claim-subject".to_string()));
+    }
+
+    #[test]
+    fn topic_anchor_inherits_definition_from_constituent_guides() {
+        // Run-13 finding F regression: the human mentions "identity"; the rich guide is
+        // `identity-model` with topic `identity`. The `identity` TOPIC anchor must NOT land empty —
+        // it inherits the constituent guide's summary so the primer is non-empty.
+        let rows = vec![
+            idx("identity-model", "identity", "Identity Model", "Same nsec means same account; identityid equals pubkey hex."),
+            idx("nmp-signers", "identity", "NMP Signers", "Per-role signers stored in a hashmap."),
+        ];
+        let reg = derive_registry(&rows, &[]);
+        let topic = reg.iter().find(|e| e.slug == "identity").expect("identity topic anchor present");
+        assert!(!topic.definition.trim().is_empty(), "topic anchor must inherit a definition");
+        assert!(topic.definition.contains("Same nsec means same account"), "got: {}", topic.definition);
+        // Both constituent guide summaries are folded in (joined).
+        assert!(topic.definition.contains("Per-role signers"), "got: {}", topic.definition);
+        assert!(topic.source_refs.contains(&"topic:identity".to_string()));
+    }
+
+    #[test]
+    fn topic_anchor_stays_thin_when_no_guide_has_summary() {
+        // A topic whose only guide has no summary legitimately stays a thin anchor.
+        let rows = vec![idx("foo", "misc", "Foo", "")];
+        let reg = derive_registry(&rows, &[]);
+        let topic = reg.iter().find(|e| e.slug == "misc").unwrap();
+        assert!(topic.definition.trim().is_empty(), "no summary anywhere → thin anchor");
+    }
+
+    #[test]
+    fn topic_slug_owned_by_a_guide_keeps_guide_definition() {
+        // When a guide's slug == its topic, the guide-level definition wins (not overwritten by
+        // a synthesized topic definition).
+        let rows = vec![idx("nwc-wallet", "nwc-wallet", "NWC Wallet", "The nmp-nwc crate is independent of nmp-core.")];
+        let reg = derive_registry(&rows, &[]);
+        let e = reg.iter().find(|x| x.slug == "nwc-wallet").unwrap();
+        assert_eq!(e.definition, "The nmp-nwc crate is independent of nmp-core.");
+    }
+
+    #[test]
+    fn first_body_sentence_extracts_definition_fallback() {
+        let body = "# Identity Model\n\n<!-- citations: [^a-1] -->\n\nThe identity model uses a single nsec per account. More detail follows here.\n";
+        let s = first_body_sentence(body);
+        assert_eq!(s, "The identity model uses a single nsec per account.");
+        // Empty / heading-only body → empty fallback.
+        assert!(first_body_sentence("# Title only\n\n## Section\n").is_empty());
+        // Strips a leading list marker.
+        assert_eq!(first_body_sentence("- A relay is a websocket endpoint that stores events."), "A relay is a websocket endpoint that stores events.");
     }
 
     #[test]
