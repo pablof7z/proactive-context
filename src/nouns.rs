@@ -27,7 +27,7 @@
 //! `PC_NOUNS` env override is set. When off, capture and inject behavior is
 //! byte-identical to the pre-entity-layer pipeline.
 
-use crate::wiki::{read_index, IndexRow};
+use crate::wiki::{read_index_live, IndexRow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -215,7 +215,10 @@ pub fn read_claim_subjects(project_dir: &Path) -> Vec<(String, String)> {
 /// Convenience: build the derived registry for a project from disk (wiki index + claims).
 /// This is the C3 entry point the inject primer uses — it requires NO capture run.
 pub fn build_registry_from_disk(wiki_dir: &Path, project_dir: &Path) -> Vec<NounEntry> {
-    let index_rows = read_index(wiki_dir);
+    // Scan LIVE guide files (not the derived `_index.md` cache) so C3 works on any wiki
+    // regardless of whether the index has been rebuilt — the experiment's promise is
+    // "derive from what already exists, zero re-capture". One directory scan; cheap.
+    let index_rows = read_index_live(wiki_dir);
     let subjects = read_claim_subjects(project_dir);
     derive_registry(&index_rows, &subjects)
 }
@@ -592,6 +595,64 @@ fn contains_phrase(haystack: &str, needle: &str) -> bool {
 
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+// ─── Inject orchestration (the additive, flagged seam inject.rs calls) ────────────
+
+/// The primer side-effect for one inject turn: the block to prepend (if any) plus the
+/// noun slugs that were primed (so the caller records them in the per-session ledger
+/// AFTER it has committed to injecting). Kept as a struct so the caller controls the
+/// commit ordering (don't mark primed if the turn ultimately injects nothing).
+pub struct PrimerResult {
+    /// The composed primer block to PREPEND to the briefing body, or None.
+    pub block: Option<String>,
+    /// Slugs primed this turn — record these in the primed-ledger on commit.
+    pub primed_slugs: Vec<String>,
+    /// The content level used (for logging).
+    pub level: PrimerLevel,
+}
+
+/// Build the first-mention primer for one inject turn — the single entry point inject.rs
+/// calls. Fully self-contained and flagged: when `config_flag`/`PC_NOUNS` is off this is a
+/// cheap no-op returning an empty result, so inject behavior is byte-identical.
+///
+/// Steps: derive the C3 registry from disk → read the per-session primed-ledger →
+/// detect first-mentioned nouns in `prompt` (not already in `recent`, not already primed)
+/// → compose the primer at `PC_PRIMER_LEVEL`. The composer's fact/intent slots are filled
+/// from the registry definition only here (a clean, retrieval-free default); the experiment
+/// can supply richer `PrimerInput`s by calling `detect_first_mentions` + `compose_primer`
+/// directly with its own fact/intent retrieval — this orchestration is the convenience path.
+///
+/// Placement is the caller's responsibility and is HELD CONSTANT (a separate prepended
+/// block); this function never touches retrieval (spec F16).
+pub fn build_inject_primer(
+    config_flag: bool,
+    wiki_dir: &Path,
+    project_dir: &Path,
+    session_id: &str,
+    prompt: &str,
+    recent: &str,
+) -> PrimerResult {
+    let level = PrimerLevel::from_env();
+    if !nouns_inject_enabled(config_flag) {
+        return PrimerResult { block: None, primed_slugs: Vec::new(), level };
+    }
+    let registry = build_registry_from_disk(wiki_dir, project_dir);
+    if registry.is_empty() {
+        return PrimerResult { block: None, primed_slugs: Vec::new(), level };
+    }
+    let primed = read_primed(project_dir, session_id);
+    let hits = detect_first_mentions(&registry, prompt, recent, &primed);
+    if hits.is_empty() {
+        return PrimerResult { block: None, primed_slugs: Vec::new(), level };
+    }
+    // Convenience path: definition-from-registry. For the `Facts`/`Intent` levels the
+    // registry definition is the best retrieval-free signal we have here; the experiment
+    // harness fills the richer facts/intent slots itself.
+    let inputs: Vec<PrimerInput> = hits.iter().map(|e| PrimerInput::from_entry(e)).collect();
+    let primed_slugs: Vec<String> = hits.iter().map(|e| e.slug.clone()).collect();
+    let block = compose_primer(&inputs, level);
+    PrimerResult { block, primed_slugs, level }
 }
 
 // ─── pc debug nouns: inspect the derived registry + first-mention detection ────────

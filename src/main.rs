@@ -477,6 +477,22 @@ enum DebugAction {
         #[arg(long)]
         no_wiki: bool,
     },
+
+    /// Inspect the entity/noun layer (entity-and-orientation-capture spec). Builds the
+    /// C3 DERIVED noun registry from the project's existing wiki guides/topics + claim
+    /// subjects (NO capture, NO LLM, NO wiki writes) and prints it. Optionally runs
+    /// first-mention detection + primer composition for a sample prompt
+    /// (PC_PRIMER_LEVEL=def|facts|intent selects the content level).
+    Nouns {
+        /// Wiki directory to derive nouns from. Defaults to the discovered project wiki
+        /// (docs/wiki) for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// A sample prompt to run first-mention detection + primer composition against.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -709,6 +725,11 @@ fn main() -> Result<()> {
             }
             DebugAction::Triage { transcript, wiki_dir, no_wiki } => {
                 crate::capture::run_debug_triage(&transcript, wiki_dir.as_deref(), no_wiki)?;
+            }
+            DebugAction::Nouns { wiki_dir, prompt } => {
+                let wiki = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                let proj_dir = project_context_dir(&root);
+                crate::nouns::run_debug_nouns(&wiki, &proj_dir, prompt.as_deref())?;
             }
         },
 

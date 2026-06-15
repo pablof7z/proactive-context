@@ -706,6 +706,29 @@ fn write_index_file_with_research(
         out.push('\n');
     }
 
+    // Nouns registry (entity layer) — listed when a `nouns/` dir holds entries. When the
+    // noun layer is off and nothing was ever persisted, `scan_nouns` returns empty and this
+    // section is absent, so `_index.md` is byte-identical to the pre-entity-layer output.
+    let nouns = crate::nouns::scan_nouns(wiki_dir);
+    if !nouns.is_empty() {
+        out.push_str(&format!(
+            "## Nouns ({} entit{})\n\n",
+            nouns.len(),
+            if nouns.len() == 1 { "y" } else { "ies" }
+        ));
+        out.push_str("| Noun | Name | Origin | Definition |\n");
+        out.push_str("|------|------|--------|------------|\n");
+        for n in &nouns {
+            let name = n.name.replace('|', "\\|");
+            let summary = n.summary.replace('|', "\\|");
+            out.push_str(&format!(
+                "| [{}](nouns/{}.md) | {} | {} | {} |\n",
+                n.slug, n.slug, name, n.origin, summary
+            ));
+        }
+        out.push('\n');
+    }
+
     fs::write(&path, out)?;
     Ok(())
 }
@@ -1563,6 +1586,50 @@ More info.
         let slugs: Vec<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
         assert!(slugs.contains(&"embeddings"), "guide row missing from read_index");
         assert!(!slugs.iter().any(|s| s.contains("run-4")), "research record leaked into guide rows: {:?}", slugs);
+    }
+
+    #[test]
+    fn rebuild_index_lists_nouns_section_and_read_index_ignores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        // One ordinary guide.
+        let guide = "---\ntitle: Mint\nslug: mint\nsummary: shared with recipient\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-06-01\nupdated: 2026-06-01\nverified: 2026-06-01\ncompiled-from: conversation\nsources: []\ntopic: nostr\n---\n\n# Mint\n\nBody.\n";
+        fs::write(wiki.join("mint.md"), guide).unwrap();
+        // One persisted noun entry in nouns/.
+        let nouns_dir = wiki.join("nouns");
+        fs::create_dir_all(&nouns_dir).unwrap();
+        let entry = crate::nouns::NounEntry {
+            slug: "token-event".to_string(),
+            name: "Token Event".to_string(),
+            definition: "Self-encrypted kind:7375 holding Cashu proofs.".to_string(),
+            source_refs: vec!["guide:token-event".to_string()],
+            origin: "derived".to_string(),
+        };
+        crate::nouns::persist_registry(wiki, std::slice::from_ref(&entry)).unwrap();
+
+        rebuild_index(wiki, "2026-06-15").unwrap();
+        let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
+        assert!(index.contains("## Nouns (1 entity)"), "nouns section header missing:\n{}", index);
+        assert!(index.contains("](nouns/token-event.md)"), "noun link missing:\n{}", index);
+        assert!(index.contains("kind:7375"), "noun definition missing");
+
+        // read_index must NOT pick up the noun row as a guide.
+        let rows = read_index(wiki);
+        let slugs: Vec<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
+        assert!(slugs.contains(&"mint"), "guide row missing from read_index");
+        assert!(!slugs.contains(&"token-event"), "noun entry leaked into guide rows: {:?}", slugs);
+    }
+
+    #[test]
+    fn rebuild_index_has_no_nouns_section_when_dir_absent() {
+        // Byte-identical guarantee: with no nouns/ dir the section never appears.
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let guide = "---\ntitle: Mint\nslug: mint\nsummary: s\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-06-01\nupdated: 2026-06-01\nverified: 2026-06-01\ncompiled-from: conversation\nsources: []\ntopic: nostr\n---\n\n# Mint\n\nBody.\n";
+        fs::write(wiki.join("mint.md"), guide).unwrap();
+        rebuild_index(wiki, "2026-06-15").unwrap();
+        let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
+        assert!(!index.contains("## Nouns"), "nouns section must be absent when no nouns/ dir");
     }
 
     #[test]
