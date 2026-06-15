@@ -32,7 +32,7 @@
 //! is fully $0. The judge is `--judge-model`. All LLM calls are within-run (design P4).
 
 use crate::eval::{judge_briefing, strip_injected_context, is_pc_self_referential, Label};
-use crate::eval_run7::{inject_claims, inject_wiki_selectless, inject_raw_rag};
+use crate::eval_run7::inject_claims;
 use crate::eval_run8::{predict, judge_prediction, Correction};
 use crate::nouns::{
     build_registry_from_disk, compose_primer, slugify, truncate_for_display, NounEntry,
@@ -221,7 +221,7 @@ pub(crate) struct NounMoment {
 pub(crate) fn extract_noun_candidates(turn: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+    let push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
         let c = c.trim().trim_matches(|ch: char| ch == '.' || ch == ',' || ch == '?' || ch == '!' || ch == ':' || ch == ';').to_string();
         let cl = c.to_lowercase();
         if c.len() >= 3 && c.len() <= 60 && seen.insert(cl.clone()) {
@@ -355,10 +355,17 @@ fn mine_noun_moments(
     // Registry lookup: slug → entry, plus a name/deslug → slug index for matching candidates.
     let by_slug: BTreeMap<&str, &NounEntry> = registry.iter().map(|e| (e.slug.as_str(), e)).collect();
 
-    // Pass 1 (cheap, no LLM): scan future human turns, extract candidates, keep only those that
-    // (a) map to a REGISTRY noun (multi-word nouns only match if in the registry — design note)
-    // and (b) the store can ground (store-knowledge filter via verify_in_store_repr on the def or
-    // any ground-truth fact). One MOMENT per (slug, first session it idiosyncratically appears).
+    // Pass 1 (cheap, no LLM): scan future human turns and collect noun candidates from TWO sources,
+    // both filtered to REGISTRY nouns the store can ground:
+    //   (i)  the foundation's `detect_first_mentions` — registry nouns the turn references by name
+    //        or deslug (whole-word), the real I1 path. This catches lowercased multi-word nouns
+    //        ("publish engine") the caps-heuristic misses.
+    //   (ii) the heuristic `extract_noun_candidates` (backticked ids / kind:NNNN / NIP / caps
+    //        phrases) — surfaces noun-shaped tokens; kept only if they ALSO map to a registry slug
+    //        (multi-word nouns only match if in the registry — design note).
+    // Store-knowledge filter (verify_in_store_repr on the def or any ground-truth fact) applies to
+    // both. One MOMENT per (slug, first session it appears). detect_first_mentions takes the
+    // already-seen set as the per-corpus dedup so each noun is mined once.
     #[derive(Clone)]
     struct Cand { slug: String, name: String, definition: String, session: String, turn: String }
     let mut cands: Vec<Cand> = Vec::new();
@@ -377,21 +384,30 @@ fn mine_noun_moments(
             let head = t.chars().take(40).collect::<String>().to_lowercase();
             if head.starts_with('<') || head.contains("caveat:") || head.starts_with("[image") { continue; }
 
-            let candidates = extract_noun_candidates(t);
-            for cand in candidates {
+            // Slugs the turn references: registry-direct (i) ∪ heuristic-mapped-to-registry (ii).
+            let mut turn_slugs: Vec<String> = Vec::new();
+            let primed: HashSet<String> = seen_slugs.clone();
+            for e in crate::nouns::detect_first_mentions(registry, t, "", &primed) {
+                turn_slugs.push(e.slug.clone());
+            }
+            for cand in extract_noun_candidates(t) {
                 let slug = slugify(&cand);
-                if slug.len() < 3 { continue; }
+                if slug.len() >= 3 && by_slug.contains_key(slug.as_str()) && !turn_slugs.contains(&slug) {
+                    turn_slugs.push(slug);
+                }
+            }
+
+            for slug in turn_slugs {
                 if seen_slugs.contains(&slug) { continue; }
-                // (a) must be a REGISTRY noun (else it's not a project noun we can prime).
                 let Some(entry) = by_slug.get(slug.as_str()) else { continue };
-                // (b) store-knowledge filter: store must be able to ground it.
+                // Store-knowledge filter: store must be able to ground it.
                 let gt = ground_truth_for_noun(&entry.name, &entry.slug, store_repr_lower, 8);
                 let groundable = !gt.is_empty()
                     || (entry.has_definition() && crate::eval::verify_in_store_repr_pub(&entry.definition, store_repr_lower));
                 if !groundable { continue; }
                 seen_slugs.insert(slug.clone());
                 cands.push(Cand {
-                    slug, name: entry.name.clone(), definition: entry.definition.clone(),
+                    slug: slug.clone(), name: entry.name.clone(), definition: entry.definition.clone(),
                     session: session_id.clone(),
                     turn: t.chars().take(1200).collect::<String>(),
                 });
@@ -464,7 +480,7 @@ struct ArmVerdict {
 fn score_arms(
     moments: &[NounMoment],
     registry: &[NounEntry],
-    store_a_wiki: &Path, store_b_claims: &Path, store_repr_lower: &str,
+    _store_a_wiki: &Path, store_b_claims: &Path, store_repr_lower: &str,
     compile_spec: &crate::provider::ModelSpec, judge_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
     out_path: &Path,
@@ -632,7 +648,7 @@ struct PredictRow {
 fn score_predict_ridealong(
     exp_dir: &Path,
     registry: &[NounEntry],
-    store_a_wiki: &Path, store_b_claims: &Path, store_c_dir: &Path,
+    _store_a_wiki: &Path, store_b_claims: &Path, _store_c_dir: &Path,
     compile_spec: &crate::provider::ModelSpec, judge_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
 ) -> Result<Vec<PredictRow>> {
@@ -650,7 +666,8 @@ fn score_predict_ridealong(
 
     let cap = std::env::var("PC_RUN13_PREDICT_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(20usize);
     let verified: Vec<&Correction> = verified.into_iter().take(cap).collect();
-    let _ = (store_a_wiki, store_c_dir); // B0/A2 both use the claims store (Store B is B0).
+    // B0/A2 both use the claims store (Store B is B0); store-a/store-c are reserved for parity
+    // with the Run-8 predict signature and intentionally unused here.
 
     let mut rows = Vec::with_capacity(verified.len());
     for (i, c) in verified.iter().enumerate() {
