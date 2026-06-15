@@ -54,9 +54,14 @@ pub struct Run13Args<'a> {
 }
 
 /// Pre-registered seeded canaries per corpus (design §3.4). The miner MUST recover all of
-/// them (as registry-grounded idiosyncratic nouns) or the mining pass is rejected.
-fn seeded_canaries(corpus_label: &str) -> Vec<&'static str> {
-    match corpus_label {
+/// them (as registry-grounded idiosyncratic nouns) or the mining pass is rejected. Overridable via
+/// `PC_RUN13_CANARIES="slug-a,slug-b,..."` for running against a richer snapshot.
+fn seeded_canaries(corpus_label: &str) -> Vec<String> {
+    if let Ok(custom) = std::env::var("PC_RUN13_CANARIES") {
+        let v: Vec<String> = custom.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !v.is_empty() { return v; }
+    }
+    let base: Vec<&'static str> = match corpus_label {
         // Corrected for cfv3 (Run-13 finding): the original canaries (nutzap/mint/token-event) were
         // for a Cashu-wallet corpus, but cfv3 is the nostr-multi-platform app where those are
         // deferred/unbuilt and ungroundable. These four ARE registry-grounded guides with rich
@@ -64,9 +69,18 @@ fn seeded_canaries(corpus_label: &str) -> Vec<&'static str> {
         // sense): publish-engine (PublishEngine FSM), marmot-protocol (marmot-protocol/mdk crate),
         // outbox-resolver (Nip65OutboxResolver), nmp-signers (NIP-44 v2 signer crate).
         "wallet" => vec!["publish-engine", "marmot-protocol", "outbox-resolver", "nmp-signers"],
-        "pc" => vec!["claim tap", "episode card", "select stage"],
+        // pc / cfv6 snapshot. The "ideal" pc canaries (episode-cards, claim-log,
+        // terminal-state-inversion, cross-guide-supersession, triage-gate) postdate the cfv6 wiki
+        // snapshot (20 early infra guides — verified absent from its guides AND claims), so they are
+        // NOT registry-grounded HERE. These three ARE grounded guides in cfv6 AND verified
+        // pc-idiosyncratic (bare model = absent on the run): capture-pipeline, context-injection,
+        // reranking. (compile-pipeline and embedding-pipeline were dropped — the bare model judged
+        // them `contained`, i.e. NOT idiosyncratic, so they fail the canary's purpose.) Override with
+        // PC_RUN13_CANARIES="a,b,c" for a richer pc snapshot.
+        "pc" => vec!["capture-pipeline", "context-injection", "reranking"],
         _ => vec![],
-    }
+    };
+    base.into_iter().map(String::from).collect()
 }
 
 pub fn run_run13(args: Run13Args) -> Result<()> {
@@ -97,11 +111,10 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
     );
     let store_repr_lower = store_repr.to_lowercase();
 
-    // Warm the local model and ask Ollama to keep it resident (keep_alive=-1) so it is not evicted
-    // mid-run by peer agents sharing the host — the eviction that 404s briefings/judges on $0-local.
-    // Best-effort; ignored for non-Ollama specs and on any error.
-    warm_ollama_model(&compile_spec, &ollama_base_url, ok);
-    if judge_spec.model != compile_spec.model { warm_ollama_model(&judge_spec, &ollama_base_url, ok); }
+    // NOTE: model warmup is PHASE-LOCAL, not eager at run start. Pinning the heavy judge model
+    // (keep_alive=-1) during the mining phase — which uses a separate small DETECT model — thrashes
+    // VRAM (the two models evict each other on a single-GPU host). So we warm the detect model inside
+    // the mining phase, and the judge/compile model just before the arm/ride-along phase.
 
     // ───────────────────────── §3.1 — C3 registry (zero re-capture) ─────────────────────────
     let registry = build_registry_from_disk(&store_a_wiki, &store_b_claims);
@@ -127,6 +140,16 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
     };
 
     // ───────────────────────── §3.4 — canary recovery (P1, loud) ─────────────────────────
+    // Canary diagnosis + all downstream judging use the heavy judge/compile model; ensure it is warm
+    // (mining may have been reused from frozen, skipping the in-mining warmup). Detector model is
+    // released if it differs, so the judge isn't VRAM-starved.
+    if std::env::var("PC_RUN13_DETECT_MODEL").is_ok() {
+        let ds = crate::provider::ModelSpec::parse(&std::env::var("PC_RUN13_DETECT_MODEL").unwrap());
+        if ds.model != judge_spec.model { unpin_ollama_model(&ds, &ollama_base_url, ok); }
+    }
+    warm_ollama_model(&judge_spec, &ollama_base_url, ok);
+    if compile_spec.model != judge_spec.model { warm_ollama_model(&compile_spec, &ollama_base_url, ok); }
+
     let canaries = seeded_canaries(corpus_label);
     let canary_status = diagnose_canaries(
         &canaries, &registry, &moments, &store_repr_lower,
@@ -358,7 +381,7 @@ pub(crate) struct CanaryStatus {
 }
 
 /// Pure helper: which canaries (by slug) surfaced as mined moments. Unit-tested.
-pub(crate) fn canary_moment_slugs(canaries: &[&str], moments: &[NounMoment]) -> BTreeSet<String> {
+pub(crate) fn canary_moment_slugs(canaries: &[String], moments: &[NounMoment]) -> BTreeSet<String> {
     let moment_slugs: HashSet<&str> = moments.iter().map(|m| m.slug.as_str()).collect();
     canaries.iter().map(|c| slugify(c)).filter(|s| moment_slugs.contains(s.as_str())).collect()
 }
@@ -369,7 +392,7 @@ pub(crate) fn canary_moment_slugs(canaries: &[&str], moments: &[NounMoment]) -> 
 /// nouns without depending on humans mentioning every canary in the future window.
 #[allow(clippy::too_many_arguments)]
 fn diagnose_canaries(
-    canaries: &[&str], registry: &[NounEntry], moments: &[NounMoment], store_repr_lower: &str,
+    canaries: &[String], registry: &[NounEntry], moments: &[NounMoment], store_repr_lower: &str,
     compile_spec: &crate::provider::ModelSpec, judge_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>,
 ) -> Vec<CanaryStatus> {
@@ -411,6 +434,65 @@ fn diagnose_canaries(
     out
 }
 
+/// Build a numbered catalog of registry nouns (1-based index → "name: one-line definition") for the
+/// LLM reference detector. Truncates each definition to keep the prompt cheap.
+fn build_noun_catalog(catalog: &[&NounEntry]) -> String {
+    let mut s = String::new();
+    for (i, e) in catalog.iter().enumerate() {
+        let def = e.definition.trim();
+        let def1 = def.split(['.', ';', '\n']).next().unwrap_or(def).trim();
+        s.push_str(&format!("{}. {}: {}\n", i + 1, e.name, def1.chars().take(120).collect::<String>()));
+    }
+    s
+}
+
+/// LLM REFERENCE DETECTOR (mining ground-truth only — offline, $0). Given a human turn and the
+/// numbered registry-noun catalog, ONE model call returns the indices of nouns the user references
+/// by ANY phrasing (informal/synonym/partial). Returns the matched registry slugs. Tolerant parse:
+/// any line/JSON containing the catalog indices is accepted; out-of-range indices are dropped.
+/// Routed through call_with_retry so shared-Ollama eviction doesn't silently zero the mining pass.
+fn detect_referenced_nouns(
+    turn: &str, catalog: &[&NounEntry], catalog_text: &str,
+    spec: &crate::provider::ModelSpec, api_key: &str, base: &str, key: Option<&str>,
+) -> Vec<String> {
+    if catalog.is_empty() { return Vec::new(); }
+    let system = "You map a developer's message to the PROJECT NOUNS it references. You are given a \
+        numbered CATALOG of project nouns (name: definition) and one USER MESSAGE. Return the numbers \
+        of every catalog noun the user refers to BY ANY PHRASING — informal names, synonyms, partial \
+        mentions, or the concept without the exact term (e.g. \"the wiki\" → a wiki/guide noun; \
+        \"how we pick guides\" → a SELECT/retrieval noun). Only include a noun if the user is genuinely \
+        talking about THAT project concept. Output ONLY a JSON array of integers (e.g. [2,7]); [] if none.";
+    let user = format!("CATALOG:\n{}\nUSER MESSAGE:\n{}\n\nReferenced noun numbers (JSON array):",
+        catalog_text, turn.chars().take(1500).collect::<String>());
+    let resp = match call_with_retry(spec, api_key, base, key, system, &user) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    // Parse the first [...] of integers; fall back to scanning bare integers.
+    let idxs: Vec<usize> = {
+        let blob = match (resp.find('['), resp.rfind(']')) {
+            (Some(a), Some(b)) if b > a => resp[a..=b].to_string(),
+            _ => resp.clone(),
+        };
+        let mut out = Vec::new();
+        let mut num = String::new();
+        for ch in blob.chars() {
+            if ch.is_ascii_digit() { num.push(ch); }
+            else if !num.is_empty() { if let Ok(n) = num.parse::<usize>() { out.push(n); } num.clear(); }
+        }
+        if !num.is_empty() { if let Ok(n) = num.parse::<usize>() { out.push(n); } }
+        out
+    };
+    let mut slugs = Vec::new();
+    for n in idxs {
+        if n >= 1 && n <= catalog.len() {
+            let slug = catalog[n - 1].slug.clone();
+            if !slugs.contains(&slug) { slugs.push(slug); }
+        }
+    }
+    slugs
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mine_noun_moments(
     exp_dir: &Path,
@@ -433,21 +515,50 @@ fn mine_noun_moments(
     // Registry lookup: slug → entry, plus a name/deslug → slug index for matching candidates.
     let by_slug: BTreeMap<&str, &NounEntry> = registry.iter().map(|e| (e.slug.as_str(), e)).collect();
 
-    // Pass 1 (cheap, no LLM): scan future human turns and collect noun candidates from TWO sources,
-    // both filtered to REGISTRY nouns the store can ground:
-    //   (i)  the foundation's `detect_first_mentions` — registry nouns the turn references by name
-    //        or deslug (whole-word), the real I1 path. This catches lowercased multi-word nouns
-    //        ("publish engine") the caps-heuristic misses.
-    //   (ii) the heuristic `extract_noun_candidates` (backticked ids / kind:NNNN / NIP / caps
-    //        phrases) — surfaces noun-shaped tokens; kept only if they ALSO map to a registry slug
-    //        (multi-word nouns only match if in the registry — design note).
-    // Store-knowledge filter (verify_in_store_repr on the def or any ground-truth fact) applies to
-    // both. One MOMENT per (slug, first session it appears). detect_first_mentions takes the
-    // already-seen set as the per-corpus dedup so each noun is mined once.
+    // Pass 1: scan future human turns and collect REGISTRY noun candidates the store can ground.
+    // Two matchers, selected by PC_RUN13_LLM_DETECT (default ON for Run 14):
+    //   • LLM REFERENCE DETECTOR (Run-14 fix for the scarcity finding): ONE cheap offline LLM call
+    //     per human turn — given the turn + the registry catalog (name + 1-line def), "which nouns
+    //     does the user reference by ANY phrasing (informal/synonym/partial)?". Humans don't type
+    //     formal slugs ("the wiki", "SELECT", "episode card"), so whole-token matching under-mines.
+    //     This is MINING ground-truth only (offline, $0, latency irrelevant) — the production
+    //     hot-path `detect_first_mentions` whole-token matcher is left UNCHANGED (see follow-up note).
+    //   • WHOLE-TOKEN (fallback, PC_RUN13_LLM_DETECT=0): the prior detect_first_mentions ∪ heuristic
+    //     extractor path. Kept for reproducibility / Run-13 parity.
+    // Store-knowledge filter (verify_in_store_repr on def or any ground-truth fact) applies to both.
+    // One MOMENT per (slug, first session it appears) — per-corpus dedup via seen_slugs.
     #[derive(Clone)]
     struct Cand { slug: String, name: String, definition: String, session: String, turn: String }
     let mut cands: Vec<Cand> = Vec::new();
     let mut seen_slugs: HashSet<String> = HashSet::new();
+
+    let use_llm_detect = std::env::var("PC_RUN13_LLM_DETECT").map(|v| v != "0").unwrap_or(true);
+    // The detector is a CHEAP classification (turn → JSON array of catalog indices) — an easy task a
+    // small fast local model handles well, unlike the single-word grounding JUDGE. Use a dedicated
+    // PC_RUN13_DETECT_MODEL (e.g. ollama:nmp-arch:latest) so mining isn't bottlenecked by the heavy
+    // 26B judge; defaults to the generative/compile model when unset.
+    let detect_spec = std::env::var("PC_RUN13_DETECT_MODEL").ok()
+        .map(|s| crate::provider::ModelSpec::parse(&s))
+        .unwrap_or_else(|| compile_spec.clone());
+    if use_llm_detect {
+        warm_ollama_model(&detect_spec, ollama_base_url, ollama_api_key);
+    }
+    // Catalog for the LLM detector: stable index → (slug). Only nouns the store can ground are
+    // offered (so a detector hit is groundable by construction); built once.
+    let catalog: Vec<&NounEntry> = registry.iter().filter(|e| {
+        let gt = ground_truth_for_noun(&e.name, &e.slug, store_repr_lower, 1);
+        !gt.is_empty() || (e.has_definition() && crate::eval::verify_in_store_repr_pub(&e.definition, store_repr_lower))
+    }).collect();
+    let catalog_text = build_noun_catalog(&catalog);
+    // Bound total detector calls (one per scanned human turn) so a slow local model can't run away.
+    let turn_cap = std::env::var("PC_RUN13_DETECT_TURN_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400usize);
+    let mut turns_scanned = 0usize;
+    if use_llm_detect {
+        println!("eval: §3.1 — LLM reference detector ON (model={}, {} groundable nouns, turn_cap={})",
+            detect_spec.model, catalog.len(), turn_cap);
+    } else {
+        println!("eval: §3.1 — whole-token matcher (LLM detector OFF)");
+    }
 
     'sessions: for sess_path in future.iter().take(scan_cap) {
         let session_id = Path::new(sess_path).file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
@@ -455,28 +566,35 @@ fn mine_noun_moments(
         for m in &msgs {
             if m.is_sidechain || m.is_meta { continue; }
             if m.role.trim() != "user" { continue; }
+            // T5 self-referential guard: strip pc's own injected primers/system-reminders, then skip
+            // turns dominated by pc's derived artifacts (critical on the pc corpus).
             let text = strip_injected_context(&m.text);
             let t = text.trim();
             if t.len() < 25 || t.len() > 4000 { continue; }
             if is_pc_self_referential(t) { continue; }
             let head = t.chars().take(40).collect::<String>().to_lowercase();
             if head.starts_with('<') || head.contains("caveat:") || head.starts_with("[image") { continue; }
-            // Genuine HUMAN turns only (design §3.1): exclude agent/tool result envelopes that
-            // arrive on the user channel ("[Agent task result: …]", "[Request interrupted…]").
+            // Genuine HUMAN turns only (design §3.1): exclude agent/tool result envelopes.
             if head.starts_with("[agent ") || head.starts_with("[request ") || head.starts_with("[tool ") { continue; }
 
-            // Slugs the turn references: registry-direct (i) ∪ heuristic-mapped-to-registry (ii).
-            let mut turn_slugs: Vec<String> = Vec::new();
-            let primed: HashSet<String> = seen_slugs.clone();
-            for e in crate::nouns::detect_first_mentions(registry, t, "", &primed) {
-                turn_slugs.push(e.slug.clone());
-            }
-            for cand in extract_noun_candidates(t) {
-                let slug = slugify(&cand);
-                if slug.len() >= 3 && by_slug.contains_key(slug.as_str()) && !turn_slugs.contains(&slug) {
-                    turn_slugs.push(slug);
+            // Slugs this turn references.
+            let turn_slugs: Vec<String> = if use_llm_detect {
+                if turns_scanned >= turn_cap { break 'sessions; }
+                turns_scanned += 1;
+                if turns_scanned % 10 == 0 {
+                    println!("eval:   §3.1 detector scanned {} human turns → {} candidates so far", turns_scanned, cands.len());
                 }
-            }
+                detect_referenced_nouns(t, &catalog, &catalog_text, &detect_spec, api_key, ollama_base_url, ollama_api_key)
+            } else {
+                let mut v: Vec<String> = Vec::new();
+                let primed: HashSet<String> = seen_slugs.clone();
+                for e in crate::nouns::detect_first_mentions(registry, t, "", &primed) { v.push(e.slug.clone()); }
+                for cand in extract_noun_candidates(t) {
+                    let slug = slugify(&cand);
+                    if slug.len() >= 3 && by_slug.contains_key(slug.as_str()) && !v.contains(&slug) { v.push(slug); }
+                }
+                v
+            };
 
             for slug in turn_slugs {
                 if seen_slugs.contains(&slug) { continue; }
@@ -497,6 +615,14 @@ fn mine_noun_moments(
         }
     }
     println!("eval: §3.1 — {} registry+store-grounded noun candidates (pre-idiosyncrasy)", cands.len());
+
+    // Phase transition: the detector (small fast model) is done; the idiosyncrasy bare-probe uses the
+    // heavy compile/judge model. On a single-GPU host release the detect model first, then warm the
+    // compile model, so they don't thrash VRAM (the Run-14 contention finding).
+    if use_llm_detect && detect_spec.model != compile_spec.model {
+        unpin_ollama_model(&detect_spec, ollama_base_url, ollama_api_key);
+    }
+    warm_ollama_model(compile_spec, ollama_base_url, ollama_api_key);
 
     // Pass 2 (LLM): idiosyncrasy filter — bare model answers "in this project what is N?". If the
     // judge says the bare answer already CONTAINS the store's grounding → model already knows it →
@@ -603,20 +729,43 @@ fn call_with_retry(
 fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
     if spec.provider != crate::provider::Provider::Ollama { return; }
     let url = format!("{}/api/chat", base.trim_end_matches('/'));
+    // FINITE keep_alive (not -1): long enough to survive the phase, but self-expiring so a killed
+    // run cannot leave a PERMANENT pin that starves the next run's model on a single-GPU host
+    // (Run-14 finding: a stale keep_alive=-1 pin from an aborted run poisoned later runs).
+    let keep = std::env::var("PC_RUN13_KEEPALIVE").unwrap_or_else(|_| "20m".to_string());
     let body = serde_json::json!({
         "model": spec.model,
         "messages": [{"role": "user", "content": "ok"}],
         "stream": false,
-        "keep_alive": -1,
+        "keep_alive": keep,
     });
     let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120)).build() { Ok(c) => c, Err(_) => return };
+        .timeout(std::time::Duration::from_secs(180)).build() { Ok(c) => c, Err(_) => return };
     let mut req = client.post(&url).json(&body);
     if let Some(k) = key { if !k.is_empty() { req = req.bearer_auth(k); } }
     match req.send() {
-        Ok(_) => println!("eval: warmed + pinned Ollama model {} (keep_alive=-1)", spec.model),
+        Ok(_) => println!("eval: warmed Ollama model {} (keep_alive={})", spec.model, keep),
         Err(_) => {}
     }
+}
+
+/// Release an Ollama model from VRAM (keep_alive=0) so the next phase's model isn't starved on a
+/// single-GPU host. No-op for non-Ollama; best-effort.
+fn unpin_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
+    if spec.provider != crate::provider::Provider::Ollama { return; }
+    let url = format!("{}/api/chat", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": spec.model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "stream": false,
+        "keep_alive": 0,
+    });
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60)).build() { Ok(c) => c, Err(_) => return };
+    let mut req = client.post(&url).json(&body);
+    if let Some(k) = key { if !k.is_empty() { req = req.bearer_auth(k); } }
+    let _ = req.send();
+    println!("eval: released Ollama model {} (keep_alive=0)", spec.model);
 }
 
 // ═══════════════════════════ §2 — arms + §3.2 grounding judge ═══════════════════════════
@@ -754,7 +903,7 @@ fn judge_def(briefing: &str, name: &str, spec: &crate::provider::ModelSpec, api_
         partial — the briefing alludes to the noun but does not clearly define it\n\
         absent  — the briefing does not define the noun. Output ONLY the word.";
     let user = format!("NOUN: {}\n\nBRIEFING:\n{}\n\nVerdict:", name, briefing.chars().take(1400).collect::<String>());
-    match crate::capture::call_model_blocking(spec, api_key, base, key, system, &user) {
+    match call_with_retry(spec, api_key, base, key, system, &user) {
         Ok(r) => { let r = r.trim().to_lowercase();
             if r.contains("present") { "present".into() } else if r.contains("partial") { "partial".into() } else { "absent".into() } }
         Err(_) => "absent".into(),
@@ -771,7 +920,7 @@ fn judge_facts(briefing: &str, name: &str, gt: &str, spec: &crate::provider::Mod
         absent    — the briefing conveys none of the facts. Output ONLY the word.";
     let user = format!("NOUN: {}\n\nGROUND-TRUTH FACTS:\n- {}\n\nBRIEFING:\n{}\n\nVerdict:",
         name, gt.chars().take(700).collect::<String>(), briefing.chars().take(1200).collect::<String>());
-    match crate::capture::call_model_blocking(spec, api_key, base, key, system, &user) {
+    match call_with_retry(spec, api_key, base, key, system, &user) {
         Ok(r) => { let r = r.trim().to_lowercase();
             if r.contains("contained") { "contained".into() } else if r.contains("partial") { "partial".into() } else { "absent".into() } }
         Err(_) => "absent".into(),
@@ -790,7 +939,7 @@ fn judge_correct(briefing: &str, name: &str, gt: &str, spec: &crate::provider::M
         wrong   — the briefing asserts something clearly contradicting the ground truth. Output ONLY the word.";
     let user = format!("NOUN: {}\n\nGROUND TRUTH:\n- {}\n\nBRIEFING:\n{}\n\nVerdict:",
         name, gt.chars().take(700).collect::<String>(), briefing.chars().take(1200).collect::<String>());
-    match crate::capture::call_model_blocking(spec, api_key, base, key, system, &user) {
+    match call_with_retry(spec, api_key, base, key, system, &user) {
         Ok(r) => { let r = r.trim().to_lowercase();
             if r.contains("wrong") { "wrong".into() } else if r.contains("drift") { "drift".into() } else { "correct".into() } }
         Err(_) => "correct".into(),
@@ -1095,12 +1244,12 @@ fn report(
         let confirmed = (a2_prim >= b0_prim + 15.0) && conc && (a2_wrong <= 10.0) && p1_ok && predict_ok;
         let rejected = (a2_prim - b0_prim <= 5.0) || !conc || (a2_wrong > 10.0) || !p1_ok;
         if confirmed {
-            println!("  VERDICT: CONFIRMED (wallet) — A2 beats B0 by ≥15pt on load-bearing nouns, G-correct clean,");
-            println!("           no P1 regression, predict not reduced. (Run 14 pc must replicate to ship.)");
+            println!("  VERDICT: CONFIRMED ({corpus}) — A2 beats B0 by ≥15pt on load-bearing nouns, G-correct clean,");
+            println!("           no P1 regression, predict not reduced.");
         } else if rejected {
-            println!("  VERDICT: REJECTED (wallet) — A2 fails the pre-registered bars (decorative attention).");
+            println!("  VERDICT: REJECTED ({corpus}) — A2 fails the pre-registered bars (decorative attention).");
         } else {
-            println!("  VERDICT: INCONCLUSIVE (wallet) — A2 in the 5–15pt grey zone; not CONFIRMED, not REJECTED.");
+            println!("  VERDICT: INCONCLUSIVE ({corpus}) — A2 in the 5–15pt grey zone; not CONFIRMED, not REJECTED.");
         }
     }
 
@@ -1189,7 +1338,7 @@ mod tests {
             session: "s".into(), turn: "t".into(), bare_answer: "a".into(),
             bare_verdict: "absent".into(), load_bearing: true, ground_truth_facts: vec![],
         }];
-        let canaries = vec!["publish-engine", "marmot-protocol", "outbox resolver"];
+        let canaries: Vec<String> = ["publish-engine", "marmot-protocol", "outbox resolver"].iter().map(|s| s.to_string()).collect();
         let mined = canary_moment_slugs(&canaries, &moments);
         assert!(mined.contains("publish-engine"));
         assert!(!mined.contains("marmot-protocol"));
@@ -1201,8 +1350,10 @@ mod tests {
     #[test]
     fn seeded_canaries_known_corpora() {
         // Corrected wallet canaries (cfv3 = nostr-multi-platform app), all registry-grounded guides.
+        std::env::remove_var("PC_RUN13_CANARIES");
         assert_eq!(seeded_canaries("wallet"), vec!["publish-engine", "marmot-protocol", "outbox-resolver", "nmp-signers"]);
-        assert_eq!(seeded_canaries("pc"), vec!["claim tap", "episode card", "select stage"]);
+        // pc / cfv6 snapshot canaries (grounded + idiosyncratic infra guides in that snapshot).
+        assert_eq!(seeded_canaries("pc"), vec!["capture-pipeline", "context-injection", "reranking"]);
         assert!(seeded_canaries("other").is_empty());
     }
 

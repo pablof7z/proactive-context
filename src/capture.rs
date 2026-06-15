@@ -239,7 +239,13 @@ pub(crate) fn call_model_blocking_with_timeout(
 
                 let text = resp.text().unwrap_or_default();
                 let snippet = text[..text.len().min(300)].to_string();
-                let transient = status.as_u16() == 429 || status.is_server_error();
+                // An Ollama 404 "model not found" is transient under shared-host load: the model was
+                // evicted by a peer and needs a reload — retrying (with backoff) recovers it rather
+                // than bailing and emitting a 0%/absent artifact. Other 4xx stay hard failures.
+                let ollama_evicted = is_ollama
+                    && status.as_u16() == 404
+                    && snippet.to_lowercase().contains("not found");
+                let transient = status.as_u16() == 429 || status.is_server_error() || ollama_evicted;
                 if !transient || attempt == MAX_ATTEMPTS {
                     anyhow::bail!("{} error {}: {}", spec.provider_name(), status, snippet);
                 }
@@ -259,10 +265,11 @@ pub(crate) fn call_model_blocking_with_timeout(
         }
 
         eprintln!(
-            "capture: {} call failed (attempt {}/{}), retrying…",
+            "capture: {} call failed (attempt {}/{}: {}), retrying…",
             spec.provider_name(),
             attempt,
-            MAX_ATTEMPTS
+            MAX_ATTEMPTS,
+            last_err.as_ref().map(|e| e.to_string()).unwrap_or_default().chars().take(160).collect::<String>(),
         );
         std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
     }
