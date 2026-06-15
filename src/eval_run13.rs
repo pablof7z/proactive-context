@@ -71,12 +71,13 @@ fn seeded_canaries(corpus_label: &str) -> Vec<String> {
         "wallet" => vec!["publish-engine", "marmot-protocol", "outbox-resolver", "nmp-signers"],
         // pc / cfv6 snapshot. The "ideal" pc canaries (episode-cards, claim-log,
         // terminal-state-inversion, cross-guide-supersession, triage-gate) postdate the cfv6 wiki
-        // snapshot (20 early infra guides — verified: those concepts are absent from its guides AND
-        // claims), so they are NOT registry-grounded HERE. Use canaries that ARE grounded guides in
-        // cfv6 AND are pc-idiosyncratic (a bare model won't know them in THIS project's sense):
-        // capture-pipeline, context-injection, compile-pipeline, reranking, embedding-pipeline.
-        // (Override with PC_RUN13_CANARIES="a,b,c" if running against a richer pc snapshot.)
-        "pc" => vec!["capture-pipeline", "context-injection", "compile-pipeline", "reranking", "embedding-pipeline"],
+        // snapshot (20 early infra guides — verified absent from its guides AND claims), so they are
+        // NOT registry-grounded HERE. These three ARE grounded guides in cfv6 AND verified
+        // pc-idiosyncratic (bare model = absent on the run): capture-pipeline, context-injection,
+        // reranking. (compile-pipeline and embedding-pipeline were dropped — the bare model judged
+        // them `contained`, i.e. NOT idiosyncratic, so they fail the canary's purpose.) Override with
+        // PC_RUN13_CANARIES="a,b,c" for a richer pc snapshot.
+        "pc" => vec!["capture-pipeline", "context-injection", "reranking"],
         _ => vec![],
     };
     base.into_iter().map(String::from).collect()
@@ -1351,8 +1352,8 @@ mod tests {
         // Corrected wallet canaries (cfv3 = nostr-multi-platform app), all registry-grounded guides.
         std::env::remove_var("PC_RUN13_CANARIES");
         assert_eq!(seeded_canaries("wallet"), vec!["publish-engine", "marmot-protocol", "outbox-resolver", "nmp-signers"]);
-        // pc / cfv6 snapshot canaries (grounded infra guides in that snapshot).
-        assert_eq!(seeded_canaries("pc"), vec!["capture-pipeline", "context-injection", "compile-pipeline", "reranking", "embedding-pipeline"]);
+        // pc / cfv6 snapshot canaries (grounded + idiosyncratic infra guides in that snapshot).
+        assert_eq!(seeded_canaries("pc"), vec!["capture-pipeline", "context-injection", "reranking"]);
         assert!(seeded_canaries("other").is_empty());
     }
 
