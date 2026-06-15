@@ -275,6 +275,14 @@ enum Commands {
         harness: String,
     },
 
+    /// Hook adapter commands called by agent harnesses.
+    /// Reads the harness's hook JSON from stdin.
+    /// Use `pc hook --help` to list subcommands.
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+
     /// Detect local agent harnesses (Claude Code, Codex, opencode, Hermes, TENEX)
     /// and wire pc's inject/capture hooks into each. With no flags, shows an
     /// interactive checklist of detected harnesses to install.
@@ -426,6 +434,43 @@ enum Commands {
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Distill lessons from a completed session transcript.
+    /// SessionEnd hook: runs immediately. Stop hook: use `--in 45` for debounced capture.
+    Capture {
+        /// Debounce capture instead of running immediately (Stop hook).
+        #[arg(long, value_name = "SECS")]
+        r#in: Option<u64>,
+        #[arg(long, hide = true)]
+        deferred: Option<String>,
+        /// Harness whose hook invoked this (claude | codex | hermes | tenex | opencode).
+        #[arg(long, default_value = "claude")]
+        harness: String,
+    },
+    /// Compile a relevance-filtered briefing (UserPromptSubmit hook).
+    Inject {
+        /// Show a systemMessage with hits, guides read, and the generated briefing.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Harness whose hook invoked this (claude | codex | hermes | tenex | opencode).
+        #[arg(long, default_value = "claude")]
+        harness: String,
+    },
+    /// Inject open questions from the previous session (SessionStart hook).
+    SessionStart {
+        /// Harness whose hook invoked this (accepted for uniform invocation; behavior is identical).
+        #[arg(long, default_value = "claude")]
+        harness: String,
+    },
+    /// Render a one-line status bar indicator (statusLine.command).
+    Statusline {
+        /// Append context-window usage % (green <70, yellow 70–89, red ≥90).
+        #[arg(long)]
+        with_context: bool,
     },
 }
 
@@ -677,6 +722,27 @@ fn main() -> Result<()> {
         Commands::Inject { verbose, harness } => {
             crate::inject::run_inject(verbose, &harness)?;
         }
+
+        Commands::Hook { action } => match action {
+            HookAction::Capture { r#in, deferred, harness } => {
+                if let Some(session_id) = deferred {
+                    crate::capture::run_deferred_capture(&session_id)?;
+                } else if let Some(secs) = r#in {
+                    crate::capture::run_capture_scheduled(secs, &harness)?;
+                } else {
+                    crate::capture::run_capture(&harness)?;
+                }
+            }
+            HookAction::Inject { verbose, harness } => {
+                crate::inject::run_inject(verbose, &harness)?;
+            }
+            HookAction::SessionStart { harness: _ } => {
+                crate::session_start::run_session_start()?;
+            }
+            HookAction::Statusline { with_context } => {
+                crate::statusline::run_statusline(with_context);
+            }
+        },
 
 
         Commands::Statusline { with_context } => {

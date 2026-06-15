@@ -75,7 +75,7 @@ pub enum InstallStrategy {
     FileDrop,
 }
 
-/// One hook to register: harness event → `pc <args> --harness <id>`.
+/// One hook to register: harness event → `pc hook <args> --harness <id>`.
 pub struct Wiring {
     pub event: &'static str,
     pub args: &'static str,
@@ -106,28 +106,26 @@ pub struct HarnessSpec {
 // ─── The registry: the ONE place harnesses are listed ─────────────────────────
 
 const CLAUDE_WIRINGS: &[Wiring] = &[
-    Wiring { event: "UserPromptSubmit", args: "inject", matcher: None, timeout: 30 },
-    Wiring { event: "SessionStart", args: "session_start", matcher: None, timeout: 10 },
-    Wiring { event: "SessionEnd", args: "capture", matcher: None, timeout: 10 },
-    Wiring { event: "Stop", args: "capture --in 45", matcher: None, timeout: 10 },
-    Wiring { event: "PostToolUse", args: "awareness --hook PostToolUse", matcher: Some(".*"), timeout: 10 },
+    Wiring { event: "UserPromptSubmit", args: "hook inject", matcher: None, timeout: 30 },
+    Wiring { event: "SessionStart", args: "hook session-start", matcher: None, timeout: 10 },
+    Wiring { event: "SessionEnd", args: "hook capture", matcher: None, timeout: 10 },
+    Wiring { event: "Stop", args: "hook capture --in 45", matcher: None, timeout: 10 },
 ];
 
 const CODEX_WIRINGS: &[Wiring] = &[
-    Wiring { event: "UserPromptSubmit", args: "inject", matcher: None, timeout: 30 },
-    Wiring { event: "SessionStart", args: "session_start", matcher: Some("startup|resume"), timeout: 10 },
-    Wiring { event: "Stop", args: "capture --in 45", matcher: None, timeout: 10 },
-    Wiring { event: "PostToolUse", args: "awareness --hook PostToolUse", matcher: Some(".*"), timeout: 10 },
+    Wiring { event: "UserPromptSubmit", args: "hook inject", matcher: None, timeout: 30 },
+    Wiring { event: "SessionStart", args: "hook session-start", matcher: Some("startup|resume"), timeout: 10 },
+    Wiring { event: "Stop", args: "hook capture --in 45", matcher: None, timeout: 10 },
 ];
 
 const HERMES_WIRINGS: &[Wiring] = &[
-    Wiring { event: "pre_llm_call", args: "inject", matcher: None, timeout: 30 },
-    Wiring { event: "on_session_end", args: "capture", matcher: None, timeout: 10 },
+    Wiring { event: "pre_llm_call", args: "hook inject", matcher: None, timeout: 30 },
+    Wiring { event: "on_session_end", args: "hook capture", matcher: None, timeout: 10 },
 ];
 
 const TENEX_WIRINGS: &[Wiring] = &[
-    Wiring { event: "UserPromptSubmit", args: "inject", matcher: None, timeout: 30 },
-    Wiring { event: "Stop", args: "capture --in 45", matcher: None, timeout: 10 },
+    Wiring { event: "UserPromptSubmit", args: "hook inject", matcher: None, timeout: 30 },
+    Wiring { event: "Stop", args: "hook capture --in 45", matcher: None, timeout: 10 },
 ];
 
 /// Every harness pc knows how to integrate with. To add one, append a spec here.

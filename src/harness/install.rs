@@ -246,7 +246,7 @@ fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<
     if spec.statusline {
         root.as_object_mut().unwrap().insert(
             "statusLine".into(),
-            serde_json::json!({ "type": "command", "command": format!("{} statusline", bin_prefix) }),
+            serde_json::json!({ "type": "command", "command": format!("{} hook statusline", bin_prefix) }),
         );
     }
 
