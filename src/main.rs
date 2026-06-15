@@ -18,6 +18,7 @@ mod eval_run9;
 mod eval_run10;
 mod eval_run11;
 mod merged_recognition;
+mod nouns;
 mod session_start;
 mod chunker;
 mod config;
