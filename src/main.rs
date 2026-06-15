@@ -492,6 +492,12 @@ enum DebugAction {
         /// A sample prompt to run first-mention detection + primer composition against.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
+
+        /// Run the C1 definitional recognition pass on this transcript (LLM-backed) and print
+        /// the transcript-cited definitions it would persist. Off the experiment critical path;
+        /// for inspecting the deferred definitional-EXTRACT bucket.
+        #[arg(long, value_name = "FILE")]
+        transcript: Option<PathBuf>,
     },
 }
 
@@ -726,10 +732,22 @@ fn main() -> Result<()> {
             DebugAction::Triage { transcript, wiki_dir, no_wiki } => {
                 crate::capture::run_debug_triage(&transcript, wiki_dir.as_deref(), no_wiki)?;
             }
-            DebugAction::Nouns { wiki_dir, prompt } => {
+            DebugAction::Nouns { wiki_dir, prompt, transcript } => {
                 let wiki = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
                 let proj_dir = project_context_dir(&root);
                 crate::nouns::run_debug_nouns(&wiki, &proj_dir, prompt.as_deref())?;
+                if let Some(t) = transcript {
+                    println!("\n=== C1 definitional recognition (LLM) on {} ===", t.display());
+                    let entries = crate::nouns::recognize_definitions(&t.to_string_lossy())?;
+                    if entries.is_empty() {
+                        println!("  (no transcript-cited definitions recognized)");
+                    } else {
+                        for e in &entries {
+                            println!("  {} [{}] {}", e.slug, e.origin, crate::nouns::truncate_for_display(&e.definition, 90));
+                            println!("       cites: {}", e.source_refs.join(", "));
+                        }
+                    }
+                }
             }
         },
 

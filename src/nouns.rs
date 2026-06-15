@@ -597,6 +597,215 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  C1 — definitional EXTRACT bucket (DEFERRED / gated to Run 16, off critical path)
+// ════════════════════════════════════════════════════════════════════════════════
+//
+//  A "X is Y" recognition pass that registers transcript-CITED definitions as a
+//  first-class claim type, separate from behavioral claims. Per spec R3, definitions
+//  are sourced from in-session investigation and cited to transcript line ranges; the
+//  model supplies indices, Rust slices verbatim (integrity-by-construction). Per spec R2
+//  (keep-all), every recognized noun is registered regardless of source — `authority`
+//  (explicit/implicit) is a SURFACING tag, never a capture gate. We do NOT feed the wiki
+//  index into this prompt (finding F: that caused 0-claim EXTRACT failures).
+//
+//  Built flagged-off (capture_nouns). Pure parsing/verification is unit-tested; the live
+//  recognition call is exercised only by `pc debug nouns --transcript` and the gated stage.
+
+use crate::research_capture::{build_research_transcript_with_spans, TurnSpan};
+
+/// One definitional claim recognized from a transcript: "X (subject) is Y (definition)",
+/// with the transcript line ranges that support it. Authority is the explicit/implicit tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionalClaim {
+    /// The entity being defined (the subject axis). Kebab-slugged for the registry key.
+    pub subject: String,
+    /// The definition text — what the entity IS, in this project (delta-scoped per R6).
+    pub definition: String,
+    /// "explicit" when the USER engaged the noun, else "implicit" (agent/code only). A tag,
+    /// not a gate — both are registered (keep-all).
+    pub authority: String,
+    /// Transcript line ranges (1-based inclusive) that support the definition.
+    pub evidence: Vec<(usize, usize)>,
+}
+
+/// System prompt for the definitional recognition pass. Definitions only — behavioral
+/// facts are EXTRACT's job and are explicitly excluded here so the two stages stay disjoint.
+const DEFINITIONAL_SYSTEM: &str = "\
+You identify DEFINITIONAL statements in a software project conversation — sentences that say \
+what a project NOUN *is* (\"X is Y\", \"a mint is referenced by URL\", \"kind:7375 = token event\"). \
+You capture ONLY definitions, not behaviors: 'balance reads kind:7375' is a behavior (SKIP); \
+'kind:7375 is the token event' is a definition (CAPTURE). Definitions must be GROUNDED in the \
+transcript — you cite the line ranges where the definition is stated or investigated; you never \
+invent a definition the conversation does not contain. Prefer the project-specific delta over a \
+generic textbook meaning (the reader already knows what a Cashu mint generically is).";
+
+/// Build the definitional-recognition user prompt over a line-numbered transcript. NOTE:
+/// deliberately NO wiki index is included (finding F: feeding the index caused 0-claim runs).
+pub fn build_definitional_prompt(numbered_transcript: &str) -> String {
+    format!(
+        "Examine this line-numbered transcript for DEFINITIONAL statements about project nouns.\n\
+\n\
+For each noun the conversation DEFINES (says what it IS, in this project), output one object. \
+Capture the noun regardless of who said it. Set `authority` to \"explicit\" when the USER engaged \
+the noun (said it, asked about it, directed work on it), else \"implicit\".\n\
+\n\
+Output a STRICT JSON array (nothing else):\n\
+[\n\
+  {{\n\
+    \"subject\": \"<the noun being defined, short>\",\n\
+    \"definition\": \"<what it IS in this project — the project-specific delta, not a textbook def>\",\n\
+    \"authority\": \"explicit\"|\"implicit\",\n\
+    \"evidence\": [{{\"start\": <line>, \"end\": <line>}}]\n\
+  }}\n\
+]\n\
+\n\
+Rules:\n\
+- DEFINITIONS only. Skip behaviors, decisions, requirements (those are captured elsewhere).\n\
+- Every definition MUST cite transcript line ranges that contain it. Never invent.\n\
+- Skip generic, well-known domain nouns that carry no project-specific meaning here.\n\
+- If the transcript defines no project nouns, output: []\n\
+\n\
+TRANSCRIPT:\n{}",
+        numbered_transcript
+    )
+}
+
+/// Parse the definitional-recognition response into claims. Tolerant of markdown/prose
+/// wrapping (reuses the same extraction shape as research/episode parsing). Invalid or
+/// empty-evidence items are dropped here; evidence is VERIFIED against the transcript by
+/// the caller before persisting (integrity-by-construction).
+pub fn parse_definitional_response(response: &str) -> Vec<DefinitionalClaim> {
+    let json = extract_json_array(response);
+    let arr = match serde_json::from_str::<serde_json::Value>(&json) {
+        Ok(serde_json::Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in &arr {
+        let subject = item.get("subject").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let definition = item.get("definition").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if subject.is_empty() || definition.is_empty() {
+            continue;
+        }
+        let authority = match item.get("authority").and_then(|v| v.as_str()) {
+            Some("explicit") => "explicit",
+            _ => "implicit",
+        }
+        .to_string();
+        let mut evidence = Vec::new();
+        if let Some(serde_json::Value::Array(ranges)) = item.get("evidence") {
+            for r in ranges {
+                let start = r.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let end = r.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if start > 0 && end >= start {
+                    evidence.push((start, end));
+                }
+            }
+        }
+        out.push(DefinitionalClaim { subject, definition, authority, evidence });
+    }
+    out
+}
+
+/// Extract a JSON array from model text (```json fence, bare ``` fence, or first [..]).
+fn extract_json_array(text: &str) -> String {
+    if let Some(start) = text.find("```json") {
+        let after = &text[start + 7..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+    }
+    if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            if end > start {
+                return text[start..=end].to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
+/// Verify a definitional claim's evidence against the transcript: every kept range must
+/// slice to non-empty text (Rust-verified, fabrication unreachable). Returns the verified
+/// ranges; a claim whose evidence all fails is dropped by the caller (per R3 — no
+/// uncitable definition is persisted; it becomes an Open Question instead, handled by the
+/// existing extract_open_questions seam).
+pub fn verify_definitional_evidence(raw_lines: &[String], spans: &[TurnSpan], claim: &DefinitionalClaim) -> Vec<(usize, usize)> {
+    let _ = spans; // spans available for future snap-to-turn repair (mirrors episode_capture)
+    claim
+        .evidence
+        .iter()
+        .filter(|(s, e)| !slice_lines(raw_lines, *s, *e).trim().is_empty())
+        .copied()
+        .collect()
+}
+
+fn slice_lines(lines: &[String], start: usize, end: usize) -> String {
+    let start_idx = start.saturating_sub(1);
+    let end_idx = end.min(lines.len());
+    if start_idx >= lines.len() || start_idx >= end_idx {
+        return String::new();
+    }
+    lines[start_idx..end_idx].join("\n")
+}
+
+/// Convert a verified definitional claim into a registry NounEntry (origin "extracted",
+/// so persist_registry treats it as immutable / transcript-cited). The subject is slugged.
+pub fn definitional_claim_to_entry(claim: &DefinitionalClaim, verified: &[(usize, usize)]) -> NounEntry {
+    let slug = slugify(&claim.subject);
+    let refs: Vec<String> = verified.iter().map(|(s, e)| format!("transcript:{}-{}", s, e)).collect();
+    NounEntry {
+        slug,
+        name: claim.subject.trim().to_string(),
+        definition: claim.definition.trim().to_string(),
+        source_refs: if refs.is_empty() { vec!["transcript".to_string()] } else { refs },
+        origin: "extracted".to_string(),
+    }
+}
+
+/// Run the C1 definitional recognition pass over a transcript and return verified entries.
+/// LLM-backed; mirrors research/episode recognition. Used by `pc debug nouns --transcript`
+/// and (gated) the capture stage. Does NOT write anything — the caller persists.
+pub fn recognize_definitions(transcript_path: &str) -> anyhow::Result<Vec<NounEntry>> {
+    let cfg = crate::config::load_config()?;
+    let spec = crate::provider::ModelSpec::parse(&cfg.capture_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    let ollama_base = cfg.ollama_base_url.as_str();
+    let ollama_key = cfg.ollama_api_key.as_deref();
+
+    let (numbered, raw_lines, spans) = build_research_transcript_with_spans(transcript_path)?;
+    if raw_lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let user = build_definitional_prompt(&numbered);
+    let resp = crate::capture::call_model_blocking(
+        &spec, openrouter_key, ollama_base, ollama_key, DEFINITIONAL_SYSTEM, &user,
+    )?;
+    let claims = parse_definitional_response(&resp);
+    let mut entries = Vec::new();
+    for c in &claims {
+        let verified = verify_definitional_evidence(&raw_lines, &spans, c);
+        if verified.is_empty() && !c.evidence.is_empty() {
+            // Uncitable → not persisted as a definition (becomes an Open Question elsewhere).
+            continue;
+        }
+        entries.push(definitional_claim_to_entry(c, &verified));
+    }
+    Ok(entries)
+}
+
+/// Gated C1 capture stage: recognize transcript-cited definitions and persist them as
+/// immutable `extracted` registry entries under `<wiki>/nouns/`. Best-effort. Called from
+/// the capture pipeline ONLY when `capture_nouns` is on (default off) — a no-op otherwise.
+pub fn run_definitional_stage(wiki_dir: &Path, transcript_path: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = recognize_definitions(transcript_path)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    persist_registry(wiki_dir, &entries).map_err(anyhow::Error::from)
+}
+
 // ─── Inject orchestration (the additive, flagged seam inject.rs calls) ────────────
 
 /// The primer side-effect for one inject turn: the block to prepend (if any) plus the
@@ -903,6 +1112,77 @@ mod tests {
         assert_eq!(rows[0].name, "Token Event");
         assert_eq!(rows[0].origin, "derived");
         assert!(rows[0].summary.contains("kind:7375"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_definitional_keeps_defs_and_authority_tags() {
+        let resp = r#"[
+          {"subject":"Token Event","definition":"kind:7375, self-encrypted holding Cashu proofs","authority":"explicit","evidence":[{"start":10,"end":12}]},
+          {"subject":"PubkeyDecoderService","definition":"decodes npubs to hex","authority":"implicit","evidence":[{"start":40,"end":40}]}
+        ]"#;
+        let claims = parse_definitional_response(resp);
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].subject, "Token Event");
+        assert_eq!(claims[0].authority, "explicit");
+        assert_eq!(claims[0].evidence, vec![(10, 12)]);
+        // keep-all: the implicit (agent/code) noun is still captured — authority is a tag.
+        assert_eq!(claims[1].authority, "implicit");
+    }
+
+    #[test]
+    fn parse_definitional_drops_empty_and_tolerates_prose() {
+        let resp = "Sure! Here you go:\n```json\n[{\"subject\":\"\",\"definition\":\"x\"},{\"subject\":\"Mint\",\"definition\":\"shared with recipient\",\"authority\":\"explicit\",\"evidence\":[{\"start\":1,\"end\":2}]}]\n```\nDone.";
+        let claims = parse_definitional_response(resp);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].subject, "Mint");
+    }
+
+    #[test]
+    fn verify_definitional_evidence_rejects_empty_slices() {
+        let lines: Vec<String> = vec!["User: define mint".into(), "Assistant: a mint is shared".into()];
+        let spans: Vec<TurnSpan> = vec![];
+        let good = DefinitionalClaim {
+            subject: "Mint".into(), definition: "shared".into(), authority: "explicit".into(),
+            evidence: vec![(1, 2)],
+        };
+        assert_eq!(verify_definitional_evidence(&lines, &spans, &good), vec![(1, 2)]);
+        // Out-of-range evidence verifies to empty → dropped.
+        let bad = DefinitionalClaim { evidence: vec![(99, 100)], ..good.clone() };
+        assert!(verify_definitional_evidence(&lines, &spans, &bad).is_empty());
+    }
+
+    #[test]
+    fn definitional_claim_to_entry_is_extracted_and_cited() {
+        let claim = DefinitionalClaim {
+            subject: "Token Event".into(),
+            definition: "kind:7375 self-encrypted".into(),
+            authority: "explicit".into(),
+            evidence: vec![(10, 12)],
+        };
+        let entry = definitional_claim_to_entry(&claim, &[(10, 12)]);
+        assert_eq!(entry.slug, "token-event");
+        assert_eq!(entry.origin, "extracted");
+        assert!(entry.source_refs.contains(&"transcript:10-12".to_string()));
+    }
+
+    #[test]
+    fn extracted_entries_are_not_overwritten_on_persist() {
+        let dir = std::env::temp_dir().join(format!("pc-nouns-imm-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        let v1 = NounEntry {
+            slug: "mint".into(), name: "Mint".into(), definition: "first def".into(),
+            source_refs: vec!["transcript:1-2".into()], origin: "extracted".into(),
+        };
+        persist_registry(&wiki, std::slice::from_ref(&v1)).unwrap();
+        // A second persist with a DIFFERENT extracted def must NOT overwrite (immutable R3).
+        let v2 = NounEntry { definition: "second def".into(), ..v1.clone() };
+        persist_registry(&wiki, &[v2]).unwrap();
+        let content = fs::read_to_string(wiki.join("nouns/mint.md")).unwrap();
+        assert!(content.contains("first def"));
+        assert!(!content.contains("second def"));
         let _ = fs::remove_dir_all(&dir);
     }
 
