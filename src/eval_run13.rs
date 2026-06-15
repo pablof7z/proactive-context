@@ -523,6 +523,16 @@ fn mine_noun_moments(
     let mut seen_slugs: HashSet<String> = HashSet::new();
 
     let use_llm_detect = std::env::var("PC_RUN13_LLM_DETECT").map(|v| v != "0").unwrap_or(true);
+    // The detector is a CHEAP classification (turn → JSON array of catalog indices) — an easy task a
+    // small fast local model handles well, unlike the single-word grounding JUDGE. Use a dedicated
+    // PC_RUN13_DETECT_MODEL (e.g. ollama:nmp-arch:latest) so mining isn't bottlenecked by the heavy
+    // 26B judge; defaults to the generative/compile model when unset.
+    let detect_spec = std::env::var("PC_RUN13_DETECT_MODEL").ok()
+        .map(|s| crate::provider::ModelSpec::parse(&s))
+        .unwrap_or_else(|| compile_spec.clone());
+    if use_llm_detect {
+        warm_ollama_model(&detect_spec, ollama_base_url, ollama_api_key);
+    }
     // Catalog for the LLM detector: stable index → (slug). Only nouns the store can ground are
     // offered (so a detector hit is groundable by construction); built once.
     let catalog: Vec<&NounEntry> = registry.iter().filter(|e| {
@@ -534,7 +544,8 @@ fn mine_noun_moments(
     let turn_cap = std::env::var("PC_RUN13_DETECT_TURN_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400usize);
     let mut turns_scanned = 0usize;
     if use_llm_detect {
-        println!("eval: §3.1 — LLM reference detector ON ({} groundable registry nouns offered; turn_cap={})", catalog.len(), turn_cap);
+        println!("eval: §3.1 — LLM reference detector ON (model={}, {} groundable nouns, turn_cap={})",
+            detect_spec.model, catalog.len(), turn_cap);
     } else {
         println!("eval: §3.1 — whole-token matcher (LLM detector OFF)");
     }
@@ -563,7 +574,7 @@ fn mine_noun_moments(
                 if turns_scanned % 10 == 0 {
                     println!("eval:   §3.1 detector scanned {} human turns → {} candidates so far", turns_scanned, cands.len());
                 }
-                detect_referenced_nouns(t, &catalog, &catalog_text, compile_spec, api_key, ollama_base_url, ollama_api_key)
+                detect_referenced_nouns(t, &catalog, &catalog_text, &detect_spec, api_key, ollama_base_url, ollama_api_key)
             } else {
                 let mut v: Vec<String> = Vec::new();
                 let primed: HashSet<String> = seen_slugs.clone();
