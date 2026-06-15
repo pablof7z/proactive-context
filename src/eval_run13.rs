@@ -32,7 +32,6 @@
 //! is fully $0. The judge is `--judge-model`. All LLM calls are within-run (design P4).
 
 use crate::eval::{judge_briefing, strip_injected_context, is_pc_self_referential, Label};
-use crate::eval_run7::inject_claims;
 use crate::eval_run8::{predict, judge_prediction, Correction};
 use crate::nouns::{
     build_registry_from_disk, compose_primer, slugify, truncate_for_display, NounEntry,
@@ -471,6 +470,66 @@ fn mine_noun_moments(
     Ok(moments)
 }
 
+/// B0 claims briefing for the eval, compiled via the PROVEN `/api/chat` path
+/// (`call_model_blocking`) instead of inject.rs's rig-based `compile_briefing_pub`, which 404s
+/// for some local Ollama model tags (e.g. `gemma4:26b-mlx`). Faithful to "B0 = existing claims
+/// briefing path": it reuses the same public retrieval (`retrieve_top_clusters`) + edge-aware
+/// render (`render_clusters_with_edges`) and a librarian compile preamble; only the transport
+/// differs, keeping the $0-Ollama run valid. Returns `(briefing)`; an error/empty store yields a
+/// `(...)`-style placeholder the judges treat as absent (same contract as inject_claims).
+#[allow(clippy::too_many_arguments)]
+fn b0_claims_briefing(
+    prompt: &str, claims_dir: &Path,
+    compile_spec: &crate::provider::ModelSpec,
+    api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
+) -> String {
+    if !claims_dir.exists() { return "(no claims store built)".into(); }
+    let mut embedder = match crate::embed::build_embedder(cfg) {
+        Ok(e) => e, Err(e) => return format!("(embedder error: {})", e),
+    };
+    let clusters = match crate::claims::retrieve_top_clusters(claims_dir, embedder.as_mut(), prompt, cfg.inject_max_guides) {
+        Ok(c) => c, Err(e) => return format!("(retrieval error: {})", e),
+    };
+    if clusters.is_empty() { return "(no claims retrieved)".into(); }
+    let tau = std::env::var("PC_CLAIMS_SUPERSEDE_TAU").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.55);
+    let rendered = crate::claims::render_clusters_with_edges(&clusters, claims_dir, embedder.as_mut(), tau);
+    // Librarian compile: surface facts relevant to the prompt, no analysis (mirrors inject's intent).
+    let system = "You are a context compiler for an AI coding assistant. Given a developer's QUERY \
+        and SOURCE NOTES (atomic project facts), surface ONLY the notes relevant to the query as a \
+        terse factual briefing. Do not answer the query, hypothesize, or summarize — just relay the \
+        relevant facts. If nothing is relevant, say so in one line.";
+    let user = format!("QUERY:\n{}\n\nSOURCE NOTES:\n{}\n\nRelevant facts:",
+        prompt.chars().take(cfg.inject_query_char_cap).collect::<String>(),
+        rendered.chars().take(8000).collect::<String>());
+    call_with_retry(compile_spec, api_key, ollama_base_url, ollama_api_key, system, &user)
+        .unwrap_or_else(|e| format!("(compile error: {})", e))
+}
+
+/// Call the model, retrying transient Ollama 404s (model evicted under concurrent shared-Ollama
+/// load — a real hazard when peer agents load other models). Up to 3 attempts with a short backoff.
+/// Non-404 errors are returned immediately (no point retrying a real failure).
+fn call_with_retry(
+    spec: &crate::provider::ModelSpec, api_key: &str, base: &str, key: Option<&str>,
+    system: &str, user: &str,
+) -> anyhow::Result<String> {
+    let mut last = anyhow::anyhow!("no attempt");
+    for attempt in 0..3 {
+        match crate::capture::call_model_blocking(spec, api_key, base, key, system, user) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let es = e.to_string();
+                if es.contains("404") || es.to_lowercase().contains("not found") {
+                    std::thread::sleep(std::time::Duration::from_millis(1500 * (attempt + 1)));
+                    last = e;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last)
+}
+
 // ═══════════════════════════ §2 — arms + §3.2 grounding judge ═══════════════════════════
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -507,7 +566,7 @@ fn score_arms(
 
     for (i, m) in moments.iter().enumerate() {
         // B0 = the existing claims briefing for THIS prompt (Run-7/8 Store B), NO primer.
-        let (b0_brief, _, _, _) = inject_claims(&m.turn, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
+        let b0_brief = b0_claims_briefing(&m.turn, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
 
         // Compose the primer arms. We own fact/intent retrieval (foundation note): facts =
         // prompt-filtered ground-truth about N; intent = "what the user said to do with N" = the
@@ -689,7 +748,7 @@ fn score_predict_ridealong(
     let mut rows = Vec::with_capacity(verified.len());
     for (i, c) in verified.iter().enumerate() {
         let retrieval_query = format!("{}\n\nWhat will the user most likely want changed or corrected here?", c.context_before);
-        let (b0_brief, _, _, _) = inject_claims(&retrieval_query, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
+        let b0_brief = b0_claims_briefing(&retrieval_query, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
 
         // A2 = B0 + primer for any registry noun first-mentioned in the pre-correction context.
         let primed = std::collections::HashSet::new();
@@ -745,7 +804,7 @@ fn score_p1_ridealong(
     let cap = std::env::var("PC_RUN13_P1_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(labels.len());
     let mut rows = Vec::with_capacity(labels.len().min(cap));
     for (i, label) in labels.iter().take(cap).enumerate() {
-        let (b0_brief, _, _, _) = inject_claims(&label.future_prompt, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
+        let b0_brief = b0_claims_briefing(&label.future_prompt, store_b_claims, compile_spec, api_key, ollama_base_url, ollama_api_key, cfg);
         let primed = std::collections::HashSet::new();
         let hits = crate::nouns::detect_first_mentions(registry, &label.future_prompt, "", &primed);
         let inputs: Vec<PrimerInput> = hits.iter().map(|e| PrimerInput {
@@ -755,6 +814,9 @@ fn score_p1_ridealong(
         let primer = compose_primer(&inputs, PrimerLevel::Facts);
         let a2_brief = prepend_primer(primer.as_deref(), &b0_brief);
 
+        if std::env::var("PC_RUN13_DEBUG").is_ok() {
+            eprintln!("eval:   [dbg] P1 {} B0_brief_len={} head={:?}", i + 1, b0_brief.len(), b0_brief.chars().take(80).collect::<String>());
+        }
         let v_b0 = judge_briefing(&b0_brief, &label.restated_fact, judge_spec, api_key, ollama_base_url, ollama_api_key);
         let v_a2 = judge_briefing(&a2_brief, &label.restated_fact, judge_spec, api_key, ollama_base_url, ollama_api_key);
         println!("eval:   P1 {}/{} B0={} A2={}", i + 1, labels.len().min(cap), v_b0, v_a2);
