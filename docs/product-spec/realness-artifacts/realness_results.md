@@ -14,12 +14,14 @@ Gold distribution: {"neutral": 18, "real": 12, "rejected": 4}
 
 ## Results table
 
-| approach | AUC | rej-prec | recovery | flip% | LLM calls | drops | ~tokens |
-|---|---|---|---|---|---|---|---|
-| A signed-delta ledger | 0.979 | 1.000 | ✅ | 0% | 22 | 0 | 21051 |
-| B holistic re-judgment | 1.000 | 1.000 | ✅ | 9% | 35 | 0 | 31417 |
-| C lifecycle state-machine | 0.958 | 1.000 | ✅ | 3% | 22 | 0 | 21051 |
-| frequency baseline | 0.500 | 0.800 | ✅ | 0% | 0 | 0 | 0 |
+| approach | AUC | reject-prec | promotion-prec | real-recall | recovery | flip% | LLM calls | ~tokens | promoted (real/neut/rej) |
+|---|---|---|---|---|---|---|---|---|---|
+| A signed-delta ledger | 1.000 | 1.000 | 1.000 | 0.333 | ✅ | 3% | 22 | 21000 | 4/0/0 |
+| B holistic re-judgment | 1.000 | 1.000 | 0.588 | 0.833 | ✅ | 15% | 34 | 30477 | 10/7/0 |
+| C lifecycle state-machine | 1.000 | 1.000 | 1.000 | 0.250 | ✅ | 32% | 22 | 21000 | 3/0/0 |
+| frequency baseline | 0.500 | 0.800 | 0.800 | 0.333 | ✅ | 0% | 0 | 0 | 4/0/1 |
+
+*promotion-precision* = of the nouns an approach would prime, the fraction that are genuinely gold-REAL (the over-priming / pasted-snippet-noise guard). *reject-precision* only counts confabulations; promotion-precision also penalizes priming NEUTRAL noise.
 
 Frequency-baseline AUC = **0.500** (the LLM approaches must beat this by ≥ 0.10).
 
@@ -27,28 +29,34 @@ Frequency-baseline AUC = **0.500** (the LLM approaches must beat this by ≥ 0.1
 
 ### A signed-delta ledger
 
-- Separation (AUC ≥ 0.85 and ≥ freq+0.10): **PASS** (0.979 vs freq 0.500)
+- Separation (AUC ≥ 0.85 and ≥ freq+0.10): **PASS** (1.000 vs freq 0.500)
 - Reject-precision ≥ 0.90: **PASS** (1.000; 0 confabulation(s) promoted of 4 promoted)
+- Promotion-precision ≥ 0.90 (no priming of non-real noise): **PASS** (1.000; 0 neutral noise promoted)
+- Real-recall: 0.333 (4 of the gold-real nouns promoted)
 - Recovery: **PASS**
-- Determinism (≤ 10% flip): **PASS** (0%)
+- Determinism (≤ 10% flip): **PASS** (3%)
 
 ### B holistic re-judgment
 
 - Separation (AUC ≥ 0.85 and ≥ freq+0.10): **PASS** (1.000 vs freq 0.500)
-- Reject-precision ≥ 0.90: **PASS** (1.000; 0 confabulation(s) promoted of 20 promoted)
+- Reject-precision ≥ 0.90: **PASS** (1.000; 0 confabulation(s) promoted of 17 promoted)
+- Promotion-precision ≥ 0.90 (no priming of non-real noise): **FAIL** (0.588; 7 neutral noise promoted)
+- Real-recall: 0.833 (10 of the gold-real nouns promoted)
 - Recovery: **PASS**
-- Determinism (≤ 10% flip): **PASS** (9%)
+- Determinism (≤ 10% flip): **FAIL** (15%)
 
 ### C lifecycle state-machine
 
-- Separation (AUC ≥ 0.85 and ≥ freq+0.10): **PASS** (0.958 vs freq 0.500)
+- Separation (AUC ≥ 0.85 and ≥ freq+0.10): **PASS** (1.000 vs freq 0.500)
 - Reject-precision ≥ 0.90: **PASS** (1.000; 0 confabulation(s) promoted of 3 promoted)
+- Promotion-precision ≥ 0.90 (no priming of non-real noise): **PASS** (1.000; 0 neutral noise promoted)
+- Real-recall: 0.250 (3 of the gold-real nouns promoted)
 - Recovery: **PASS**
-- Determinism (≤ 10% flip): **PASS** (3%)
+- Determinism (≤ 10% flip): **FAIL** (32%)
 
 ## Winner
 
-**B holistic re-judgment** — best REAL-vs-REJECTED separation (AUC 1.000) while holding reject-precision 1.000 (≥ 0.90) and recovery ✅ at 35 LLM call(s)/run. Determinism flip 9%.
+**A signed-delta ledger** — best separation (AUC 1.000) among approaches that clear EVERY gate: reject-precision 1.000 AND promotion-precision 1.000 (≥ 0.90; never primes confabulations OR neutral noise), determinism 3% flip (≤ 10%), recovery ✅, at 22 LLM call(s)/run.
 
 ## Per-noun verdicts (run 0)
 
@@ -57,34 +65,34 @@ Frequency-baseline AUC = **0.500** (the LLM approaches must beat this by ≥ 0.1
 | fabric-provider | rejected | -6 Suppressed | -1.00 rejected | rejected (-2) | 3 real |
 | SyncOrchestrator | rejected | -4 Suppressed | -1.00 rejected | rejected (-2) | 2 below |
 | RetryDaemon | rejected | -2 Suppressed | -1.00 rejected | rejected (-2) | 1 below |
-| episode cards | real | 3 Real | +0.80 real | real (2) | 6 real |
+| episode cards | real | 3 Real | +0.90 real | real (2) | 6 real |
 | context injection | real | 3 Real | +1.00 real | real (2) | 3 real |
 | capture pipeline | real | 3 Real | +1.00 real | real (2) | 3 real |
 | vector database | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 2 below |
 | archeologist feature | real | 3 Real | +1.00 real | dormant (-1) | 3 real |
-| kind:1 | neutral | 1 Provisional | +0.90 real | provisional (1) | 2 below |
+| kind:1 | neutral | 2 Provisional | +0.85 real | provisional (1) | 2 below |
 | pc archeologist | real | 2 Provisional | +1.00 real | provisional (1) | 2 below |
-| Configuration Location | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
+| Configuration Location | neutral | 0 Provisional | -1.00 rejected | candidate (0) | 1 below |
 | Hugging Face | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
 | John Vervaeke | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
-| Modular NostrClient | neutral | 1 Provisional | +0.50 real | provisional (1) | 1 below |
-| NIP-60 | neutral | 1 Provisional | +0.60 real | provisional (1) | 1 below |
-| NIP-61 | neutral | 1 Provisional | +0.00 neutral | provisional (1) | 1 below |
-| NostrClient | neutral | 1 Provisional | +0.60 real | provisional (1) | 1 below |
-| Project Wiki | real | 1 Provisional | +0.80 real | provisional (1) | 1 below |
+| Modular NostrClient | neutral | 0 Provisional | +0.10 neutral | candidate (0) | 1 below |
+| NIP-60 | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
+| NIP-61 | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
+| NostrClient | neutral | 0 Provisional | +0.20 neutral | candidate (0) | 1 below |
+| Project Wiki | real | 1 Provisional | +0.70 real | provisional (1) | 1 below |
 | Security Model | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
-| TUI Client | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
+| TUI Client | neutral | 1 Provisional | +0.00 neutral | provisional (1) | 1 below |
 | encode_ask | neutral | 0 Provisional | +0.80 real | candidate (0) | 1 below |
-| handle_thread_event | neutral | 0 Provisional | +0.60 real | candidate (0) | 1 below |
-| is_tool_use | neutral | 0 Provisional | +0.60 real | candidate (0) | 1 below |
+| handle_thread_event | neutral | 0 Provisional | +0.80 real | candidate (0) | 1 below |
+| is_tool_use | neutral | 0 Provisional | +0.75 real | candidate (0) | 1 below |
 | pc autodoc | rejected | -2 Suppressed | -1.00 rejected | rejected (-2) | 1 below |
 | pc capture | real | 1 Provisional | +0.80 real | provisional (1) | 1 below |
-| pc debug extract --all | neutral | 1 Provisional | +0.85 real | provisional (1) | 1 below |
-| pc debug transcript --all | neutral | 1 Provisional | +0.90 real | provisional (1) | 1 below |
-| proactive-context | real | 1 Provisional | +0.90 real | provisional (1) | 1 below |
+| pc debug extract --all | neutral | 1 Provisional | +1.00 real | provisional (1) | 1 below |
+| pc debug transcript --all | neutral | 1 Provisional | +1.00 real | provisional (1) | 1 below |
+| proactive-context | real | 1 Provisional | +1.00 real | provisional (1) | 1 below |
 | proactive-context archeologist | real | 1 Provisional | +0.10 neutral | provisional (1) | 1 below |
-| proactive-context tail | real | 1 Provisional | +1.00 real | provisional (1) | 1 below |
+| proactive-context tail | real | 1 Provisional | +0.90 real | provisional (1) | 1 below |
 | q_tags | neutral | 0 Provisional | +0.00 neutral | candidate (0) | 1 below |
-| tenex-edge proposal | real | 1 Provisional | +0.85 real | provisional (1) | 1 below |
-| tool_name | neutral | 0 Provisional | +0.80 real | candidate (0) | 1 below |
-| wiki-tidy | real | -2 Suppressed | -0.70 rejected | rejected (-2) | 1 below |
+| tenex-edge proposal | real | 1 Provisional | +0.80 real | provisional (1) | 1 below |
+| tool_name | neutral | 0 Provisional | +0.90 real | candidate (0) | 1 below |
+| wiki-tidy | real | 0 Provisional | -0.60 rejected | candidate (0) | 1 below |
