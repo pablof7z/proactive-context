@@ -728,18 +728,22 @@ fn call_with_retry(
 fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
     if spec.provider != crate::provider::Provider::Ollama { return; }
     let url = format!("{}/api/chat", base.trim_end_matches('/'));
+    // FINITE keep_alive (not -1): long enough to survive the phase, but self-expiring so a killed
+    // run cannot leave a PERMANENT pin that starves the next run's model on a single-GPU host
+    // (Run-14 finding: a stale keep_alive=-1 pin from an aborted run poisoned later runs).
+    let keep = std::env::var("PC_RUN13_KEEPALIVE").unwrap_or_else(|_| "20m".to_string());
     let body = serde_json::json!({
         "model": spec.model,
         "messages": [{"role": "user", "content": "ok"}],
         "stream": false,
-        "keep_alive": -1,
+        "keep_alive": keep,
     });
     let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120)).build() { Ok(c) => c, Err(_) => return };
+        .timeout(std::time::Duration::from_secs(180)).build() { Ok(c) => c, Err(_) => return };
     let mut req = client.post(&url).json(&body);
     if let Some(k) = key { if !k.is_empty() { req = req.bearer_auth(k); } }
     match req.send() {
-        Ok(_) => println!("eval: warmed + pinned Ollama model {} (keep_alive=-1)", spec.model),
+        Ok(_) => println!("eval: warmed Ollama model {} (keep_alive={})", spec.model, keep),
         Err(_) => {}
     }
 }
