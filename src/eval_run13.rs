@@ -669,7 +669,7 @@ fn mine_noun_moments(
 /// differs, keeping the $0-Ollama run valid. Returns `(briefing)`; an error/empty store yields a
 /// `(...)`-style placeholder the judges treat as absent (same contract as inject_claims).
 #[allow(clippy::too_many_arguments)]
-fn b0_claims_briefing(
+pub(crate) fn b0_claims_briefing(
     prompt: &str, claims_dir: &Path,
     compile_spec: &crate::provider::ModelSpec,
     api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>, cfg: &crate::config::Config,
@@ -699,7 +699,7 @@ fn b0_claims_briefing(
 /// Call the model, retrying transient Ollama 404s (model evicted under concurrent shared-Ollama
 /// load — a real hazard when peer agents load other models). Up to 3 attempts with a short backoff.
 /// Non-404 errors are returned immediately (no point retrying a real failure).
-fn call_with_retry(
+pub(crate) fn call_with_retry(
     spec: &crate::provider::ModelSpec, api_key: &str, base: &str, key: Option<&str>,
     system: &str, user: &str,
 ) -> anyhow::Result<String> {
@@ -726,7 +726,7 @@ fn call_with_retry(
 
 /// Warm an Ollama model and pin it resident (`keep_alive: -1`) to survive peer-agent contention on
 /// a shared host. No-op for non-Ollama specs; best-effort (swallows all errors).
-fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
+pub(crate) fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
     if spec.provider != crate::provider::Provider::Ollama { return; }
     let url = format!("{}/api/chat", base.trim_end_matches('/'));
     // FINITE keep_alive (not -1): long enough to survive the phase, but self-expiring so a killed
@@ -751,7 +751,7 @@ fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<
 
 /// Release an Ollama model from VRAM (keep_alive=0) so the next phase's model isn't starved on a
 /// single-GPU host. No-op for non-Ollama; best-effort.
-fn unpin_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
+pub(crate) fn unpin_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
     if spec.provider != crate::provider::Provider::Ollama { return; }
     let url = format!("{}/api/chat", base.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -783,11 +783,11 @@ struct ArmRow {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
-struct ArmVerdict {
-    g_def: String,     // present | partial | absent
-    g_facts: String,   // contained | partial | absent
-    g_correct: String, // correct | drift | wrong
-    primary: bool,
+pub(crate) struct ArmVerdict {
+    pub(crate) g_def: String,     // present | partial | absent
+    pub(crate) g_facts: String,   // contained | partial | absent
+    pub(crate) g_correct: String, // correct | drift | wrong
+    pub(crate) primary: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -871,7 +871,7 @@ fn user_intent_for(turn: &str, _name: &str) -> String {
 }
 
 /// Prepend a primer block to the B0 briefing (placement HELD CONSTANT — a separate leading block).
-fn prepend_primer(primer: Option<&str>, b0: &str) -> String {
+pub(crate) fn prepend_primer(primer: Option<&str>, b0: &str) -> String {
     match primer {
         Some(p) if !p.trim().is_empty() => format!("{}\n\n{}", p, b0),
         _ => b0.to_string(),
@@ -879,7 +879,7 @@ fn prepend_primer(primer: Option<&str>, b0: &str) -> String {
 }
 
 /// §3.2 — three separate grounding judge calls for one briefing against one noun-moment.
-fn grounding_judge(
+pub(crate) fn grounding_judge(
     briefing: &str, m: &NounMoment,
     judge_spec: &crate::provider::ModelSpec, api_key: &str, ollama_base_url: &str, ollama_api_key: Option<&str>,
 ) -> ArmVerdict {

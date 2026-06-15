@@ -20,6 +20,7 @@ mod eval_run10;
 mod eval_run11;
 mod eval_realness;
 mod eval_run13;
+mod eval_run15;
 mod eval_t0;
 mod merged_recognition;
 mod nouns;
@@ -404,6 +405,14 @@ enum Commands {
         /// the population for curation with PC_REALNESS_MINE=1. $0 Ollama (glm cloud, think-ON).
         #[arg(long)]
         realness: bool,
+
+        /// Run 15 (realness-gated noun-primer verdict): re-runs the noun-grounding probe on the
+        /// USER-STANCE population (mined from user turns → alias-normalized → Approach-A realness
+        /// gate), REPLACING the rejected guide-title population. Reports real-recall before/after
+        /// alias, the user-real vs guide-title contrast, and B0 vs realness-primer grounding.
+        /// pc/cfv6 ONLY. $0 Ollama (glm cloud, think-ON).
+        #[arg(long)]
+        run15: bool,
 
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
@@ -901,6 +910,7 @@ fn main() -> Result<()> {
             run13,
             t0,
             realness,
+            run15,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -918,6 +928,7 @@ fn main() -> Result<()> {
                 run13,
                 t0,
                 realness,
+                run15,
                 judge_model,
             })?;
         }

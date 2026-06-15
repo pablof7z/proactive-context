@@ -37,6 +37,7 @@ pub struct EvalArgs {
     pub run13: bool,
     pub t0: bool,
     pub realness: bool,
+    pub run15: bool,
     pub judge_model: Option<String>,
 }
 
@@ -167,6 +168,11 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
     if args.realness {
         let cfg = load_config().unwrap_or_default();
         return crate::eval_realness::run_realness(&exp_dir, &cfg);
+    }
+
+    if args.run15 {
+        let cfg = load_config().unwrap_or_default();
+        return crate::eval_run15::run_run15(&exp_dir, &project_key, &cfg);
     }
 
     if args.run13 {
