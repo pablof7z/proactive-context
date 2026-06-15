@@ -91,6 +91,12 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
     );
     let store_repr_lower = store_repr.to_lowercase();
 
+    // Warm the local model and ask Ollama to keep it resident (keep_alive=-1) so it is not evicted
+    // mid-run by peer agents sharing the host — the eviction that 404s briefings/judges on $0-local.
+    // Best-effort; ignored for non-Ollama specs and on any error.
+    warm_ollama_model(&compile_spec, &ollama_base_url, ok);
+    if judge_spec.model != compile_spec.model { warm_ollama_model(&judge_spec, &ollama_base_url, ok); }
+
     // ───────────────────────── §3.1 — C3 registry (zero re-capture) ─────────────────────────
     let registry = build_registry_from_disk(&store_a_wiki, &store_b_claims);
     println!("eval: C3 registry: {} nouns derived from existing wiki+claims (zero re-capture)", registry.len());
@@ -513,13 +519,16 @@ fn call_with_retry(
     system: &str, user: &str,
 ) -> anyhow::Result<String> {
     let mut last = anyhow::anyhow!("no attempt");
-    for attempt in 0..3 {
+    // Heavy MLX models reload slowly (10–20s for a 16GB model) after eviction under shared-Ollama
+    // load, so back off generously: 5 attempts, linear 4s→20s.
+    let attempts: u32 = std::env::var("PC_RUN13_RETRY").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    for attempt in 0..attempts {
         match crate::capture::call_model_blocking(spec, api_key, base, key, system, user) {
             Ok(r) => return Ok(r),
             Err(e) => {
                 let es = e.to_string();
                 if es.contains("404") || es.to_lowercase().contains("not found") {
-                    std::thread::sleep(std::time::Duration::from_millis(1500 * (attempt + 1)));
+                    std::thread::sleep(std::time::Duration::from_secs(4 * (attempt as u64 + 1)));
                     last = e;
                     continue;
                 }
@@ -528,6 +537,27 @@ fn call_with_retry(
         }
     }
     Err(last)
+}
+
+/// Warm an Ollama model and pin it resident (`keep_alive: -1`) to survive peer-agent contention on
+/// a shared host. No-op for non-Ollama specs; best-effort (swallows all errors).
+fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
+    if spec.provider != crate::provider::Provider::Ollama { return; }
+    let url = format!("{}/api/chat", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": spec.model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "stream": false,
+        "keep_alive": -1,
+    });
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120)).build() { Ok(c) => c, Err(_) => return };
+    let mut req = client.post(&url).json(&body);
+    if let Some(k) = key { if !k.is_empty() { req = req.bearer_auth(k); } }
+    match req.send() {
+        Ok(_) => println!("eval: warmed + pinned Ollama model {} (keep_alive=-1)", spec.model),
+        Err(_) => {}
+    }
 }
 
 // ═══════════════════════════ §2 — arms + §3.2 grounding judge ═══════════════════════════
