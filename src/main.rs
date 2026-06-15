@@ -19,6 +19,7 @@ mod eval_run10;
 mod eval_run11;
 mod eval_realness;
 mod eval_run13;
+mod eval_prompt_variant;
 mod eval_t0;
 mod merged_recognition;
 mod nouns;
@@ -407,6 +408,14 @@ enum Commands {
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
         judge_model: Option<String>,
+
+        /// Prompt-variant A/B arm: run ONE single-variable prompt variant within-run against the
+        /// existing instruments. Accepts spec ids or aliases: I0/librarian, I1/verdict,
+        /// I2/divergence, S1/select-verdict, C0/base, C1/typed, C2/terminal. Sets the matching
+        /// PC_COMPILE_VARIANT / PC_SELECT_VARIANT / PC_EXTRACT_VARIANT toggle, validates the seeded
+        /// canary fixtures, and dispatches the Run-13 instrument bundle. Reuses --experiment-dir.
+        #[arg(long, value_name = "ARM")]
+        prompt_variant: Option<String>,
     },
 }
 
@@ -901,6 +910,7 @@ fn main() -> Result<()> {
             t0,
             realness,
             judge_model,
+            prompt_variant,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
                 project,
@@ -918,6 +928,7 @@ fn main() -> Result<()> {
                 t0,
                 realness,
                 judge_model,
+                prompt_variant,
             })?;
         }
 
