@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
+mod alias;
 mod archeologist;
 mod tenex;
 mod codex;
