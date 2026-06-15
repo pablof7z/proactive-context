@@ -36,17 +36,30 @@ use std::path::{Path, PathBuf};
 
 // ─── Feature flag ──────────────────────────────────────────────────────────────
 
-/// True when the noun layer's INJECT side should run. The capture side is gated by the
-/// `capture_nouns` config flag at its call site; the inject side honors the same config
-/// flag OR the `PC_NOUNS` env override (so the experiment harness can flip it on without
-/// editing config). Default OFF.
+/// True when the noun layer's INJECT side should run. Default ON (Run-14: ship the primer
+/// default-on at level `facts`). The `PC_NOUNS` env override takes precedence in BOTH
+/// directions — `PC_NOUNS=0|false|off` is the clean off-switch (inject output then
+/// byte-identical to the pre-primer pipeline); `PC_NOUNS=1|true|on` forces it on regardless
+/// of config. Absent any env override, the caller's `config_flag` (`inject_noun_primer`,
+/// default true) decides. NOTE: this gates only INJECT; the C1 capture stage is gated
+/// separately by `capture_nouns` (default off, deferred).
 pub fn nouns_inject_enabled(config_flag: bool) -> bool {
-    if config_flag {
-        return true;
+    nouns_inject_enabled_with(config_flag, std::env::var("PC_NOUNS").ok().as_deref())
+}
+
+/// Pure core of `nouns_inject_enabled` (env value injected) so the precedence logic is unit-
+/// testable without racing the process-global environment.
+fn nouns_inject_enabled_with(config_flag: bool, env: Option<&str>) -> bool {
+    if let Some(v) = env {
+        let v = v.trim();
+        if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+            return false;
+        }
+        if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
+            return true;
+        }
     }
-    std::env::var("PC_NOUNS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    config_flag
 }
 
 // ─── Primer content level (the experiment's content seam — I2) ──────────────────
@@ -502,8 +515,8 @@ pub fn record_primed(project_dir: &Path, session_id: &str, slugs: &[String]) {
 /// Detect which registry nouns are referenced for the FIRST time this session.
 ///
 /// A noun is a first-mention candidate when:
-///   1. it is referenced in the CURRENT prompt (matched on name OR deslug(slug),
-///      whole-word, case-insensitive), AND
+///   1. it is referenced in the CURRENT prompt (see `noun_referenced_in` — whole-phrase
+///      high-confidence match PLUS a precision-leaning alias-token recall extension), AND
 ///   2. it is NOT in the recent-turns text (already in the live transcript — not "first"),
 ///      AND
 ///   3. it has not already been primed this session (the primed-ledger).
@@ -523,19 +536,82 @@ pub fn detect_first_mentions<'a>(
         if already_primed.contains(&e.slug) {
             continue;
         }
-        // Match on the human name and the deslugged slug (so `token-event` matches "token event").
-        let needle_name = e.name.to_lowercase();
-        let needle_slug = deslug(&e.slug).to_lowercase();
-        let in_prompt = contains_phrase(&prompt_l, &needle_name) || contains_phrase(&prompt_l, &needle_slug);
-        if !in_prompt {
+        if !noun_referenced_in(&prompt_l, &e.name, &e.slug) {
             continue;
         }
-        // Already in the recent transcript → not a first mention.
-        let in_recent = contains_phrase(&recent_l, &needle_name) || contains_phrase(&recent_l, &needle_slug);
-        if in_recent {
+        // Already in the recent transcript → not a first mention. The SAME (broader) matcher
+        // is used here so a noun discussed under informal phrasing earlier still suppresses
+        // (suppression leaning = precision: we'd rather skip a prime than re-prime).
+        if noun_referenced_in(&recent_l, &e.name, &e.slug) {
             continue;
         }
         out.push(e);
+    }
+    out
+}
+
+/// Generic component tokens too common to safely prime on alone — they recur across many
+/// project nouns ("pipeline", "model", "state", …), so a multi-token noun is NEVER matched by
+/// one of these in isolation. Precision guard for the alias-token recall path.
+const GENERIC_NOUN_TOKENS: &[&str] = &[
+    "pipeline", "model", "models", "state", "system", "systems", "service", "services",
+    "manager", "config", "context", "layer", "layers", "data", "store", "stores", "engine",
+    "module", "modules", "handler", "client", "server", "stage", "stages", "phase", "phases",
+    "core", "base", "default", "value", "values", "object", "objects", "record", "records",
+    "entry", "entries", "index", "node", "nodes", "graph", "table", "field", "fields", "type",
+    "types", "view", "views", "mode", "modes", "flag", "flags", "file", "files", "logic",
+];
+
+/// True when `prompt_l` (already lowercase) references the noun. Two layered paths:
+///   - HIGH-CONFIDENCE (whole phrase): the full display name OR the deslugged slug appears as a
+///     token-bounded phrase — the original Run-13 behavior, kept exactly.
+///   - RECALL EXTENSION (alias tokens): for a MULTI-token noun, any single DISTINCTIVE token of
+///     its name/slug appears as a whole token. This fires on natural human phrasing the strict
+///     whole-phrase matcher misses — "diagnostics" → `ffi-pipeline-diagnostics`, "cards" →
+///     `episode-cards` — while leaning precision: generic/short tokens never fire alone, and a
+///     single-token noun (e.g. `mint`) only matches via the whole-token high-confidence path.
+fn noun_referenced_in(prompt_l: &str, name: &str, slug: &str) -> bool {
+    let needle_name = name.to_lowercase();
+    let needle_slug = deslug(slug).to_lowercase();
+    if contains_phrase(prompt_l, &needle_name) || contains_phrase(prompt_l, &needle_slug) {
+        return true;
+    }
+    for tok in distinctive_tokens(name, slug) {
+        if contains_phrase(prompt_l, &tok) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The distinctive component tokens of a noun usable for alias recall: the kebab tokens of its
+/// slug ∪ the slugified tokens of its display name, keeping only those that are ≥5 chars, purely
+/// alphabetic (so numeric atoms like `7375`/`60` never alias-fire), and not in
+/// `GENERIC_NOUN_TOKENS`. Returns EMPTY for a single-token noun — such a noun must match as a
+/// whole token (handled by the high-confidence path), never on a fragment. Pure — unit-tested.
+fn distinctive_tokens(name: &str, slug: &str) -> Vec<String> {
+    let mut all: Vec<String> = slug
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    for w in slugify(name).split('-').filter(|p| !p.is_empty()) {
+        all.push(w.to_string());
+    }
+    // Single-token noun → no alias tokens (whole-token match only).
+    let distinct: std::collections::HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+    if distinct.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for t in all {
+        if t.len() >= 5
+            && t.chars().all(|c| c.is_ascii_alphabetic())
+            && !GENERIC_NOUN_TOKENS.contains(&t.as_str())
+            && !out.contains(&t)
+        {
+            out.push(t);
+        }
     }
     out
 }
@@ -608,16 +684,180 @@ pub struct PrimerInput {
     pub user_intent: String,
 }
 
-impl PrimerInput {
-    /// Build a PrimerInput from a registry entry with no extra facts/intent (def-level seed).
-    pub fn from_entry(e: &NounEntry) -> Self {
-        PrimerInput {
-            name: e.name.clone(),
-            definition: e.definition.clone(),
-            prompt_filtered_facts: String::new(),
-            user_intent: String::new(),
+// ─── Fact retrieval for the Facts-level primer (the validated A2 content, LLM-FREE) ──────
+
+/// Gather a noun's backing text from its `source_refs` — the substance the prompt-relevant
+/// facts are mined from. LLM-FREE, disk-only (a handful of small guide reads per primed noun):
+///   - `guide:<slug>`   → the body of that wiki guide.
+///   - `topic:<slug>`   → the bodies of the guides grouped under that topic (the constituents).
+///   - `claim-subject`  → the assertions of claims whose subject slugifies to this noun.
+/// The noun's own `definition` is always included. Returns the concatenated text (one item per
+/// line, list/heading markers preserved for the fact splitter). Pure over its inputs.
+fn noun_store_repr(
+    entry: &NounEntry,
+    wiki_dir: &Path,
+    index_rows: &[IndexRow],
+    claim_subjects: &[(String, String)],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !entry.definition.trim().is_empty() {
+        parts.push(entry.definition.trim().to_string());
+    }
+    let mut push_guide_body = |slug: &str, parts: &mut Vec<String>| {
+        if let Some(guide) = crate::wiki::load_guide(&crate::wiki::guide_path(wiki_dir, slug)) {
+            parts.push(guide.body);
+        }
+    };
+    for r in &entry.source_refs {
+        if let Some(slug) = r.strip_prefix("guide:") {
+            push_guide_body(slug, &mut parts);
+        } else if let Some(topic_slug) = r.strip_prefix("topic:") {
+            for row in index_rows {
+                if slugify(row.topic.trim()) == topic_slug && row.slug != topic_slug {
+                    push_guide_body(&row.slug, &mut parts);
+                }
+            }
+        } else if r == "claim-subject" {
+            for (subject, assertion) in claim_subjects {
+                if slugify(subject) == entry.slug && !assertion.trim().is_empty() {
+                    parts.push(assertion.trim().to_string());
+                }
+            }
         }
     }
+    parts.join("\n")
+}
+
+/// Extract the candidate fact lines about a noun from its backing text: lines that MENTION the
+/// noun by display name or deslugged slug, list/heading markers stripped, deduped, capped. This
+/// is the production twin of `eval_run13::ground_truth_for_noun` (the validated A2 fact set),
+/// kept here as the inject-canonical version. Pure — unit-tested.
+fn noun_fact_lines(name: &str, slug: &str, store_repr: &str, max: usize) -> Vec<String> {
+    let needle_name = name.to_lowercase();
+    let needle_slug = deslug(slug).to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for line in store_repr.lines() {
+        let l = line.trim();
+        if l.len() < 12 {
+            continue;
+        }
+        // Skip markdown headings — they are section/title labels, not facts (and the guide's own
+        // `# <Title>` heading would otherwise leak in as a content-free "fact" that just echoes
+        // the noun name).
+        if l.starts_with('#') {
+            continue;
+        }
+        let ll = l.to_lowercase();
+        if ll.contains(&needle_name) || (needle_slug.len() >= 3 && ll.contains(&needle_slug)) {
+            let clean = l
+                .trim_start_matches(|c| c == '-' || c == '*' || c == '>' || c == ' ')
+                .to_string();
+            // Drop a line that is just the noun name echoed back (no actual fact content).
+            let cl = clean.to_lowercase();
+            if cl == needle_name || cl == needle_slug {
+                continue;
+            }
+            if clean.len() >= 12 && !out.iter().any(|x: &String| x == &clean) {
+                out.push(clean);
+                if out.len() >= max {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Keep the `max` facts whose content-word overlap with the prompt is highest, joined with " • ".
+/// Mirrors the validated A2 `prompt_filtered_facts`: ties keep original (source) order, and with
+/// no overlap it still returns the leading facts (the noun's backing text is on-topic by
+/// construction — it was first-mentioned in this prompt). Pure — unit-tested.
+fn filter_facts_by_prompt(prompt: &str, facts: &[String], max: usize) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    let pwords: std::collections::HashSet<String> = prompt
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() >= 4)
+        .map(|w| w.to_string())
+        .collect();
+    let mut scored: Vec<(usize, usize, &String)> = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let overlap = f
+                .to_lowercase()
+                .split_whitespace()
+                .filter(|w| pwords.contains(*w))
+                .count();
+            (overlap, i, f)
+        })
+        .collect();
+    // Highest overlap first; stable on original index for ties.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Truncate, then dedup near-identical facts (the same claim often appears in both a guide and
+    // its topic constituents) before taking the top `max`.
+    let mut picked: Vec<String> = Vec::new();
+    for (_, _, f) in scored {
+        let t: String = f.chars().take(220).collect();
+        if !picked.iter().any(|p| p == &t) {
+            picked.push(t);
+            if picked.len() >= max {
+                break;
+            }
+        }
+    }
+    picked.join(" \u{2022} ")
+}
+
+/// The prompt-relevant facts about a noun for the `Facts`-level primer — the validated A2 content,
+/// produced WITHOUT any LLM call: gather the noun's backing text (`noun_store_repr`), take the
+/// lines mentioning the noun (`noun_fact_lines`), and keep the few most prompt-overlapping
+/// (`filter_facts_by_prompt`). Empty when the noun has no backing text.
+pub fn prompt_relevant_facts(
+    entry: &NounEntry,
+    prompt: &str,
+    wiki_dir: &Path,
+    index_rows: &[IndexRow],
+    claim_subjects: &[(String, String)],
+) -> String {
+    let repr = noun_store_repr(entry, wiki_dir, index_rows, claim_subjects);
+    if repr.trim().is_empty() {
+        return String::new();
+    }
+    let facts = noun_fact_lines(&entry.name, &entry.slug, &repr, 8);
+    filter_facts_by_prompt(prompt, &facts, 3)
+}
+
+/// Assemble the per-noun `PrimerInput`s for a set of first-mentioned nouns at `level`. At the
+/// `Facts`/`Intent` levels each noun's facts slot is filled by `prompt_relevant_facts`
+/// (LLM-free); at `Definition` level facts are skipped. `user_intent` is left empty — session
+/// intent is caller-owned (the experiment fills it; the production default arm is `Facts`).
+/// Shared by `build_inject_primer` and `run_debug_nouns` so the dry-run shows the real primer.
+fn compose_primer_inputs(
+    hits: &[&NounEntry],
+    prompt: &str,
+    level: PrimerLevel,
+    wiki_dir: &Path,
+    index_rows: &[IndexRow],
+    claim_subjects: &[(String, String)],
+) -> Vec<PrimerInput> {
+    hits.iter()
+        .map(|e| {
+            let facts = if matches!(level, PrimerLevel::Facts | PrimerLevel::Intent) {
+                prompt_relevant_facts(e, prompt, wiki_dir, index_rows, claim_subjects)
+            } else {
+                String::new()
+            };
+            PrimerInput {
+                name: e.name.clone(),
+                definition: e.definition.clone(),
+                prompt_filtered_facts: facts,
+                user_intent: String::new(),
+            }
+        })
+        .collect()
 }
 
 // ─── Slug / phrase helpers ──────────────────────────────────────────────────────
@@ -903,19 +1143,22 @@ pub struct PrimerResult {
     pub level: PrimerLevel,
 }
 
+/// Max nouns primed in a single inject turn. A wrong prime spends attention (a missed one is
+/// cheap), so a pathological prompt that brushes many registry nouns is bounded — we prime the
+/// first few in registry order rather than flooding the briefing.
+const MAX_PRIME_PER_TURN: usize = 6;
+
 /// Build the first-mention primer for one inject turn — the single entry point inject.rs
-/// calls. Fully self-contained and flagged: when `config_flag`/`PC_NOUNS` is off this is a
-/// cheap no-op returning an empty result, so inject behavior is byte-identical.
+/// calls. Fully self-contained and flagged: when the flag/`PC_NOUNS` is off this is a cheap
+/// no-op returning an empty result, so inject behavior is byte-identical.
 ///
-/// Steps: derive the C3 registry from disk → read the per-session primed-ledger →
-/// detect first-mentioned nouns in `prompt` (not already in `recent`, not already primed)
-/// → compose the primer at `PC_PRIMER_LEVEL`. The composer's fact/intent slots are filled
-/// from the registry definition only here (a clean, retrieval-free default); the experiment
-/// can supply richer `PrimerInput`s by calling `detect_first_mentions` + `compose_primer`
-/// directly with its own fact/intent retrieval — this orchestration is the convenience path.
+/// Steps: derive the C3 registry from disk → read the per-session primed-ledger → detect
+/// first-mentioned nouns in `prompt` (not already in `recent`, not already primed) → for the
+/// default `Facts` level, retrieve each noun's prompt-relevant facts LLM-FREE from its source
+/// guides/claims (`prompt_relevant_facts`) → compose the primer at `PC_PRIMER_LEVEL`.
 ///
-/// Placement is the caller's responsibility and is HELD CONSTANT (a separate prepended
-/// block); this function never touches retrieval (spec F16).
+/// Placement is the caller's responsibility and is HELD CONSTANT (a separate prepended block);
+/// this function never blends into retrieval (spec F16) and makes NO model call on the hot path.
 pub fn build_inject_primer(
     config_flag: bool,
     wiki_dir: &Path,
@@ -933,14 +1176,20 @@ pub fn build_inject_primer(
         return PrimerResult { block: None, primed_slugs: Vec::new(), level };
     }
     let primed = read_primed(project_dir, session_id);
-    let hits = detect_first_mentions(&registry, prompt, recent, &primed);
+    let mut hits = detect_first_mentions(&registry, prompt, recent, &primed);
     if hits.is_empty() {
         return PrimerResult { block: None, primed_slugs: Vec::new(), level };
     }
-    // Convenience path: definition-from-registry. For the `Facts`/`Intent` levels the
-    // registry definition is the best retrieval-free signal we have here; the experiment
-    // harness fills the richer facts/intent slots itself.
-    let inputs: Vec<PrimerInput> = hits.iter().map(|e| PrimerInput::from_entry(e)).collect();
+    hits.truncate(MAX_PRIME_PER_TURN);
+
+    // Fact retrieval (LLM-free, the validated A2 content): read the noun-backing sources once,
+    // then fill each noun's prompt-relevant facts. Only read when the level actually needs facts.
+    let (index_rows, claim_subjects) = if matches!(level, PrimerLevel::Facts | PrimerLevel::Intent) {
+        (read_index_live(wiki_dir), read_claim_subjects(project_dir))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let inputs = compose_primer_inputs(&hits, prompt, level, wiki_dir, &index_rows, &claim_subjects);
     let primed_slugs: Vec<String> = hits.iter().map(|e| e.slug.clone()).collect();
     let block = compose_primer(&inputs, level);
     PrimerResult { block, primed_slugs, level }
@@ -984,7 +1233,10 @@ pub fn run_debug_nouns(
                 println!("  → {} ({})", h.slug, h.name);
             }
             let level = PrimerLevel::from_env();
-            let inputs: Vec<PrimerInput> = hits.iter().map(|e| PrimerInput::from_entry(e)).collect();
+            // Real inject content: LLM-free prompt-relevant fact retrieval at Facts/Intent levels.
+            let index_rows = read_index_live(wiki_dir);
+            let claim_subjects = read_claim_subjects(project_dir);
+            let inputs = compose_primer_inputs(&hits, prompt, level, wiki_dir, &index_rows, &claim_subjects);
             if let Some(block) = compose_primer(&inputs, level) {
                 println!("\n=== Primer block (PC_PRIMER_LEVEL={}) ===", level.as_str());
                 println!("{}", block);
@@ -1144,6 +1396,178 @@ mod tests {
         primed.insert("mint".to_string());
         let hits = detect_first_mentions(&reg, "choose the mint", "", &primed);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn matcher_alias_token_recall_fires_on_natural_phrasing() {
+        // Run-13 gap: strict whole-phrase matching misses "diagnostics" for `ffi-pipeline-diagnostics`
+        // and "cards" for `episode-cards`. The alias-token recall extension must catch both.
+        let reg = derive_registry(
+            &[
+                idx("ffi-pipeline-diagnostics", "tooling", "FFI Pipeline Diagnostics", "Diagnostics for the FFI pipeline."),
+                idx("episode-cards", "capture", "Episode Cards", "Historical session decision records."),
+            ],
+            &[],
+        );
+        let primed = std::collections::HashSet::new();
+        // "diagnostics" (distinctive token) → ffi-pipeline-diagnostics.
+        let h1 = detect_first_mentions(&reg, "can you look at the diagnostics output?", "", &primed);
+        assert!(h1.iter().any(|e| e.slug == "ffi-pipeline-diagnostics"), "alias 'diagnostics' should fire");
+        // "cards" (distinctive token, ≥5 chars) → episode-cards.
+        let h2 = detect_first_mentions(&reg, "how do the cards get written?", "", &primed);
+        assert!(h2.iter().any(|e| e.slug == "episode-cards"), "alias 'cards' should fire");
+    }
+
+    #[test]
+    fn matcher_generic_token_does_not_alias_fire() {
+        // A bare generic token ("pipeline") must NOT prime a niche multi-token noun — precision guard.
+        let reg = derive_registry(
+            &[idx("ffi-pipeline-diagnostics", "tooling", "FFI Pipeline Diagnostics", "Diagnostics for the FFI pipeline.")],
+            &[],
+        );
+        let primed = std::collections::HashSet::new();
+        let hits = detect_first_mentions(&reg, "let's refactor the pipeline a bit", "", &primed);
+        assert!(hits.is_empty(), "generic token 'pipeline' must not alias-fire");
+    }
+
+    #[test]
+    fn matcher_single_token_noun_only_matches_whole_token() {
+        // A single-token noun contributes no alias tokens; it must still match its whole token,
+        // and must NOT fire on a substring/derivative.
+        let reg = derive_registry(&[idx("reranking", "retrieval", "Reranking", "Cross-encoder reranking.")], &[]);
+        let primed = std::collections::HashSet::new();
+        assert_eq!(detect_first_mentions(&reg, "explain reranking please", "", &primed).len(), 1);
+        // No partial fire ("rerank" alone is a different token; whole-token bound).
+        assert!(detect_first_mentions(&reg, "we should rerank later", "", &primed).is_empty());
+    }
+
+    #[test]
+    fn distinctive_tokens_filters_generic_short_and_numeric() {
+        // Multi-token noun: keep distinctive ≥5-char alpha tokens, drop generic + short + numeric.
+        let toks = distinctive_tokens("FFI Pipeline Diagnostics", "ffi-pipeline-diagnostics");
+        assert!(toks.contains(&"diagnostics".to_string()));
+        assert!(!toks.iter().any(|t| t == "pipeline"), "generic dropped");
+        assert!(!toks.iter().any(|t| t == "ffi"), "short (<5) dropped");
+        // kind:7375 → "kind-7375": numeric atom dropped, "kind" too short.
+        assert!(distinctive_tokens("kind:7375", "kind-7375").is_empty());
+        // Single-token noun → no alias tokens.
+        assert!(distinctive_tokens("Mint", "mint").is_empty());
+    }
+
+    #[test]
+    fn noun_fact_lines_keeps_only_mentioning_lines() {
+        let repr = "Episode cards are immutable session decision records.\n\
+                    Unrelated line about something else entirely here.\n\
+                    Each card stores prior-state, trigger, decision, consequences.";
+        let facts = noun_fact_lines("Episode Cards", "episode-cards", repr, 8);
+        // First line mentions "episode cards"; third mentions "card" (slug deslug 'episode cards'
+        // won't match 'card', and name 'episode cards' won't match — so only the first line qualifies).
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].starts_with("Episode cards are immutable"));
+    }
+
+    #[test]
+    fn noun_fact_lines_skips_headings_and_name_echoes() {
+        // The guide's own `# Reranking` heading and a bare name-echo line must NOT become facts.
+        let repr = "# Reranking\n\
+                    Reranking\n\
+                    Reranking uses a cross-encoder over the top-k vector hits to reorder them.";
+        let facts = noun_fact_lines("Reranking", "reranking", repr, 8);
+        assert_eq!(facts.len(), 1, "heading + name-echo dropped, got: {:?}", facts);
+        assert!(facts[0].contains("cross-encoder"));
+    }
+
+    #[test]
+    fn filter_facts_by_prompt_dedups_repeated_facts() {
+        let facts = vec![
+            "Reranking uses a cross-encoder model over the top-k hits.".to_string(),
+            "Reranking uses a cross-encoder model over the top-k hits.".to_string(),
+        ];
+        let out = filter_facts_by_prompt("reranking cross-encoder", &facts, 3);
+        assert!(!out.contains(" \u{2022} "), "duplicate facts must collapse, got: {}", out);
+    }
+
+    #[test]
+    fn filter_facts_by_prompt_ranks_by_overlap() {
+        let facts = vec![
+            "Reranking uses a cross-encoder model.".to_string(),
+            "Reranking is disabled in inject by default to avoid latency.".to_string(),
+        ];
+        // Prompt overlaps the second fact ("latency","inject","default").
+        let out = filter_facts_by_prompt("why is reranking off in inject by default for latency", &facts, 1);
+        assert!(out.contains("disabled in inject"), "highest-overlap fact first, got: {}", out);
+    }
+
+    #[test]
+    fn nouns_inject_enabled_defaults_on_with_env_off_switch() {
+        // Default ON when config flag true and no env.
+        assert!(nouns_inject_enabled_with(true, None));
+        // PC_NOUNS=0 / false / off is the clean off-switch (overrides config).
+        assert!(!nouns_inject_enabled_with(true, Some("0")));
+        assert!(!nouns_inject_enabled_with(true, Some("false")));
+        assert!(!nouns_inject_enabled_with(true, Some("off")));
+        // PC_NOUNS=1 / true / on forces on even if config is false.
+        assert!(nouns_inject_enabled_with(false, Some("1")));
+        assert!(nouns_inject_enabled_with(false, Some("true")));
+        // Unrecognized env value falls through to config.
+        assert!(!nouns_inject_enabled_with(false, Some("maybe")));
+        assert!(nouns_inject_enabled_with(true, Some("maybe")));
+    }
+
+    #[test]
+    fn build_inject_primer_off_switch_is_byte_identical_and_fires_when_on() {
+        let dir = std::env::temp_dir().join(format!("pc-primer-gate-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let proj = dir.join("proj");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            wiki.join("code-grounding-staleness.md"),
+            "---\ntitle: Code Grounding Staleness\nsummary: A staleness detector demotes guides whose cited files no longer exist.\n---\n\n# Code Grounding Staleness\n\nThe staleness detector demotes guides whose cited files no longer exist.\n",
+        )
+        .unwrap();
+        // Natural phrasing: separate words, NOT the whole slug phrase (the Run-13 gap).
+        let prompt = "what does the staleness detector do?";
+        std::env::remove_var("PC_PRIMER_LEVEL");
+
+        // Disabled (config flag false, no env): byte-identical no-op — empty block, nothing primed.
+        let off = build_inject_primer(false, &wiki, &proj, "sess-gate", prompt, "");
+        assert!(off.block.is_none(), "disabled primer must emit no block");
+        assert!(off.primed_slugs.is_empty());
+
+        // Enabled (config flag true): the alias matcher fires and a Facts-level block is composed.
+        let on = build_inject_primer(true, &wiki, &proj, "sess-gate", prompt, "");
+        let block = on.block.expect("enabled primer should fire on natural phrasing");
+        assert!(block.contains("Code Grounding Staleness"));
+        assert!(on.primed_slugs.contains(&"code-grounding-staleness".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_relevant_facts_pulls_from_source_guide_body() {
+        // End-to-end (disk): a noun whose source guide body carries noun-mentioning facts →
+        // prompt_relevant_facts surfaces the prompt-overlapping ones, LLM-free.
+        let dir = std::env::temp_dir().join(format!("pc-nounfacts-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        let guide = "---\ntitle: Reranking\nsummary: Cross-encoder reranking.\n---\n\n\
+                     # Reranking\n\n\
+                     Reranking uses a cross-encoder over the top-k vector hits.\n\
+                     Reranking is disabled in inject by default to avoid per-call model load.\n";
+        fs::write(wiki.join("reranking.md"), guide).unwrap();
+        let index_rows = crate::wiki::read_index_live(&wiki);
+        let entry = NounEntry {
+            slug: "reranking".into(),
+            name: "Reranking".into(),
+            definition: "Cross-encoder reranking.".into(),
+            source_refs: vec!["guide:reranking".into()],
+            origin: "derived".into(),
+        };
+        let facts = prompt_relevant_facts(&entry, "is reranking disabled in inject by default?", &wiki, &index_rows, &[]);
+        assert!(facts.contains("disabled in inject"), "got: {}", facts);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
