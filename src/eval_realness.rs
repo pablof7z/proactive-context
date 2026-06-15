@@ -63,7 +63,8 @@ const STOP: &[&str] = &[
     "does", "please", "ok", "okay", "yes", "no", "maybe", "you", "your", "my", "our", "a", "an", "to",
     "for", "of", "in", "on", "use", "using", "want", "need", "first", "next", "great", "good",
     "thanks", "hmm", "wait", "actually", "just", "like", "see", "look", "got", "get", "im", "ive",
-    "dont", "didnt", "doesnt", "eg", "ie", "etc",
+    "dont", "didnt", "doesnt", "eg", "ie", "etc", "none", "current", "known", "future", "upon",
+    "non-goals", "hello",
 ];
 
 const KNOWN_EXTS: &[&str] = &[
@@ -97,6 +98,19 @@ pub(crate) fn is_entity_candidate(c: &str) -> bool {
     }
     // file:line code location (message.rs:413, src/foo.rs:12) → drop.
     if is_file_line_ref(c) {
+        return false;
+    }
+    // Mid-token "label: Word" heading/transcript fragment ("Briefing: This", "X: Fixing") → drop.
+    // (kind:7375 / NIP-60 have no space after the colon, so they survive.)
+    if c.contains(": ") {
+        return false;
+    }
+    // Hex commit-hash / id artifact (90993c3, deadbeef) → drop.
+    let lc0 = c.to_lowercase();
+    if c.len() >= 6
+        && lc0.chars().all(|ch| ch.is_ascii_hexdigit())
+        && lc0.chars().any(|ch| ch.is_ascii_digit())
+    {
         return false;
     }
     // Code / JSON / snippet punctuation anywhere → a pasted fragment, not a named entity. (Note `:`
@@ -249,9 +263,10 @@ fn mine_population(manifest_dir: &Path, per_noun_cap: usize) -> Result<Vec<NounP
                     noun: noun.clone(),
                     refs: Vec::new(),
                 });
-                // One reference per (noun, session) — avoid double-counting a noun named twice in a
-                // single turn / session, matching T-0's per-session de-dup.
-                if entry.refs.iter().any(|r| r.session == session_id) {
+                // One reference per distinct USER TURN that names the noun (a noun named in N turns
+                // across sessions = N stance events). De-dup only identical turns (a noun named twice
+                // in one turn counts once).
+                if entry.refs.iter().any(|r| r.turn == turn_clip) {
                     continue;
                 }
                 if entry.refs.len() >= per_noun_cap {
@@ -498,6 +513,9 @@ pub fn run_realness(exp_dir: &Path, cfg: &Config) -> Result<()> {
             txt.push('\n');
         }
         fs::write(artifact_dir.join("population.txt"), &txt)?;
+        // Emit the hand-seeded canaries (single source of truth = build_noun_canaries) so the frozen
+        // gold can be assembled = canaries ∪ curated mined nouns.
+        fs::write(artifact_dir.join("canaries.jsonl"), emit_canaries_jsonl()?)?;
         println!(
             "realness: wrote {} nouns → {} (+ population.txt for labeling)",
             pop.len(),
