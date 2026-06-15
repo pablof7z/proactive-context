@@ -7,7 +7,6 @@ mod archeologist;
 mod tenex;
 mod codex;
 mod opencode;
-mod awareness;
 mod capture;
 mod episode_capture;
 mod research_capture;
@@ -155,36 +154,6 @@ enum Commands {
         harness: String,
     },
 
-    /// Cross-agent awareness hook (invoked from Claude Code hooks). Reads the hook
-    /// JSON ({ session_id, cwd, transcript_path, prompt }) from stdin. On PostToolUse,
-    /// prints peer-delta additionalContext; other hooks run side-effects only.
-    /// Always exits 0; never blocks a prompt or tool.
-    Awareness {
-        /// Which hook fired: UserPromptSubmit | PostToolUse | Stop | SessionEnd.
-        #[arg(long)]
-        hook: Option<String>,
-
-        // Internal: run the detached intent distill for this session_id.
-        #[arg(long, hide = true)]
-        distill: Option<String>,
-
-        // Internal: cwd to locate the per-repo agents.db for --distill.
-        #[arg(long, hide = true)]
-        cwd: Option<String>,
-
-        /// Which harness's hook dialect the stdin is in (claude | codex | tenex).
-        #[arg(long, default_value = "claude")]
-        harness: String,
-    },
-
-    /// Show the cross-agent standup board for this repo: every concurrent Claude Code
-    /// agent's branch, age, status, and distilled intent. On-demand snapshot (the
-    /// awareness hooks otherwise only surface ephemeral deltas after tool calls).
-    Agents {
-        /// Also show expired agents (inactive > awareness_expiry_secs).
-        #[arg(long)]
-        all: bool,
-    },
 
     /// Render a one-line Claude Code status bar indicator (invoked via statusLine.command).
     /// Reads the Claude Code status-line JSON from stdin; prints one styled line to stdout.
@@ -709,22 +678,6 @@ fn main() -> Result<()> {
             crate::inject::run_inject(verbose, &harness)?;
         }
 
-        Commands::Awareness { hook, distill, cwd, harness } => {
-            if let Some(session_id) = distill {
-                // Detached worker spawned by a hook tick.
-                let cwd = cwd.unwrap_or_default();
-                if let Err(e) = crate::awareness::run_distill(&session_id, &cwd) {
-                    eprintln!("awareness distill: {}", e);
-                }
-            } else if let Some(hook) = hook {
-                let _ = crate::awareness::run_hook(&hook, &harness);
-            }
-        }
-
-        Commands::Agents { all } => {
-            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-            crate::awareness::print_board(&cwd, all)?;
-        }
 
         Commands::Statusline { with_context } => {
             crate::statusline::run_statusline(with_context);
