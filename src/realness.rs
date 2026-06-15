@@ -399,8 +399,10 @@ pub fn classify_batched(
     if refs.is_empty() {
         return Ok(vec![]);
     }
-    // ~120 output tokens per item, floored generously; capped so a runaway can't burn the budget.
-    let max_tokens = (refs.len() as u32 * 140 + 256).min(4096);
+    // Reasoning models (e.g. glm-5.1) spend a large, roughly fixed `thinking` budget BEFORE the
+    // visible content; too small a cap truncates the answer to empty. Floor generously for the
+    // reasoning preamble (~1024) plus ~160 visible tokens per item; cap to bound a runaway.
+    let max_tokens = (1024 + refs.len() as u32 * 160).min(8192);
     let raw = stance_llm_call(
         spec,
         openrouter_api_key,
@@ -430,7 +432,8 @@ pub fn classify_single(
         ollama_api_key,
         &single_system(),
         &single_user(r),
-        256,
+        // Generous budget so a reasoning model's `thinking` preamble doesn't truncate the JSON.
+        1536,
         120,
     )?;
     Ok(parse_single(&raw))

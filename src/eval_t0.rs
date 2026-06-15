@@ -144,6 +144,39 @@ fn build_canaries() -> Vec<GoldRef> {
 
 // ─── Mining ─────────────────────────────────────────────────────────────────────
 
+/// Whether a raw candidate looks like a genuine PROJECT NOUN rather than a conversational
+/// fragment. Drops stopword-led runs ("User: We", "Add NIP60", "The thing") and requires an
+/// identifier-ish signal (internal caps / digit / `_-:`) OR a multi-word Title-Case phrase. Pure.
+fn plausible_noun(c: &str) -> bool {
+    let c = c.trim();
+    if c.len() < 3 || c.len() > 50 {
+        return false;
+    }
+    const STOP: &[&str] = &[
+        "user", "assistant", "human", "system", "we", "i", "the", "this", "that", "these", "those", "add", "make", "let", "lets",
+        "let's", "can", "could", "should", "would", "when", "what", "why", "how", "if", "so",
+        "but", "and", "also", "now", "then", "here", "there", "it", "is", "are", "do", "does",
+        "please", "ok", "okay", "yes", "no", "maybe", "you", "your", "my", "our", "a", "an", "to",
+        "for", "of", "in", "on", "use", "using", "want", "need", "first", "next", "great", "good",
+        "thanks", "hmm", "wait", "actually", "just", "like", "see", "look", "got", "get",
+    ];
+    let first = c.split_whitespace().next().unwrap_or("");
+    let first_l = first
+        .trim_end_matches(|ch: char| !ch.is_alphanumeric())
+        .to_lowercase();
+    if STOP.contains(&first_l.as_str()) {
+        return false;
+    }
+    let words: Vec<&str> = c.split_whitespace().collect();
+    let has_ident = c.chars().any(|ch| ch == '_' || ch == '-' || ch.is_ascii_digit())
+        || c.chars().skip(1).any(|ch| ch.is_uppercase());
+    let multiword_titlecase = words.len() >= 2
+        && words
+            .iter()
+            .all(|w| w.chars().next().map(|x| x.is_uppercase()).unwrap_or(false));
+    has_ident || multiword_titlecase
+}
+
 /// A mined reference, pre-gold-labeling.
 struct MinedRef {
     source: String,
@@ -231,7 +264,7 @@ fn mine_corpus(
                     break;
                 }
                 let noun = cand.trim().to_string();
-                if noun.len() < 3 {
+                if !plausible_noun(&noun) {
                     continue;
                 }
                 let key = noun.to_lowercase();
@@ -389,8 +422,14 @@ fn render_confusion(m: &Metrics) -> String {
 pub fn run_t0(exp_dir: &Path, cfg: &Config) -> Result<()> {
     println!("\n=== T-0 — STANCE-CALIBRATION GATE for noun-realness ===\n");
 
-    let gold_model = std::env::var("PC_T0_GOLD_MODEL")
-        .unwrap_or_else(|_| "anthropic/claude-sonnet-4-6".to_string());
+    // GOLD defaults to the configured capture model (glm-5.1:cloud) to honor the $0-Ollama
+    // constraint — glm-5.1 is the project's production-strength model and prior runs used it as the
+    // judge. The gold call uses the careful SINGLE-reference shape (one ref, max context, temp 0);
+    // production uses the cheap BATCHED shape. When gold==production model, the hand-labeled CANARIES
+    // are the INDEPENDENT ground-truth anchor (absolute correctness), and the mined-ref agreement
+    // measures batching robustness. Override gold with a stronger model via PC_T0_GOLD_MODEL.
+    let gold_model =
+        std::env::var("PC_T0_GOLD_MODEL").unwrap_or_else(|_| cfg.capture_model.clone());
     let prod_model =
         std::env::var("PC_T0_PROD_MODEL").unwrap_or_else(|_| cfg.capture_model.clone());
     let gold_spec = ModelSpec::parse(&gold_model);
@@ -402,6 +441,10 @@ pub fn run_t0(exp_dir: &Path, cfg: &Config) -> Result<()> {
 
     println!("t0: GOLD model       = {} ({})", gold_spec.model, gold_spec.provider_name());
     println!("t0: PRODUCTION model = {} ({})", prod_spec.model, prod_spec.provider_name());
+    if gold_spec.model == prod_spec.model {
+        println!("t0: NOTE — gold and production share a model; hand-labeled CANARIES are the");
+        println!("t0:        independent ground-truth anchor (set PC_T0_GOLD_MODEL to differ).");
+    }
 
     // ── PRE-REGISTERED BARS (declared before any scoring) ──
     let bar_macro_f1 = 0.80f32;
@@ -831,6 +874,23 @@ mod tests {
             assert!(ids.insert(g.id.clone()), "duplicate canary id {}", g.id);
             assert!(g.is_canary);
         }
+    }
+
+    #[test]
+    fn plausible_noun_filters_junk_keeps_real() {
+        // Junk conversational fragments rejected.
+        assert!(!plausible_noun("User: We"));
+        assert!(!plausible_noun("Assistant: I've"));
+        assert!(!plausible_noun("Add NIP60"));
+        assert!(!plausible_noun("The thing"));
+        assert!(!plausible_noun("Make Faster"));
+        // Genuine project nouns kept.
+        assert!(plausible_noun("SyncOrchestrator"));
+        assert!(plausible_noun("fabric-provider"));
+        assert!(plausible_noun("kind:7375"));
+        assert!(plausible_noun("Context Injection"));
+        assert!(plausible_noun("TUI Client"));
+        assert!(plausible_noun("inject_compile_model"));
     }
 
     #[test]
