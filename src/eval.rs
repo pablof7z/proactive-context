@@ -34,6 +34,7 @@ pub struct EvalArgs {
     pub run9: bool,
     pub run10: bool,
     pub run11: bool,
+    pub run13: bool,
     pub judge_model: Option<String>,
 }
 
@@ -154,6 +155,18 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
         let cfg = load_config().unwrap_or_default();
         let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
         return crate::eval_run11::run_run11(&exp_dir, &judge_model, &cfg);
+    }
+
+    if args.run13 {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        let corpus_label = if project_key.contains("proactive-context") { "pc" }
+            else if project_key.contains("nostr") { "wallet" }
+            else { "corpus" };
+        return crate::eval_run13::run_run13(crate::eval_run13::Run13Args {
+            corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
+            judge_model: &judge_model, cfg: &cfg, corpus_label,
+        });
     }
 
     // Dirs for each store's output under the experiment dir.
@@ -811,6 +824,12 @@ fn strip_frontmatter(content: &str) -> String {
 ///    representation (catches judge quotes copied from the HISTORY SUMMARY).
 /// 2. **Token-overlap match** — ≥60% of the candidate's content words (len ≥ 4) appear somewhere
 ///    in the store representation (catches lightly-paraphrased facts that strict substring misses).
+/// Public wrapper so other eval modules (Run 13's store-knowledge filter) can reuse the exact
+/// same store-grounding test used for label-mining fairness.
+pub(crate) fn verify_in_store_repr_pub(text: &str, store_repr_lower: &str) -> bool {
+    verify_in_store_repr(text, store_repr_lower)
+}
+
 fn verify_in_store_repr(text: &str, store_repr_lower: &str) -> bool {
     if text.trim().len() < 10 || store_repr_lower.is_empty() {
         return false;

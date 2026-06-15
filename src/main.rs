@@ -17,6 +17,7 @@ mod eval_run8;
 mod eval_run9;
 mod eval_run10;
 mod eval_run11;
+mod eval_run13;
 mod merged_recognition;
 mod nouns;
 mod session_start;
@@ -377,6 +378,13 @@ enum Commands {
         /// Run 11: terminal-state inversion fix validation (BAR 1 dm-relay case + BAR 2 sibling flips).
         #[arg(long)]
         run11: bool,
+
+        /// Run 13 (noun-primer probe): mine idiosyncratic noun-moments from FUTURE human turns
+        /// (idiosyncrasy + store-knowledge filtered), score arms B0/A1/A2/A3 with the C3 noun
+        /// primer + 3-call grounding judge, plus attention/predict/P1 ride-alongs. Reuses the
+        /// frozen labels/corrections/stores in --experiment-dir. $0 Ollama (PC_RUN13_MODEL).
+        #[arg(long)]
+        run13: bool,
 
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
@@ -871,6 +879,7 @@ fn main() -> Result<()> {
             run9,
             run10,
             run11,
+            run13,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -885,6 +894,7 @@ fn main() -> Result<()> {
                 run9,
                 run10,
                 run11,
+                run13,
                 judge_model,
             })?;
         }
