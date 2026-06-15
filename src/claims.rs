@@ -55,6 +55,13 @@ pub struct ClaimRecord {
     pub session: String,
     pub assertion: String,
     pub authority: String, // "explicit" | "implicit"
+    /// The entity/noun this claim is ABOUT (the subject axis from the entity-layer spec, R1).
+    /// Empty for behavioral claims that are not anchored to a specific noun (backward
+    /// compatible: pre-entity-layer records have no `subject` and serde defaults it to "").
+    /// A non-empty `subject` is a kebab-case noun slug (e.g. `token-event`, `mint`) that lets
+    /// facts be grouped under the entity they predicate over rather than floating free.
+    #[serde(default)]
+    pub subject: String,
     pub evidence_text: String,
     pub evidence: Vec<EvidenceRange>,
     /// Cluster this claim was assigned to (deterministic cosine matching).
@@ -230,6 +237,7 @@ pub fn append_claim(
         session: session.to_string(),
         assertion: assertion.to_string(),
         authority: authority.to_string(),
+        subject: String::new(),
         evidence_text: evidence_text.to_string(),
         evidence: evidence.to_vec(),
         cluster_id: cluster_id.clone(),
@@ -373,6 +381,7 @@ pub fn append_claim_typed(
     let rec = ClaimRecord {
         id: id.to_string(), ts: ts.to_string(), session: session.to_string(),
         assertion: assertion.to_string(), authority: authority.to_string(),
+        subject: String::new(),
         evidence_text: evidence_text.to_string(), evidence: evidence.to_vec(),
         cluster_id: cluster_id.clone(), supersedes, confirmed_ts: String::new(),
     };

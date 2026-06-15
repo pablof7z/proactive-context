@@ -2374,6 +2374,27 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
+    // Definitional-noun stage (C1, feature-flagged via `capture_nouns`, default OFF and
+    // gated to a later experiment run). Recognizes transcript-cited "X is Y" definitions and
+    // persists them as immutable `extracted` entries under <wiki>/nouns/. Independent of the
+    // normal pass; best-effort — a failure here never breaks capture. Does NOT feed the wiki
+    // index into its prompt (finding F: that caused 0-claim EXTRACT failures). No-op when off.
+    if cfg.capture_nouns {
+        match crate::nouns::run_definitional_stage(&wiki_path, &input.transcript_path) {
+            Ok(paths) if !paths.is_empty() => {
+                log_event(
+                    "capture.nouns",
+                    None,
+                    serde_json::json!({ "entries": paths.len() }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("capture: definitional-noun stage failed: {}", e);
+            }
+        }
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.

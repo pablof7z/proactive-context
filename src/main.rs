@@ -18,6 +18,7 @@ mod eval_run9;
 mod eval_run10;
 mod eval_run11;
 mod merged_recognition;
+mod nouns;
 mod session_start;
 mod chunker;
 mod config;
@@ -476,6 +477,28 @@ enum DebugAction {
         #[arg(long)]
         no_wiki: bool,
     },
+
+    /// Inspect the entity/noun layer (entity-and-orientation-capture spec). Builds the
+    /// C3 DERIVED noun registry from the project's existing wiki guides/topics + claim
+    /// subjects (NO capture, NO LLM, NO wiki writes) and prints it. Optionally runs
+    /// first-mention detection + primer composition for a sample prompt
+    /// (PC_PRIMER_LEVEL=def|facts|intent selects the content level).
+    Nouns {
+        /// Wiki directory to derive nouns from. Defaults to the discovered project wiki
+        /// (docs/wiki) for the current repo.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+
+        /// A sample prompt to run first-mention detection + primer composition against.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+
+        /// Run the C1 definitional recognition pass on this transcript (LLM-backed) and print
+        /// the transcript-cited definitions it would persist. Off the experiment critical path;
+        /// for inspecting the deferred definitional-EXTRACT bucket.
+        #[arg(long, value_name = "FILE")]
+        transcript: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -708,6 +731,23 @@ fn main() -> Result<()> {
             }
             DebugAction::Triage { transcript, wiki_dir, no_wiki } => {
                 crate::capture::run_debug_triage(&transcript, wiki_dir.as_deref(), no_wiki)?;
+            }
+            DebugAction::Nouns { wiki_dir, prompt, transcript } => {
+                let wiki = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                let proj_dir = project_context_dir(&root);
+                crate::nouns::run_debug_nouns(&wiki, &proj_dir, prompt.as_deref())?;
+                if let Some(t) = transcript {
+                    println!("\n=== C1 definitional recognition (LLM) on {} ===", t.display());
+                    let entries = crate::nouns::recognize_definitions(&t.to_string_lossy())?;
+                    if entries.is_empty() {
+                        println!("  (no transcript-cited definitions recognized)");
+                    } else {
+                        for e in &entries {
+                            println!("  {} [{}] {}", e.slug, e.origin, crate::nouns::truncate_for_display(&e.definition, 90));
+                            println!("       cites: {}", e.source_refs.join(", "));
+                        }
+                    }
+                }
             }
         },
 

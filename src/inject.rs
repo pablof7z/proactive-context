@@ -1,4 +1,4 @@
-use crate::config::{load_config, normalize_path, project_db_path, resolve_project_root};
+use crate::config::{load_config, normalize_path, project_context_dir, project_db_path, resolve_project_root};
 use crate::events::{init_context, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
@@ -510,13 +510,38 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 return Ok(());
             }
 
+            // ── Noun first-mention primer (entity-layer, flagged off by default) ──
+            // Additive: a SEPARATE block prepended to the briefing body, placement held
+            // constant, retrieval NOT blended (spec F16). No-op (byte-identical) unless
+            // `capture_nouns`/`PC_NOUNS` is on. Computed here so it rides the same commit.
+            let primer = crate::nouns::build_inject_primer(
+                cfg.capture_nouns,
+                &wiki_path,
+                &project_context_dir(&root),
+                &input.session_id,
+                &input.prompt,
+                &recent,
+            );
+            let body_with_primer = match &primer.block {
+                Some(block) => format!("{}\n\n{}", block, body),
+                None => body.to_string(),
+            };
+
             let out = format!(
                 "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
-                project_basename, body
+                project_basename, body_with_primer
             );
 
             // Record what we just injected so later turns this session dedup against it.
-            crate::ledger::append(&root, &input.session_id, title_opt.as_deref(), body);
+            crate::ledger::append(&root, &input.session_id, title_opt.as_deref(), &body_with_primer);
+            // Mark primed nouns once we've committed to injecting (so they prime once/session).
+            if !primer.primed_slugs.is_empty() {
+                crate::nouns::record_primed(&project_context_dir(&root), &input.session_id, &primer.primed_slugs);
+                log_event("inject.noun_primer", None, serde_json::json!({
+                    "level": primer.level.as_str(),
+                    "primed": primer.primed_slugs,
+                }));
+            }
 
             log_event("generate.briefing", None, serde_json::json!({
                 "briefing_chars": body.len(),
