@@ -1,0 +1,51 @@
+{
+  "bars": {
+    "falsify_macro_f1": 0.6000000238418579,
+    "macro_f1": 0.800000011920929,
+    "reject_precision": 0.8999999761581421
+  },
+  "canary_correct": 10,
+  "canary_loud_fail": false,
+  "gold_distribution": {
+    "neutral": 30,
+    "operate_on": 51,
+    "reject": 7
+  },
+  "gold_model": "glm-5.1:cloud",
+  "metrics": {
+    "accuracy": 0.7954545617103577,
+    "confusion_gold_by_pred": [
+      [
+        40,
+        0,
+        11
+      ],
+      [
+        0,
+        6,
+        1
+      ],
+      [
+        6,
+        0,
+        24
+      ]
+    ],
+    "dropped": 0,
+    "macro_f1": 0.8250306248664856,
+    "n_scored": 88,
+    "per_class_f1": {
+      "neutral": 0.7272727489471436,
+      "operate_on": 0.8247422575950623,
+      "reject": 0.9230769276618958
+    },
+    "reject_as_operate_on": 0,
+    "reject_precision": 1.0,
+    "reject_recall": 0.8571428656578064
+  },
+  "n_canary": 10,
+  "n_mined": 78,
+  "n_total": 88,
+  "production_model": "glm-5.1:cloud",
+  "verdict": "PASS"
+}

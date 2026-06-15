@@ -298,6 +298,7 @@ pub fn stance_llm_call(
     user: &str,
     max_tokens: u32,
     timeout_secs: u64,
+    think: bool,
 ) -> Result<String> {
     let is_ollama = spec.provider == Provider::Ollama;
     let url = if is_ollama {
@@ -306,9 +307,12 @@ pub fn stance_llm_call(
         "https://openrouter.ai/api/v1/chat/completions".to_string()
     };
     let body = if is_ollama {
+        // `think` toggles a reasoning model's hidden chain-of-thought. OFF for the cheap production
+        // path (compact, fast, num_predict-frugal); ON for the careful gold path.
         serde_json::json!({
             "model": spec.model,
             "stream": false,
+            "think": think,
             "options": { "temperature": 0, "num_predict": max_tokens },
             "messages": [
                 { "role": "system", "content": system },
@@ -386,9 +390,14 @@ pub fn stance_llm_call(
     Err(last)
 }
 
-/// Production callable: classify ALL noun references from one session in ONE batched call.
+/// Production callable: classify ALL noun references from one session, in BATCHED LLM calls.
 /// Returns judgments aligned to `refs` (input order); `None` for any item the model dropped.
-#[allow(clippy::too_many_arguments)]
+///
+/// The production shape is one batched call per session. Sessions are chunked into sub-batches of at
+/// most `PC_T0_BATCH_CHUNK` (default 8) refs: a single huge session (e.g. 14 refs) makes the
+/// reasoning model's `thinking` + JSON array overrun any sane token budget and truncate (→ all items
+/// dropped, an unfair instrumentation miss). Chunking bounds each call; typical sessions (≤8 refs)
+/// remain a single call.
 pub fn classify_batched(
     refs: &[NounRef],
     spec: &ModelSpec,
@@ -399,10 +408,48 @@ pub fn classify_batched(
     if refs.is_empty() {
         return Ok(vec![]);
     }
-    // Reasoning models (e.g. glm-5.1) spend a large, roughly fixed `thinking` budget BEFORE the
-    // visible content; too small a cap truncates the answer to empty. Floor generously for the
-    // reasoning preamble (~1024) plus ~160 visible tokens per item; cap to bound a runaway.
-    let max_tokens = (1024 + refs.len() as u32 * 160).min(8192);
+    let chunk = std::env::var("PC_T0_BATCH_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(6);
+    let mut out: Vec<Option<StanceJudgment>> = Vec::with_capacity(refs.len());
+    for group in refs.chunks(chunk) {
+        let mut res = classify_batch_call(
+            group,
+            spec,
+            openrouter_api_key,
+            ollama_base_url,
+            ollama_api_key,
+        )?;
+        // A fully-empty chunk = a truncated/garbled array (reasoning overran the budget) rather than
+        // a genuine read; retry once before conceding the items as drops.
+        if group.len() > 1 && res.iter().all(|j| j.is_none()) {
+            res = classify_batch_call(
+                group,
+                spec,
+                openrouter_api_key,
+                ollama_base_url,
+                ollama_api_key,
+            )?;
+        }
+        out.extend(res);
+    }
+    Ok(out)
+}
+
+/// One batched LLM call over a bounded group of refs (≤ chunk size). Thinking ON: this runs at
+/// CAPTURE time (off the hot path), and reasoning markedly improves stance quality (cleaner
+/// reject-precision, far fewer operate_on↔neutral confusions) vs the no-think shape. Budget covers
+/// the per-item thinking + JSON so the array never truncates.
+fn classify_batch_call(
+    refs: &[NounRef],
+    spec: &ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+) -> Result<Vec<Option<StanceJudgment>>> {
+    let max_tokens = (2500 + refs.len() as u32 * 700).min(12000);
     let raw = stance_llm_call(
         spec,
         openrouter_api_key,
@@ -411,7 +458,8 @@ pub fn classify_batched(
         &batched_system(),
         &batched_user(refs),
         max_tokens,
-        180,
+        240,
+        true,
     )?;
     let ids: Vec<String> = refs.iter().map(|r| r.id.clone()).collect();
     Ok(parse_batched(&raw, &ids))
@@ -432,9 +480,10 @@ pub fn classify_single(
         ollama_api_key,
         &single_system(),
         &single_user(r),
-        // Generous budget so a reasoning model's `thinking` preamble doesn't truncate the JSON.
+        // Generous budget so the gold model's `thinking` preamble doesn't truncate the JSON.
         1536,
         120,
+        true,
     )?;
     Ok(parse_single(&raw))
 }
