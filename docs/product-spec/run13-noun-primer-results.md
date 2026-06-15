@@ -81,9 +81,16 @@ seen from the human-turn side.**
 ## 3. Grounding table (design §3.2) — DIAGNOSTIC ONLY (probe invalid, sub-gate n=3)
 
 Scored under `PC_RUN13_FORCE=1` (the verdict stays gated; these numbers are informational). Primary =
-`G-def=present AND G-facts∈{contained,partial} AND G-correct=correct`.
+`G-def=present AND G-facts∈{contained,partial} AND G-correct=correct`. n=3 moments.
 
-<!-- RIDEALONG_TABLE_PLACEHOLDER -->
+| arm | primary | G-def=present | G-facts∈{cont,part} | G-correct=wrong |
+|---|---|---|---|---|
+| B0 | 0.0% | 0.0% | 0.0% | 0.0% |
+| A1 def | 0.0% | 0.0% | 0.0% | 0.0% |
+| A2 facts | 0.0% | 0.0% | 0.0% | 0.0% |
+| A3 intent | 0.0% | 0.0% | 0.0% | 0.0% |
+
+Load-bearing subset (n=3, all kept moments are load-bearing): identical (all arms 0.0% primary).
 
 **Diagnostic read:** with only 3 sub-gate moments — two of which (`identity`, `content-rendering`) are
 **thin anchors with an empty C3 definition**, and whose store "ground-truth" lines are noisy
@@ -95,16 +102,41 @@ exactly the nouns humans raise, which is the gap C1 (deferred to Run 16) is mean
 
 ## 4. Ride-alongs (guards)
 
-<!-- RIDEALONG_DETAIL_PLACEHOLDER -->
+| ride-along | B0 | A2 | bar |
+|---|---|---|---|
+| restatement P1 recall (contained+partial) | 0% | 0% | no P1 drop >5pt: **PASS** (tie at 0) |
+| predict-the-correction (predicted) | 0% | 0% | A2 predict ≥ B0: **PASS** (tie) |
+| attention-efficiency | all 3 moments load-bearing (bare=absent) | — | gain-concentration N/A (n=3) |
 
-The restatement-P1 and predict-the-correction ride-alongs reuse the frozen `labels.jsonl` /
-`run8_corrections.jsonl` and are independent of the noun probe, so they remain valid guards.
+(Ride-along n varies by the `PC_RUN13_*_CAP` used; the *direction* — A2 ties B0 — is the guard, not n.)
+
+The P1 and predict ride-alongs reuse the frozen `labels.jsonl` / `run8_corrections.jsonl` and are
+independent of the noun probe, so their *no-regression* bars are valid (A2 ties B0 — the primer does
+not hurt). **However**, the absolute B0 levels (0% P1 recall, 0% prediction) are NOT credible as a true
+floor: under the $0-local constraint the briefing/judge model (`gemma4:26b-mlx`) is intermittently
+evicted by peer agents on the shared Ollama host, returning a `(compile error: 404)` placeholder the
+judge scores as absent/missed. Run-13 mitigates this (briefing via `/api/chat` + retry-on-404, and
+`keep_alive=-1` model pinning), but a single 16 GB MLX model cannot reliably saturate a multi-hundred-
+call within-run eval against contending peers. **Treat the no-regression direction (A2 = B0) as the
+valid guard signal; treat the absolute 0% levels as an infra artifact, not a finding.** (The original
+cfv3 Run-7/8 P1 numbers — produced with an OpenRouter compile model — were materially non-zero.)
 
 ---
 
 ## 5. Pre-registered bars (verbatim, design §Run-13 + §Stop)
 
-<!-- BARS_PLACEHOLDER -->
+| bar (verbatim) | result | detail |
+|---|---|---|
+| Probe validity: canaries recovered + ≥12 moments | **FAIL** | canaries_recovered=false (3 missing), moments=3 (gate 12) |
+| A2 grounding ≥ B0+15pt | **N/A** | [diag] A2=0.0% B0=0.0% (Δ=+0.0pt) — probe invalid, not verdict-bearing |
+| A2 gain concentrated on load-bearing subset | **N/A** | [diag] all 3 kept moments load-bearing |
+| A2 G-correct wrong ≤10% | **N/A** | [diag] A2 wrong=0.0% |
+| no arm P1 drop >5pt vs B0 | **PASS** | B0=0.0% A2=0.0% (drop=+0.0pt) — tie (see §4 caveat on absolute level) |
+| A2 predict ≥ B0 (tie ok) | **PASS** | B0 predicted=0 A2 predicted=0 — tie |
+
+The three headline grounding bars are **N/A**: they are gated on probe validity, which FAILED. They are
+reported as `[diag]` numbers only (§3), not as PASS/FAIL, because a primer A2-vs-B0 verdict cannot be
+read off an invalid probe.
 
 ---
 
