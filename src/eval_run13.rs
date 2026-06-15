@@ -150,11 +150,25 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
 
     // ───────────────────────── §2 — arms B0/A1/A2/A3 + §3.2 grounding judge ─────────────────────────
     let arms_path = exp_dir.join("run13_arms.jsonl");
-    let arm_rows: Vec<ArmRow> = if scarcity_stop || (!canary_pass && std::env::var("PC_RUN13_FORCE").is_err()) {
-        // Gate not met (or canaries failed and not forced): do not burn LLM budget scoring arms.
-        // The probe-validity finding (canary/scarcity) is the result. Set PC_RUN13_FORCE=1 to
-        // score arms anyway for diagnostics.
+    let forced = std::env::var("PC_RUN13_FORCE").is_ok();
+    let gate_blocks = scarcity_stop || !canary_pass;
+    let arm_rows: Vec<ArmRow> = if gate_blocks && !forced {
+        // Probe-validity gate not met (canary failure and/or scarcity) and not forced: do not burn
+        // LLM budget scoring arms. The probe-validity finding IS the result. Set PC_RUN13_FORCE=1
+        // to score arms anyway as a DIAGNOSTIC (the verdict stays gated; arms are sub-gate signal).
+        if gate_blocks { println!("eval: §2 — arms skipped (probe-validity gate not met; set PC_RUN13_FORCE=1 for diagnostic arms)"); }
         Vec::new()
+    } else if gate_blocks && forced {
+        println!("eval: §2 — PC_RUN13_FORCE=1: scoring arms as DIAGNOSTIC despite probe-validity gate (verdict remains gated)");
+        if arms_path.exists() && file_nonempty(&arms_path) {
+            let r: Vec<ArmRow> = read_jsonl(&arms_path);
+            if r.len() == moments.len() { println!("eval: §2 — REUSING {} arm rows", r.len()); r }
+            else { score_arms(&moments, &registry, &store_a_wiki, &store_b_claims, &store_repr_lower,
+                &compile_spec, &judge_spec, &api_key, &ollama_base_url, ok, cfg, &arms_path)? }
+        } else {
+            score_arms(&moments, &registry, &store_a_wiki, &store_b_claims, &store_repr_lower,
+                &compile_spec, &judge_spec, &api_key, &ollama_base_url, ok, cfg, &arms_path)?
+        }
     } else if arms_path.exists() && file_nonempty(&arms_path) {
         let r: Vec<ArmRow> = read_jsonl(&arms_path);
         if r.len() == moments.len() {
@@ -383,6 +397,9 @@ fn mine_noun_moments(
             if is_pc_self_referential(t) { continue; }
             let head = t.chars().take(40).collect::<String>().to_lowercase();
             if head.starts_with('<') || head.contains("caveat:") || head.starts_with("[image") { continue; }
+            // Genuine HUMAN turns only (design §3.1): exclude agent/tool result envelopes that
+            // arrive on the user channel ("[Agent task result: …]", "[Request interrupted…]").
+            if head.starts_with("[agent ") || head.starts_with("[request ") || head.starts_with("[tool ") { continue; }
 
             // Slugs the turn references: registry-direct (i) ∪ heuristic-mapped-to-registry (ii).
             let mut turn_slugs: Vec<String> = Vec::new();
@@ -831,12 +848,33 @@ fn report(
         &format!("canaries_recovered={} ({} missing), moments={} (gate {})",
             canary_pass, missing.len(), moments.len(), gate_n));
 
-    if n == 0 || !probe_valid {
+    if n == 0 {
         bar("A2 grounding ≥ B0+15pt", None, "arms not scored (probe-validity gate not met)");
         bar("A2 gain concentrated on load-bearing subset", None, "arms not scored");
         bar("A2 G-correct wrong ≤10%", None, "arms not scored");
-        bar("no arm P1 drop >5pt vs B0", if p1m > 0 { /* still computable */ None } else { None }, "deferred to confirmed run");
-        bar("A2 predict ≥ B0 (tie ok)", if pm > 0 { None } else { None }, "deferred to confirmed run");
+        bar("no arm P1 drop >5pt vs B0", None, "deferred to confirmed run");
+        bar("A2 predict ≥ B0 (tie ok)", None, "deferred to confirmed run");
+    } else if !probe_valid {
+        // Arms were force-scored as a DIAGNOSTIC even though the probe is invalid. Report the
+        // numbers (so the signal isn't lost) but mark the bars N/A — the pre-registered verdict
+        // is gated by probe validity and CANNOT be rendered from an invalid probe.
+        println!("  (DIAGNOSTIC — probe invalid; bars below are informational, NOT verdict-bearing)");
+        let b0_prim = pct(prim(|r| &r.b0), n);
+        let a2_prim = pct(prim(|r| &r.a2), n);
+        let a2_wrong = pct(sub_wrong(|r| &r.a2), n);
+        bar("A2 grounding ≥ B0+15pt", None, &format!("[diag] A2={:.1}% B0={:.1}% (Δ={:+.1}pt)", a2_prim, b0_prim, a2_prim - b0_prim));
+        bar("A2 gain concentrated on load-bearing subset", None, "[diag] all kept moments load-bearing by construction");
+        bar("A2 G-correct wrong ≤10%", None, &format!("[diag] A2 wrong={:.1}%", a2_wrong));
+        if p1m > 0 {
+            let b0r = pct(p1tally(|r| r.b0_verdict.as_str()), p1m);
+            let a2r = pct(p1tally(|r| r.a2_verdict.as_str()), p1m);
+            bar("no arm P1 drop >5pt vs B0", Some((b0r - a2r) <= 5.0), &format!("B0={:.1}% A2={:.1}% (drop={:+.1}pt) [P1 reuses frozen labels — valid]", b0r, a2r, b0r - a2r));
+        } else { bar("no arm P1 drop >5pt vs B0", None, "no P1 rows"); }
+        if pm > 0 {
+            let b0p = predict.iter().filter(|r| r.b0_verdict == "predicted").count();
+            let a2p = predict.iter().filter(|r| r.a2_verdict == "predicted").count();
+            bar("A2 predict ≥ B0 (tie ok)", Some(a2p >= b0p), &format!("B0 predicted={}/{} A2 predicted={}/{} [predict reuses frozen corrections — valid]", b0p, pm, a2p, pm));
+        } else { bar("A2 predict ≥ B0 (tie ok)", None, "no predict rows"); }
     } else {
         let b0_prim = pct(prim(|r| &r.b0), n);
         let a2_prim = pct(prim(|r| &r.a2), n);
