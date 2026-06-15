@@ -1,0 +1,68 @@
+{
+  "approaches": [
+    {
+      "auc": 0.9791666666666666,
+      "drops": 0,
+      "est_tokens": 21051,
+      "flip_rate": 0.0,
+      "llm_calls": 22,
+      "n_promoted": 4,
+      "name": "A signed-delta ledger",
+      "promoted_rejected": 0,
+      "recovery_ok": true,
+      "reject_precision": 1.0
+    },
+    {
+      "auc": 1.0,
+      "drops": 0,
+      "est_tokens": 31417,
+      "flip_rate": 0.08823529411764706,
+      "llm_calls": 35,
+      "n_promoted": 20,
+      "name": "B holistic re-judgment",
+      "promoted_rejected": 0,
+      "recovery_ok": true,
+      "reject_precision": 1.0
+    },
+    {
+      "auc": 0.9583333333333334,
+      "drops": 0,
+      "est_tokens": 21051,
+      "flip_rate": 0.029411764705882353,
+      "llm_calls": 22,
+      "n_promoted": 3,
+      "name": "C lifecycle state-machine",
+      "promoted_rejected": 0,
+      "recovery_ok": true,
+      "reject_precision": 1.0
+    },
+    {
+      "auc": 0.5,
+      "drops": 0,
+      "est_tokens": 0,
+      "flip_rate": 0.0,
+      "llm_calls": 0,
+      "n_promoted": 5,
+      "name": "frequency baseline",
+      "promoted_rejected": 1,
+      "recovery_ok": true,
+      "reject_precision": 0.8
+    }
+  ],
+  "bars": {
+    "auc": 0.85,
+    "auc_margin": 0.1,
+    "flip": 0.1,
+    "reject_precision": 0.9
+  },
+  "frequency_auc": 0.5,
+  "gold_distribution": {
+    "neutral": 18,
+    "real": 12,
+    "rejected": 4
+  },
+  "model": "glm-5.1:cloud",
+  "n_gold": 34,
+  "n_runs": 2,
+  "winner": "B holistic re-judgment"
+}

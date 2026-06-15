@@ -464,9 +464,13 @@ struct ApproachRun {
 struct ApproachReport {
     name: &'static str,
     auc: f64,
-    reject_precision: f64, // of promoted, fraction not gold-rejected
+    reject_precision: f64,    // of promoted, fraction NOT gold-rejected (never prime a confabulation)
+    promotion_precision: f64, // of promoted, fraction gold-REAL (never prime ANY non-real noun: the
+    // over-priming / snippet-noise guard — finding #1)
+    real_recall: f64, // of gold-real nouns, fraction promoted
     n_promoted: usize,
     promoted_rejected: usize, // confabulations wrongly promoted
+    promoted_neutral: usize,  // neutral noise (e.g. pasted code symbols) wrongly promoted
     recovery_ok: bool,
     flip_rate: f64,
     cost: CostSnapshot, // run-0 cost
@@ -704,10 +708,26 @@ pub fn run_realness(exp_dir: &Path, cfg: &Config) -> Result<()> {
         // reject-precision: of promoted, fraction not gold-rejected.
         let promoted: Vec<usize> = (0..gold.len()).filter(|&i| r0.verdicts[i].promoted).collect();
         let promoted_rejected = promoted.iter().filter(|&&i| gold[i].gold == "rejected").count();
+        let promoted_neutral = promoted.iter().filter(|&&i| gold[i].gold == "neutral").count();
+        let promoted_real = promoted.iter().filter(|&&i| gold[i].gold == "real").count();
         let reject_precision = if promoted.is_empty() {
             f64::NAN
         } else {
             1.0 - promoted_rejected as f64 / promoted.len() as f64
+        };
+        // promotion-precision: of everything promoted, fraction genuinely gold-REAL. Generalizes
+        // reject-precision to ALL non-real classes — catches an approach that floods primer noise by
+        // promoting NEUTRAL pasted code symbols (finding #1's pollution).
+        let promotion_precision = if promoted.is_empty() {
+            f64::NAN
+        } else {
+            promoted_real as f64 / promoted.len() as f64
+        };
+        let n_real_gold = gold.iter().filter(|g| g.gold == "real").count();
+        let real_recall = if n_real_gold == 0 {
+            f64::NAN
+        } else {
+            promoted_real as f64 / n_real_gold as f64
         };
         // recovery: the recovery canary promoted to real?
         let recovery_ok = gold
@@ -730,8 +750,11 @@ pub fn run_realness(exp_dir: &Path, cfg: &Config) -> Result<()> {
             name,
             auc: a_auc,
             reject_precision,
+            promotion_precision,
+            real_recall,
             n_promoted: promoted.len(),
             promoted_rejected,
+            promoted_neutral,
             recovery_ok,
             flip_rate,
             cost: r0.cost,
@@ -788,10 +811,16 @@ fn print_and_write_report(
 ) -> Result<()> {
     let fmt = |x: f64| if x.is_nan() { "N/A".to_string() } else { format!("{:.3}", x) };
 
-    // Determine winner: best AUC among approaches that PASS reject-precision ≥ bar_rp and clear the
-    // separation bars (AUC ≥ bar_auc AND ≥ freq + margin). Frequency is the baseline, never a winner.
+    // Winner = best separation among approaches that clear EVERY safety/quality gate:
+    //   - separation: AUC ≥ bar_auc AND ≥ freq + margin;
+    //   - reject-precision ≥ bar_rp (never prime a confabulation);
+    //   - promotion-precision ≥ bar_rp (never FLOOD the primer with non-real noise — the decisive
+    //     guard that disqualifies an approach which promotes pasted code symbols / neutral mentions);
+    //   - determinism: flip ≤ bar_flip;
+    //   - recovery.
+    // Frequency is the baseline, never a winner. Tie-break (AUC within 0.03) → cheaper, then steadier.
+    let auc_tol = 0.03f64;
     let mut winner: Option<usize> = None;
-    let mut winner_auc = -1.0f64;
     for (i, r) in reports.iter().enumerate() {
         if r.name.starts_with("frequency") {
             continue;
@@ -800,30 +829,50 @@ fn print_and_write_report(
             && r.auc >= bar_auc
             && (freq_auc.is_nan() || r.auc >= freq_auc + bar_margin);
         let rp_ok = !r.reject_precision.is_nan() && r.reject_precision >= bar_rp;
-        if sep_ok && rp_ok && r.auc > winner_auc {
-            winner = Some(i);
-            winner_auc = r.auc;
+        let pp_ok = !r.promotion_precision.is_nan() && r.promotion_precision >= bar_rp;
+        let det_ok = r.flip_rate <= bar_flip;
+        if !(sep_ok && rp_ok && pp_ok && det_ok && r.recovery_ok) {
+            continue;
         }
+        winner = Some(match winner {
+            None => i,
+            Some(w) => {
+                let cur = &reports[w];
+                if r.auc > cur.auc + auc_tol {
+                    i // clearly better separation
+                } else if cur.auc > r.auc + auc_tol {
+                    w
+                } else if r.cost.calls < cur.cost.calls {
+                    i // within tolerance → cheaper wins
+                } else if r.cost.calls == cur.cost.calls && r.flip_rate < cur.flip_rate {
+                    i // equal cost → steadier wins
+                } else {
+                    w
+                }
+            }
+        });
     }
 
     println!("\nrealness: ══ RESULTS (run-0 canonical; determinism vs run-1) ══\n");
     println!(
-        "  {:<28} {:>7} {:>10} {:>9} {:>9} {:>8} {:>7} {:>9}",
-        "approach", "AUC", "rej-prec", "recovery", "flip%", "calls", "drops", "~tokens"
+        "  {:<28} {:>6} {:>8} {:>8} {:>7} {:>4} {:>5} {:>6} {:>6}",
+        "approach", "AUC", "rejP", "promP", "recall", "rec", "flip%", "calls", "~tok"
     );
     for r in reports {
         println!(
-            "  {:<28} {:>7} {:>10} {:>9} {:>8.0}% {:>8} {:>7} {:>9}",
+            "  {:<28} {:>6} {:>8} {:>8} {:>7} {:>4} {:>4.0}% {:>6} {:>6}",
             r.name,
             fmt(r.auc),
             fmt(r.reject_precision),
-            if r.recovery_ok { "YES" } else { "no" },
+            fmt(r.promotion_precision),
+            fmt(r.real_recall),
+            if r.recovery_ok { "Y" } else { "n" },
             r.flip_rate * 100.0,
             r.cost.calls,
-            r.drops,
             r.cost.est_tokens(),
         );
     }
+    println!("  (rejP=of promoted, frac not rejected · promP=of promoted, frac real · recall=of real, frac promoted)");
     println!("\n  frequency-baseline AUC = {} (approaches must beat by ≥ {:.2})", fmt(freq_auc), bar_margin);
     match winner {
         Some(i) => println!("\n  ===> WINNER: {} (AUC {} at reject-precision {}) <===\n",
@@ -855,20 +904,26 @@ fn print_and_write_report(
     s.push_str("- **Cost**: LLM calls + est. tokens per approach (A & C share the one stance pass; B is a separate call per noun).\n\n");
 
     s.push_str("## Results table\n\n");
-    s.push_str("| approach | AUC | rej-prec | recovery | flip% | LLM calls | drops | ~tokens |\n|---|---|---|---|---|---|---|---|\n");
+    s.push_str("| approach | AUC | reject-prec | promotion-prec | real-recall | recovery | flip% | LLM calls | ~tokens | promoted (real/neut/rej) |\n|---|---|---|---|---|---|---|---|---|---|\n");
     for r in reports {
+        let promoted_real = r.n_promoted - r.promoted_neutral - r.promoted_rejected;
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {:.0}% | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.0}% | {} | {} | {}/{}/{} |\n",
             r.name,
             fmt(r.auc),
             fmt(r.reject_precision),
+            fmt(r.promotion_precision),
+            fmt(r.real_recall),
             if r.recovery_ok { "✅" } else { "❌" },
             r.flip_rate * 100.0,
             r.cost.calls,
-            r.drops,
             r.cost.est_tokens(),
+            promoted_real,
+            r.promoted_neutral,
+            r.promoted_rejected,
         ));
     }
+    s.push_str("\n*promotion-precision* = of the nouns an approach would prime, the fraction that are genuinely gold-REAL (the over-priming / pasted-snippet-noise guard). *reject-precision* only counts confabulations; promotion-precision also penalizes priming NEUTRAL noise.\n");
     s.push_str(&format!("\nFrequency-baseline AUC = **{}** (the LLM approaches must beat this by ≥ {:.2}).\n\n", fmt(freq_auc), bar_margin));
 
     s.push_str("## Per-bar verdicts\n\n");
@@ -878,10 +933,13 @@ fn print_and_write_report(
         }
         let sep_ok = !r.auc.is_nan() && r.auc >= bar_auc && (freq_auc.is_nan() || r.auc >= freq_auc + bar_margin);
         let rp_ok = !r.reject_precision.is_nan() && r.reject_precision >= bar_rp;
+        let pp_ok = !r.promotion_precision.is_nan() && r.promotion_precision >= bar_rp;
         let det_ok = r.flip_rate <= bar_flip;
         s.push_str(&format!("### {}\n\n", r.name));
         s.push_str(&format!("- Separation (AUC ≥ {:.2} and ≥ freq+{:.2}): **{}** ({} vs freq {})\n", bar_auc, bar_margin, yn(sep_ok), fmt(r.auc), fmt(freq_auc)));
         s.push_str(&format!("- Reject-precision ≥ {:.2}: **{}** ({}; {} confabulation(s) promoted of {} promoted)\n", bar_rp, yn(rp_ok), fmt(r.reject_precision), r.promoted_rejected, r.n_promoted));
+        s.push_str(&format!("- Promotion-precision ≥ {:.2} (no priming of non-real noise): **{}** ({}; {} neutral noise promoted)\n", bar_rp, yn(pp_ok), fmt(r.promotion_precision), r.promoted_neutral));
+        s.push_str(&format!("- Real-recall: {} ({} of the gold-real nouns promoted)\n", fmt(r.real_recall), r.n_promoted - r.promoted_neutral - r.promoted_rejected));
         s.push_str(&format!("- Recovery: **{}**\n", yn(r.recovery_ok)));
         s.push_str(&format!("- Determinism (≤ {:.0}% flip): **{}** ({:.0}%)\n\n", bar_flip * 100.0, yn(det_ok), r.flip_rate * 100.0));
     }
@@ -889,9 +947,10 @@ fn print_and_write_report(
     s.push_str("## Winner\n\n");
     match winner {
         Some(i) => s.push_str(&format!(
-            "**{}** — best REAL-vs-REJECTED separation (AUC {}) while holding reject-precision {} (≥ {:.2}) and recovery {} at {} LLM call(s)/run. Determinism flip {:.0}%.\n\n",
-            reports[i].name, fmt(reports[i].auc), fmt(reports[i].reject_precision), bar_rp,
-            if reports[i].recovery_ok { "✅" } else { "❌" }, reports[i].cost.calls, reports[i].flip_rate * 100.0
+            "**{}** — best separation (AUC {}) among approaches that clear EVERY gate: reject-precision {} AND promotion-precision {} (≥ {:.2}; never primes confabulations OR neutral noise), determinism {:.0}% flip (≤ {:.0}%), recovery {}, at {} LLM call(s)/run.\n\n",
+            reports[i].name, fmt(reports[i].auc), fmt(reports[i].reject_precision), fmt(reports[i].promotion_precision), bar_rp,
+            reports[i].flip_rate * 100.0, bar_flip * 100.0,
+            if reports[i].recovery_ok { "✅" } else { "❌" }, reports[i].cost.calls
         )),
         None => s.push_str("No approach cleared all pre-registered bars.\n\n"),
     }
@@ -930,8 +989,11 @@ fn print_and_write_report(
             "name": r.name,
             "auc": if r.auc.is_nan() { serde_json::Value::Null } else { serde_json::json!(r.auc) },
             "reject_precision": if r.reject_precision.is_nan() { serde_json::Value::Null } else { serde_json::json!(r.reject_precision) },
+            "promotion_precision": if r.promotion_precision.is_nan() { serde_json::Value::Null } else { serde_json::json!(r.promotion_precision) },
+            "real_recall": if r.real_recall.is_nan() { serde_json::Value::Null } else { serde_json::json!(r.real_recall) },
             "n_promoted": r.n_promoted,
             "promoted_rejected": r.promoted_rejected,
+            "promoted_neutral": r.promoted_neutral,
             "recovery_ok": r.recovery_ok,
             "flip_rate": r.flip_rate,
             "llm_calls": r.cost.calls,
