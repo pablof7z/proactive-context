@@ -530,8 +530,11 @@ fn mine_noun_moments(
         !gt.is_empty() || (e.has_definition() && crate::eval::verify_in_store_repr_pub(&e.definition, store_repr_lower))
     }).collect();
     let catalog_text = build_noun_catalog(&catalog);
+    // Bound total detector calls (one per scanned human turn) so a slow local model can't run away.
+    let turn_cap = std::env::var("PC_RUN13_DETECT_TURN_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400usize);
+    let mut turns_scanned = 0usize;
     if use_llm_detect {
-        println!("eval: §3.1 — LLM reference detector ON ({} groundable registry nouns offered)", catalog.len());
+        println!("eval: §3.1 — LLM reference detector ON ({} groundable registry nouns offered; turn_cap={})", catalog.len(), turn_cap);
     } else {
         println!("eval: §3.1 — whole-token matcher (LLM detector OFF)");
     }
@@ -555,6 +558,11 @@ fn mine_noun_moments(
 
             // Slugs this turn references.
             let turn_slugs: Vec<String> = if use_llm_detect {
+                if turns_scanned >= turn_cap { break 'sessions; }
+                turns_scanned += 1;
+                if turns_scanned % 10 == 0 {
+                    println!("eval:   §3.1 detector scanned {} human turns → {} candidates so far", turns_scanned, cands.len());
+                }
                 detect_referenced_nouns(t, &catalog, &catalog_text, compile_spec, api_key, ollama_base_url, ollama_api_key)
             } else {
                 let mut v: Vec<String> = Vec::new();
