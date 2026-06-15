@@ -18,8 +18,10 @@ mod eval_run9;
 mod eval_run10;
 mod eval_run11;
 mod eval_run13;
+mod eval_t0;
 mod merged_recognition;
 mod nouns;
+mod realness;
 mod session_start;
 mod chunker;
 mod config;
@@ -385,6 +387,13 @@ enum Commands {
         /// frozen labels/corrections/stores in --experiment-dir. $0 Ollama (PC_RUN13_MODEL).
         #[arg(long)]
         run13: bool,
+
+        /// T-0: stance-calibration gate for noun-realness. Mines ~100 user-turn noun references from
+        /// the frozen corpora (cfv6 primary + cfv3), gold-labels stance with a strong model, seeds
+        /// hand canaries, and scores the production (glm cloud) BATCHED stance classifier vs gold.
+        /// Bars: macro-F1 ≥ 0.80 AND reject-precision ≥ 0.90; falsified if macro-F1 < 0.6.
+        #[arg(long)]
+        t0: bool,
 
         /// Judge model for label mining and scoring (default: capture_model from config).
         #[arg(long, value_name = "MODEL")]
@@ -880,6 +889,7 @@ fn main() -> Result<()> {
             run10,
             run11,
             run13,
+            t0,
             judge_model,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
@@ -895,6 +905,7 @@ fn main() -> Result<()> {
                 run10,
                 run11,
                 run13,
+                t0,
                 judge_model,
             })?;
         }
