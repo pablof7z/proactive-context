@@ -119,50 +119,6 @@ enum Commands {
     /// Fetches available models from OpenRouter and/or Ollama automatically.
     Configure,
 
-    /// Distill lessons from a completed session transcript.
-    /// Reads { session_id, cwd, transcript_path } JSON from stdin.
-    ///
-    /// SessionEnd hook: `capture` (runs immediately, deduplicates via marker).
-    /// Stop hook:       `capture --in` (returns immediately, runs in background after
-    ///                  the configured silence window; resets the timer on each new turn).
-    Capture {
-        /// Debounce capture instead of running immediately (Stop hook).
-        /// `--in <SECS>` returns immediately; the deferred process sleeps then captures.
-        #[arg(long, value_name = "SECS")]
-        r#in: Option<u64>,
-
-        // Internal: run the deferred capture for this session_id (spawned by --in).
-        #[arg(long, hide = true)]
-        deferred: Option<String>,
-
-        /// Which harness's hook dialect the stdin is in (claude | codex | hermes | tenex | opencode).
-        #[arg(long, default_value = "claude")]
-        harness: String,
-    },
-
-    /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
-    /// Reads { prompt, cwd, session_id, transcript_path } JSON from stdin.
-    /// Writes a <system-reminder> block to stdout. Never blocks or errors out the prompt.
-    Inject {
-        /// Show a systemMessage with hits, guides read, and the generated briefing
-        #[arg(long, short = 'v')]
-        verbose: bool,
-
-        /// Which harness's hook dialect to read stdin / format stdout for
-        /// (claude | codex | hermes | tenex | opencode).
-        #[arg(long, default_value = "claude")]
-        harness: String,
-    },
-
-
-    /// Render a one-line Claude Code status bar indicator (invoked via statusLine.command).
-    /// Reads the Claude Code status-line JSON from stdin; prints one styled line to stdout.
-    /// Always exits 0. No LLM, no network, sub-10ms.
-    Statusline {
-        /// Append context-window usage % (green <70, yellow 70-89, red >=90).
-        #[arg(long)]
-        with_context: bool,
-    },
 
     /// Test OpenRouter connectivity and print the raw response (status + headers + body).
     /// Use this to inspect cost metadata, usage fields, and generation IDs.
@@ -264,16 +220,6 @@ enum Commands {
         plain: bool,
     },
 
-    /// Fired by the Claude Code SessionStart hook. Reads open questions left by the previous
-    /// session's capture pass and injects them as additionalContext so Claude can answer
-    /// them naturally during the session. Reads { session_id, cwd, source } JSON from stdin.
-    /// Always exits 0.
-    SessionStart {
-        /// Harness whose hook invoked this (accepted for a uniform hook command; the
-        /// session_start input/output shape is identical across harnesses).
-        #[arg(long, default_value = "claude")]
-        harness: String,
-    },
 
     /// Hook adapter commands called by agent harnesses.
     /// Reads the harness's hook JSON from stdin.
@@ -709,20 +655,6 @@ fn main() -> Result<()> {
             crate::configure::run_configure()?;
         }
 
-        Commands::Capture { r#in, deferred, harness } => {
-            if let Some(session_id) = deferred {
-                crate::capture::run_deferred_capture(&session_id)?;
-            } else if let Some(secs) = r#in {
-                crate::capture::run_capture_scheduled(secs, &harness)?;
-            } else {
-                crate::capture::run_capture(&harness)?;
-            }
-        }
-
-        Commands::Inject { verbose, harness } => {
-            crate::inject::run_inject(verbose, &harness)?;
-        }
-
         Commands::Hook { action } => match action {
             HookAction::Capture { r#in, deferred, harness } => {
                 if let Some(session_id) = deferred {
@@ -745,10 +677,6 @@ fn main() -> Result<()> {
         },
 
 
-        Commands::Statusline { with_context } => {
-            crate::statusline::run_statusline(with_context);
-            // run_statusline calls process::exit(0) — never returns
-        }
 
         Commands::Probe { prompt, model, with_generation } => {
             let cfg = load_config()?;
@@ -837,9 +765,6 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::SessionStart { harness: _ } => {
-            crate::session_start::run_session_start()?;
-        }
 
         Commands::Research { transcript, out_dir, session_id, dump_transcript } => {
             let out_dir = out_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/research-capture-experiment"));
