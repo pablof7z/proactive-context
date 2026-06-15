@@ -54,6 +54,15 @@ pub struct Config {
     #[serde(default = "default_capture_episode_cards")]
     pub capture_episode_cards: bool,
 
+    /// Enable the entity/noun-layer capture + inject paths (entity-and-orientation-capture spec).
+    /// Capture side: a definitional ("X is Y") recognition pass registers project nouns and
+    /// persists transcript-cited entity records under <wiki>/nouns/. Inject side: a first-mention
+    /// primer block surfaces a noun's definition the first time it is referenced in a session.
+    /// Default OFF — when off, both paths are no-ops and capture/inject behavior is byte-identical
+    /// to the pre-entity-layer pipeline. See docs/product-spec/entity-and-orientation-capture.md.
+    #[serde(default = "default_capture_nouns")]
+    pub capture_nouns: bool,
+
     /// Model used for lesson distillation and synthesis (a reasoning task — use a capable model).
     #[serde(default = "default_capture_model")]
     pub capture_model: String,
@@ -205,6 +214,13 @@ fn default_capture_episode_cards() -> bool {
     // same sweep). Phase-2 fixtures: 4/4. One recognition call per session;
     // best-effort, never breaks the normal capture path.
     true
+}
+
+fn default_capture_nouns() -> bool {
+    // OFF by default: the entity/noun layer is the shared foundation for an upcoming
+    // experiment. It is built flagged-off so it cannot disturb the live capture/inject
+    // pipeline until the experiment turns it on. Byte-identical behavior when false.
+    false
 }
 
 fn default_capture_research() -> bool {
@@ -447,6 +463,7 @@ impl Default for Config {
             capture_enabled: default_capture_enabled(),
             capture_research: default_capture_research(),
             capture_episode_cards: default_capture_episode_cards(),
+            capture_nouns: default_capture_nouns(),
             capture_model: default_capture_model(),
             capture_triage_model: default_capture_triage_model(),
             // Observability
