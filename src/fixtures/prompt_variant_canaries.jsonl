@@ -1,0 +1,33 @@
+{"kind":"status","id":"settled-01","expected":"settled","text":"The default embedding provider is local fastembed.","note":"adopted default"}
+{"kind":"status","id":"settled-02","expected":"settled","text":"Nothing is ever deleted from the wiki; supersession retains every claim (keep-everything).","note":"adopted policy"}
+{"kind":"status","id":"settled-03","expected":"settled","text":"pc wiki doctor demotes stale guides rather than deleting them.","note":"shipped behavior"}
+{"kind":"status","id":"settled-04","expected":"settled","text":"The capture pipeline routes each claim to exactly one topic slug.","note":"in-force mechanism"}
+{"kind":"status","id":"settled-05","expected":"settled","text":"Inject compile synthesizes dense prose with mandatory inline (file:line) citations.","note":"adopted design"}
+{"kind":"status","id":"settled-06","expected":"settled","text":"Research capture writes immutable records under docs/wiki/research/.","note":"landed"}
+{"kind":"status","id":"settled-07","expected":"settled","text":"capture_research is enabled by default.","note":"default on"}
+{"kind":"status","id":"settled-08","expected":"settled","text":"PC_INCLUDE_TASK_RESULTS is on by default so subagent task-results are captured.","note":"default on"}
+{"kind":"status","id":"settled-09","expected":"settled","text":"The EXTRACT granularity block is on by default in all capture arms.","note":"settled default"}
+{"kind":"status","id":"settled-10","expected":"settled","text":"Episode cards are treated as historical provenance, not current truth.","note":"adopted contract"}
+{"kind":"status","id":"settled-11","expected":"settled","text":"The reranking stage assigns each claim to exactly one guide or declares it NEW.","note":"in-force"}
+{"kind":"status","id":"settled-12","expected":"settled","text":"delta-EXTRACT is off by default in the live capture path.","note":"settled default"}
+{"kind":"status","id":"proposed-01","expected":"proposed","text":"We could add a pull-based context tool the agent queries on demand.","note":"floated; proactive-push rejected pull-tools"}
+{"kind":"status","id":"proposed-02","expected":"proposed","text":"Maybe later we switch the cache to Redis.","note":"never acted on"}
+{"kind":"status","id":"proposed-03","expected":"proposed","text":"We could merge stale guides instead of grouping them into topics.","note":"merge is the not-chosen alternative"}
+{"kind":"status","id":"proposed-04","expected":"proposed","text":"We might add an uncertainty-gated injection mode.","note":"rejected by Pablo"}
+{"kind":"status","id":"proposed-05","expected":"proposed","text":"One option is to dump everything into a single PRODUCT_MODEL.md.","note":"rejected; wiki chosen"}
+{"kind":"status","id":"proposed-06","expected":"proposed","text":"We could gate inject on a reasoning model to improve correctness.","note":"discussed; blows latency, not adopted"}
+{"kind":"status","id":"proposed-07","expected":"proposed","text":"Perhaps we add a cross-agent standup board later.","note":"agent-awareness later removed"}
+{"kind":"status","id":"proposed-08","expected":"proposed","text":"We could delete agent-authored claims and keep only user claims.","note":"superseded by keep-everything"}
+{"kind":"status","id":"proposed-09","expected":"proposed","text":"Maybe we render the explicit/implicit direction tag in the briefing.","note":"tag is metadata only, never rendered"}
+{"kind":"status","id":"proposed-10","expected":"proposed","text":"We could enable delta-EXTRACT by default.","note":"not adopted; sweet-spot keeps it off"}
+{"kind":"status","id":"proposed-11","expected":"proposed","text":"One idea: a spin-3 routing pass that drops low-signal facts.","note":"rejected; drops facts"}
+{"kind":"status","id":"proposed-12","expected":"proposed","text":"We might add a context-file dump the agent reads at session start.","note":"rejected delivery mode"}
+{"kind":"default_flip","id":"flip-01","topic":"embedding-provider","stale":"OpenAI","replacement":"local fastembed","probe":"Which embedding provider does pc use by default?"}
+{"kind":"default_flip","id":"flip-02","topic":"supersession-policy","stale":"drop agent / keep user","replacement":"keep everything (nothing deleted)","probe":"What is the supersession retention policy?"}
+{"kind":"default_flip","id":"flip-03","topic":"doctor-stale-handling","stale":"merge stale guides","replacement":"demote and group, never delete","probe":"How does the wiki doctor handle stale guides?"}
+{"kind":"coexist_trap","id":"f8-01","old":"embeddings support the OpenAI provider","new":"the default embedder is now local fastembed","must_supersede":true,"note":"canonical F8 OpenAI->local flip"}
+{"kind":"coexist_trap","id":"f8-02","old":"the inject librarian emits verbatim source slices","new":"inject compile now synthesizes dense prose with inline citations","must_supersede":true,"note":"verbatim->synthesis flip"}
+{"kind":"coexist_trap","id":"f8-03","old":"supersession drops agent claims and keeps user claims","new":"supersession keeps everything; nothing is deleted","must_supersede":true,"note":"retention-by-authority->keep-all flip"}
+{"kind":"reversal","id":"rev-01","topic":"embedding-provider","old_direction":"the default embedder is OpenAI","new_direction":"the default embedder is local fastembed","query":"what embedding provider is the default?"}
+{"kind":"reversal","id":"rev-02","topic":"inject-compile-output","old_direction":"inject emits verbatim librarian slices","new_direction":"inject compile synthesizes prose with citations","query":"how does inject compile format its output?"}
+{"kind":"reversal","id":"rev-03","topic":"supersession-retention","old_direction":"supersession drops agent claims, keeps user claims","new_direction":"supersession keeps everything, deletes nothing","query":"what gets retained on supersession?"}

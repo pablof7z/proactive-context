@@ -39,6 +39,7 @@ pub struct EvalArgs {
     pub realness: bool,
     pub run15: bool,
     pub judge_model: Option<String>,
+    pub prompt_variant: Option<String>,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -184,6 +185,18 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
         return crate::eval_run13::run_run13(crate::eval_run13::Run13Args {
             corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
             judge_model: &judge_model, cfg: &cfg, corpus_label,
+        });
+    }
+
+    if let Some(ref variant) = args.prompt_variant {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        let corpus_label = if project_key.contains("proactive-context") { "pc" }
+            else if project_key.contains("nostr") { "wallet" }
+            else { "corpus" };
+        return crate::eval_prompt_variant::run_prompt_variant(crate::eval_prompt_variant::PromptVariantArgs {
+            corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
+            judge_model: &judge_model, cfg: &cfg, corpus_label, variant,
         });
     }
 

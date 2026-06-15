@@ -74,6 +74,123 @@ TITLE: <2-8 words naming the topic, or the single word none if nothing is releva
 If NOTHING in the sources is relevant to the query, output exactly:\n\
 TITLE: none";
 
+// ─── Prompt-variant toggles (A/B, mirrors PC_DELTA_EXTRACT / PC_EXTRACT_NO_GRANULARITY) ───
+//
+// PC_COMPILE_VARIANT selects the COMPILE preamble at the assembly site. Default `librarian`
+// reproduces COMPILE_PREAMBLE byte-for-byte (control arm I0). `verdict` (I1) and `divergence`
+// (I2) are the two replacement preambles from the prompt-variant spec, copied verbatim.
+
+/// I1 — Judgment / verdict-at-decision-point (`PC_COMPILE_VARIANT=verdict`). Verbatim from spec.
+const COMPILE_PREAMBLE_VERDICT: &str = r#"You are a context compiler for an AI coding assistant (Claude Code). The user prompt is a
+SEARCH QUERY describing what the assistant is about to do. You are given SOURCE DOCUMENTS,
+line-numbered, each under a header naming its absolute file path.
+
+Your job: brief the assistant so it makes the RIGHT decision on THIS task. Surface the relevant
+facts, and then state — in one line — what they IMPLY for the decision at hand: the consequence
+the assistant would otherwise walk past. You are a decision brief, not a fact dump and not a
+free essay.
+
+GROUNDING — non-negotiable: every fact AND every implication must trace to the cited sources.
+Each factual sentence MUST be immediately followed by an inline (path:line) or (path:start-end)
+citation using the EXACT path from the header and the N| line numbers shown. A claim with no
+citation is invalid. Never invent paths or line numbers. Synthesize in your own words.
+
+THE ONE ADDITION (this is what differs from a pure extract): for each topic, after its cited
+facts, you MAY add ONE line beginning "IMPLICATION:" stating what those facts mean for the task
+— which option is foreclosed, which default will bite, what the assistant must do differently.
+The implication MUST follow necessarily from the cited facts on the lines directly above it. If
+it needs ANY assumption not present in the sources, do NOT write it. Omit IMPLICATION when no
+consequence follows cleanly.
+
+STILL PROHIBITED: do NOT answer the whole query or write the assistant's code for it; do NOT
+speculate about causes the sources do not state ("might be", "likely because"); do NOT invent
+facts or citations; no filler, no query restatement.
+
+EPISODE CARDS (paths containing /episodes/): historical decision records — treat as trajectory
+and rationale, not current truth; state a card's decision as current only when a guide/committed
+doc corroborates it; otherwise label it historical ("previously…", "as of <date>…"). Cite cards
+like any other source.
+
+Output EXACTLY:
+TITLE: <2-8 words naming the topic, or the single word none if nothing is relevant>
+<cited facts, one claim per sentence, each followed by its (path:line)>
+IMPLICATION: <one grounded consequence for the task>   (omit the line if none follows)
+
+If nothing is relevant, output exactly:
+TITLE: none"#;
+
+/// I2 — Weight-what-the-model-wouldn't-know (`PC_COMPILE_VARIANT=divergence`). Verbatim from spec.
+const COMPILE_PREAMBLE_DIVERGENCE: &str = r#"You are a context compiler for an AI coding assistant (Claude Code). The user prompt is a
+SEARCH QUERY describing what the assistant is about to do. You are given SOURCE DOCUMENTS,
+line-numbered, each under a header naming its absolute file path.
+
+Your job: tell the assistant the things it would get WRONG by default. A competent coding model
+already knows general best practice and common library behavior; briefing it on those wastes its
+attention. Surface the facts where THIS project DIVERGES from the sensible default assumption —
+project-specific decisions, idiosyncratic constraints, non-obvious config, locally-defined
+terms-of-art, and gotchas that contradict the obvious approach.
+
+ORDER BY SURPRISE: lead with the highest-divergence facts — a fact that contradicts the default
+the model would otherwise pick. A fact the model would already assume is LOW value; you MAY omit
+it. A fact whose absence would cause a wrong action is HIGH value; put it first.
+
+ALWAYS KEEP user direction, even if it sounds mundane: anything the USER explicitly asked for or
+decided is load-bearing regardless of how default-like it reads — never drop it on surprise
+grounds.
+
+GROUNDING — non-negotiable: every sentence MUST end with an inline (path:line) or
+(path:start-end) citation using the EXACT header path and the N| line numbers shown. No citation
+= invalid. Never invent paths/lines. Synthesize in your own words.
+
+STILL PROHIBITED: do NOT answer the query or pre-bake a response; do NOT write hypotheses,
+diagnoses, or "why it might…"; do NOT write summary/conclusion sections; do NOT write code; do
+NOT restate the query.
+
+EPISODE CARDS (paths containing /episodes/): historical decision records — trajectory and
+rationale, not current truth; corroborate against a guide before stating as current, else label
+historical. Cite like any source.
+
+Output EXACTLY:
+TITLE: <2-8 words naming the topic, or the single word none>
+<cited divergent facts, MOST surprising first, one per sentence, each with (path:line)>
+
+If nothing diverges from what the model already knows, output exactly:
+TITLE: none"#;
+
+/// Select the active COMPILE preamble from `PC_COMPILE_VARIANT`. Default (unset / `librarian`
+/// / any unrecognized value) returns the librarian baseline, so default behavior is unchanged.
+pub(crate) fn compile_preamble() -> &'static str {
+    match std::env::var("PC_COMPILE_VARIANT").ok().as_deref() {
+        Some("verdict") => COMPILE_PREAMBLE_VERDICT,
+        Some("divergence") => COMPILE_PREAMBLE_DIVERGENCE,
+        _ => COMPILE_PREAMBLE, // "librarian" | unset | unknown → control arm I0
+    }
+}
+
+/// S1 — verdict-oriented SELECT relevance test (`PC_SELECT_VARIANT=verdict`). Replaces ONLY the
+/// relevance-decision sentence in `SELECT_PREAMBLE`; NOTHING_RELEVANT, the one-key-per-line output
+/// rules, and the episode-card paragraph are kept unchanged. Verbatim from spec.
+const SELECT_DECISION_VERDICT: &str = "Decide which sources would CHANGE what the assistant DOES on this task — not which are merely \
+topically related. Select a source only if its absence would let the assistant make a wrong or \
+uninformed decision. A source that is on-topic but inert (background that will not alter the \
+action) is NOT relevant — leave it out. When in doubt, leave it out: injecting inert context is \
+worse than injecting nothing.";
+
+/// The exact baseline relevance sentence in `SELECT_PREAMBLE` that S1 swaps out.
+const SELECT_DECISION_BASE: &str =
+    "Decide which sources (if any) contain context DIRECTLY relevant to what the user now needs.";
+
+/// Select the active SELECT preamble from `PC_SELECT_VARIANT`. Default (unset / `base` / unknown)
+/// returns `SELECT_PREAMBLE` borrowed unchanged, so default behavior is byte-identical.
+pub(crate) fn select_preamble() -> std::borrow::Cow<'static, str> {
+    match std::env::var("PC_SELECT_VARIANT").ok().as_deref() {
+        Some("verdict") => std::borrow::Cow::Owned(
+            SELECT_PREAMBLE.replace(SELECT_DECISION_BASE, SELECT_DECISION_VERDICT),
+        ),
+        _ => std::borrow::Cow::Borrowed(SELECT_PREAMBLE), // "base" | unset | unknown → control
+    }
+}
+
 // ─── Title stripping ──────────────────────────────────────────────────────────
 
 /// If the model output begins with `TITLE: <text>`, strip that line and return
@@ -969,7 +1086,7 @@ async fn wiki_navigate_and_compile(
     if resolve_query {
         preamble.push_str(SELECT_RESOLVE_PREFIX);
     }
-    preamble.push_str(SELECT_PREAMBLE);
+    preamble.push_str(&select_preamble());
     preamble.push_str("\n\nCATALOG:\n");
     preamble.push_str(&render_catalog(&catalog));
     if !recent.is_empty() {
@@ -1150,7 +1267,7 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
         );
     }
 
-    let preamble = format!("{}\n\n{}", COMPILE_PREAMBLE, context);
+    let preamble = format!("{}\n\n{}", compile_preamble(), context);
     let response: String = match spec.provider {
         Provider::OpenRouter => {
             let client = make_client();
@@ -1321,6 +1438,53 @@ mod tests {
     use super::parse_query_line;
     use super::{build_catalog, read_catalog_content, EPISODE_KEY_PREFIX};
     use std::fs;
+
+    // Serialize the env-mutating prompt-variant tests (env vars are process-global).
+    static VARIANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn compile_preamble_default_is_byte_identical() {
+        use super::{compile_preamble, COMPILE_PREAMBLE, COMPILE_PREAMBLE_DIVERGENCE, COMPILE_PREAMBLE_VERDICT};
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_COMPILE_VARIANT");
+        assert_eq!(compile_preamble(), COMPILE_PREAMBLE);
+        std::env::set_var("PC_COMPILE_VARIANT", "librarian");
+        assert_eq!(compile_preamble(), COMPILE_PREAMBLE);
+        std::env::set_var("PC_COMPILE_VARIANT", "totally-unknown");
+        assert_eq!(compile_preamble(), COMPILE_PREAMBLE, "unknown value must fall back to baseline");
+        std::env::set_var("PC_COMPILE_VARIANT", "verdict");
+        let v = compile_preamble();
+        assert_eq!(v, COMPILE_PREAMBLE_VERDICT);
+        assert!(v.contains("IMPLICATION:"), "verdict arm must carry the implication line");
+        std::env::set_var("PC_COMPILE_VARIANT", "divergence");
+        let d = compile_preamble();
+        assert_eq!(d, COMPILE_PREAMBLE_DIVERGENCE);
+        assert!(d.contains("ORDER BY SURPRISE"), "divergence arm must order by surprise");
+        assert!(d.contains("ALWAYS KEEP user direction"), "divergence arm must keep user direction");
+        std::env::remove_var("PC_COMPILE_VARIANT");
+    }
+
+    #[test]
+    fn select_preamble_default_is_byte_identical_and_verdict_swaps_only_the_decision() {
+        use super::{select_preamble, SELECT_DECISION_BASE, SELECT_DECISION_VERDICT, SELECT_PREAMBLE};
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_SELECT_VARIANT");
+        assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE);
+        std::env::set_var("PC_SELECT_VARIANT", "base");
+        assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE);
+        std::env::set_var("PC_SELECT_VARIANT", "unknown");
+        assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE, "unknown value must fall back to baseline");
+        // Sanity: the swap anchor must actually exist in the baseline.
+        assert!(SELECT_PREAMBLE.contains(SELECT_DECISION_BASE));
+        std::env::set_var("PC_SELECT_VARIANT", "verdict");
+        let v = select_preamble().into_owned();
+        assert!(v.contains(SELECT_DECISION_VERDICT), "verdict arm must carry counterfactual gate text");
+        assert!(!v.contains(SELECT_DECISION_BASE), "verdict arm must remove the baseline decision sentence");
+        // Episode-card paragraph and NOTHING_RELEVANT are preserved unchanged.
+        assert!(v.contains("NOTHING_RELEVANT"));
+        assert!(v.contains("SESSION EPISODE CARDS"));
+        std::env::remove_var("PC_SELECT_VARIANT");
+    }
 
     /// Write a minimal episode card into `<wiki>/episodes/<name>.md`.
     fn write_episode_card(wiki: &std::path::Path, name: &str, title: &str, decision: &str) {
