@@ -764,13 +764,88 @@ facts to match a topic; only emit what the transcript actually supports.\n",
     s
 }
 
+// ─── EXTRACT prompt-variant toggles (A/B, mirrors PC_DELTA_EXTRACT precedent) ───────────────
+//
+// PC_EXTRACT_VARIANT={base|typed|terminal} selects the EXTRACT preamble body. `base` (default /
+// unset / unknown) reproduces EXTRACT_PREAMBLE byte-for-byte (control arm C0). The granularity
+// block stays ON in every arm (the preamble body is the only variable). Variants are derived
+// from EXTRACT_PREAMBLE by anchored string surgery so they track future edits to the base.
+
+/// C1 — `status={settled|proposed}` classification block (`PC_EXTRACT_VARIANT=typed`). Verbatim
+/// from spec; inserted immediately before the `## Rules` section (i.e. after the `ratified`
+/// definition). A matching `status` JSON field is also added to the output-shape line.
+const EXTRACT_STATUS_BLOCK_C1: &str = r#"- `status`: "settled" | "proposed".
+  - "settled" = a decision or behavior that is IN FORCE — how the product works, or has been
+    adopted/decided/implemented to work.
+  - "proposed" = an option, plan, or idea RAISED but NOT adopted in this transcript: a
+    discussed-but-not-chosen alternative, a "we could…", a "maybe later" the user never acted on.
+  status is ORTHOGONAL to ratified. ratified is about AUTHORSHIP (who said it); status is about
+  ADOPTION (was it decided). A user can float a "proposed" idea (ratified true, status proposed);
+  the assistant can implement a "settled" behavior the user blessed (status settled). Decide them
+  independently.
+  When unsure, prefer "proposed": call a thing "settled" only when the transcript shows it
+  adopted/decided/implemented, not merely discussed. Mislabeling a real decision as proposed loses
+  spec; mislabeling a proposal as settled fabricates spec — both are errors, weigh toward proposed.
+
+"#;
+
+/// C2 — replacement-mandate + definitional-lead blocks (`PC_EXTRACT_VARIANT=terminal`). Verbatim
+/// from spec; appended to the base preamble (before the granularity block).
+const EXTRACT_TERMINAL_BLOCK_C2: &str = r#"
+## Replacements, not co-existing capabilities
+When a default, value, or approach CHANGES, you MUST phrase the claim as a REPLACEMENT that makes
+the old value FALSE — never as an added capability that contradicts nothing.
+- WRONG: "The system can use a local embedding provider."  (when local REPLACED OpenAI as the
+  default — this leaves the old default standing and the reversal is lost)
+- RIGHT: "The default embedding provider is now local fastembed (replacing the earlier OpenAI
+  default)."
+Before finalizing ANY claim about a default/value/approach, ask: did this REPLACE a prior value
+in the transcript? If yes, name the prior value and state the new one as its replacement.
+
+## Definitional lead for project-specific nouns
+For each project-specific term, component, file, or config the transcript treats as already-known
+(a name a newcomer would not recognize), emit ONE definitional claim stating what it IS — its role
+or purpose — in addition to any claims about how it behaves: "X is the <role> that <does what>."
+Do not skip this because the term "is obvious in context"; the definition is the unit later
+grounding depends on. This is a COMPLETENESS rule, not a license to split one mechanism into many
+claims — keep one atomic fact each.
+"#;
+
+/// Anchors for C1 string surgery (must match EXTRACT_PREAMBLE exactly).
+const EXTRACT_JSON_SHAPE_BASE: &str = "\"ratified\": true|false}]";
+const EXTRACT_JSON_SHAPE_C1: &str = "\"ratified\": true|false, \"status\": \"settled\"|\"proposed\"}]";
+const EXTRACT_RULES_ANCHOR: &str = "## Rules\n";
+
+/// Select the active EXTRACT preamble body from `PC_EXTRACT_VARIANT`. Default (unset / `base` /
+/// unknown) returns `EXTRACT_PREAMBLE` borrowed unchanged, so default behavior is byte-identical.
+fn extract_preamble_variant() -> std::borrow::Cow<'static, str> {
+    match std::env::var("PC_EXTRACT_VARIANT").ok().as_deref() {
+        Some("typed") => {
+            // C1: add the status JSON field, then insert the classification block before `## Rules`.
+            let s = EXTRACT_PREAMBLE
+                .replacen(EXTRACT_JSON_SHAPE_BASE, EXTRACT_JSON_SHAPE_C1, 1)
+                .replacen(
+                    EXTRACT_RULES_ANCHOR,
+                    &format!("{}{}", EXTRACT_STATUS_BLOCK_C1, EXTRACT_RULES_ANCHOR),
+                    1,
+                );
+            std::borrow::Cow::Owned(s)
+        }
+        Some("terminal") => {
+            // C2: append the replacement-mandate + definitional-lead blocks to the base preamble.
+            std::borrow::Cow::Owned(format!("{}{}", EXTRACT_PREAMBLE, EXTRACT_TERMINAL_BLOCK_C2))
+        }
+        _ => std::borrow::Cow::Borrowed(EXTRACT_PREAMBLE), // "base" | unset | unknown → control C0
+    }
+}
+
 /// Assemble the EXTRACT system prompt: the base preamble plus an optional wiki-index block.
 /// Used by BOTH the live capture path (`run_wiki_agent`) and `pc debug extract`, so the
 /// production prompt and the debug command stay in lockstep.
 fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
-    let mut s = String::from(EXTRACT_PREAMBLE);
+    let mut s = String::from(extract_preamble_variant().as_ref());
     // Granularity nudge on by default; PC_EXTRACT_NO_GRANULARITY=1 reproduces the original
-    // prompt for A/B comparison.
+    // prompt for A/B comparison. ON in all PC_EXTRACT_VARIANT arms (preamble body is the variable).
     if std::env::var("PC_EXTRACT_NO_GRANULARITY").ok().as_deref() != Some("1") {
         s.push_str(EXTRACT_GRANULARITY_BLOCK);
     }
@@ -3531,6 +3606,62 @@ pub(crate) fn run_structural_maintenance_for_eval(
 mod tests {
     use super::*;
     use crate::wiki::{parse_guide, revise_section};
+
+    // Serialize the env-mutating EXTRACT prompt-variant tests (env vars are process-global).
+    static EXTRACT_VARIANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn extract_preamble_variant_default_is_byte_identical() {
+        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+        assert_eq!(extract_preamble_variant().as_ref(), EXTRACT_PREAMBLE);
+        std::env::set_var("PC_EXTRACT_VARIANT", "base");
+        assert_eq!(extract_preamble_variant().as_ref(), EXTRACT_PREAMBLE);
+        std::env::set_var("PC_EXTRACT_VARIANT", "unknown-arm");
+        assert_eq!(extract_preamble_variant().as_ref(), EXTRACT_PREAMBLE, "unknown value falls back to baseline");
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+    }
+
+    #[test]
+    fn build_extract_system_default_assembly_unchanged() {
+        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+        std::env::remove_var("PC_EXTRACT_NO_GRANULARITY");
+        // Default: base preamble + granularity block (no wiki index for an empty catalog).
+        let expected = format!("{}{}", EXTRACT_PREAMBLE, EXTRACT_GRANULARITY_BLOCK);
+        assert_eq!(build_extract_system(&[]), expected);
+    }
+
+    #[test]
+    fn extract_typed_variant_adds_status_field_and_block() {
+        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("PC_EXTRACT_VARIANT", "typed");
+        let s = extract_preamble_variant().into_owned();
+        // JSON shape gains the status field.
+        assert!(s.contains("\"status\": \"settled\"|\"proposed\""), "typed must add status JSON field");
+        // Classification block is inserted (verbatim marker) before the Rules section.
+        assert!(s.contains("status is ORTHOGONAL to ratified"), "typed must insert the classification block");
+        let block_pos = s.find("`status`: \"settled\" | \"proposed\"").expect("block present");
+        let rules_pos = s.find("## Rules").expect("rules present");
+        assert!(block_pos < rules_pos, "status block must precede ## Rules");
+        // Granularity stays ON in the assembled system prompt.
+        std::env::remove_var("PC_EXTRACT_NO_GRANULARITY");
+        assert!(build_extract_system(&[]).contains("Sweep the WHOLE transcript"));
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+    }
+
+    #[test]
+    fn extract_terminal_variant_appends_both_blocks() {
+        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("PC_EXTRACT_VARIANT", "terminal");
+        let s = extract_preamble_variant().into_owned();
+        assert!(s.starts_with(EXTRACT_PREAMBLE), "terminal must keep the base preamble intact");
+        assert!(s.contains("## Replacements, not co-existing capabilities"), "terminal must add replacement-mandate block");
+        assert!(s.contains("## Definitional lead for project-specific nouns"), "terminal must add definitional-lead block");
+        // No status field leaks into the terminal arm.
+        assert!(!s.contains("\"status\": \"settled\"|\"proposed\""));
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+    }
 
     // ─── Fix: summary refresh after RECONCILE revise/remove ───────────────────
 
