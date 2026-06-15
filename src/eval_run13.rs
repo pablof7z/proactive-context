@@ -1244,12 +1244,12 @@ fn report(
         let confirmed = (a2_prim >= b0_prim + 15.0) && conc && (a2_wrong <= 10.0) && p1_ok && predict_ok;
         let rejected = (a2_prim - b0_prim <= 5.0) || !conc || (a2_wrong > 10.0) || !p1_ok;
         if confirmed {
-            println!("  VERDICT: CONFIRMED (wallet) — A2 beats B0 by ≥15pt on load-bearing nouns, G-correct clean,");
-            println!("           no P1 regression, predict not reduced. (Run 14 pc must replicate to ship.)");
+            println!("  VERDICT: CONFIRMED ({corpus}) — A2 beats B0 by ≥15pt on load-bearing nouns, G-correct clean,");
+            println!("           no P1 regression, predict not reduced.");
         } else if rejected {
-            println!("  VERDICT: REJECTED (wallet) — A2 fails the pre-registered bars (decorative attention).");
+            println!("  VERDICT: REJECTED ({corpus}) — A2 fails the pre-registered bars (decorative attention).");
         } else {
-            println!("  VERDICT: INCONCLUSIVE (wallet) — A2 in the 5–15pt grey zone; not CONFIRMED, not REJECTED.");
+            println!("  VERDICT: INCONCLUSIVE ({corpus}) — A2 in the 5–15pt grey zone; not CONFIRMED, not REJECTED.");
         }
     }
 

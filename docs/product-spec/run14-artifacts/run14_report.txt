@@ -1,0 +1,41 @@
+╔════════════ RUN 13 (pc) — GROUNDING TABLE (design §3.2)  n=14 ════════════╗
+  arm        primary    G-def=present   G-facts∈{cont,part}   G-correct=wrong
+  B0          28.6%      42.9%           50.0%                 0.0%
+  A1 def      50.0%      85.7%           85.7%                28.6%
+  A2 facts    57.1%      92.9%          100.0%                 0.0%
+  A3 intent   57.1%      71.4%          100.0%                14.3%
+
+  load-bearing subset (n=14):
+    B0         primary  28.6%
+    A1 def     primary  50.0%
+    A2 facts   primary  57.1%
+    A3 intent  primary  57.1%
+
+╔════════════ RUN 13 (pc) — RIDE-ALONGS ════════════╗
+  predict-the-correction (n=12):  predicted/partial
+    B0  0/12   3/12
+    A2  0/12   1/12
+  restatement P1 recall (n=12):  contained+partial
+    B0  10/12 = 83.3%
+    A2  10/12 = 83.3%
+
+╔════════════ RUN 13 (pc) — PRE-REGISTERED BARS (verbatim) ════════════╗
+  [PASS] Probe validity: canaries recovered + ≥12 moments — canaries_recovered=true (0 missing), moments=14 (gate 12)
+  [PASS] A2 grounding ≥ B0+15pt — A2=57.1% B0=28.6% (Δ=+28.6pt; need ≥+15)
+  [PASS] A2 gain concentrated on load-bearing subset — LB Δ=+28.6pt vs overall Δ=+28.6pt (LB n=14)
+  [PASS] A2 G-correct wrong ≤10% — A2 wrong=0.0%
+  [PASS] no arm P1 drop >5pt vs B0 — B0=83.3% A2=83.3% (drop=+0.0pt)
+  [PASS] A2 predict ≥ B0 (tie ok) — B0 predicted=0/12 A2 predicted=0/12
+
+╔════════════ RUN 13 (pc) — VERDICT (design §Stop) ════════════╗
+  VERDICT: CONFIRMED (wallet) — A2 beats B0 by ≥15pt on load-bearing nouns, G-correct clean,
+           no P1 regression, predict not reduced. (Run 14 pc must replicate to ship.)
+
+eval: RUN 13 (pc) DONE → /Users/pablofernandez/.proactive-context/experiments/cfv6-20260611-012408
+╔════════════ RUN 13 (pc) — CANARY RECOVERY (design §3.4) ════════════╗
+  recovered = registry-grounded AND idiosyncratic (bare ≠ contained); moment = also mined from a human turn
+  [RECOVERED] capture-pipeline     grounded=true idiosyncratic=true (bare=absent) moment=true
+  [RECOVERED] context-injection    grounded=true idiosyncratic=true (bare=absent) moment=true
+  [RECOVERED] reranking            grounded=true idiosyncratic=true (bare=absent) moment=false
+
+eval: §3.1 — verified idiosyncratic noun-moments: 14 (gate ≥ 12)
