@@ -265,10 +265,11 @@ pub(crate) fn call_model_blocking_with_timeout(
         }
 
         eprintln!(
-            "capture: {} call failed (attempt {}/{}), retrying…",
+            "capture: {} call failed (attempt {}/{}: {}), retrying…",
             spec.provider_name(),
             attempt,
-            MAX_ATTEMPTS
+            MAX_ATTEMPTS,
+            last_err.as_ref().map(|e| e.to_string()).unwrap_or_default().chars().take(160).collect::<String>(),
         );
         std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
     }
