@@ -1,0 +1,41 @@
+╔════════════ RUN 13 (wallet) — GROUNDING TABLE (design §3.2)  n=3 ════════════╗
+  arm        primary    G-def=present   G-facts∈{cont,part}   G-correct=wrong
+  B0           0.0%       0.0%            0.0%                 0.0%
+  A1 def       0.0%       0.0%            0.0%                 0.0%
+  A2 facts     0.0%       0.0%            0.0%                 0.0%
+  A3 intent    0.0%       0.0%            0.0%                 0.0%
+
+  load-bearing subset (n=3):
+    B0         primary   0.0%
+    A1 def     primary   0.0%
+    A2 facts   primary   0.0%
+    A3 intent  primary   0.0%
+
+╔════════════ RUN 13 (wallet) — RIDE-ALONGS ════════════╗
+  predict-the-correction (n=12):  predicted/partial
+    B0  0/12   0/12
+    A2  0/12   0/12
+  restatement P1 recall (n=12):  contained+partial
+    B0  0/12 = 0.0%
+    A2  0/12 = 0.0%
+
+╔════════════ RUN 13 (wallet) — PRE-REGISTERED BARS (verbatim) ════════════╗
+  [FAIL] Probe validity: canaries recovered + ≥12 moments — canaries_recovered=false (3 missing), moments=3 (gate 12)
+  (DIAGNOSTIC — probe invalid; bars below are informational, NOT verdict-bearing)
+  [N/A ] A2 grounding ≥ B0+15pt — [diag] A2=0.0% B0=0.0% (Δ=+0.0pt)
+  [N/A ] A2 gain concentrated on load-bearing subset — [diag] all kept moments load-bearing by construction
+  [N/A ] A2 G-correct wrong ≤10% — [diag] A2 wrong=0.0%
+  [PASS] no arm P1 drop >5pt vs B0 — B0=0.0% A2=0.0% (drop=+0.0pt) [P1 reuses frozen labels — valid]
+  [PASS] A2 predict ≥ B0 (tie ok) — B0 predicted=0/12 A2 predicted=0/12 [predict reuses frozen corrections — valid]
+
+╔════════════ RUN 13 (wallet) — VERDICT (design §Stop) ════════════╗
+  VERDICT: PROBE INVALID — mining pass REJECTED (canary recovery failed).
+  FINDING: registry-coverage gap. The seeded wallet canaries are NOT grounded by
+           the C3 registry in THIS corpus. Missing: nutzap, mint, token-event
+           → C3 sources (guide titles/slugs/topics + claim subjects) do not cover
+             these nouns here. Cannot adjudicate A2>B0 on wallet from this corpus.
+           This is NOT a silent skip and NOT an A2 rejection — it is a probe-validity
+           finding that must be resolved (corpus/registry-source) before Run-13 can
+           render the CONFIRMED/REJECTED noun-primer verdict.
+
+eval: RUN 13 (wallet) DONE → /Users/pablofernandez/.proactive-context/experiments/cfv3-20260610-175752

@@ -92,6 +92,12 @@ Scored under `PC_RUN13_FORCE=1` (the verdict stays gated; these numbers are info
 
 Load-bearing subset (n=3, all kept moments are load-bearing): identical (all arms 0.0% primary).
 
+**Fidelity caveat:** the three grounding judges (`G-def`/`G-facts`/`G-correct`) call the model
+directly (not via the B0 briefing's retry/keep-alive path), so under shared-Ollama eviction some of
+these `absent` verdicts are 404-defaults rather than true judgements. Because the probe is invalid
+(n=3 sub-gate) these numbers are non-verdict-bearing regardless; a CONFIRMED run on a valid corpus
+should route every judge through the retry path (or use a hosted judge).
+
 **Diagnostic read:** with only 3 sub-gate moments — two of which (`identity`, `content-rendering`) are
 **thin anchors with an empty C3 definition**, and whose store "ground-truth" lines are noisy
 co-occurrences rather than crisp definitions — the grounding signal is **uninformative by construction**.
@@ -167,9 +173,26 @@ CONFIRMED/REJECTED noun-primer verdict on wallet.
 
 ---
 
-## Frozen artifacts (in the experiment dir)
+## Frozen artifacts
 
-- `run13_nouns.jsonl` — the frozen idiosyncratic noun-moments (3).
-- `run13_arms.jsonl` — B0/A1/A2/A3 grounding sub-verdicts per moment (diagnostic).
-- `run13_predict.jsonl` — predict-the-correction B0 vs A2 (ride-along).
-- `run13_p1.jsonl` — restatement-P1 B0 vs A2 (ride-along).
+Committed under `docs/product-spec/run13-artifacts/` (and live in the experiment dir
+`~/.proactive-context/experiments/cfv3-20260610-175752/`):
+
+- `run13_nouns.jsonl` — the frozen idiosyncratic noun-moments (3): `identity`, `content-rendering`,
+  `nwc-wallet`, each with bare-model answer, idiosyncrasy verdict, and ground-truth fact set.
+- `run13_arms.jsonl` — B0/A1/A2/A3 grounding sub-verdicts per moment (diagnostic, all-absent).
+- `run13_p1.jsonl` — restatement-P1 B0 vs A2 (ride-along, from the completed run; all absent — see §4 caveat).
+- `run13_report.txt` — verbatim console report of the completed run (grounding table, ride-alongs,
+  bars, verdict). The predict-the-correction row (B0 0/12, A2 0/12) is captured here; the predict
+  JSONL is reproducible via `pc eval --run13` and was not hand-authored.
+
+**Reproduce:**
+```
+PC_RUN13_FORCE=1 PC_RUN13_MODEL=ollama:gemma4:26b-mlx \
+PC_HOME=~/.proactive-context/experiments/cfv3-20260610-175752 \
+pc eval --project /Users/pablofernandez/Work/nostr-multi-platform \
+  --experiment-dir ~/.proactive-context/experiments/cfv3-20260610-175752 \
+  --run13 --judge-model ollama:gemma4:26b-mlx
+```
+The probe-validity finding (canary failure + 3<12 scarcity) is deterministic and model-independent
+(it comes from the no-LLM Pass-1 miner); only the diagnostic LLM numbers depend on the judge model.
