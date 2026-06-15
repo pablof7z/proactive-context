@@ -318,6 +318,169 @@ pub fn build_registry_from_disk(wiki_dir: &Path, project_dir: &Path) -> Vec<Noun
     registry
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  APPROACH A — USER-STANCE REALNESS SURFACING GATE (Phase 3 Move 2)
+// ════════════════════════════════════════════════════════════════════════════════
+//
+//  The shipped primer (Runs 13–14) sourced its noun population from WIKI GUIDE TITLES (C3) — i.e.
+//  from artifacts pc itself synthesized. Pablo rejected this: a guide title like `fabric-provider`
+//  can be a confabulation the user never asked for, yet it primed anyway.
+//
+//  The correct model (validated in the T-A bake-off, `src/realness.rs` Approach A): the noun
+//  POPULATION comes from the USER's own turns, and realness = the accumulated SIGNED stance score
+//  over those turns (operate_on +1 / reject −2 / neutral 0). Only nouns the user made REAL
+//  (signed ≥ REAL_THRESHOLD) prime; SUPPRESSED (≤ SUPPRESS_THRESHOLD) and in-between PROVISIONAL
+//  nouns never prime. C3 guide content is demoted from POPULATION SOURCE to mere DEFINITION
+//  ENRICHMENT — a real user noun may pull its definition from a guide whose canonical name matches.
+//
+//  This gate is the inject-side seam. The user-stance realness scores are computed at CAPTURE time
+//  (the LLM stance pass is off the hot path) and PERSISTED as a small registry the inject path reads;
+//  the surfacing transform here is pure and LLM-free. Flagged (`PC_NOUNS_REALNESS`, default OFF):
+//  when off, the primer sources the C3 registry exactly as before (byte-identical).
+
+/// A user-stance noun with its accumulated Approach-A realness, persisted at capture time and read by
+/// the inject surfacing gate. Sourced from USER TURNS (never guide titles), alias-normalized
+/// (`crate::alias::canonical_key`) so cross-phrasing references accumulate onto one canonical id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RealnessNoun {
+    /// Canonical id (alias-normalized) — the accumulation key and enrichment-match key.
+    pub canonical: String,
+    /// Best human-readable surface form the user actually used (the primer display name).
+    pub name: String,
+    /// Approach-A signed-delta ledger sum over the user's stance events for this noun.
+    pub signed: i32,
+    /// Derived status string: "real" (≥ REAL_THRESHOLD) | "suppressed" (≤ SUPPRESS_THRESHOLD) |
+    /// "provisional" (in between). Mirrors `realness::RealnessStatus`; carried for inspection.
+    pub status: String,
+}
+
+impl RealnessNoun {
+    /// Construct from a name + signed score, deriving canonical id and status (single source of the
+    /// status thresholds: `crate::realness::{REAL_THRESHOLD, SUPPRESS_THRESHOLD}`).
+    pub fn new(name: &str, signed: i32) -> Self {
+        let status = if signed >= crate::realness::REAL_THRESHOLD {
+            "real"
+        } else if signed <= crate::realness::SUPPRESS_THRESHOLD {
+            "suppressed"
+        } else {
+            "provisional"
+        };
+        RealnessNoun {
+            canonical: crate::alias::canonical_key(name),
+            name: name.trim().to_string(),
+            signed,
+            status: status.to_string(),
+        }
+    }
+
+    /// True when this noun is REAL and should prime (signed ≥ REAL_THRESHOLD).
+    pub fn is_real(&self) -> bool {
+        self.signed >= crate::realness::REAL_THRESHOLD
+    }
+}
+
+/// The inject-side realness gate flag. Default OFF so the primer's population source is unchanged
+/// (the C3 guide-title path) unless explicitly enabled. `PC_NOUNS_REALNESS=1|true|on` switches the
+/// population to the USER-STANCE realness registry; anything else (incl. unset) keeps C3.
+pub fn realness_gate_enabled() -> bool {
+    realness_gate_enabled_with(std::env::var("PC_NOUNS_REALNESS").ok().as_deref())
+}
+
+fn realness_gate_enabled_with(env: Option<&str>) -> bool {
+    matches!(
+        env.map(|s| s.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Index a C3 registry by canonical key (alias-normalized) for enrichment lookup. Both the entry's
+/// display NAME and its deslugged SLUG are canonicalized so a user noun matches a guide by either.
+/// The richest definition wins when several C3 entries share a canonical key.
+fn c3_by_canonical(c3: &[NounEntry]) -> std::collections::HashMap<String, &NounEntry> {
+    let mut map: std::collections::HashMap<String, &NounEntry> = std::collections::HashMap::new();
+    for e in c3 {
+        for key in [
+            crate::alias::canonical_key(&e.name),
+            crate::alias::canonical_key(&deslug(&e.slug)),
+        ] {
+            match map.get(&key) {
+                Some(existing) if existing.has_definition() => {} // keep the defined one
+                _ => {
+                    map.insert(key, e);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Approach-A surfacing gate (Phase 3 Move 2): turn the USER-STANCE realness registry into the
+/// priming population, REPLACING the C3 guide-title population. Only nouns the user made REAL
+/// (`signed ≥ REAL_THRESHOLD`) become primeable; SUPPRESSED and PROVISIONAL nouns are dropped (a
+/// confabulation like `fabric-provider`, suppressed at ≤ −2, can never prime). Each promoted noun
+/// pulls its DEFINITION + source refs as ENRICHMENT from a C3 guide whose canonical key matches
+/// (a real noun may be defined by a matching guide); with no match it stays a thin anchor. Pure.
+pub fn realness_gated_registry(realness: &[RealnessNoun], c3: &[NounEntry]) -> Vec<NounEntry> {
+    let by_key = c3_by_canonical(c3);
+    let mut out: Vec<NounEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in realness {
+        if !r.is_real() {
+            continue; // suppressed + provisional never prime — the whole point of the gate
+        }
+        if !seen.insert(r.canonical.clone()) {
+            continue; // one entry per canonical id (defensive against a duplicated registry)
+        }
+        let enrich = by_key.get(&r.canonical);
+        out.push(NounEntry {
+            slug: slugify(&r.name),
+            name: r.name.clone(),
+            definition: enrich.map(|e| e.definition.clone()).unwrap_or_default(),
+            source_refs: enrich.map(|e| e.source_refs.clone()).unwrap_or_default(),
+            origin: "user-real".to_string(),
+        });
+    }
+    out
+}
+
+// ─── realness registry persistence: <wiki>/nouns/realness.jsonl ──
+
+/// Path to the persisted user-stance realness registry (one `RealnessNoun` JSON per line).
+fn realness_registry_path(wiki_dir: &Path) -> PathBuf {
+    wiki_dir.join("nouns").join("realness.jsonl")
+}
+
+/// Read the persisted user-stance realness registry. Missing file / parse errors degrade to an
+/// empty vec (never an error) — an absent registry simply means the gate primes nothing.
+pub fn read_realness_registry(wiki_dir: &Path) -> Vec<RealnessNoun> {
+    let path = realness_registry_path(wiki_dir);
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<RealnessNoun>(l).ok())
+        .collect()
+}
+
+/// Persist the user-stance realness registry (overwrite). Created by the capture-side stance pass
+/// (and by the Run-15 eval); read by the inject gate. Best-effort directory creation.
+pub fn write_realness_registry(wiki_dir: &Path, nouns: &[RealnessNoun]) -> std::io::Result<PathBuf> {
+    let path = realness_registry_path(wiki_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    for n in nouns {
+        body.push_str(&serde_json::to_string(n).unwrap_or_default());
+        body.push('\n');
+    }
+    fs::write(&path, body)?;
+    Ok(path)
+}
+
 // ─── Registry persistence: <wiki>/nouns/<slug>.md (mirrors research/episode stores) ──
 
 /// Persist a derived/extracted registry to `<wiki>/nouns/<slug>.md` immutable-ish entries
@@ -1171,7 +1334,17 @@ pub fn build_inject_primer(
     if !nouns_inject_enabled(config_flag) {
         return PrimerResult { block: None, primed_slugs: Vec::new(), level };
     }
-    let registry = build_registry_from_disk(wiki_dir, project_dir);
+    // Population source. Default (gate OFF): the C3 derived registry, byte-identical to the shipped
+    // primer. Gate ON (`PC_NOUNS_REALNESS`): the USER-STANCE realness registry — only nouns the user
+    // made REAL prime, C3 guides supply DEFINITIONS only (the model Pablo accepted). When the gate is
+    // on but no realness registry has been persisted yet, the population is empty (prime nothing)
+    // rather than silently falling back to guide titles.
+    let c3 = build_registry_from_disk(wiki_dir, project_dir);
+    let registry: Vec<NounEntry> = if realness_gate_enabled() {
+        realness_gated_registry(&read_realness_registry(wiki_dir), &c3)
+    } else {
+        c3
+    };
     if registry.is_empty() {
         return PrimerResult { block: None, primed_slugs: Vec::new(), level };
     }
@@ -1514,6 +1687,127 @@ mod tests {
         assert!(nouns_inject_enabled_with(true, Some("maybe")));
     }
 
+    // ─── Approach-A surfacing gate (Phase 3 Move 2) ───
+
+    #[test]
+    fn realness_noun_derives_status_and_canonical() {
+        let real = RealnessNoun::new("the Fabric Provider", 3);
+        assert_eq!(real.canonical, "fabric provider");
+        assert_eq!(real.status, "real");
+        assert!(real.is_real());
+        let prov = RealnessNoun::new("Episode Cards", 1);
+        assert_eq!(prov.status, "provisional");
+        assert!(!prov.is_real());
+        let sup = RealnessNoun::new("fabric-provider", -6);
+        assert_eq!(sup.status, "suppressed");
+        assert!(!sup.is_real());
+        // canonical collapses the phrasings → same accumulation key.
+        assert_eq!(real.canonical, sup.canonical);
+    }
+
+    #[test]
+    fn realness_gate_flag_defaults_off() {
+        assert!(!realness_gate_enabled_with(None));
+        assert!(!realness_gate_enabled_with(Some("0")));
+        assert!(!realness_gate_enabled_with(Some("false")));
+        assert!(!realness_gate_enabled_with(Some("maybe")));
+        assert!(realness_gate_enabled_with(Some("1")));
+        assert!(realness_gate_enabled_with(Some("true")));
+        assert!(realness_gate_enabled_with(Some("ON")));
+    }
+
+    #[test]
+    fn gate_promotes_only_real_and_enriches_from_matching_guide() {
+        // C3 guides (the OLD population source) — now demoted to definition enrichment.
+        let c3 = derive_registry(
+            &[
+                idx("context-injection", "inject", "Context Injection", "Pushes project facts into the prompt at decision points."),
+                idx("fabric-provider", "infra", "Fabric Provider", "A provider abstraction."),
+            ],
+            &[],
+        );
+        // User-stance realness registry (sourced from USER TURNS):
+        //   - context injection: REAL (+3) → primes, pulls the guide definition.
+        //   - fabric-provider: SUPPRESSED (−6) → must NOT prime even though a guide title exists.
+        //   - episode cards: PROVISIONAL (+1) → must NOT prime.
+        //   - capture pipeline: REAL (+3) but no matching guide → thin anchor, still primes.
+        let realness = vec![
+            RealnessNoun::new("context injection", 3),
+            RealnessNoun::new("fabric-provider", -6),
+            RealnessNoun::new("episode cards", 1),
+            RealnessNoun::new("capture pipeline", 3),
+        ];
+        let gated = realness_gated_registry(&realness, &c3);
+        let names: Vec<&str> = gated.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"context injection"), "real noun primes: {:?}", names);
+        assert!(names.contains(&"capture pipeline"), "real noun w/o guide still primes: {:?}", names);
+        // THE headline: the confabulation is never primed, despite a guide title of the same name.
+        assert!(!names.iter().any(|n| n.contains("fabric")), "suppressed confab must NOT prime: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("episode")), "provisional must NOT prime: {:?}", names);
+        // Enrichment: the real noun pulled its definition from the matching C3 guide.
+        let ci = gated.iter().find(|e| e.name == "context injection").unwrap();
+        assert!(ci.definition.contains("decision points"), "def enriched from guide: {}", ci.definition);
+        assert_eq!(ci.origin, "user-real");
+        assert!(ci.source_refs.contains(&"guide:context-injection".to_string()), "refs inherited: {:?}", ci.source_refs);
+        // The no-guide real noun is a thin anchor.
+        let cp = gated.iter().find(|e| e.name == "capture pipeline").unwrap();
+        assert!(!cp.has_definition());
+    }
+
+    #[test]
+    fn realness_registry_roundtrips_on_disk() {
+        let dir = std::env::temp_dir().join(format!("pc-realreg-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        assert!(read_realness_registry(&wiki).is_empty());
+        let nouns = vec![RealnessNoun::new("context injection", 4), RealnessNoun::new("fabric-provider", -6)];
+        write_realness_registry(&wiki, &nouns).unwrap();
+        let back = read_realness_registry(&wiki);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].name, "context injection");
+        assert_eq!(back[0].signed, 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_inject_primer_realness_gate_replaces_guide_population() {
+        // With the gate ON, a guide-title noun the user NEVER made real must NOT prime, while a
+        // user-REAL noun does — proving the population source switched from guide titles to user
+        // stance. (Contrast with the gate-OFF behavior in the test below.)
+        let dir = std::env::temp_dir().join(format!("pc-gate-on-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let proj = dir.join("proj");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            wiki.join("fabric-provider.md"),
+            "---\ntitle: Fabric Provider\nsummary: A provider abstraction nobody asked for.\n---\n\n# Fabric Provider\n\nA provider abstraction.\n",
+        ).unwrap();
+        fs::write(
+            wiki.join("context-injection.md"),
+            "---\ntitle: Context Injection\nsummary: Pushes project facts into the prompt at decision points.\n---\n\n# Context Injection\n\nPushes facts in.\n",
+        ).unwrap();
+        // Realness registry: only context injection is REAL; fabric-provider is suppressed.
+        write_realness_registry(&wiki, &[
+            RealnessNoun::new("context injection", 4),
+            RealnessNoun::new("fabric-provider", -6),
+        ]).unwrap();
+        std::env::remove_var("PC_PRIMER_LEVEL");
+
+        // Gate ON: prompt names BOTH; only the user-real one primes.
+        std::env::set_var("PC_NOUNS_REALNESS", "1");
+        let prompt = "how does the fabric provider interact with context injection?";
+        let on = build_inject_primer(true, &wiki, &proj, "sess-gate-on", prompt, "");
+        std::env::remove_var("PC_NOUNS_REALNESS");
+        let block = on.block.expect("real noun should prime");
+        assert!(block.contains("Context Injection") || block.contains("context injection"), "block: {}", block);
+        assert!(!block.to_lowercase().contains("fabric provider"), "suppressed confab must NOT prime: {}", block);
+        assert!(on.primed_slugs.iter().all(|s| !s.contains("fabric")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn build_inject_primer_off_switch_is_byte_identical_and_fires_when_on() {
         let dir = std::env::temp_dir().join(format!("pc-primer-gate-{}", std::process::id()));
@@ -1530,6 +1824,7 @@ mod tests {
         // Natural phrasing: separate words, NOT the whole slug phrase (the Run-13 gap).
         let prompt = "what does the staleness detector do?";
         std::env::remove_var("PC_PRIMER_LEVEL");
+        std::env::remove_var("PC_NOUNS_REALNESS"); // this test exercises the default C3 path
 
         // Disabled (config flag false, no env): byte-identical no-op — empty block, nothing primed.
         let off = build_inject_primer(false, &wiki, &proj, "sess-gate", prompt, "");
