@@ -110,11 +110,10 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
     );
     let store_repr_lower = store_repr.to_lowercase();
 
-    // Warm the local model and ask Ollama to keep it resident (keep_alive=-1) so it is not evicted
-    // mid-run by peer agents sharing the host — the eviction that 404s briefings/judges on $0-local.
-    // Best-effort; ignored for non-Ollama specs and on any error.
-    warm_ollama_model(&compile_spec, &ollama_base_url, ok);
-    if judge_spec.model != compile_spec.model { warm_ollama_model(&judge_spec, &ollama_base_url, ok); }
+    // NOTE: model warmup is PHASE-LOCAL, not eager at run start. Pinning the heavy judge model
+    // (keep_alive=-1) during the mining phase — which uses a separate small DETECT model — thrashes
+    // VRAM (the two models evict each other on a single-GPU host). So we warm the detect model inside
+    // the mining phase, and the judge/compile model just before the arm/ride-along phase.
 
     // ───────────────────────── §3.1 — C3 registry (zero re-capture) ─────────────────────────
     let registry = build_registry_from_disk(&store_a_wiki, &store_b_claims);
@@ -140,6 +139,16 @@ pub fn run_run13(args: Run13Args) -> Result<()> {
     };
 
     // ───────────────────────── §3.4 — canary recovery (P1, loud) ─────────────────────────
+    // Canary diagnosis + all downstream judging use the heavy judge/compile model; ensure it is warm
+    // (mining may have been reused from frozen, skipping the in-mining warmup). Detector model is
+    // released if it differs, so the judge isn't VRAM-starved.
+    if std::env::var("PC_RUN13_DETECT_MODEL").is_ok() {
+        let ds = crate::provider::ModelSpec::parse(&std::env::var("PC_RUN13_DETECT_MODEL").unwrap());
+        if ds.model != judge_spec.model { unpin_ollama_model(&ds, &ollama_base_url, ok); }
+    }
+    warm_ollama_model(&judge_spec, &ollama_base_url, ok);
+    if compile_spec.model != judge_spec.model { warm_ollama_model(&compile_spec, &ollama_base_url, ok); }
+
     let canaries = seeded_canaries(corpus_label);
     let canary_status = diagnose_canaries(
         &canaries, &registry, &moments, &store_repr_lower,
@@ -606,6 +615,14 @@ fn mine_noun_moments(
     }
     println!("eval: §3.1 — {} registry+store-grounded noun candidates (pre-idiosyncrasy)", cands.len());
 
+    // Phase transition: the detector (small fast model) is done; the idiosyncrasy bare-probe uses the
+    // heavy compile/judge model. On a single-GPU host release the detect model first, then warm the
+    // compile model, so they don't thrash VRAM (the Run-14 contention finding).
+    if use_llm_detect && detect_spec.model != compile_spec.model {
+        unpin_ollama_model(&detect_spec, ollama_base_url, ollama_api_key);
+    }
+    warm_ollama_model(compile_spec, ollama_base_url, ollama_api_key);
+
     // Pass 2 (LLM): idiosyncrasy filter — bare model answers "in this project what is N?". If the
     // judge says the bare answer already CONTAINS the store's grounding → model already knows it →
     // EXCLUDE (design §3.1 step 2; operationalizes F12 counterfactual-load control).
@@ -725,6 +742,25 @@ fn warm_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<
         Ok(_) => println!("eval: warmed + pinned Ollama model {} (keep_alive=-1)", spec.model),
         Err(_) => {}
     }
+}
+
+/// Release an Ollama model from VRAM (keep_alive=0) so the next phase's model isn't starved on a
+/// single-GPU host. No-op for non-Ollama; best-effort.
+fn unpin_ollama_model(spec: &crate::provider::ModelSpec, base: &str, key: Option<&str>) {
+    if spec.provider != crate::provider::Provider::Ollama { return; }
+    let url = format!("{}/api/chat", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": spec.model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "stream": false,
+        "keep_alive": 0,
+    });
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60)).build() { Ok(c) => c, Err(_) => return };
+    let mut req = client.post(&url).json(&body);
+    if let Some(k) = key { if !k.is_empty() { req = req.bearer_auth(k); } }
+    let _ = req.send();
+    println!("eval: released Ollama model {} (keep_alive=0)", spec.model);
 }
 
 // ═══════════════════════════ §2 — arms + §3.2 grounding judge ═══════════════════════════
