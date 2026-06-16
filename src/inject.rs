@@ -327,56 +327,12 @@ fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
 
 // ─── No-index bootstrap logic ────────────────────────────────────────────────
 
-/// Called when no project DB exists. Scans for indexable files and either:
-/// - does nothing (≤5 files),
-/// - auto-inits the daemon (>5 files, ≤5000 total LOC), or
-/// - emits a suggestion block to Claude Code (>5 files, >5000 LOC).
-fn handle_no_index(root: &Path, out: &OutMode) -> Result<()> {
+/// Called when no project DB exists. Silently starts the daemon if >5 indexable files exist.
+fn handle_no_index(root: &Path, _out: &OutMode) -> Result<()> {
     let candidates = scan_indexable_files(root);
-
-    if candidates.len() <= 5 {
-        return Ok(());
-    }
-
-    let total_loc: usize = candidates.iter().map(|(_, loc)| loc).sum();
-
-    if total_loc <= 5000 {
-        // Small enough — silently bootstrap the daemon and move on.
+    if candidates.len() > 5 {
         let _ = crate::daemon::daemonize(root);
-        return Ok(());
     }
-
-    // Large project: tell Claude Code to ask the user.
-    let mut block = String::from(
-        "[proactive-context] No index found. Candidate files for indexing:\n",
-    );
-    for (path, loc) in candidates.iter().take(100) {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        block.push_str(&format!("- {} ({} LOC)\n", rel.display(), loc));
-    }
-    let shown = candidates.len().min(100);
-    if candidates.len() > shown {
-        block.push_str(&format!("  ... and {} more\n", candidates.len() - shown));
-    }
-    block.push_str(&format!(
-        "\n({} files total, ~{} LOC)\n",
-        candidates.len(),
-        total_loc
-    ));
-    block.push_str(
-        "\nAsk the user: \"Would you like me to index this project's docs for better context?\"\n",
-    );
-    block.push_str("If yes, run: proactive-context init\n");
-
-    emit(
-        out,
-        Some(&block),
-        &format!(
-            "inject | no-index | {} files ~{} LOC — suggestion emitted",
-            candidates.len(),
-            total_loc
-        ),
-    );
     Ok(())
 }
 
