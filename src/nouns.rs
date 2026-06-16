@@ -379,18 +379,28 @@ impl RealnessNoun {
     }
 }
 
-/// The inject-side realness gate flag. Default OFF so the primer's population source is unchanged
-/// (the C3 guide-title path) unless explicitly enabled. `PC_NOUNS_REALNESS=1|true|on` switches the
-/// population to the USER-STANCE realness registry; anything else (incl. unset) keeps C3.
+/// The inject-side realness gate flag. Default ON (Phase-4 landing): the primer's population is the
+/// USER-STANCE realness registry, NOT guide titles — so a synthesized guide title like
+/// `fabric-provider` can never prime unless the USER actually made it real. `PC_NOUNS_REALNESS`
+/// overrides in both directions: `=0|false|off` reverts to the legacy C3 guide-title population;
+/// `=1|true|on` forces the gate on; absent/unrecognized → the default (on). NOTE: the gate is moot
+/// when the primer itself is off (`PC_NOUNS=0` / `inject_noun_primer=false`) — then nothing primes
+/// at all, byte-identical to the pre-primer pipeline.
 pub fn realness_gate_enabled() -> bool {
     realness_gate_enabled_with(std::env::var("PC_NOUNS_REALNESS").ok().as_deref())
 }
 
 fn realness_gate_enabled_with(env: Option<&str>) -> bool {
-    matches!(
-        env.map(|s| s.trim().to_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("on")
-    )
+    if let Some(v) = env {
+        let v = v.trim().to_lowercase();
+        if v == "0" || v == "false" || v == "off" {
+            return false;
+        }
+        if v == "1" || v == "true" || v == "on" {
+            return true;
+        }
+    }
+    true
 }
 
 /// Index a C3 registry by canonical key (alias-normalized) for enrichment lookup. Both the entry's
@@ -479,6 +489,160 @@ pub fn write_realness_registry(wiki_dir: &Path, nouns: &[RealnessNoun]) -> std::
     }
     fs::write(&path, body)?;
     Ok(path)
+}
+
+// ─── Capture-time user-stance realness writer (Approach A) — the live registry builder ──
+
+/// Soft cap on the number of (noun, turn) references classified per session, to bound capture-time
+/// LLM cost on a pathologically noun-dense session. Overridable via `PC_REALNESS_MAX_REFS`.
+fn realness_max_refs() -> usize {
+    std::env::var("PC_REALNESS_MAX_REFS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(150)
+}
+
+/// Capture-time user-stance realness writer (Approach A) — the live counterpart to the Run-15
+/// realness eval's stance pass, and the thing that makes the inject realness gate non-inert over
+/// time. Mirrors `run_research_stage` / `run_episode_stage`: it runs AFTER the normal capture pass,
+/// is fully independent, BEST-EFFORT (the caller logs any error and never breaks capture), and OFF
+/// the inject hot path.
+///
+/// Per session it:
+///   1. reads the USER turns only (agent/code turns carry no stance — Approach A scores the user);
+///   2. extracts entity-filtered noun candidates (T-0 carry-forward #1: `is_entity_candidate` drops
+///      code symbols / `file:line` refs / snippet fragments that have no stance);
+///   3. classifies each (noun, turn) reference's stance via the THINKING-ON batched transport (T-0
+///      carry-forward #2: `realness::classify_batched`, reasoning ON, off the hot path);
+///   4. accumulates the signed Approach-A delta per ALIAS-CANONICAL noun (`alias::canonical_key`, so
+///      "the fabric provider" / "fabric-provider" / "FabricProvider" land on ONE ledger);
+///   5. FOLDS those deltas into the persisted per-project realness registry (accumulate ACROSS
+///      sessions — a noun crosses +3 only after enough operate-on turns; one reject sinks it ≤ −2)
+///      and rewrites `<wiki>/nouns/realness.jsonl`.
+///
+/// Returns the number of nouns whose accumulated realness moved this session.
+pub fn run_realness_stage(
+    wiki_dir: &Path,
+    transcript_path: &str,
+    spec: &crate::provider::ModelSpec,
+    openrouter_api_key: &str,
+    ollama_base_url: &str,
+    ollama_api_key: Option<&str>,
+) -> anyhow::Result<usize> {
+    let msgs = crate::transcript::parse_transcript_meta(transcript_path)?;
+
+    // ── 1+2. Build entity-filtered (noun, turn) references from USER turns only. One reference per
+    //         (canonical-noun, turn): a noun named twice in one turn is a SINGLE stance event. ──
+    let mut refs: Vec<crate::realness::NounRef> = Vec::new();
+    // ref index → (canonical key, surface name) for accumulation after classification.
+    let mut ref_meta: Vec<(String, String)> = Vec::new();
+    let mut prev_text = String::new();
+    let max_refs = realness_max_refs();
+    for m in &msgs {
+        let this_prev = std::mem::take(&mut prev_text);
+        prev_text = m.text.clone();
+        if m.is_sidechain || m.is_meta || m.role.trim() != "user" {
+            continue;
+        }
+        // Strip pc's own injected briefing so we never read stance from text pc inserted, and skip
+        // turns that are about pc itself / transcript-tool artifacts (mirror the realness miner).
+        let text = crate::eval::strip_injected_context(&m.text);
+        let t = text.trim();
+        if t.len() < 25 || t.len() > 4000 {
+            continue;
+        }
+        if crate::eval::is_pc_self_referential(t) {
+            continue;
+        }
+        let head = t.chars().take(40).collect::<String>().to_lowercase();
+        if head.starts_with('<')
+            || head.contains("caveat:")
+            || head.starts_with("[image")
+            || head.starts_with("[agent ")
+            || head.starts_with("[request ")
+            || head.starts_with("[tool ")
+        {
+            continue;
+        }
+        let turn_clip: String = t.chars().take(600).collect();
+        let context_clip: String = this_prev.chars().take(300).collect();
+        let mut seen_in_turn: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cand in crate::eval_run13::extract_noun_candidates(t) {
+            let noun = cand.trim().to_string();
+            if !crate::eval_realness::is_entity_candidate(&noun) {
+                continue;
+            }
+            let key = crate::alias::canonical_key(&noun);
+            if key.is_empty() || !seen_in_turn.insert(key.clone()) {
+                continue; // one stance event per canonical noun per turn
+            }
+            refs.push(crate::realness::NounRef {
+                id: refs.len().to_string(),
+                noun: noun.clone(),
+                turn: turn_clip.clone(),
+                context: context_clip.clone(),
+            });
+            ref_meta.push((key, noun));
+            if refs.len() >= max_refs {
+                break;
+            }
+        }
+        if refs.len() >= max_refs {
+            break;
+        }
+    }
+    if refs.is_empty() {
+        return Ok(0);
+    }
+
+    // ── 3. Stance pass: batched + thinking-ON (both internal to classify_batched), off the hot path.
+    let judgments = crate::realness::classify_batched(
+        &refs,
+        spec,
+        openrouter_api_key,
+        ollama_base_url,
+        ollama_api_key,
+    )?;
+
+    // ── 4. Accumulate this session's signed deltas per canonical noun. A dropped (None) reference
+    //       contributes nothing — strictly better than guessing a stance it could not read. ──
+    let mut session_delta: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    for (i, j) in judgments.iter().enumerate() {
+        let Some(j) = j else { continue };
+        let (key, name) = &ref_meta[i];
+        let d = crate::realness::stance_delta(j.stance);
+        session_delta
+            .entry(key.clone())
+            .or_insert((0, name.clone()))
+            .0 += d;
+    }
+    if session_delta.is_empty() {
+        return Ok(0);
+    }
+
+    // ── 5. Fold into the persisted registry (accumulate across sessions) and rewrite. ──
+    let mut acc: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    for n in read_realness_registry(wiki_dir) {
+        acc.insert(n.canonical.clone(), (n.signed, n.name));
+    }
+    let mut changed = 0usize;
+    for (key, (delta, name)) in session_delta {
+        // Keep the stored (stable) display name when the noun already exists; else seed it.
+        let entry = acc.entry(key).or_insert((0, name));
+        if delta != 0 {
+            entry.0 += delta;
+            changed += 1;
+        }
+    }
+    // `RealnessNoun::new` re-derives canonical + status from (name, signed); a stored name always
+    // canonicalizes back to its key (it was minted the same way), so the keys round-trip stably.
+    let nouns: Vec<RealnessNoun> = acc
+        .into_iter()
+        .map(|(_key, (signed, name))| RealnessNoun::new(&name, signed))
+        .collect();
+    write_realness_registry(wiki_dir, &nouns)?;
+    Ok(changed)
 }
 
 // ─── Registry persistence: <wiki>/nouns/<slug>.md (mirrors research/episode stores) ──
@@ -1435,6 +1599,10 @@ mod tests {
     use super::*;
     use crate::wiki::IndexRow;
 
+    /// Serializes tests that mutate the process-global `PC_NOUNS_REALNESS` env var so they don't race
+    /// each other under the default multi-threaded test runner. Poison-tolerant.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn idx(slug: &str, topic: &str, title: &str, summary: &str) -> IndexRow {
         IndexRow {
             slug: slug.to_string(),
@@ -1706,11 +1874,15 @@ mod tests {
     }
 
     #[test]
-    fn realness_gate_flag_defaults_off() {
-        assert!(!realness_gate_enabled_with(None));
+    fn realness_gate_flag_defaults_on() {
+        // Default ON (Phase-4 landing): absent / unrecognized env → the user-stance population.
+        assert!(realness_gate_enabled_with(None));
+        assert!(realness_gate_enabled_with(Some("maybe")));
+        // Explicit disable reverts to the legacy C3 guide-title population.
         assert!(!realness_gate_enabled_with(Some("0")));
         assert!(!realness_gate_enabled_with(Some("false")));
-        assert!(!realness_gate_enabled_with(Some("maybe")));
+        assert!(!realness_gate_enabled_with(Some("off")));
+        // Explicit force-on.
         assert!(realness_gate_enabled_with(Some("1")));
         assert!(realness_gate_enabled_with(Some("true")));
         assert!(realness_gate_enabled_with(Some("ON")));
@@ -1775,6 +1947,7 @@ mod tests {
         // With the gate ON, a guide-title noun the user NEVER made real must NOT prime, while a
         // user-REAL noun does — proving the population source switched from guide titles to user
         // stance. (Contrast with the gate-OFF behavior in the test below.)
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pc-gate-on-{}", std::process::id()));
         let wiki = dir.join("wiki");
         let proj = dir.join("proj");
@@ -1810,6 +1983,7 @@ mod tests {
 
     #[test]
     fn build_inject_primer_off_switch_is_byte_identical_and_fires_when_on() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pc-primer-gate-{}", std::process::id()));
         let wiki = dir.join("wiki");
         let proj = dir.join("proj");
@@ -1824,18 +1998,88 @@ mod tests {
         // Natural phrasing: separate words, NOT the whole slug phrase (the Run-13 gap).
         let prompt = "what does the staleness detector do?";
         std::env::remove_var("PC_PRIMER_LEVEL");
-        std::env::remove_var("PC_NOUNS_REALNESS"); // this test exercises the default C3 path
+        // The realness gate now DEFAULTS ON, so to exercise the legacy C3 guide-title path this test
+        // must explicitly disable it (=0 reverts to the C3 population).
+        std::env::set_var("PC_NOUNS_REALNESS", "0");
 
-        // Disabled (config flag false, no env): byte-identical no-op — empty block, nothing primed.
+        // Disabled (config flag false): byte-identical no-op — empty block, nothing primed.
         let off = build_inject_primer(false, &wiki, &proj, "sess-gate", prompt, "");
         assert!(off.block.is_none(), "disabled primer must emit no block");
         assert!(off.primed_slugs.is_empty());
 
         // Enabled (config flag true): the alias matcher fires and a Facts-level block is composed.
         let on = build_inject_primer(true, &wiki, &proj, "sess-gate", prompt, "");
+        std::env::remove_var("PC_NOUNS_REALNESS");
         let block = on.block.expect("enabled primer should fire on natural phrasing");
         assert!(block.contains("Code Grounding Staleness"));
         assert!(on.primed_slugs.contains(&"code-grounding-staleness".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_inject_primer_gate_on_empty_realness_is_inert() {
+        // THE SAFETY INVARIANT (Phase-4 landing): with the realness gate ON but NO accrued stance
+        // (empty realness.jsonl), the gate suppresses everything → the primer is INERT → it can NEVER
+        // prime a confabulation, even when a guide title of that exact name exists on disk. This is
+        // what makes flipping the gate default-on safe before the capture-time writer has run: a
+        // fresh project primes NOTHING until real user stance accumulates.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("pc-gate-inert-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let proj = dir.join("proj");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // A guide title that the OLD population would have primed (the rejected `fabric-provider`).
+        fs::write(
+            wiki.join("fabric-provider.md"),
+            "---\ntitle: Fabric Provider\nsummary: A provider abstraction nobody asked for.\n---\n\n# Fabric Provider\n\nA provider abstraction.\n",
+        )
+        .unwrap();
+        // NO realness registry is written → read_realness_registry returns empty.
+        assert!(read_realness_registry(&wiki).is_empty());
+        std::env::remove_var("PC_PRIMER_LEVEL");
+        std::env::set_var("PC_NOUNS_REALNESS", "1"); // gate ON
+
+        let prompt = "how does the fabric provider work?";
+        let res = build_inject_primer(true, &wiki, &proj, "sess-inert", prompt, "");
+        std::env::remove_var("PC_NOUNS_REALNESS");
+        // Gate-on + empty registry → population is empty → nothing primes (not the guide title).
+        assert!(res.block.is_none(), "empty realness registry must prime NOTHING, got: {:?}", res.block);
+        assert!(res.primed_slugs.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_realness_stage_accumulates_and_folds_across_sessions() {
+        // The capture writer must FOLD a new session's signed deltas into the persisted registry
+        // (accumulate across sessions), keying by alias-canonical noun. We can't drive the LLM here,
+        // so we assert the fold/accumulate contract directly on the persistence layer the writer uses:
+        // an existing +2 noun plus a fresh +1 reaches +3 (Real) under the SAME canonical key even when
+        // the surface phrasing differs ("Fabric Provider" vs "fabric-provider").
+        let dir = std::env::temp_dir().join(format!("pc-realfold-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+        write_realness_registry(&wiki, &[RealnessNoun::new("Fabric Provider", 2)]).unwrap();
+
+        // Simulate the writer's fold step: existing registry + a new +1 delta on a variant phrasing.
+        let mut acc: BTreeMap<String, (i32, String)> = BTreeMap::new();
+        for n in read_realness_registry(&wiki) {
+            acc.insert(n.canonical.clone(), (n.signed, n.name));
+        }
+        let key = crate::alias::canonical_key("fabric-provider");
+        acc.entry(key).or_insert((0, "fabric-provider".to_string())).0 += 1;
+        let folded: Vec<RealnessNoun> = acc
+            .into_iter()
+            .map(|(_k, (signed, name))| RealnessNoun::new(&name, signed))
+            .collect();
+        write_realness_registry(&wiki, &folded).unwrap();
+
+        let back = read_realness_registry(&wiki);
+        assert_eq!(back.len(), 1, "variant phrasings collapse onto one canonical ledger");
+        assert_eq!(back[0].signed, 3, "deltas accumulated across sessions");
+        assert!(back[0].is_real(), "crossed +3 → Real (now primeable)");
         let _ = fs::remove_dir_all(&dir);
     }
 
