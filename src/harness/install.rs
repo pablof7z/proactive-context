@@ -13,6 +13,18 @@ use std::path::{Path, PathBuf};
 const SENTINEL_OPEN: &str = "# >>> proactive-context (managed) — edit via `pc install` >>>";
 const SENTINEL_CLOSE: &str = "# <<< proactive-context <<<";
 const PLUGIN_BAKE_MARKER: &str = "const PC_BIN_BAKED = \"\"";
+const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "PermissionRequest",
+];
 /// The opencode plugin, embedded so `pc install` is self-contained.
 const PLUGIN_TS: &str = include_str!("../../integrations/opencode/proactive-context.ts");
 
@@ -165,17 +177,25 @@ fn command_str(bin: &Path, wiring: &Wiring, id: &str) -> String {
 // ─── Install / uninstall dispatch ─────────────────────────────────────────────
 
 fn install_one(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<String> {
-    match spec.strategy {
+    let mut summary = match spec.strategy {
         InstallStrategy::JsonMerge => json_merge(spec, bin, path, dry),
         InstallStrategy::TomlSentinel => sentinel_install(spec, bin, path, dry, render_toml(spec, bin)),
         InstallStrategy::YamlSentinel => yaml_install(spec, bin, path, dry),
         InstallStrategy::FileDrop => file_drop(bin, path, dry),
+    }?;
+    if spec.id == "codex" && cleanup_legacy_codex_toml(path, dry)? {
+        summary.push_str(if dry {
+            "; would remove legacy config.toml hook block"
+        } else {
+            "; removed legacy config.toml hook block"
+        });
     }
+    Ok(summary)
 }
 
 fn uninstall_one(spec: &HarnessSpec, bin: &Path, path: &Path) -> Result<String> {
-    match spec.strategy {
-        InstallStrategy::JsonMerge => json_unmerge(bin, path),
+    let mut summary = match spec.strategy {
+        InstallStrategy::JsonMerge => json_unmerge(spec, bin, path),
         InstallStrategy::TomlSentinel | InstallStrategy::YamlSentinel => sentinel_uninstall(path),
         InstallStrategy::FileDrop => {
             if path.exists() {
@@ -185,7 +205,11 @@ fn uninstall_one(spec: &HarnessSpec, bin: &Path, path: &Path) -> Result<String> 
                 Ok("nothing to remove".into())
             }
         }
+    }?;
+    if spec.id == "codex" && cleanup_legacy_codex_toml(path, false)? {
+        summary.push_str("; removed legacy config.toml hook block");
     }
+    Ok(summary)
 }
 
 fn is_installed(spec: &HarnessSpec, path: &Path) -> bool {
@@ -197,7 +221,7 @@ fn is_installed(spec: &HarnessSpec, path: &Path) -> bool {
     }
 }
 
-// ─── Strategy: JSON merge (Claude settings.json, TENEX .tenex-hooks.json) ──────
+// ─── Strategy: JSON merge (Claude, Codex, TENEX hook JSON) ───────────────
 
 fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<String> {
     let mut root: serde_json::Value = std::fs::read_to_string(path)
@@ -206,6 +230,9 @@ fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<
         .unwrap_or_else(|| serde_json::json!({}));
     if !root.is_object() {
         root = serde_json::json!({});
+    }
+    if spec.id == "codex" {
+        migrate_codex_root_events(&mut root);
     }
 
     let bin_prefix = bin.display().to_string();
@@ -273,11 +300,54 @@ fn group_is_ours(group: &serde_json::Value, bin_prefix: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn json_unmerge(bin: &Path, path: &Path) -> Result<String> {
+fn migrate_codex_root_events(root: &mut serde_json::Value) {
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+
+    let mut moved = Vec::new();
+    for event in CODEX_HOOK_EVENTS {
+        if let Some(value) = obj.remove(*event) {
+            moved.push(((*event).to_string(), value));
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let hooks = hooks.as_object_mut().unwrap();
+
+    for (event, incoming) in moved {
+        if let Some(existing) = hooks.get_mut(&event) {
+            merge_hook_event(existing, incoming);
+        } else {
+            hooks.insert(event, incoming);
+        }
+    }
+}
+
+fn merge_hook_event(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    if let Some(existing_arr) = existing.as_array_mut() {
+        if let serde_json::Value::Array(mut incoming_arr) = incoming {
+            existing_arr.append(&mut incoming_arr);
+        }
+    } else if existing.is_null() {
+        *existing = incoming;
+    }
+}
+
+fn json_unmerge(spec: &HarnessSpec, bin: &Path, path: &Path) -> Result<String> {
     let Ok(text) = std::fs::read_to_string(path) else { return Ok("nothing to remove".into()) };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Ok("config not JSON — skipped".into());
     };
+    if spec.id == "codex" {
+        migrate_codex_root_events(&mut root);
+    }
     let bin_prefix = bin.display().to_string();
     let mut removed = 0;
     if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
@@ -301,7 +371,7 @@ fn json_unmerge(bin: &Path, path: &Path) -> Result<String> {
     Ok(format!("removed {} hook group(s)", removed))
 }
 
-// ─── Strategy: TOML sentinel block (Codex config.toml) ────────────────────────
+// ─── Strategy: TOML sentinel block ──────────────────────────────────────────
 
 fn render_toml(spec: &HarnessSpec, bin: &Path) -> String {
     let mut out = String::new();
@@ -458,6 +528,58 @@ fn sentinel_uninstall(path: &Path) -> Result<String> {
     Ok("removed managed block".into())
 }
 
+fn cleanup_legacy_codex_toml(hooks_json_path: &Path, dry: bool) -> Result<bool> {
+    let Some(dir) = hooks_json_path.parent() else {
+        return Ok(false);
+    };
+    let path = dir.join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    if !text.contains(SENTINEL_OPEN) {
+        return Ok(false);
+    }
+    if !dry {
+        let cleaned = strip_legacy_codex_toml_hooks(&text);
+        std::fs::write(path, format!("{}\n", cleaned.trim_end()))?;
+    }
+    Ok(true)
+}
+
+fn strip_legacy_codex_toml_hooks(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_managed = false;
+    let mut skip_hook_table = false;
+
+    for line in text.lines() {
+        if line == SENTINEL_OPEN {
+            in_managed = true;
+            skip_hook_table = false;
+            continue;
+        }
+        if in_managed && line == SENTINEL_CLOSE {
+            in_managed = false;
+            skip_hook_table = false;
+            continue;
+        }
+
+        if in_managed && line.starts_with("[[hooks.") {
+            skip_hook_table = true;
+            continue;
+        }
+        if in_managed && line.starts_with('[') {
+            skip_hook_table = false;
+        }
+        if in_managed && skip_hook_table {
+            continue;
+        }
+
+        out.push(line);
+    }
+
+    out.join("\n")
+}
+
 fn write_with_parents(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -468,4 +590,63 @@ fn write_with_parents(path: &Path, contents: &str) -> Result<()> {
 
 fn indent(s: &str) -> String {
     s.lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_install_writes_hooks_json_and_migrates_root_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_dir = temp.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let hooks_path = codex_dir.join("hooks.json");
+        std::fs::write(
+            &hooks_path,
+            r#"{
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "./bin/brew lgtm",
+          "timeout": 360
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            format!(
+                "model = \"gpt-5\"\n\n{}\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"/tmp/pc hook capture --harness codex\"\ntimeout = 10\n\n[hooks.state]\n[hooks.state.\"/tmp/hooks.json:stop:0:0\"]\ntrusted_hash = \"sha256:abc\"\n{}\n",
+                SENTINEL_OPEN, SENTINEL_CLOSE
+            ),
+        )
+        .unwrap();
+
+        let specs = crate::harness::registry();
+        let codex = specs.iter().find(|s| s.id == "codex").unwrap();
+        assert_eq!(codex.config_rel, ".codex/hooks.json");
+
+        install_one(codex, Path::new("/tmp/pc"), &hooks_path, false).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(root.get("Stop").is_none());
+        assert!(root.get("SessionStart").is_none());
+        assert!(root.get("hooks").is_some());
+        assert!(root.pointer("/hooks/UserPromptSubmit").is_some());
+        assert_eq!(root.pointer("/hooks/Stop").and_then(|v| v.as_array()).unwrap().len(), 2);
+
+        let config_toml = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(config_toml.contains("model = \"gpt-5\""));
+        assert!(config_toml.contains("[hooks.state]"));
+        assert!(config_toml.contains("trusted_hash = \"sha256:abc\""));
+        assert!(!config_toml.contains(SENTINEL_OPEN));
+        assert!(!config_toml.contains("[[hooks.Stop]]"));
+    }
 }

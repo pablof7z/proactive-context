@@ -67,7 +67,8 @@ pub enum TranscriptDialect {
 pub enum InstallStrategy {
     /// Structured JSON merge (Claude `settings.json`, TENEX `.tenex-hooks.json`).
     JsonMerge,
-    /// Append a sentinel-wrapped TOML block of `[[hooks.Event]]` tables (Codex).
+    /// Append a sentinel-wrapped TOML block of `[[hooks.Event]]` tables.
+    #[allow(dead_code)]
     TomlSentinel,
     /// Append a sentinel-wrapped YAML `hooks:` block (Hermes).
     YamlSentinel,
@@ -142,11 +143,11 @@ pub fn registry() -> Vec<HarnessSpec> {
         HarnessSpec {
             id: "codex", name: "Codex", scope: Scope::Global,
             input: InputDialect::Claude, output: OutputDialect::AdditionalContextJson,
-            transcript: TranscriptDialect::CodexRollout, strategy: InstallStrategy::TomlSentinel,
+            transcript: TranscriptDialect::CodexRollout, strategy: InstallStrategy::JsonMerge,
             wirings: CODEX_WIRINGS, statusline: false,
             note: Some("Codex requires hook trust: run `codex` and use `/hooks` to review & trust the new hooks (or pass --dangerously-bypass-hook-trust for automation)."),
             detect: || home_marker(".codex") || bin_on_path("codex"),
-            config_rel: ".codex/config.toml",
+            config_rel: ".codex/hooks.json",
         },
         HarnessSpec {
             id: "opencode", name: "opencode", scope: Scope::Global,
