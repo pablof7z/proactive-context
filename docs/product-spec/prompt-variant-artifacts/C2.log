@@ -1,0 +1,138 @@
+eval: corpus project = /Users/pablofernandez/src/proactive-context
+eval: project key    = Users_pablofernandez_src_proactive-context
+eval: experiment dir = /Users/pablofernandez/.proactive-context/experiments/pv-arms/C2
+
+eval: ═══════════════ PROMPT VARIANT C2 (C2) ═══════════════
+eval: Replacement-mandate + definitional-lead EXTRACT preamble.
+eval: toggle        → PC_EXTRACT_VARIANT=terminal
+eval: stage         → Capture
+eval: PRIMARY       → trajectory + stale-leak AND noun-grounding (+15pt)
+eval: GUARDS        → restatement-recall; attention-efficiency (bloat guard)
+eval: instruments   → probe2-trajectory, noun-grounding, restatement-recall, attention-efficiency
+eval: canaries      → 12 settled / 12 proposed / 3 default-flip / 3 F8-trap / 3 reversal
+eval: NOTE — capture arm: Store B must be rebuilt under PC_EXTRACT_VARIANT=terminal before scoring (build path honors the toggle now that it is set).
+
+eval: ═══════════════════ RUN 13 (pc) — noun-primer probe ═══════════════════
+eval: generative model = glm-5.1:cloud (Ollama)
+eval: judge model      = glm-5.1:cloud (Ollama)
+eval: C3 registry: 24 nouns derived from existing wiki+claims (zero re-capture)
+eval: §3.1 — REUSING 14 frozen noun-moments from /Users/pablofernandez/.proactive-context/experiments/pv-arms/C2/run13_nouns.jsonl
+eval: warmed Ollama model glm-5.1:cloud (keep_alive=20m)
+
+╔════════════ RUN 13 (pc) — CANARY RECOVERY (design §3.4) ════════════╗
+  recovered = registry-grounded AND idiosyncratic (bare ≠ contained); moment = also mined from a human turn
+  [RECOVERED] capture-pipeline     grounded=true idiosyncratic=true (bare=absent) moment=true
+  [RECOVERED] context-injection    grounded=true idiosyncratic=true (bare=absent) moment=true
+  [RECOVERED] reranking            grounded=true idiosyncratic=true (bare=absent) moment=false
+
+eval: §3.1 — verified idiosyncratic noun-moments: 14 (gate ≥ 12)
+eval:   §2 arm 1/14 Context Injection    B0[false] A1[false] A2[false] A3[false]
+eval:   §2 arm 2/14 Tail TUI             B0[false] A1[false] A2[false] A3[false]
+eval:   §2 arm 3/14 Model Configuratio…  B0[true] A1[true] A2[true] A3[false]
+eval:   §2 arm 4/14 Capture Pipeline     B0[false] A1[false] A2[true] A3[true]
+eval:   §2 arm 5/14 Global Lessons       B0[false] A1[true] A2[true] A3[true]
+eval:   §2 arm 6/14 project positionin…  B0[true] A1[true] A2[true] A3[true]
+eval:   §2 arm 7/14 README Positioning   B0[true] A1[true] A2[true] A3[true]
+eval:   §2 arm 8/14 Archeologist         B0[true] A1[true] A2[true] A3[true]
+eval:   §2 arm 9/14 OpenRouter Embeddi…  B0[false] A1[false] A2[false] A3[false]
+eval:   §2 arm 10/14 generate             B0[false] A1[false] A2[true] A3[false]
+eval:   §2 arm 11/14 Generate Command     B0[false] A1[false] A2[false] A3[false]
+eval:   §2 arm 12/14 Vector Search        B0[false] A1[false] A2[false] A3[false]
+eval:   §2 arm 13/14 observability        B0[false] A1[true] A2[true] A3[true]
+eval:   §2 arm 14/14 ui components        B0[false] A1[true] A2[true] A3[false]
+eval:   predict 1/20 B0=predicted A2=missed
+eval:   predict 2/20 B0=missed A2=missed
+eval:   predict 3/20 B0=missed A2=missed
+eval:   predict 4/20 B0=missed A2=missed
+eval:   predict 5/20 B0=missed A2=missed
+eval:   predict 6/20 B0=missed A2=missed
+eval:   predict 7/20 B0=missed A2=missed
+eval:   predict 8/20 B0=missed A2=missed
+eval:   predict 9/20 B0=missed A2=missed
+eval:   predict 10/20 B0=missed A2=missed
+eval:   predict 11/20 B0=missed A2=partial
+eval:   predict 12/20 B0=missed A2=missed
+eval:   predict 13/20 B0=partial A2=partial
+eval:   predict 14/20 B0=missed A2=missed
+eval:   predict 15/20 B0=missed A2=missed
+eval:   predict 16/20 B0=missed A2=missed
+eval:   predict 17/20 B0=partial A2=partial
+eval:   predict 18/20 B0=partial A2=partial
+eval:   predict 19/20 B0=missed A2=missed
+eval:   predict 20/20 B0=missed A2=missed
+eval:   P1 1/42 B0=absent A2=absent
+eval:   P1 2/42 B0=absent A2=partial
+eval:   P1 3/42 B0=partial A2=partial
+eval:   P1 4/42 B0=absent A2=absent
+eval:   P1 5/42 B0=partial A2=partial
+eval:   P1 6/42 B0=partial A2=partial
+eval:   P1 7/42 B0=absent A2=partial
+eval:   P1 8/42 B0=partial A2=partial
+eval:   P1 9/42 B0=contained A2=contained
+eval:   P1 10/42 B0=contained A2=contained
+eval:   P1 11/42 B0=partial A2=partial
+eval:   P1 12/42 B0=absent A2=absent
+eval:   P1 13/42 B0=partial A2=partial
+eval:   P1 14/42 B0=partial A2=partial
+eval:   P1 15/42 B0=partial A2=partial
+eval:   P1 16/42 B0=contained A2=partial
+eval:   P1 17/42 B0=contained A2=contained
+eval:   P1 18/42 B0=contained A2=contained
+eval:   P1 19/42 B0=partial A2=partial
+eval:   P1 20/42 B0=partial A2=partial
+eval:   P1 21/42 B0=partial A2=partial
+eval:   P1 22/42 B0=absent A2=absent
+eval:   P1 23/42 B0=partial A2=partial
+eval:   P1 24/42 B0=absent A2=absent
+eval:   P1 25/42 B0=contained A2=contained
+eval:   P1 26/42 B0=absent A2=absent
+eval:   P1 27/42 B0=absent A2=absent
+eval:   P1 28/42 B0=absent A2=absent
+eval:   P1 29/42 B0=absent A2=absent
+eval:   P1 30/42 B0=partial A2=partial
+eval:   P1 31/42 B0=absent A2=absent
+eval:   P1 32/42 B0=absent A2=absent
+eval:   P1 33/42 B0=absent A2=absent
+eval:   P1 34/42 B0=absent A2=absent
+eval:   P1 35/42 B0=absent A2=absent
+eval:   P1 36/42 B0=contained A2=contained
+eval:   P1 37/42 B0=contained A2=contained
+eval:   P1 38/42 B0=contained A2=contained
+eval:   P1 39/42 B0=partial A2=partial
+eval:   P1 40/42 B0=absent A2=absent
+eval:   P1 41/42 B0=contained A2=partial
+eval:   P1 42/42 B0=partial A2=partial
+
+╔════════════ RUN 13 (pc) — GROUNDING TABLE (design §3.2)  n=14 ════════════╗
+  arm        primary    G-def=present   G-facts∈{cont,part}   G-correct=wrong
+  B0          28.6%      35.7%           57.1%                14.3%
+  A1 def      50.0%      92.9%           85.7%                28.6%
+  A2 facts    64.3%      85.7%          100.0%                14.3%
+  A3 intent   42.9%      78.6%          100.0%                21.4%
+
+  load-bearing subset (n=14):
+    B0         primary  28.6%
+    A1 def     primary  50.0%
+    A2 facts   primary  64.3%
+    A3 intent  primary  42.9%
+
+╔════════════ RUN 13 (pc) — RIDE-ALONGS ════════════╗
+  predict-the-correction (n=20):  predicted/partial
+    B0  1/20   3/20
+    A2  0/20   4/20
+  restatement P1 recall (n=42):  contained+partial
+    B0  25/42 = 59.5%
+    A2  27/42 = 64.3%
+
+╔════════════ RUN 13 (pc) — PRE-REGISTERED BARS (verbatim) ════════════╗
+  [PASS] Probe validity: canaries recovered + ≥12 moments — canaries_recovered=true (0 missing), moments=14 (gate 12)
+  [PASS] A2 grounding ≥ B0+15pt — A2=64.3% B0=28.6% (Δ=+35.7pt; need ≥+15)
+  [PASS] A2 gain concentrated on load-bearing subset — LB Δ=+35.7pt vs overall Δ=+35.7pt (LB n=14)
+  [FAIL] A2 G-correct wrong ≤10% — A2 wrong=14.3%
+  [PASS] no arm P1 drop >5pt vs B0 — B0=59.5% A2=64.3% (drop=-4.8pt)
+  [FAIL] A2 predict ≥ B0 (tie ok) — B0 predicted=1/20 A2 predicted=0/20
+
+╔════════════ RUN 13 (pc) — VERDICT (design §Stop) ════════════╗
+  VERDICT: REJECTED (pc) — A2 fails the pre-registered bars (decorative attention).
+
+eval: RUN 13 (pc) DONE → /Users/pablofernandez/.proactive-context/experiments/pv-arms/C2

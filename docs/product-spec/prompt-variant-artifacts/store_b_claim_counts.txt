@@ -1,0 +1,4 @@
+store-b claims.jsonl line counts (history=30 sessions):
+C0/baseline (frozen):      260
+C1 typed (rebuilt):        200
+C2 terminal (rebuilt):     179
