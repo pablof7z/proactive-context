@@ -2477,6 +2477,35 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
+    // User-stance realness stage (Approach A) — the LIVE writer for the noun-primer's realness gate.
+    // It runs only when the primer is enabled AND the gate sources its population from user stance
+    // (both default-on post-Phase-4). Mirrors the stages above: independent of the normal pass,
+    // BEST-EFFORT (errors logged, never break capture), and OFF the inject hot path. Per session it
+    // reads the USER turns, batch-classifies each entity noun reference's stance (thinking-ON), and
+    // folds the signed deltas into <wiki>/nouns/realness.jsonl so real nouns accumulate past +3 over
+    // sessions while confabulations stay suppressed (≤ −2) and never prime. No-op (byte-identical to
+    // legacy) when the primer is off (`PC_NOUNS=0`) or the gate is explicitly off (`PC_NOUNS_REALNESS=0`).
+    if crate::nouns::nouns_inject_enabled(cfg.inject_noun_primer)
+        && crate::nouns::realness_gate_enabled()
+    {
+        match crate::nouns::run_realness_stage(
+            &wiki_path,
+            &input.transcript_path,
+            &capture_spec,
+            &openrouter_api_key,
+            &ollama_base_url,
+            ollama_api_key.as_deref(),
+        ) {
+            Ok(n) if n > 0 => {
+                log_event("capture.realness", None, serde_json::json!({ "nouns": n }));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("capture: realness stage failed: {}", e);
+            }
+        }
+    }
+
     // Structural maintenance: run once after the loop unless suppressed.
     // `skip_structural_maintenance` is set by archeologist for non-checkpoint sessions;
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
