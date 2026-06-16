@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/stress-test-plan.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Exhaustive Adversarial Stress-Test Plan",
+  "summary": "Defines executable adversarial test scenarios for inject, capture, statusline, tail, integrity, and regression behavior.",
+  "scope": ["stress tests", "inject", "capture", "statusline", "tail", "integrity audit"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

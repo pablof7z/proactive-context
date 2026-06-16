@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/t0-stance-calibration-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "T-0 - Stance-Calibration Gate for Noun-Realness (RESULTS)",
+  "summary": "Reports stance calibration for operate_on, reject, and neutral noun references.",
+  "scope": ["stance calibration", "operate_on", "reject", "neutral", "noun realness"],
+  "cross_refs": ["docs/product-spec/t0-artifacts/t0_report.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

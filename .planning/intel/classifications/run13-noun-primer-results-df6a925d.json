@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/run13-noun-primer-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Run 13 - Noun-Primer Probe (wallet corpus): Results",
+  "summary": "Reports noun-primer probe results on the wallet corpus and validates definition fixes with insufficient natural moments.",
+  "scope": ["noun primer", "C3 registry", "definition fix", "wallet corpus", "grounding"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

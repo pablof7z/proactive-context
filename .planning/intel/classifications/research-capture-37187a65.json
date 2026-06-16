@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/research-capture.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Research Capture: Investigation Artifacts as a First-Class Knowledge Type",
+  "summary": "Specifies immutable research records recognized from structured investigation artifacts and delivered with method attached.",
+  "scope": ["research records", "investigation artifacts", "task results", "immutable records", "inject ranking"],
+  "cross_refs": ["claims-first-learnings.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

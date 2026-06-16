@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/statusline-mechanics.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Claude Code `statusLine` - Authoritative Technical Mechanics",
+  "summary": "Documents Claude Code statusLine settings, stdin schema, output contract, refresh cadence, performance constraints, and gotchas.",
+  "scope": ["Claude Code statusLine", "stdin schema", "settings.json", "refreshInterval", "performance"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

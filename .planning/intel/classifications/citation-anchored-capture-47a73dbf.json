@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/citation-anchored-capture.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Citation-Anchored Capture & the `wiki_*` Tool Contract",
+  "summary": "Defines citation-anchored wiki mutation semantics, Rust-sliced transcript evidence, and the wiki tool contract.",
+  "scope": ["citation log", "wiki tools", "line-range evidence", "integrity by construction", "capture"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

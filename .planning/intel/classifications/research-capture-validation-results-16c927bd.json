@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/research-capture-validation-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Research-Capture Validation Results",
+  "summary": "Reports validation of research capture recognition, provenance, coverage, precision, and integration quality.",
+  "scope": ["research capture", "task-result visibility", "capture_research", "PC_INCLUDE_TASK_RESULTS", "validation"],
+  "cross_refs": ["research-capture.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

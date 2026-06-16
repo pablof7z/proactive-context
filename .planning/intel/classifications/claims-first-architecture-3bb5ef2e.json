@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/claims-first-architecture.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Claims-First: Make the Claim Log the System of Record, the Wiki a Regenerable Projection",
+  "summary": "Records the closed claims-first architecture result and the settled hybrid of guides, claim log, episode cards, and research records.",
+  "scope": ["claim log", "wiki guides", "episode cards", "research records", "SELECT composition", "Delta-EXTRACT"],
+  "cross_refs": ["claims-first-validation-results.md", "claims-first-learnings.md", "docs/product-spec/claims-first-validation.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": "Status is CLOSED and decision-like, but not an ADR; treated as a high-precedence SPEC without ADR lock semantics."
+}

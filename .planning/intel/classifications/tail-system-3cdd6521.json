@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/tail-system.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Generate-Based Injection + Observability Log + `tail`",
+  "summary": "Specifies Rust inject, the event log schema and transport, tail reader, config fields, and hook wiring.",
+  "scope": ["inject", "events.jsonl", "tail", "observability", "hook wiring", "config"],
+  "cross_refs": ["lessons-capture.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

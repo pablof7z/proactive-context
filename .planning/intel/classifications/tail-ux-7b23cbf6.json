@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/tail-ux.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context `tail` - Live View UX Spec",
+  "summary": "Specifies tail's human-readable stream, correlation model, rendering, flags, TUI mode, and terminal safety.",
+  "scope": ["tail UX", "event rendering", "request correlation", "TUI", "JSON passthrough"],
+  "cross_refs": ["tail-system.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

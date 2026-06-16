@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/capture-redesign.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Capture Redesign - Product Spec",
+  "summary": "Defines the staged EXTRACT, ROUTE, RECONCILE, HISTORY capture pipeline and its governing invariants.",
+  "scope": ["capture pipeline", "routing", "reconciliation", "claim events", "wiki guides", "supersession"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

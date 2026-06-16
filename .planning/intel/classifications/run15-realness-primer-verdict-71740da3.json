@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/run15-artifacts/run15-realness-primer-verdict.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Run 15 - Noun-primer grounding verdict on the USER-STANCE population",
+  "summary": "Reports the realness-gated primer verdict and confirms priming only user-real nouns improves grounding directionally.",
+  "scope": ["realness-gated primer", "user-real nouns", "alias merge", "grounding lift"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/statusline-content.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Status Line: Content & UX Design",
+  "summary": "Specifies statusline rendering model, state enumeration, glyphs, colors, and default variants.",
+  "scope": ["statusline", "UX", "state snapshot", "Claude Code", "rendering"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

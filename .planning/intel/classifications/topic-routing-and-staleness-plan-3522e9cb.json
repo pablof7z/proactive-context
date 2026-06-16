@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/topic-routing-and-staleness-plan.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Plan: Topic-Organized Capture + Staleness Retirement",
+  "summary": "Plans validation of altitude fixes, topic-organized routing, metadata layout, and code-grounded staleness retirement.",
+  "scope": ["topic routing", "staleness retirement", "wiki doctor", "guide topics", "routing validation"],
+  "cross_refs": ["capture-redesign.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

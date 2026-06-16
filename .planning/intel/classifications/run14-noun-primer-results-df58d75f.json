@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/run14-noun-primer-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Run 14 - Noun-Primer Probe (pc corpus): Results",
+  "summary": "Reports noun-primer results on the pc corpus, including load-bearing grounding lift and alias limits.",
+  "scope": ["noun primer", "pc corpus", "grounding", "alias matching", "definition plus facts"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

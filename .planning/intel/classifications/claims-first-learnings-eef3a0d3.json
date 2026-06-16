@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/claims-first-learnings.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "What the Claims-First Experiments Taught Us (Beyond the Verdicts)",
+  "summary": "Distills architecture-independent findings, evaluation lessons, and experimental pitfalls from the claims-first program.",
+  "scope": ["claims-first experiments", "evaluation", "RECONCILE", "SELECT", "episode cards", "noun primer"],
+  "cross_refs": ["claims-first-validation-results.md", "claims-first-architecture.md", "claims-first-validation.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

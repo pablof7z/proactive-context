@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/lessons-capture.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "proactive-context - Lessons Capture & Injection",
+  "summary": "Older spec for capturing corrections, product memory, contradictions, injection cadence, and lesson lifecycle.",
+  "scope": ["lessons capture", "product memory", "contradictions", "SessionEnd", "injection"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": "Status is proposed v0.2 and later docs note divergence from v0.4 capture reality; useful as context and legacy constraint source."
+}

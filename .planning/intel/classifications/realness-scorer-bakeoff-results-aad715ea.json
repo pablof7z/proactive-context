@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/realness-scorer-bakeoff-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "T-A - Noun-Realness Scorer Bake-off (RESULTS)",
+  "summary": "Analyzes noun realness scoring approaches and selects the signed-delta ledger as the default gate.",
+  "scope": ["noun realness", "signed-delta ledger", "stance", "primer gate", "confabulation suppression"],
+  "cross_refs": ["docs/product-spec/realness-artifacts/gold_nouns.jsonl", "docs/product-spec/realness-artifacts/realness_results.{md,json}"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

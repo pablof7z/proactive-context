@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/claims-first-validation.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Claims-First Validation: Temporal Holdout Replay",
+  "summary": "Specifies the feature-flagged temporal holdout experiment used to compare wiki and claim stores.",
+  "scope": ["temporal holdout", "claims-first experiment", "validation harness", "replay stores"],
+  "cross_refs": ["docs/product-spec/claims-first-validation-results.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

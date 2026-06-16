@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/entity-and-orientation-capture.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Entity & Orientation Capture (the Nouns Problem)",
+  "summary": "Specifies a first-class entity layer, noun promotion, open questions, and orientation seed for project wikis.",
+  "scope": ["entities", "noun capture", "orientation seed", "open questions", "deep research guides"],
+  "cross_refs": ["./citation-anchored-capture.md", "./llm-wiki-review.md", "./topic-routing-and-staleness-plan.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

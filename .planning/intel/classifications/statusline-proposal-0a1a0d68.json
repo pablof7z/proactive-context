@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/statusline-proposal.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - Status Line Indicator: Decision-Ready Proposal",
+  "summary": "Proposes the statusline subcommand, event-log state derivation, rendering states, settings wiring, and phased implementation.",
+  "scope": ["statusline", "events.jsonl", "session_id", "guide count", "Claude Code settings"],
+  "cross_refs": ["statusline-mechanics.md", "statusline-content.md", "statusline-priorart.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

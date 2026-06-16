@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/claims-first-validation-results.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Claims-First Validation Results",
+  "summary": "Longitudinal run report for claims, wiki, raw transcript, episode card, delta-extract, and primer experiments.",
+  "scope": ["claims-first validation", "temporal holdout", "raw transcript RAG", "episode cards", "Delta-EXTRACT", "predict-the-correction"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

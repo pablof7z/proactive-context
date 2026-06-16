@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/pablofernandez/src/proactive-context/docs/product-spec/archeologist.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "proactive-context - `archeologist`: Bulk-Historical Capture",
+  "summary": "Specifies chronological backlog replay through the existing capture pipeline with dated stamping, picker, TUI, and resumability.",
+  "scope": ["archeologist", "bulk capture", "Claude transcripts", "chronological replay", "dated stamping", "TUI"],
+  "cross_refs": ["lessons-capture.md", "tail-system.md", "citation-anchored-capture.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}
