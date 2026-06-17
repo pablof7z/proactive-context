@@ -760,7 +760,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
 // ─── Navigation result ────────────────────────────────────────────────────────
 
-enum NavigateResult {
+pub(crate) enum NavigateResult {
     /// The fast model found relevant guides and the strong model compiled a briefing.
     Briefing { text: String, guides_read: Vec<String> },
     /// The fast model determined nothing is relevant — short-circuit, emit nothing.
@@ -1259,6 +1259,46 @@ async fn wiki_navigate_and_compile(
     )
     .await
     .map(|text| NavigateResult::Briefing { text, guides_read })
+}
+
+/// Eval-only entry point: run the FULL inject path (build_catalog + SELECT + compile) against a
+/// single prompt and a wiki store, with no RAG hits, no recent context, and no query resolution.
+/// Used by the Phase 3 source-type eval arms to exercise the typed catalog + SELECT semantics that
+/// the legacy probe scorer bypasses. With empty `hits` the catalog still enumerates the whole wiki
+/// (guides/episodes/research/nouns) — fine for the small eval corpus — so SELECT sees every typed
+/// row. `root` is set to the wiki dir (no committed-markdown rows). Behavior of the live path is
+/// unaffected: this is a separate caller of the same orchestration.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn navigate_and_compile_for_eval(
+    api_key: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    select_spec: &ModelSpec,
+    compile_spec: &ModelSpec,
+    prompt: &str,
+    wiki_dir: &Path,
+    max_guides: usize,
+    max_tokens: usize,
+) -> Result<NavigateResult> {
+    let index_rows = crate::wiki::read_index(wiki_dir);
+    wiki_navigate_and_compile(
+        api_key,
+        ollama_api_key,
+        ollama_base_url,
+        select_spec,
+        compile_spec,
+        prompt,
+        "",        // no recent context in eval
+        &[],       // no RAG hits — catalog enumerates the full wiki
+        wiki_dir,
+        &index_rows,
+        wiki_dir,  // root = wiki dir → no committed-markdown rows
+        max_guides,
+        max_tokens,
+        false,     // no query resolution
+        "",        // no already-injected ledger
+    )
+    .await
 }
 
 // ─── Source rendering (compile model input) ───────────────────────────────────
