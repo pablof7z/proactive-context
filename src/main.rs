@@ -429,6 +429,18 @@ enum Commands {
         /// canary fixtures, and dispatches the Run-13 instrument bundle. Reuses --experiment-dir.
         #[arg(long, value_name = "ARM")]
         prompt_variant: Option<String>,
+
+        /// Phase 3 source-type eval-arm harness: run the FULL inject path (typed catalog +
+        /// source-type SELECT + COMPILE) over the FROZEN labels/reversals in --experiment-dir for
+        /// each flag-combo arm (A0 baseline → A4 noun catalog) and write phase3-arms-results.md.
+        /// Requires an existing experiment dir with frozen labels.jsonl + a built Store-A wiki;
+        /// does NOT build stores or mine. Expensive (live LLM) — run a base eval first.
+        #[arg(long)]
+        select_arms: bool,
+
+        /// Cap the number of frozen labels (and reversals) scored per arm, for cheaper runs.
+        #[arg(long, value_name = "N")]
+        arms_label_cap: Option<usize>,
     },
 }
 
@@ -953,6 +965,8 @@ fn main() -> Result<()> {
             run15,
             judge_model,
             prompt_variant,
+            select_arms,
+            arms_label_cap,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
                 project,
@@ -972,6 +986,8 @@ fn main() -> Result<()> {
                 run15,
                 judge_model,
                 prompt_variant,
+                select_arms,
+                arms_label_cap,
             })?;
         }
 

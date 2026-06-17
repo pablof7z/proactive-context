@@ -40,6 +40,12 @@ pub struct EvalArgs {
     pub run15: bool,
     pub judge_model: Option<String>,
     pub prompt_variant: Option<String>,
+    /// Phase 3 source-type eval-arm harness: run the FULL inject path (typed catalog +
+    /// source-type SELECT + COMPILE) over the FROZEN labels/reversals for each flag-combo arm
+    /// and write a comparison report. Requires an existing experiment dir with frozen data.
+    pub select_arms: bool,
+    /// Cap the number of frozen labels (and reversals) scored per arm, to bound cost.
+    pub arms_label_cap: Option<usize>,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -198,6 +204,14 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
             corpus_root: &corpus_root, project_key: &project_key, exp_dir: &exp_dir,
             judge_model: &judge_model, cfg: &cfg, corpus_label, variant,
         });
+    }
+
+    // Phase 3 source-type eval-arm harness. Requires an existing experiment dir with frozen
+    // labels.jsonl + reversals.jsonl (does NOT build stores or mine). Behind --select-arms only.
+    if args.select_arms {
+        let cfg = load_config().unwrap_or_default();
+        let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
+        return run_select_arms(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg, args.arms_label_cap);
     }
 
     // Dirs for each store's output under the experiment dir.
@@ -1787,4 +1801,499 @@ fn format_date_now() -> String {
         .as_secs();
     let days = secs as i64 / 86400;
     crate::capture::civil_date_from_days_pub(days)
+}
+
+// ─── Phase 3 source-type eval-arm harness ──────────────────────────────────────
+//
+// Runs the FULL inject path (catalog build + SELECT LLM + COMPILE) over the FROZEN
+// labels/reversals for each Phase 3 flag-combo "arm" and writes a comparison report. This
+// measures what the legacy probe scorer cannot: typed-catalog + source-type SELECT behaviour.
+//
+// Arms (env vars toggled around each call, cleared between arms):
+//   A0 baseline: (no flags)
+//   A1: PC_TYPED_CATALOG
+//   A2: PC_TYPED_CATALOG + PC_SELECT_SOURCE_TYPES
+//   A3: A2 + PC_RESEARCH_CATALOG
+//   A4: A3 + PC_NOUN_CATALOG
+//   A5 (claim catalog): intentionally OUT — Phase 5 deferred; reported as N/A.
+
+/// Human-readable arm names, indexed by arm number.
+const ARM_NAMES: [&str; 5] = ["A0", "A1", "A2", "A3", "A4"];
+
+/// The taxonomy feature flags an arm enables, as `(name, value)` pairs. A0 is empty.
+/// This is the single source of truth for the env-var matrix (also unit-tested).
+fn arm_env_vars(arm: usize) -> Vec<(&'static str, &'static str)> {
+    let mut v: Vec<(&'static str, &'static str)> = Vec::new();
+    if arm >= 1 {
+        v.push(("PC_TYPED_CATALOG", "1"));
+    }
+    if arm >= 2 {
+        v.push(("PC_SELECT_SOURCE_TYPES", "1"));
+    }
+    if arm >= 3 {
+        v.push(("PC_RESEARCH_CATALOG", "1"));
+    }
+    if arm >= 4 {
+        v.push(("PC_NOUN_CATALOG", "1"));
+    }
+    v
+}
+
+/// All taxonomy flags this harness ever sets — cleared before every arm so arms don't leak
+/// into one another (and so a stale ambient env doesn't taint A0).
+const ALL_ARM_FLAGS: [&str; 4] = [
+    "PC_TYPED_CATALOG",
+    "PC_SELECT_SOURCE_TYPES",
+    "PC_RESEARCH_CATALOG",
+    "PC_NOUN_CATALOG",
+];
+
+/// Tally selected catalog keys by their [`ContentKind`] (classified via `parse_key`).
+fn classify_selected_kinds(keys: &[String]) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for key in keys {
+        let (kind, _) = crate::content_kind::ContentKind::parse_key(key);
+        *counts.entry(kind.label()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Per-arm aggregate metrics.
+#[derive(Default, Clone)]
+struct ArmStats {
+    name: &'static str,
+    // Probe 1 (recall over labels).
+    n_labels: usize,
+    contained: usize,
+    partial: usize,
+    absent: usize,
+    nothing_relevant: usize, // ShortCircuit count (SELECT said NOTHING_RELEVANT)
+    total_selected: usize,   // sum of selected keys across labels
+    kind_counts: std::collections::BTreeMap<&'static str, usize>,
+    latencies_ms: Vec<u64>,
+    briefing_chars: Vec<usize>,
+    // Probe 2 (reversal fidelity over reversals).
+    n_reversals: usize,
+    asserts_current: usize,
+    stale_leak: usize,
+    trajectory: usize,
+}
+
+impl ArmStats {
+    fn recall_pct(&self) -> f64 {
+        if self.n_labels == 0 { 0.0 } else { (self.contained + self.partial) as f64 / self.n_labels as f64 * 100.0 }
+    }
+    fn avg_selected(&self) -> f64 {
+        if self.n_labels == 0 { 0.0 } else { self.total_selected as f64 / self.n_labels as f64 }
+    }
+    fn p50_latency(&self) -> u64 {
+        if self.latencies_ms.is_empty() { return 0; }
+        let mut v = self.latencies_ms.clone();
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+    fn avg_briefing_chars(&self) -> f64 {
+        if self.briefing_chars.is_empty() { 0.0 } else {
+            self.briefing_chars.iter().sum::<usize>() as f64 / self.briefing_chars.len() as f64
+        }
+    }
+}
+
+/// Load frozen labels/reversals from `exp_dir`, run the full typed-catalog inject path for each
+/// Phase 3 arm, and write `phase3-arms-results.md`. Does NOT build stores or mine — errors if the
+/// frozen data is missing (instructs the user to run a base eval first).
+fn run_select_arms(
+    corpus_root: &Path,
+    project_key: &str,
+    exp_dir: &Path,
+    judge_model: &str,
+    cfg: &crate::config::Config,
+    label_cap: Option<usize>,
+) -> Result<()> {
+    let store_a_dir = exp_dir.join("store-a");
+    let wiki_dir = store_a_dir
+        .join("projects")
+        .join(project_key)
+        .join("docs")
+        .join("wiki");
+
+    // ── Preconditions: frozen data + a built Store-A wiki must already exist. ─────────────
+    let labels_path = exp_dir.join("labels.jsonl");
+    let reversals_path = exp_dir.join("reversals.jsonl");
+    if !labels_path.exists() || fs::read_to_string(&labels_path).map(|s| s.trim().is_empty()).unwrap_or(true) {
+        bail!(
+            "select-arms requires frozen labels at {} — run a base eval first \
+             (e.g. `pc eval --project {} --experiment-dir {} --score-only`) to mine + freeze labels.jsonl.",
+            labels_path.display(), corpus_root.display(), exp_dir.display()
+        );
+    }
+    if !wiki_dir.exists() {
+        bail!(
+            "select-arms requires a built Store-A wiki at {} — run a base eval first to build the store.",
+            wiki_dir.display()
+        );
+    }
+
+    // Read frozen labels/reversals, tolerating malformed lines (same as the base readers).
+    let labels: Vec<Label> = fs::read_to_string(&labels_path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Label>(l).ok())
+        .filter(|l| l.verified)
+        .collect();
+    let reversals: Vec<Reversal> = if reversals_path.exists() {
+        fs::read_to_string(&reversals_path)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Reversal>(l).ok())
+            .filter(|r| r.verified)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let labels: Vec<&Label> = match label_cap {
+        Some(c) => labels.iter().take(c).collect(),
+        None => labels.iter().collect(),
+    };
+    let reversals: Vec<&Reversal> = match label_cap {
+        Some(c) => reversals.iter().take(c).collect(),
+        None => reversals.iter().collect(),
+    };
+
+    if labels.is_empty() {
+        bail!("select-arms: no verified labels found in {} — run a base eval to mine them first.", labels_path.display());
+    }
+
+    // ── Specs / keys. ────────────────────────────────────────────────────────────────────
+    let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
+    let ollama_base_url = cfg.ollama_base_url.clone();
+    let ollama_api_key = cfg.ollama_api_key.clone();
+    let select_spec = crate::provider::ModelSpec::parse(&cfg.inject_select_model);
+    let compile_spec = crate::provider::ModelSpec::parse(&cfg.inject_compile_model);
+    let judge_spec = crate::provider::ModelSpec::parse(judge_model);
+    let max_guides = cfg.inject_max_guides;
+    let max_tokens = cfg.inject_max_tokens;
+
+    // ── Detect whether the store has research/noun artifacts (A3/A4 are vacuous otherwise). ─
+    let n_research = count_wiki_artifacts(&wiki_dir, "research");
+    let n_nouns = count_wiki_artifacts(&wiki_dir, "nouns");
+
+    println!(
+        "\neval: === PHASE 3 SOURCE-TYPE ARMS === wiki={} | {} label(s), {} reversal(s) | research={} noun={}",
+        wiki_dir.display(), labels.len(), reversals.len(), n_research, n_nouns
+    );
+    if n_research == 0 {
+        println!("eval: WARNING — store has 0 research artifacts; A3 (research catalog) is vacuous.");
+    }
+    if n_nouns == 0 {
+        println!("eval: WARNING — store has 0 noun artifacts; A4 (noun catalog) is vacuous.");
+    }
+
+    // One tokio runtime reused for all async navigate_and_compile_for_eval calls.
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut all_stats: Vec<ArmStats> = Vec::new();
+
+    for arm in 0..ARM_NAMES.len() {
+        // Clear ALL arm flags first (so arms never leak), then set this arm's flags.
+        for f in ALL_ARM_FLAGS {
+            std::env::remove_var(f);
+        }
+        let env = arm_env_vars(arm);
+        for (k, v) in &env {
+            std::env::set_var(k, v);
+        }
+        let flag_str = if env.is_empty() {
+            "(none)".to_string()
+        } else {
+            env.iter().map(|(k, _)| *k).collect::<Vec<_>>().join("+")
+        };
+        println!("\neval: --- arm {} [{}] ---", ARM_NAMES[arm], flag_str);
+
+        let mut stats = ArmStats { name: ARM_NAMES[arm], ..Default::default() };
+
+        // Probe 1: recall over labels.
+        for (idx, label) in labels.iter().enumerate() {
+            let t = Instant::now();
+            let res = rt.block_on(crate::inject::navigate_and_compile_for_eval(
+                &api_key,
+                ollama_api_key.as_deref(),
+                &ollama_base_url,
+                &select_spec,
+                &compile_spec,
+                &label.future_prompt,
+                &wiki_dir,
+                max_guides,
+                max_tokens,
+            ));
+            let latency = t.elapsed().as_millis() as u64;
+            stats.latencies_ms.push(latency);
+
+            let (briefing, selected): (String, Vec<String>) = match res {
+                Ok(crate::inject::NavigateResult::Briefing { text, guides_read }) => (text, guides_read),
+                Ok(crate::inject::NavigateResult::ShortCircuit { guides_read }) => {
+                    stats.nothing_relevant += 1;
+                    (String::new(), guides_read)
+                }
+                Err(_) => (String::new(), Vec::new()),
+            };
+
+            stats.n_labels += 1;
+            stats.total_selected += selected.len();
+            stats.briefing_chars.push(briefing.chars().count());
+            for (k, c) in classify_selected_kinds(&selected) {
+                *stats.kind_counts.entry(k).or_insert(0) += c;
+            }
+
+            let verdict = judge_briefing(
+                &briefing,
+                &label.restated_fact,
+                &judge_spec,
+                &api_key,
+                &ollama_base_url,
+                ollama_api_key.as_deref(),
+            );
+            match verdict.as_str() {
+                "contained" => stats.contained += 1,
+                "partial" => stats.partial += 1,
+                _ => stats.absent += 1,
+            }
+            println!(
+                "eval:   [{}] label {}/{}: {} | {} key(s) | {}ms",
+                ARM_NAMES[arm], idx + 1, labels.len(), verdict, selected.len(), latency
+            );
+        }
+
+        // Probe 2: reversal fidelity over reversals.
+        for (idx, rev) in reversals.iter().enumerate() {
+            let res = rt.block_on(crate::inject::navigate_and_compile_for_eval(
+                &api_key,
+                ollama_api_key.as_deref(),
+                &ollama_base_url,
+                &select_spec,
+                &compile_spec,
+                &rev.query,
+                &wiki_dir,
+                max_guides,
+                max_tokens,
+            ));
+            let briefing = match res {
+                Ok(crate::inject::NavigateResult::Briefing { text, .. }) => text,
+                Ok(crate::inject::NavigateResult::ShortCircuit { .. }) => String::new(),
+                Err(_) => String::new(),
+            };
+            let (ac, leak, traj) = judge_probe2(
+                &briefing,
+                rev,
+                &judge_spec,
+                &api_key,
+                &ollama_base_url,
+                ollama_api_key.as_deref(),
+            );
+            stats.n_reversals += 1;
+            if ac { stats.asserts_current += 1; }
+            if leak { stats.stale_leak += 1; }
+            if traj { stats.trajectory += 1; }
+            println!(
+                "eval:   [{}] reversal {}/{}: asserts_current={} stale_leak={} trajectory={}",
+                ARM_NAMES[arm], idx + 1, reversals.len(), ac, leak, traj
+            );
+        }
+
+        // Per-arm stdout summary.
+        println!(
+            "eval: [{}] recall={:.0}% (c={} p={} a={}) | nothing_relevant={} | avg_sel={:.1} | p50={}ms | avg_chars={:.0} | rev: assert={}/{} leak={}/{} traj={}/{}",
+            stats.name, stats.recall_pct(), stats.contained, stats.partial, stats.absent,
+            stats.nothing_relevant, stats.avg_selected(), stats.p50_latency(), stats.avg_briefing_chars(),
+            stats.asserts_current, stats.n_reversals, stats.stale_leak, stats.n_reversals, stats.trajectory, stats.n_reversals,
+        );
+
+        all_stats.push(stats);
+    }
+
+    // Clear arm flags so we don't leak into the rest of the process.
+    for f in ALL_ARM_FLAGS {
+        std::env::remove_var(f);
+    }
+
+    // ── Write the markdown comparison report. ──────────────────────────────────────────────
+    let report = render_arms_report(&all_stats, &wiki_dir, n_research, n_nouns, judge_model);
+    let report_path = exp_dir.join("phase3-arms-results.md");
+    fs::write(&report_path, &report)
+        .with_context(|| format!("failed to write {}", report_path.display()))?;
+    println!("\neval: PHASE 3 ARMS report → {}", report_path.display());
+
+    Ok(())
+}
+
+/// Count immutable artifact files under `<wiki>/<subdir>/` (e.g. research/, nouns/). Markdown
+/// files only; ignores realness.jsonl and other non-md sidecars. Returns 0 if the dir is absent.
+fn count_wiki_artifacts(wiki_dir: &Path, subdir: &str) -> usize {
+    let dir = wiki_dir.join(subdir);
+    match fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("md")
+            })
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Render the per-arm comparison markdown report (A0 as baseline) + a per-kind selection table.
+fn render_arms_report(
+    stats: &[ArmStats],
+    wiki_dir: &Path,
+    n_research: usize,
+    n_nouns: usize,
+    judge_model: &str,
+) -> String {
+    use std::collections::BTreeSet;
+    let mut s = String::new();
+    s.push_str("# Phase 3 source-type eval-arm results\n\n");
+    s.push_str(&format!("Date: {}\n\n", format_date_now()));
+    s.push_str(&format!("Store-A wiki: `{}`\n\n", wiki_dir.display()));
+    s.push_str(&format!("Judge model: `{}`\n\n", judge_model));
+
+    if let Some(a0) = stats.first() {
+        s.push_str(&format!(
+            "Scored {} label(s) and {} reversal(s) per arm.\n\n",
+            a0.n_labels, a0.n_reversals
+        ));
+    }
+
+    if n_research == 0 {
+        s.push_str("> **WARNING:** the store has **0 research artifacts** — arm **A3** (research catalog) is vacuous.\n\n");
+    }
+    if n_nouns == 0 {
+        s.push_str("> **WARNING:** the store has **0 noun artifacts** — arm **A4** (noun catalog) is vacuous.\n\n");
+    }
+
+    // Arm-flag legend.
+    s.push_str("## Arms\n\n");
+    s.push_str("| Arm | Flags |\n|-----|-------|\n");
+    for arm in 0..ARM_NAMES.len() {
+        let env = arm_env_vars(arm);
+        let flags = if env.is_empty() {
+            "(baseline — none)".to_string()
+        } else {
+            env.iter().map(|(k, _)| format!("`{}`", k)).collect::<Vec<_>>().join(" + ")
+        };
+        s.push_str(&format!("| {} | {} |\n", ARM_NAMES[arm], flags));
+    }
+    s.push_str("| A5 | claim catalog — **N/A (Phase 5 deferred)** |\n\n");
+
+    // Comparison table (A0 = baseline; deltas vs A0).
+    let base_recall = stats.first().map(|a| a.recall_pct()).unwrap_or(0.0);
+    s.push_str("## Comparison (A0 = baseline)\n\n");
+    s.push_str("| Arm | Recall % | Δ vs A0 | contained | partial | absent | NOTHING_RELEVANT | avg sel/label | p50 ms | avg briefing chars | asserts_current | stale_leak | trajectory |\n");
+    s.push_str("|-----|----------|---------|-----------|---------|--------|------------------|---------------|--------|--------------------|-----------------|------------|------------|\n");
+    for a in stats {
+        let delta = a.recall_pct() - base_recall;
+        let delta_str = if a.name == "A0" { "—".to_string() } else { format!("{:+.0}", delta) };
+        s.push_str(&format!(
+            "| {} | {:.0}% | {} | {} | {} | {} | {} | {:.1} | {} | {:.0} | {}/{} | {}/{} | {}/{} |\n",
+            a.name, a.recall_pct(), delta_str,
+            a.contained, a.partial, a.absent, a.nothing_relevant,
+            a.avg_selected(), a.p50_latency(), a.avg_briefing_chars(),
+            a.asserts_current, a.n_reversals, a.stale_leak, a.n_reversals, a.trajectory, a.n_reversals,
+        ));
+    }
+    s.push_str("| A5 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |\n\n");
+
+    // Per-kind selection breakdown (union of all kinds seen across arms).
+    let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
+    for a in stats {
+        for k in a.kind_counts.keys() {
+            kinds.insert(*k);
+        }
+    }
+    s.push_str("## Selection counts by ContentKind\n\n");
+    if kinds.is_empty() {
+        s.push_str("_No keys selected by any arm._\n\n");
+    } else {
+        s.push_str("| Arm |");
+        for k in &kinds {
+            s.push_str(&format!(" {} |", k));
+        }
+        s.push('\n');
+        s.push_str("|-----|");
+        for _ in &kinds {
+            s.push_str("------|");
+        }
+        s.push('\n');
+        for a in stats {
+            s.push_str(&format!("| {} |", a.name));
+            for k in &kinds {
+                s.push_str(&format!(" {} |", a.kind_counts.get(*k).copied().unwrap_or(0)));
+            }
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+
+    s.push_str(
+        "_Notes: recall = (contained+partial)/labels. `asserts_current`/`trajectory` higher is better; \
+         `stale_leak` lower is better. NOTHING_RELEVANT counts SELECT short-circuits (empty briefing). \
+         A5 (claim catalog) is deferred to Phase 5 and not scored here._\n",
+    );
+    s
+}
+
+#[cfg(test)]
+mod arm_tests {
+    use super::*;
+
+    #[test]
+    fn arm_env_var_mapping() {
+        // A0 baseline: no flags.
+        assert!(arm_env_vars(0).is_empty(), "A0 must set no flags");
+
+        // A1: typed catalog only.
+        let a1: Vec<&str> = arm_env_vars(1).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(a1, vec!["PC_TYPED_CATALOG"]);
+
+        // A2 includes both TYPED_CATALOG and SELECT_SOURCE_TYPES.
+        let a2: Vec<&str> = arm_env_vars(2).into_iter().map(|(k, _)| k).collect();
+        assert!(a2.contains(&"PC_TYPED_CATALOG"));
+        assert!(a2.contains(&"PC_SELECT_SOURCE_TYPES"));
+        assert_eq!(a2.len(), 2);
+
+        // A3 adds research catalog.
+        let a3: Vec<&str> = arm_env_vars(3).into_iter().map(|(k, _)| k).collect();
+        assert!(a3.contains(&"PC_RESEARCH_CATALOG"));
+        assert_eq!(a3.len(), 3);
+
+        // A4 includes all four flags.
+        let a4: Vec<&str> = arm_env_vars(4).into_iter().map(|(k, _)| k).collect();
+        for f in ["PC_TYPED_CATALOG", "PC_SELECT_SOURCE_TYPES", "PC_RESEARCH_CATALOG", "PC_NOUN_CATALOG"] {
+            assert!(a4.contains(&f), "A4 must include {f}");
+        }
+        assert_eq!(a4.len(), 4);
+
+        // Every flag an arm sets has value "1".
+        for arm in 0..ARM_NAMES.len() {
+            for (_, v) in arm_env_vars(arm) {
+                assert_eq!(v, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_key_kind_classification() {
+        let keys = vec![
+            "episode:x".to_string(),
+            "research:y".to_string(),
+            "noun:z".to_string(),
+            "some-guide".to_string(),
+        ];
+        let counts = classify_selected_kinds(&keys);
+        assert_eq!(counts.get("episode-card").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("research-record").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("noun-entry").copied().unwrap_or(0), 1);
+        // A bare slug classifies as a current guide.
+        assert_eq!(counts.get("current-guide").copied().unwrap_or(0), 1);
+    }
 }
