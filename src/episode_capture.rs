@@ -86,17 +86,15 @@ pub fn run_episode_capture(
     let captured_at = rfc3339_now();
     let date = captured_at[..captured_at.len().min(10)].to_string();
 
-    // Build the dialogue once — it is session-level and shared by every card. When
-    // enabled, clean it up with one LLM pass (verbatim user words, pasted content
-    // stripped, agent replies abbreviated); best-effort, falls back to the raw dialogue.
-    let mut dialogue = build_dialogue(transcript_path);
-    if cfg.clean_episode_dialogue {
-        dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
-    }
-    // Persist the cleaned conversation as a standalone transcript JSON shared by every
-    // card from this session; the cards link to it rather than embedding the turns.
-    let conversation_ref =
-        write_clean_transcript(out_dir, &transcript_stem(transcript_path), &dialogue);
+    // Build the session dialogue once (verbatim user words, injected/system content
+    // stripped). The RAW dialogue keeps full agent replies; the CLEANED dialogue runs
+    // one LLM pass (pasted content stripped, agent replies abbreviated) when enabled.
+    let raw_dialogue = build_dialogue(transcript_path);
+    let clean_dialogue_turns = if cfg.clean_episode_dialogue {
+        clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &raw_dialogue)
+    } else {
+        raw_dialogue.clone()
+    };
 
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
@@ -115,8 +113,14 @@ pub fn run_episode_capture(
         }
 
         let slug = slugify_arc(&arc.title, idx + 1);
-        let filename = format!("{}-{}.md", date, slug);
+        let card_stem = format!("{}-{}", date, slug);
+        let filename = format!("{}.md", card_stem);
         let card_path = out_dir.join(&filename);
+
+        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
+        // raw at transcripts/raw/<stem>.json. The card links to both.
+        let conversation_ref = write_transcript_json(out_dir, "", &card_stem, &clean_dialogue_turns);
+        let raw_conversation_ref = write_transcript_json(out_dir, "raw", &card_stem, &raw_dialogue);
 
         let content = render_episode_card(
             &session_id,
@@ -124,6 +128,7 @@ pub fn run_episode_capture(
             arc,
             &verified_evidence,
             conversation_ref.as_deref(),
+            raw_conversation_ref.as_deref(),
             &captured_at,
         );
         fs::write(&card_path, &content)?;
@@ -183,17 +188,15 @@ pub fn run_episode_stage(
         .map(str::to_string)
         .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
-    // Build the dialogue once — it is session-level and shared by every card. When
-    // enabled, clean it up with one LLM pass (verbatim user words, pasted content
-    // stripped, agent replies abbreviated); best-effort, falls back to the raw dialogue.
-    let mut dialogue = build_dialogue(transcript_path);
-    if cfg.clean_episode_dialogue {
-        dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
-    }
-    // Persist the cleaned conversation as a standalone transcript JSON shared by every
-    // card from this session; the cards link to it rather than embedding the turns.
-    let conversation_ref =
-        write_clean_transcript(&episodes_dir, &transcript_stem(transcript_path), &dialogue);
+    // Build the session dialogue once (verbatim user words, injected/system content
+    // stripped). The RAW dialogue keeps full agent replies; the CLEANED dialogue runs
+    // one LLM pass (pasted content stripped, agent replies abbreviated) when enabled.
+    let raw_dialogue = build_dialogue(transcript_path);
+    let clean_dialogue_turns = if cfg.clean_episode_dialogue {
+        clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &raw_dialogue)
+    } else {
+        raw_dialogue.clone()
+    };
 
     let mut persisted = Vec::new();
     let mut newly_written: Vec<PathBuf> = Vec::new();
@@ -204,19 +207,27 @@ pub fn run_episode_stage(
             continue;
         }
         let slug = slugify_arc(&arc.title, idx + 1);
-        let filename = format!("{}-{}.md", date, slug);
+        let card_stem = format!("{}-{}", date, slug);
+        let filename = format!("{}.md", card_stem);
         let card_path = episodes_dir.join(&filename);
         // Immutability: never overwrite an existing card.
         if card_path.exists() {
             persisted.push(card_path);
             continue;
         }
+        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
+        // raw at transcripts/raw/<stem>.json. The card links to both.
+        let conversation_ref =
+            write_transcript_json(&episodes_dir, "", &card_stem, &clean_dialogue_turns);
+        let raw_conversation_ref =
+            write_transcript_json(&episodes_dir, "raw", &card_stem, &raw_dialogue);
         let content = render_episode_card_dated(
             session_id,
             transcript_path,
             arc,
             &verified_evidence,
             conversation_ref.as_deref(),
+            raw_conversation_ref.as_deref(),
             &date,
             &captured_at,
         );
@@ -918,19 +929,31 @@ pub fn dialogue_to_json(dialogue: &[DialogueTurn]) -> String {
     serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Write the cleaned conversation for a session to `<base_dir>/transcripts/<stem>.json`
-/// in `[[role, text], ...]` form, and return the card-relative path
-/// (`transcripts/<stem>.json`) to reference from the card.
+/// Write `dialogue` as a `[[role, text], ...]` JSON transcript named to match the
+/// card it belongs to (`stem` is the card's filename stem, e.g.
+/// `2026-05-28-1-init-command-forks-daemon-to-background`), and return the
+/// card-relative path to reference from the card body.
 ///
-/// One transcript per session: all cards from the same transcript share the file.
+/// `rel_sub` selects the variant directory under `transcripts/`: `""` for the
+/// cleaned transcript (`transcripts/<stem>.json`) and `"raw"` for the raw
+/// pre-cleanup transcript (`transcripts/raw/<stem>.json`).
+///
 /// Immutable — an existing file is not overwritten — but the relative path is still
-/// returned so every card links to it. Returns None when the dialogue is empty or
-/// the write fails (the card then renders no conversation pointer).
-fn write_clean_transcript(base_dir: &Path, stem: &str, dialogue: &[DialogueTurn]) -> Option<String> {
+/// returned so the card always links to it. Returns None when the dialogue is empty
+/// or the write fails.
+fn write_transcript_json(
+    base_dir: &Path,
+    rel_sub: &str,
+    stem: &str,
+    dialogue: &[DialogueTurn],
+) -> Option<String> {
     if dialogue.is_empty() {
         return None;
     }
-    let dir = base_dir.join("transcripts");
+    let mut dir = base_dir.join("transcripts");
+    if !rel_sub.is_empty() {
+        dir = dir.join(rel_sub);
+    }
     if fs::create_dir_all(&dir).is_err() {
         return None;
     }
@@ -941,7 +964,11 @@ fn write_clean_transcript(base_dir: &Path, stem: &str, dialogue: &[DialogueTurn]
             return None;
         }
     }
-    Some(format!("transcripts/{}.json", stem))
+    Some(if rel_sub.is_empty() {
+        format!("transcripts/{}.json", stem)
+    } else {
+        format!("transcripts/{}/{}.json", rel_sub, stem)
+    })
 }
 
 // ─── Card rendering ───────────────────────────────────────────────────────────
@@ -954,6 +981,7 @@ pub fn render_episode_card(
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
     conversation_ref: Option<&str>,
+    raw_conversation_ref: Option<&str>,
     captured_at: &str,
 ) -> String {
     render_episode_card_dated(
@@ -962,6 +990,7 @@ pub fn render_episode_card(
         arc,
         verified_evidence,
         conversation_ref,
+        raw_conversation_ref,
         &captured_at[..captured_at.len().min(10)],
         captured_at,
     )
@@ -978,6 +1007,7 @@ pub fn render_episode_card_dated(
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
     conversation_ref: Option<&str>,
+    raw_conversation_ref: Option<&str>,
     date: &str,
     captured_at: &str,
 ) -> String {
@@ -1073,15 +1103,24 @@ captured_at: {ts}\n\
     }
     out.push('\n');
 
-    // Conversation: a pointer to the separate cleaned transcript JSON
-    // (transcripts/<stem>.json), which holds the [[role, text], ...] dialogue.
+    // Conversation: pointers to the separate transcript JSON files (named to match
+    // this card), each holding the [[role, text], ...] dialogue.
     out.push_str("## Conversation\n\n");
-    match conversation_ref {
-        Some(rel) => out.push_str(&format!(
-            "Cleaned transcript (verbatim user words, abbreviated agent replies): [`{rel}`]({rel})\n",
-            rel = rel
-        )),
-        None => out.push_str("*(no conversation captured)*\n"),
+    if conversation_ref.is_none() && raw_conversation_ref.is_none() {
+        out.push_str("*(no conversation captured)*\n");
+    } else {
+        if let Some(rel) = conversation_ref {
+            out.push_str(&format!(
+                "- Cleaned transcript (verbatim user words, abbreviated agent replies): [`{rel}`]({rel})\n",
+                rel = rel
+            ));
+        }
+        if let Some(rel) = raw_conversation_ref {
+            out.push_str(&format!(
+                "- Raw transcript (verbatim user words, full agent replies): [`{rel}`]({rel})\n",
+                rel = rel
+            ));
+        }
     }
 
     out
@@ -1700,16 +1739,6 @@ fn derive_session_id(transcript_path: &str) -> String {
         .to_string()
 }
 
-/// The transcript filename stem, used to name the per-session cleaned transcript
-/// JSON (`transcripts/<stem>.json`) so all cards from one session share one file.
-fn transcript_stem(transcript_path: &str) -> String {
-    Path::new(transcript_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string()
-}
-
 fn slugify_arc(title: &str, idx: usize) -> String {
     let base: String = title
         .to_lowercase()
@@ -1811,12 +1840,14 @@ body
             "/path/t.jsonl",
             &arc,
             &evidence,
-            Some("transcripts/t.json"),
+            Some("transcripts/2026-06-11-1-foo.json"),
+            Some("transcripts/raw/2026-06-11-1-foo.json"),
             "2026-06-11T10:00:00Z",
         );
 
         assert!(rendered.contains("## Conversation"), "missing Conversation section");
-        assert!(rendered.contains("[`transcripts/t.json`](transcripts/t.json)"), "missing transcript pointer");
+        assert!(rendered.contains("[`transcripts/2026-06-11-1-foo.json`](transcripts/2026-06-11-1-foo.json)"), "missing cleaned transcript pointer");
+        assert!(rendered.contains("[`transcripts/raw/2026-06-11-1-foo.json`](transcripts/raw/2026-06-11-1-foo.json)"), "missing raw transcript pointer");
         assert!(rendered.contains("type: episode-card"), "missing type frontmatter");
         assert!(rendered.contains("date: 2026-06-11"), "missing date");
         assert!(rendered.contains("session: sess-abc"), "missing session");
@@ -1858,13 +1889,14 @@ body
             &arc,
             &evidence,
             None,
+            None,
             "2026-05-29",               // historical session date
             "2026-06-12T09:00:00Z",     // real processing time
         );
         assert!(rendered.contains("date: 2026-05-29"), "frontmatter date must be historical:\n{}", rendered);
         assert!(rendered.contains("captured_at: 2026-06-12T09:00:00Z"), "captured_at must be processing time");
         // The plain render must keep date == captured_at's date portion.
-        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, None, "2026-06-12T09:00:00Z");
+        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, None, None, "2026-06-12T09:00:00Z");
         assert!(live.contains("date: 2026-06-12"), "live render derives date from captured_at");
     }
 
