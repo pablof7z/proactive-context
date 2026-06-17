@@ -47,6 +47,19 @@ pub fn claims_log_enabled() -> bool {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/// Adoption status of a claim, ORTHOGONAL to `authority` (Phase 4 / `PC_CLAIM_STATUS`).
+/// `Settled` = a decision/behavior in force; `Proposed` = an idea raised but not adopted;
+/// `Unknown` = unclassified (the default for every pre-Phase-4 record and for any path that
+/// does not classify status). Serialized lowercase ("settled"|"proposed"|"unknown").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimStatus {
+    Settled,
+    Proposed,
+    #[default]
+    Unknown,
+}
+
 /// One record in claims.jsonl.  Matches the schema in the spec §3.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRecord {
@@ -75,6 +88,13 @@ pub struct ClaimRecord {
     /// (a `confirms` op bumps this). Empty = never re-confirmed since creation.
     #[serde(default)]
     pub confirmed_ts: String,
+    /// Phase 4 (`PC_CLAIM_STATUS`): adoption status, orthogonal to `authority`. Pre-Phase-4
+    /// records have no `status` field; `#[serde(default)]` + `ClaimStatus::Default` deserializes
+    /// them to `Unknown`, so old on-disk claims load unchanged. When the flag is off this is
+    /// always `Unknown` and round-trips identically to the pre-Phase-4 byte layout aside from
+    /// the added `"status":"unknown"` token.
+    #[serde(default)]
+    pub status: ClaimStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +225,30 @@ pub fn append_claim(
     evidence: &[EvidenceRange],
     linker: Option<&mut EdgeLinker>,
 ) -> Result<()> {
+    // Back-compat shim: existing callers (incl. any in files we don't edit) get the
+    // pre-Phase-4 behavior by delegating with `ClaimStatus::Unknown`.
+    append_claim_with_status(
+        project_dir, embedder, id, ts, session, assertion, authority, evidence_text, evidence,
+        linker, ClaimStatus::Unknown,
+    )
+}
+
+/// Phase 4 variant of [`append_claim`] that also records the adoption [`ClaimStatus`].
+/// `append_claim` delegates here with `ClaimStatus::Unknown` so old call sites are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn append_claim_with_status(
+    project_dir: &Path,
+    embedder: &mut dyn Embedder,
+    id: &str,
+    ts: &str,
+    session: &str,
+    assertion: &str,
+    authority: &str,
+    evidence_text: &str,
+    evidence: &[EvidenceRange],
+    linker: Option<&mut EdgeLinker>,
+    status: ClaimStatus,
+) -> Result<()> {
     let dim = embedder.dimension();
     let db_path = claims_db_path(project_dir);
     let conn = open_claims_db(&db_path, dim)?;
@@ -243,6 +287,7 @@ pub fn append_claim(
         cluster_id: cluster_id.clone(),
         supersedes,
         confirmed_ts: String::new(),
+        status,
     };
     let jsonl_path = claims_jsonl_path(project_dir);
     let mut f = OpenOptions::new()
@@ -368,6 +413,28 @@ pub fn append_claim_typed(
     evidence: &[EvidenceRange],
     supersedes: Vec<String>,
 ) -> Result<()> {
+    // Back-compat shim: delegate with `ClaimStatus::Unknown` (pre-Phase-4 behavior).
+    append_claim_typed_with_status(
+        project_dir, embedder, id, ts, session, assertion, authority, evidence_text, evidence,
+        supersedes, ClaimStatus::Unknown,
+    )
+}
+
+/// Phase 4 variant of [`append_claim_typed`] that also records the adoption [`ClaimStatus`].
+#[allow(clippy::too_many_arguments)]
+pub fn append_claim_typed_with_status(
+    project_dir: &Path,
+    embedder: &mut dyn Embedder,
+    id: &str,
+    ts: &str,
+    session: &str,
+    assertion: &str,
+    authority: &str,
+    evidence_text: &str,
+    evidence: &[EvidenceRange],
+    supersedes: Vec<String>,
+    status: ClaimStatus,
+) -> Result<()> {
     let dim = embedder.dimension();
     let db_path = claims_db_path(project_dir);
     let conn = open_claims_db(&db_path, dim)?;
@@ -384,6 +451,7 @@ pub fn append_claim_typed(
         subject: String::new(),
         evidence_text: evidence_text.to_string(), evidence: evidence.to_vec(),
         cluster_id: cluster_id.clone(), supersedes, confirmed_ts: String::new(),
+        status,
     };
     let jsonl_path = claims_jsonl_path(project_dir);
     let mut f = OpenOptions::new().create(true).append(true).open(&jsonl_path)
@@ -988,5 +1056,44 @@ pub fn count_clusters(project_dir: &Path, dim: usize) -> usize {
             .unwrap_or(0)
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// (a) An OLD claim JSON line with NO `status` field must still deserialize, to `Unknown`.
+    #[test]
+    fn old_claim_without_status_deserializes_to_unknown() {
+        let old = r#"{"id":"x1","ts":"2026-06-17","session":"s","assertion":"a",
+            "authority":"explicit","evidence_text":"e","evidence":[]}"#;
+        let rec: ClaimRecord = serde_json::from_str(old).expect("old record must deserialize");
+        assert_eq!(rec.status, ClaimStatus::Unknown);
+        assert_eq!(rec.authority, "explicit");
+    }
+
+    /// (b) A NEW claim JSON with `"status":"proposed"` round-trips.
+    #[test]
+    fn new_claim_with_status_roundtrips() {
+        let rec = ClaimRecord {
+            id: "x2".into(), ts: "2026-06-17".into(), session: "s".into(),
+            assertion: "a".into(), authority: "implicit".into(), subject: String::new(),
+            evidence_text: "e".into(), evidence: vec![], cluster_id: String::new(),
+            supersedes: vec![], confirmed_ts: String::new(), status: ClaimStatus::Proposed,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"status\":\"proposed\""), "serialized lowercase: {json}");
+        let back: ClaimRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, ClaimStatus::Proposed);
+        // authority stays orthogonal and untouched.
+        assert_eq!(back.authority, "implicit");
+    }
+
+    #[test]
+    fn claim_status_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&ClaimStatus::Settled).unwrap(), "\"settled\"");
+        assert_eq!(serde_json::to_string(&ClaimStatus::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(ClaimStatus::default(), ClaimStatus::Unknown);
     }
 }

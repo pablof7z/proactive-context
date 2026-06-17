@@ -1110,6 +1110,11 @@ struct ExtractedClaim {
     #[serde(default)]
     #[allow(dead_code)]
     ratified: bool,
+    // Phase 4 (`PC_CLAIM_STATUS`): the C1 typed EXTRACT (`PC_EXTRACT_VARIANT=typed`) emits
+    // `"status": "settled"|"proposed"`. Optional so old EXTRACT output (no `status`) still parses;
+    // absent → None → mapped to `ClaimStatus::Unknown`.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 /// A claim admitted into the pipeline, with Rust-derived authorship and authority tag (§5).
@@ -1122,6 +1127,31 @@ struct AdmittedClaim {
     evidence: Vec<EvidenceRange>,
     author: String,          // "user" | "assistant"
     authority: &'static str, // "explicit" (user) | "implicit" (agent-inferred, provisional)
+    /// Phase 4 (`PC_CLAIM_STATUS`): adoption status, orthogonal to authority. Always
+    /// `Unknown` when the flag is off, so behavior is byte-for-byte baseline.
+    status: claims::ClaimStatus,
+}
+
+/// Phase 4 behavior flag (`PC_CLAIM_STATUS={1|true|on}`). OFF by default — status is always
+/// stored as `Unknown` and RECONCILE is byte-for-byte unchanged. ON — the parsed adoption status
+/// is persisted and `Proposed` claims are excluded from the per-guide claim list fed to RECONCILE.
+fn claim_status_enabled() -> bool {
+    std::env::var("PC_CLAIM_STATUS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false)
+}
+
+/// Map the raw EXTRACT `status` string to a [`claims::ClaimStatus`]. Absent/unknown → `Unknown`.
+/// Always returns `Unknown` when the `PC_CLAIM_STATUS` flag is off (no behavior change).
+fn map_claim_status(raw: &Option<String>) -> claims::ClaimStatus {
+    if !claim_status_enabled() {
+        return claims::ClaimStatus::Unknown;
+    }
+    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("settled") => claims::ClaimStatus::Settled,
+        Some("proposed") => claims::ClaimStatus::Proposed,
+        _ => claims::ClaimStatus::Unknown,
+    }
 }
 
 /// Run 9 — a typed delta-EXTRACT op (assertion + relationship to an existing digest claim).
@@ -1262,6 +1292,7 @@ async fn run_staged_capture(
             evidence: c.evidence.clone(),
             author,
             authority,
+            status: map_claim_status(&c.status),
         });
     }
     eprintln!(
@@ -1445,7 +1476,7 @@ async fn run_staged_capture(
                                 };
                                 let mut linker = claims::EdgeLinker { call: &mut call, top_k: 8 };
                                 let linker_opt = if edges_on { Some(&mut linker) } else { None };
-                                if let Err(e) = claims::append_claim(
+                                if let Err(e) = claims::append_claim_with_status(
                                     cd,
                                     embedder.as_mut(),
                                     &id,
@@ -1456,6 +1487,7 @@ async fn run_staged_capture(
                                     &evidence_text,
                                     &ev,
                                     linker_opt,
+                                    c.status,
                                 ) {
                                     eprintln!("claims: failed to append claim: {}", e);
                                 }
@@ -1716,8 +1748,13 @@ async fn run_staged_capture(
         let path = guide_path(&ctx.wiki_path, slug);
         let current_body = load_guide(&path).map(|g| g.body).unwrap_or_default();
 
+        // Phase 4 (`PC_CLAIM_STATUS`): exclude `Proposed` claims from the prose fed to RECONCILE
+        // so discussed-but-not-adopted ideas don't become current guide truth. Settled/Unknown
+        // still flow through. When the flag is off, `status` is always `Unknown` and every claim
+        // passes — byte-for-byte baseline behavior.
         let claims_for_guide = claim_indices
             .iter()
+            .filter(|&&i| admitted[i].status != claims::ClaimStatus::Proposed)
             .map(|&i| {
                 let c = &admitted[i];
                 let ev = c
@@ -3638,6 +3675,40 @@ mod tests {
 
     // Serialize the env-mutating EXTRACT prompt-variant tests (env vars are process-global).
     static EXTRACT_VARIANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Serialize PC_CLAIM_STATUS env mutations (process-global) for Phase 4 tests.
+    static CLAIM_STATUS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// (c) ExtractedClaim parses the OLD shape (no `status`) AND the C1 `"status":"settled"` shape.
+    #[test]
+    fn extracted_claim_parses_old_and_status_shapes() {
+        // Old shape: no status field → status None.
+        let old = r#"{"assertion":"a","evidence":[],"ratified":true}"#;
+        let c: ExtractedClaim = serde_json::from_str(old).expect("old EXTRACT shape must parse");
+        assert_eq!(c.status, None);
+
+        // C1 typed shape: status "settled".
+        let typed = r#"{"assertion":"a","evidence":[],"ratified":true,"status":"settled"}"#;
+        let c: ExtractedClaim = serde_json::from_str(typed).expect("C1 shape must parse");
+        assert_eq!(c.status.as_deref(), Some("settled"));
+    }
+
+    /// map_claim_status honors the flag: Unknown when off, mapped when on.
+    #[test]
+    fn map_claim_status_respects_flag() {
+        let _g = CLAIM_STATUS_ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("PC_CLAIM_STATUS");
+        assert_eq!(map_claim_status(&Some("settled".into())), claims::ClaimStatus::Unknown,
+            "flag off → always Unknown");
+
+        std::env::set_var("PC_CLAIM_STATUS", "1");
+        assert_eq!(map_claim_status(&Some("settled".into())), claims::ClaimStatus::Settled);
+        assert_eq!(map_claim_status(&Some("proposed".into())), claims::ClaimStatus::Proposed);
+        assert_eq!(map_claim_status(&None), claims::ClaimStatus::Unknown);
+        assert_eq!(map_claim_status(&Some("garbage".into())), claims::ClaimStatus::Unknown);
+        std::env::remove_var("PC_CLAIM_STATUS");
+    }
 
     #[test]
     fn extract_preamble_variant_default_is_byte_identical() {

@@ -1,4 +1,5 @@
 use crate::config::{load_config, normalize_path, project_context_dir, project_db_path, resolve_project_root};
+use crate::content_kind::{ContentKind, Currentness};
 use crate::events::{init_context, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
@@ -741,6 +742,16 @@ struct CatalogItem {
     title: String,
     summary: String,
     score: Option<f64>,
+    kind: ContentKind,
+    currentness: Currentness,
+}
+
+/// Read a boolean feature flag from the environment. Treats "1"/"true"/"on"
+/// (case-insensitive) as enabled; anything else (incl. unset) is disabled.
+fn taxonomy_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
 }
 
 /// List committed markdown files (repo-relative paths) under `root`. Uses `git ls-files`
@@ -846,6 +857,19 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<Strin
         let path = wiki_dir.join("episodes").join(format!("{}.md", stem));
         return std::fs::read_to_string(path).ok();
     }
+    // New taxonomy prefixes (Phase 2). parse_key dispatches by prefix; episode/guide
+    // resolution above is unchanged.
+    match ContentKind::parse_key(key) {
+        (ContentKind::ResearchRecord, stem) => {
+            let path = wiki_dir.join("research").join(format!("{}.md", stem));
+            return std::fs::read_to_string(path).ok();
+        }
+        (ContentKind::NounEntry, slug) => {
+            let path = wiki_dir.join("nouns").join(format!("{}.md", slug));
+            return std::fs::read_to_string(path).ok();
+        }
+        _ => {}
+    }
     let path = if key.ends_with(".md") || key.contains('/') {
         root.join(key)
     } else {
@@ -894,6 +918,8 @@ fn build_catalog(
             title: r.title.clone(),
             summary: r.summary.clone(),
             score: hit_score.get(&r.slug).copied(),
+            kind: ContentKind::CurrentGuide,
+            currentness: Currentness::Current,
         });
     }
 
@@ -909,6 +935,8 @@ fn build_catalog(
             title,
             summary: ep.summary,
             score: hit_score.get(&stem).copied(),
+            kind: ContentKind::EpisodeCard,
+            currentness: Currentness::Historical,
         });
     }
 
@@ -923,7 +951,52 @@ fn build_catalog(
             title: String::new(),
             summary: String::new(),
             score: hit_score.get(&stem).copied(),
+            kind: ContentKind::CommittedMarkdown,
+            currentness: Currentness::Unknown,
         });
+    }
+
+    // Research records (`research:<stem>`): off by default; gated by PC_RESEARCH_CATALOG.
+    // Immutable historical investigation records. Subject to the same scoring/sort/cap path.
+    if taxonomy_flag("PC_RESEARCH_CATALOG") {
+        for rr in crate::wiki::scan_research_records(wiki_dir) {
+            let stem = rr
+                .filename
+                .strip_suffix(".md")
+                .unwrap_or(&rr.filename)
+                .to_string();
+            let title = rr.characterization;
+            let summary = if rr.agent_attribution.is_empty() {
+                rr.date.clone()
+            } else if rr.date.is_empty() {
+                rr.agent_attribution.clone()
+            } else {
+                format!("{} · {}", rr.agent_attribution, rr.date)
+            };
+            items.push(CatalogItem {
+                key: ContentKind::ResearchRecord.render_key(&stem),
+                title,
+                summary,
+                score: hit_score.get(&stem).copied(),
+                kind: ContentKind::ResearchRecord,
+                currentness: Currentness::Historical,
+            });
+        }
+    }
+
+    // Noun entries (`noun:<slug>`): off by default; gated by PC_NOUN_CATALOG.
+    // Current project-entity definitions. Subject to the same scoring/sort/cap path.
+    if taxonomy_flag("PC_NOUN_CATALOG") {
+        for nr in crate::nouns::scan_nouns(wiki_dir) {
+            items.push(CatalogItem {
+                key: ContentKind::NounEntry.render_key(&nr.slug),
+                title: nr.name,
+                summary: nr.summary,
+                score: hit_score.get(&nr.slug).copied(),
+                kind: ContentKind::NounEntry,
+                currentness: Currentness::Current,
+            });
+        }
     }
 
     // Scored entries first (desc), then the rest; cap before any file reads.
@@ -956,16 +1029,28 @@ fn build_catalog(
 
 /// Render the catalog for the selector preamble: one compact line per source.
 fn render_catalog(items: &[CatalogItem]) -> String {
+    // Typed catalog (PC_TYPED_CATALOG) is the ONLY flag that alters SELECT input text,
+    // and only when on: it appends a compact ` [<kind-label>]` type hint to each line.
+    // When off, output is byte-identical to the pre-taxonomy baseline.
+    let typed = taxonomy_flag("PC_TYPED_CATALOG");
     let mut out = String::new();
     for it in items {
         let hint = it
             .score
             .map(|s| format!("  [similar {:.2}]", s))
             .unwrap_or_default();
-        if it.summary.is_empty() {
-            out.push_str(&format!("- {} — {}{}\n", it.key, it.title, hint));
+        let type_hint = if typed {
+            format!(" [{}]", it.kind.label())
         } else {
-            out.push_str(&format!("- {} — {} — {}{}\n", it.key, it.title, it.summary, hint));
+            String::new()
+        };
+        if it.summary.is_empty() {
+            out.push_str(&format!("- {} — {}{}{}\n", it.key, it.title, type_hint, hint));
+        } else {
+            out.push_str(&format!(
+                "- {} — {} — {}{}{}\n",
+                it.key, it.title, it.summary, type_hint, hint
+            ));
         }
     }
     out
@@ -1520,5 +1605,49 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         assert_eq!(parse_query_line("inject-subcommand"), None);
         assert_eq!(parse_query_line("QUERY:"), None);
         assert_eq!(parse_query_line("NOTHING_RELEVANT"), None);
+    }
+
+    // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────
+
+    #[test]
+    fn taxonomy_key_prefixes_parse_to_kind_and_stem() {
+        use crate::content_kind::ContentKind;
+        assert_eq!(
+            ContentKind::parse_key("research:2026-06-12-1-foo"),
+            (ContentKind::ResearchRecord, "2026-06-12-1-foo")
+        );
+        assert_eq!(
+            ContentKind::parse_key("noun:mint"),
+            (ContentKind::NounEntry, "mint")
+        );
+    }
+
+    #[test]
+    fn render_catalog_default_is_byte_identical_to_baseline() {
+        use super::{render_catalog, CatalogItem};
+        use crate::content_kind::{ContentKind, Currentness};
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_TYPED_CATALOG");
+        // A sample item exercising the summary + score branch.
+        let items = vec![CatalogItem {
+            key: "token-model".to_string(),
+            title: "Token model".to_string(),
+            summary: "How tokens flow".to_string(),
+            score: Some(0.42),
+            kind: ContentKind::CurrentGuide,
+            currentness: Currentness::Current,
+        }];
+        // The exact baseline string produced before the taxonomy type-hint change.
+        assert_eq!(
+            render_catalog(&items),
+            "- token-model — Token model — How tokens flow  [similar 0.42]\n"
+        );
+        // With the flag ON, the kind label is appended before the similarity hint.
+        std::env::set_var("PC_TYPED_CATALOG", "1");
+        assert_eq!(
+            render_catalog(&items),
+            "- token-model — Token model — How tokens flow [current-guide]  [similar 0.42]\n"
+        );
+        std::env::remove_var("PC_TYPED_CATALOG");
     }
 }
