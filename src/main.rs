@@ -46,6 +46,7 @@ mod query;
 mod route_recall;
 mod statusline;
 mod tail;
+mod taxonomy_backfill;
 mod taxonomy_report;
 mod transcript;
 mod tui;
@@ -630,6 +631,20 @@ enum WikiAction {
         #[arg(long, value_name = "DIR")]
         wiki_dir: Option<PathBuf>,
     },
+
+    /// Backfill a typed taxonomy index (`<wiki>/taxonomy-index.json`) by scanning
+    /// existing on-disk artifacts (guides, episodes, research, nouns, realness).
+    /// Idempotent + non-destructive: re-running over an unchanged corpus produces
+    /// byte-identical output and touches NO file other than taxonomy-index.json.
+    /// Default is a dry-run (prints counts); use --write to emit the file.
+    BackfillTaxonomy {
+        /// Write `<wiki>/taxonomy-index.json` (default is a dry-run summary only).
+        #[arg(long)]
+        write: bool,
+        /// Wiki directory to index. Defaults to the discovered project wiki.
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1055,6 +1070,10 @@ fn main() -> Result<()> {
                     let _ = crate::wiki::rebuild_index(&wp, today);
                     println!("link-episodes: {} supersession link(s) written; index rebuilt", n);
                 }
+            }
+            WikiAction::BackfillTaxonomy { write, wiki_dir } => {
+                let wp = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                crate::taxonomy_backfill::run(&root, &wp, &project_context_dir(&root), write)?;
             }
         },
     }
