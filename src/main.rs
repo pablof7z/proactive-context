@@ -30,6 +30,7 @@ mod session_start;
 mod chunker;
 mod config;
 mod configure;
+mod content_kind;
 mod daemon;
 mod db;
 mod cross_supersede;
@@ -45,6 +46,7 @@ mod query;
 mod route_recall;
 mod statusline;
 mod tail;
+mod taxonomy_report;
 mod transcript;
 mod tui;
 mod wiki;
@@ -544,6 +546,15 @@ enum DebugAction {
         #[arg(long, value_name = "FILE")]
         transcript: Option<PathBuf>,
     },
+
+    /// Print a read-only taxonomy inventory: artifact counts per content kind, which kinds
+    /// are currently injection-visible (SELECT catalog rows), and the taxonomy feature-flag
+    /// state. Phase 0 audit tool — makes no changes.
+    Taxonomy {
+        /// Wiki directory to audit. Defaults to the discovered project wiki (docs/wiki).
+        #[arg(long, value_name = "DIR")]
+        wiki_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -793,6 +804,11 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+            DebugAction::Taxonomy { wiki_dir } => {
+                let wiki = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
+                let proj_dir = project_context_dir(&root);
+                crate::taxonomy_report::run(&root, &wiki, &proj_dir)?;
             }
         },
 
