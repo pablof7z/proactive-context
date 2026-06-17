@@ -46,6 +46,8 @@ pub struct EvalArgs {
     pub select_arms: bool,
     /// Cap the number of frozen labels (and reversals) scored per arm, to bound cost.
     pub arms_label_cap: Option<usize>,
+    /// Number of judge calls per briefing in --select-arms (majority-voted). Default 3.
+    pub judge_k: usize,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -211,7 +213,8 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
     if args.select_arms {
         let cfg = load_config().unwrap_or_default();
         let judge_model = args.judge_model.clone().unwrap_or_else(|| cfg.capture_model.clone());
-        return run_select_arms(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg, args.arms_label_cap);
+        let judge_k = if args.judge_k == 0 { 1 } else { args.judge_k };
+        return run_select_arms(&corpus_root, &project_key, &exp_dir, &judge_model, &cfg, args.arms_label_cap, judge_k);
     }
 
     // Dirs for each store's output under the experiment dir.
@@ -1820,6 +1823,11 @@ fn format_date_now() -> String {
 /// Human-readable arm names, indexed by arm number.
 const ARM_NAMES: [&str; 5] = ["A0", "A1", "A2", "A3", "A4"];
 
+/// The arm numbers actually executed by the run, in order. A3 is SKIPPED (the research corpus is
+/// too thin to give A3 a fair shake) but its env-var mapping is kept for the report legend; A5 is
+/// reported N/A (Phase 5 deferred). A0 is always first so it can serve as the paired baseline.
+const ARM_RUN_LIST: [usize; 4] = [0, 1, 2, 4];
+
 /// The taxonomy feature flags an arm enables, as `(name, value)` pairs. A0 is empty.
 /// This is the single source of truth for the env-var matrix (also unit-tested).
 fn arm_env_vars(arm: usize) -> Vec<(&'static str, &'static str)> {
@@ -1858,10 +1866,63 @@ fn classify_selected_kinds(keys: &[String]) -> std::collections::BTreeMap<&'stat
     counts
 }
 
-/// Per-arm aggregate metrics.
+// ─── Generate→Judge→Aggregate split with caching ──────────────────────────────
+//
+// The original harness fused GENERATE (run inject) and JUDGE (one judge call) per arm×label.
+// A single judge call has high categorical variance — recall flipped sign between identical
+// inputs. We now:
+//   1. GENERATE once per arm×(label|reversal), caching the briefing text + selected keys +
+//      latency + token estimate to `arms-cache-<runid>.json` (so judging is separable/re-runnable).
+//   2. JUDGE each cached briefing K times and MAJORITY-VOTE the verdict (categorical for labels,
+//      per-field boolean for reversals), killing single-judge noise.
+//   3. AGGREGATE per arm, plus PAIRED bootstrap CI vs A0.
+
+/// One cached label generation (the GENERATE output for one arm×label).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LabelGen {
+    label_idx: usize,
+    restated_fact: String,
+    briefing: String,
+    selected: Vec<String>,
+    short_circuit: bool, // SELECT said NOTHING_RELEVANT
+    latency_ms: u64,
+    tokens_out: usize, // approx: briefing.len()/4
+}
+
+/// One cached reversal generation (the GENERATE output for one arm×reversal).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ReversalGen {
+    reversal_idx: usize,
+    briefing: String,
+    latency_ms: u64,
+    tokens_out: usize,
+}
+
+/// All generations for one arm (the GENERATE pass output for that arm).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ArmGen {
+    arm: usize,
+    name: String,
+    flags: Vec<String>,
+    labels: Vec<LabelGen>,
+    reversals: Vec<ReversalGen>,
+}
+
+/// The full GENERATE-pass cache persisted to disk.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ArmsCache {
+    run_id: u128,
+    judge_model: String,
+    n_labels: usize,
+    n_reversals: usize,
+    arms: Vec<ArmGen>,
+}
+
+/// Per-arm aggregate metrics (built in the AGGREGATE pass from judged generations).
 #[derive(Default, Clone)]
 struct ArmStats {
-    name: &'static str,
+    name: String,
+    arm: usize,
     // Probe 1 (recall over labels).
     n_labels: usize,
     contained: usize,
@@ -1872,6 +1933,10 @@ struct ArmStats {
     kind_counts: std::collections::BTreeMap<&'static str, usize>,
     latencies_ms: Vec<u64>,
     briefing_chars: Vec<usize>,
+    tokens_out: Vec<usize>,
+    /// Per-label majority verdict score (contained=1.0, partial=0.5, absent=0.0), indexed in the
+    /// same order labels were scored, so X and A0 share the label set for paired comparison.
+    label_scores: Vec<f64>,
     // Probe 2 (reversal fidelity over reversals).
     n_reversals: usize,
     asserts_current: usize,
@@ -1887,16 +1952,121 @@ impl ArmStats {
         if self.n_labels == 0 { 0.0 } else { self.total_selected as f64 / self.n_labels as f64 }
     }
     fn p50_latency(&self) -> u64 {
-        if self.latencies_ms.is_empty() { return 0; }
-        let mut v = self.latencies_ms.clone();
-        v.sort_unstable();
-        v[v.len() / 2]
+        percentile_u64(&self.latencies_ms, 50)
+    }
+    fn p95_latency(&self) -> u64 {
+        percentile_u64(&self.latencies_ms, 95)
     }
     fn avg_briefing_chars(&self) -> f64 {
         if self.briefing_chars.is_empty() { 0.0 } else {
             self.briefing_chars.iter().sum::<usize>() as f64 / self.briefing_chars.len() as f64
         }
     }
+    fn avg_tokens_out(&self) -> f64 {
+        if self.tokens_out.is_empty() { 0.0 } else {
+            self.tokens_out.iter().sum::<usize>() as f64 / self.tokens_out.len() as f64
+        }
+    }
+}
+
+/// Map a categorical verdict to a numeric recall score for paired comparison.
+fn verdict_score(v: &str) -> f64 {
+    match v {
+        "contained" => 1.0,
+        "partial" => 0.5,
+        _ => 0.0,
+    }
+}
+
+/// Percentile (nearest-rank-ish, matching the legacy index math) of a u64 sample.
+fn percentile_u64(vals: &[u64], pct: usize) -> u64 {
+    if vals.is_empty() { return 0; }
+    let mut v = vals.to_vec();
+    v.sort_unstable();
+    let idx = match pct {
+        50 => v.len() / 2,
+        _ => ((v.len() * pct) / 100).min(v.len() - 1),
+    };
+    v[idx]
+}
+
+// ─── Seeded LCG + bootstrap CI ─────────────────────────────────────────────────
+
+/// Number of bootstrap resamples for the paired-delta CI.
+const BOOTSTRAP_B: usize = 1000;
+/// Fixed seed for the bootstrap LCG — makes every CI reproducible/testable (no wall-clock/random).
+const BOOTSTRAP_SEED: u64 = 0x5DEECE66D;
+
+/// Tiny seeded LCG (Numerical Recipes constants). Deterministic; used only for bootstrap resampling.
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        // Avoid a zero state.
+        Lcg(seed ^ 0x9E3779B97F4A7C15)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0
+    }
+    /// Uniform index in [0, n). n must be > 0.
+    fn next_index(&mut self, n: usize) -> usize {
+        (self.next_u64() >> 33) as usize % n
+    }
+}
+
+/// Bootstrap 95% CI for the MEAN of a vector of paired deltas, using a seeded LCG (reproducible).
+/// Returns (mean, ci_lo, ci_hi). For B resamples we draw `deltas.len()` values with replacement,
+/// take each resample mean, sort the B means, and read the 2.5th/97.5th percentiles.
+/// Empty input → (0,0,0).
+fn bootstrap_ci_mean(deltas: &[f64], b: usize, seed: u64) -> (f64, f64, f64) {
+    let n = deltas.len();
+    if n == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let mean = deltas.iter().sum::<f64>() / n as f64;
+    let mut rng = Lcg::new(seed);
+    let mut means: Vec<f64> = Vec::with_capacity(b);
+    for _ in 0..b {
+        let mut acc = 0.0;
+        for _ in 0..n {
+            acc += deltas[rng.next_index(n)];
+        }
+        means.push(acc / n as f64);
+    }
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo = means[((b as f64) * 0.025) as usize];
+    let hi = means[(((b as f64) * 0.975) as usize).min(b - 1)];
+    (mean, lo, hi)
+}
+
+/// Majority-vote a categorical recall verdict across K judge calls.
+/// Tie rule (documented): the winner is the most-frequent verdict; on a tie we pick the MOST
+/// CONSERVATIVE present verdict — absent < partial < contained — i.e. prefer absent over partial,
+/// partial over contained, when their counts are equal. ("partial over absent only if
+/// partial ≥ absent, else absent" reduces to this conservative ordering.)
+fn majority_verdict(verdicts: &[String]) -> String {
+    let (mut c, mut p, mut a) = (0usize, 0usize, 0usize);
+    for v in verdicts {
+        match v.as_str() {
+            "contained" => c += 1,
+            "partial" => p += 1,
+            _ => a += 1,
+        }
+    }
+    // Conservative ordering: absent wins ties over partial; partial wins ties over contained.
+    if a >= p && a >= c {
+        "absent".to_string()
+    } else if p >= c {
+        "partial".to_string()
+    } else {
+        "contained".to_string()
+    }
+}
+
+/// Majority-vote a boolean field across K judge calls (true iff strictly more trues than falses).
+fn majority_bool(votes: &[bool]) -> bool {
+    let trues = votes.iter().filter(|b| **b).count();
+    trues * 2 > votes.len()
 }
 
 /// Load frozen labels/reversals from `exp_dir`, run the full typed-catalog inject path for each
@@ -1909,7 +2079,14 @@ fn run_select_arms(
     judge_model: &str,
     cfg: &crate::config::Config,
     label_cap: Option<usize>,
+    judge_k: usize,
 ) -> Result<()> {
+    // Reproducible run-id: epoch millis (allowed by spec for the run-id only). Used to name the
+    // cache and report so prior runs are never clobbered.
+    let run_id: u128 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let store_a_dir = exp_dir.join("store-a");
     let wiki_dir = store_a_dir
         .join("projects")
@@ -1990,12 +2167,21 @@ fn run_select_arms(
         println!("eval: WARNING — store has 0 noun artifacts; A4 (noun catalog) is vacuous.");
     }
 
+    println!("eval: judge_k = {} (majority-voted per briefing), run_id = {}", judge_k, run_id);
+
     // One tokio runtime reused for all async navigate_and_compile_for_eval calls.
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
-    let mut all_stats: Vec<ArmStats> = Vec::new();
+    // ── PASS 1: GENERATE (one inject call per arm×label/reversal; cached to disk). ──────────
+    let mut cache = ArmsCache {
+        run_id,
+        judge_model: judge_model.to_string(),
+        n_labels: labels.len(),
+        n_reversals: reversals.len(),
+        arms: Vec::new(),
+    };
 
-    for arm in 0..ARM_NAMES.len() {
+    for &arm in ARM_RUN_LIST.iter() {
         // Clear ALL arm flags first (so arms never leak), then set this arm's flags.
         for f in ALL_ARM_FLAGS {
             std::env::remove_var(f);
@@ -2009,11 +2195,16 @@ fn run_select_arms(
         } else {
             env.iter().map(|(k, _)| *k).collect::<Vec<_>>().join("+")
         };
-        println!("\neval: --- arm {} [{}] ---", ARM_NAMES[arm], flag_str);
+        println!("\neval: --- GENERATE arm {} [{}] ---", ARM_NAMES[arm], flag_str);
 
-        let mut stats = ArmStats { name: ARM_NAMES[arm], ..Default::default() };
+        let mut gen = ArmGen {
+            arm,
+            name: ARM_NAMES[arm].to_string(),
+            flags: env.iter().map(|(k, _)| k.to_string()).collect(),
+            labels: Vec::new(),
+            reversals: Vec::new(),
+        };
 
-        // Probe 1: recall over labels.
         for (idx, label) in labels.iter().enumerate() {
             let t = Instant::now();
             let res = rt.block_on(crate::inject::navigate_and_compile_for_eval(
@@ -2028,45 +2219,30 @@ fn run_select_arms(
                 max_tokens,
             ));
             let latency = t.elapsed().as_millis() as u64;
-            stats.latencies_ms.push(latency);
-
-            let (briefing, selected): (String, Vec<String>) = match res {
-                Ok(crate::inject::NavigateResult::Briefing { text, guides_read }) => (text, guides_read),
-                Ok(crate::inject::NavigateResult::ShortCircuit { guides_read }) => {
-                    stats.nothing_relevant += 1;
-                    (String::new(), guides_read)
-                }
-                Err(_) => (String::new(), Vec::new()),
+            let (briefing, selected, short_circuit): (String, Vec<String>, bool) = match res {
+                Ok(crate::inject::NavigateResult::Briefing { text, guides_read }) => (text, guides_read, false),
+                Ok(crate::inject::NavigateResult::ShortCircuit { guides_read }) => (String::new(), guides_read, true),
+                Err(_) => (String::new(), Vec::new(), false),
             };
-
-            stats.n_labels += 1;
-            stats.total_selected += selected.len();
-            stats.briefing_chars.push(briefing.chars().count());
-            for (k, c) in classify_selected_kinds(&selected) {
-                *stats.kind_counts.entry(k).or_insert(0) += c;
-            }
-
-            let verdict = judge_briefing(
-                &briefing,
-                &label.restated_fact,
-                &judge_spec,
-                &api_key,
-                &ollama_base_url,
-                ollama_api_key.as_deref(),
-            );
-            match verdict.as_str() {
-                "contained" => stats.contained += 1,
-                "partial" => stats.partial += 1,
-                _ => stats.absent += 1,
-            }
+            let tokens_out = briefing.len() / 4;
             println!(
-                "eval:   [{}] label {}/{}: {} | {} key(s) | {}ms",
-                ARM_NAMES[arm], idx + 1, labels.len(), verdict, selected.len(), latency
+                "eval:   [{}] gen label {}/{}: {} key(s) | {}ms | ~{} tok{}",
+                ARM_NAMES[arm], idx + 1, labels.len(), selected.len(), latency, tokens_out,
+                if short_circuit { " | NOTHING_RELEVANT" } else { "" }
             );
+            gen.labels.push(LabelGen {
+                label_idx: idx,
+                restated_fact: label.restated_fact.clone(),
+                briefing,
+                selected,
+                short_circuit,
+                latency_ms: latency,
+                tokens_out,
+            });
         }
 
-        // Probe 2: reversal fidelity over reversals.
         for (idx, rev) in reversals.iter().enumerate() {
+            let t = Instant::now();
             let res = rt.block_on(crate::inject::navigate_and_compile_for_eval(
                 &api_key,
                 ollama_api_key.as_deref(),
@@ -2078,51 +2254,130 @@ fn run_select_arms(
                 max_guides,
                 max_tokens,
             ));
+            let latency = t.elapsed().as_millis() as u64;
             let briefing = match res {
                 Ok(crate::inject::NavigateResult::Briefing { text, .. }) => text,
                 Ok(crate::inject::NavigateResult::ShortCircuit { .. }) => String::new(),
                 Err(_) => String::new(),
             };
-            let (ac, leak, traj) = judge_probe2(
-                &briefing,
-                rev,
-                &judge_spec,
-                &api_key,
-                &ollama_base_url,
-                ollama_api_key.as_deref(),
+            let tokens_out = briefing.len() / 4;
+            gen.reversals.push(ReversalGen { reversal_idx: idx, briefing, latency_ms: latency, tokens_out });
+        }
+
+        cache.arms.push(gen);
+    }
+
+    // Clear arm flags so they don't leak into the JUDGE pass / rest of the process.
+    for f in ALL_ARM_FLAGS {
+        std::env::remove_var(f);
+    }
+
+    // Persist the GENERATE cache so JUDGE/AGGREGATE are separable & re-runnable.
+    let cache_path = exp_dir.join(format!("arms-cache-{}.json", run_id));
+    fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)
+        .with_context(|| format!("failed to write {}", cache_path.display()))?;
+    println!("\neval: GENERATE cache → {}", cache_path.display());
+
+    // ── PASS 2 + 3: JUDGE (K calls, majority-voted) + AGGREGATE. ────────────────────────────
+    let mut all_stats: Vec<ArmStats> = Vec::new();
+    for gen in &cache.arms {
+        println!("\neval: --- JUDGE arm {} (k={}) ---", gen.name, judge_k);
+        let mut stats = ArmStats { name: gen.name.clone(), arm: gen.arm, ..Default::default() };
+
+        // Probe 1: majority-voted recall verdict per label.
+        for lg in &gen.labels {
+            if lg.short_circuit {
+                stats.nothing_relevant += 1;
+            }
+            stats.n_labels += 1;
+            stats.total_selected += lg.selected.len();
+            stats.briefing_chars.push(lg.briefing.chars().count());
+            stats.latencies_ms.push(lg.latency_ms);
+            stats.tokens_out.push(lg.tokens_out);
+            for (k, c) in classify_selected_kinds(&lg.selected) {
+                *stats.kind_counts.entry(k).or_insert(0) += c;
+            }
+
+            let mut verdicts: Vec<String> = Vec::with_capacity(judge_k);
+            for _ in 0..judge_k {
+                verdicts.push(judge_briefing(
+                    &lg.briefing,
+                    &lg.restated_fact,
+                    &judge_spec,
+                    &api_key,
+                    &ollama_base_url,
+                    ollama_api_key.as_deref(),
+                ));
+            }
+            let verdict = majority_verdict(&verdicts);
+            match verdict.as_str() {
+                "contained" => stats.contained += 1,
+                "partial" => stats.partial += 1,
+                _ => stats.absent += 1,
+            }
+            stats.label_scores.push(verdict_score(&verdict));
+            println!(
+                "eval:   [{}] label {}/{}: {} (votes {:?})",
+                gen.name, lg.label_idx + 1, gen.labels.len(), verdict, verdicts
             );
+        }
+
+        // Probe 2: majority-vote each boolean field per reversal.
+        for rg in &gen.reversals {
+            let rev = reversals[rg.reversal_idx];
+            let (mut acs, mut leaks, mut trajs) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..judge_k {
+                let (ac, leak, traj) = judge_probe2(
+                    &rg.briefing,
+                    rev,
+                    &judge_spec,
+                    &api_key,
+                    &ollama_base_url,
+                    ollama_api_key.as_deref(),
+                );
+                acs.push(ac);
+                leaks.push(leak);
+                trajs.push(traj);
+            }
+            let (ac, leak, traj) = (majority_bool(&acs), majority_bool(&leaks), majority_bool(&trajs));
             stats.n_reversals += 1;
             if ac { stats.asserts_current += 1; }
             if leak { stats.stale_leak += 1; }
             if traj { stats.trajectory += 1; }
             println!(
                 "eval:   [{}] reversal {}/{}: asserts_current={} stale_leak={} trajectory={}",
-                ARM_NAMES[arm], idx + 1, reversals.len(), ac, leak, traj
+                gen.name, rg.reversal_idx + 1, gen.reversals.len(), ac, leak, traj
             );
         }
 
-        // Per-arm stdout summary.
         println!(
-            "eval: [{}] recall={:.0}% (c={} p={} a={}) | nothing_relevant={} | avg_sel={:.1} | p50={}ms | avg_chars={:.0} | rev: assert={}/{} leak={}/{} traj={}/{}",
+            "eval: [{}] recall={:.0}% (c={} p={} a={}) | nothing_relevant={} | avg_sel={:.1} | p50={}ms p95={}ms | avg_tok={:.0} | rev: assert={}/{} leak={}/{} traj={}/{}",
             stats.name, stats.recall_pct(), stats.contained, stats.partial, stats.absent,
-            stats.nothing_relevant, stats.avg_selected(), stats.p50_latency(), stats.avg_briefing_chars(),
+            stats.nothing_relevant, stats.avg_selected(), stats.p50_latency(), stats.p95_latency(), stats.avg_tokens_out(),
             stats.asserts_current, stats.n_reversals, stats.stale_leak, stats.n_reversals, stats.trajectory, stats.n_reversals,
         );
 
         all_stats.push(stats);
     }
 
-    // Clear arm flags so we don't leak into the rest of the process.
-    for f in ALL_ARM_FLAGS {
-        std::env::remove_var(f);
-    }
-
-    // ── Write the markdown comparison report. ──────────────────────────────────────────────
-    let report = render_arms_report(&all_stats, &wiki_dir, n_research, n_nouns, judge_model);
-    let report_path = exp_dir.join("phase3-arms-results.md");
+    // ── Write the markdown comparison report (run-id'd; never clobbers a prior run). ────────
+    let report = render_arms_report(&all_stats, &wiki_dir, n_research, n_nouns, judge_model, judge_k, run_id, &cache_path);
+    let report_path = exp_dir.join(format!("phase3-arms-{}.md", run_id));
     fs::write(&report_path, &report)
         .with_context(|| format!("failed to write {}", report_path.display()))?;
     println!("\neval: PHASE 3 ARMS report → {}", report_path.display());
+
+    // Refresh a stable "latest" pointer (symlink if possible, else a copy) for convenience.
+    let latest_path = exp_dir.join("phase3-arms-latest.md");
+    let _ = fs::remove_file(&latest_path);
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&report_path, &latest_path).is_ok();
+    #[cfg(not(unix))]
+    let linked = false;
+    if !linked {
+        let _ = fs::write(&latest_path, &report);
+    }
+    println!("eval: latest pointer  → {}", latest_path.display());
 
     Ok(())
 }
@@ -2142,38 +2397,65 @@ fn count_wiki_artifacts(wiki_dir: &Path, subdir: &str) -> usize {
     }
 }
 
-/// Render the per-arm comparison markdown report (A0 as baseline) + a per-kind selection table.
+/// Compute the paired delta vector (scoreX − scoreA0) over the shared label set.
+/// Returns the deltas plus (wins, losses, ties) of X vs A0 per label. Lengths are clamped to the
+/// shorter of the two score vectors (they should be equal — same frozen label set).
+fn paired_deltas(arm_scores: &[f64], base_scores: &[f64]) -> (Vec<f64>, usize, usize, usize) {
+    let n = arm_scores.len().min(base_scores.len());
+    let mut deltas = Vec::with_capacity(n);
+    let (mut w, mut l, mut t) = (0usize, 0usize, 0usize);
+    for i in 0..n {
+        let d = arm_scores[i] - base_scores[i];
+        deltas.push(d);
+        if d > 0.0 { w += 1; } else if d < 0.0 { l += 1; } else { t += 1; }
+    }
+    (deltas, w, l, t)
+}
+
+/// Render the per-arm comparison markdown report (A0 as baseline): per-arm table, paired-CI table
+/// (the variance-killing addition), selection-by-kind, latency/tokens, and the explicit per-arm
+/// default-on candidate verdict.
 fn render_arms_report(
     stats: &[ArmStats],
     wiki_dir: &Path,
     n_research: usize,
     n_nouns: usize,
     judge_model: &str,
+    judge_k: usize,
+    run_id: u128,
+    cache_path: &Path,
 ) -> String {
     use std::collections::BTreeSet;
     let mut s = String::new();
     s.push_str("# Phase 3 source-type eval-arm results\n\n");
-    s.push_str(&format!("Date: {}\n\n", format_date_now()));
-    s.push_str(&format!("Store-A wiki: `{}`\n\n", wiki_dir.display()));
-    s.push_str(&format!("Judge model: `{}`\n\n", judge_model));
 
+    // ── Run metadata. ───────────────────────────────────────────────────────────────────
+    s.push_str("## Run metadata\n\n");
+    s.push_str("| | |\n|---|---|\n");
+    s.push_str(&format!("| run_id | `{}` |\n", run_id));
+    s.push_str(&format!("| date | {} |\n", format_date_now()));
+    s.push_str(&format!("| judge model | `{}` |\n", judge_model));
+    s.push_str(&format!("| judge_k (majority-voted) | {} |\n", judge_k));
     if let Some(a0) = stats.first() {
-        s.push_str(&format!(
-            "Scored {} label(s) and {} reversal(s) per arm.\n\n",
-            a0.n_labels, a0.n_reversals
-        ));
+        s.push_str(&format!("| labels scored / arm | {} |\n", a0.n_labels));
+        s.push_str(&format!("| reversals scored / arm | {} |\n", a0.n_reversals));
     }
+    s.push_str(&format!("| arms run | {} |\n", stats.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")));
+    s.push_str(&format!("| bootstrap | B={}, seeded LCG (seed=0x{:X}) |\n", BOOTSTRAP_B, BOOTSTRAP_SEED));
+    s.push_str(&format!("| Store-A wiki | `{}` |\n", wiki_dir.display()));
+    s.push_str(&format!("| generate cache | `{}` |\n", cache_path.display()));
+    s.push_str("| A3 / A5 | **N/A** (A3 research corpus too thin; A5 claim catalog Phase-5 deferred) |\n\n");
 
     if n_research == 0 {
-        s.push_str("> **WARNING:** the store has **0 research artifacts** — arm **A3** (research catalog) is vacuous.\n\n");
+        s.push_str("> **NOTE:** the store has **0 research artifacts** — A3 (research catalog) would be vacuous; it is excluded from this run.\n\n");
     }
     if n_nouns == 0 {
         s.push_str("> **WARNING:** the store has **0 noun artifacts** — arm **A4** (noun catalog) is vacuous.\n\n");
     }
 
-    // Arm-flag legend.
+    // ── Arm-flag legend (full A0..A4 map for reference; A3/A5 marked excluded/N/A). ──────
     s.push_str("## Arms\n\n");
-    s.push_str("| Arm | Flags |\n|-----|-------|\n");
+    s.push_str("| Arm | Flags | Run? |\n|-----|-------|------|\n");
     for arm in 0..ARM_NAMES.len() {
         let env = arm_env_vars(arm);
         let flags = if env.is_empty() {
@@ -2181,29 +2463,98 @@ fn render_arms_report(
         } else {
             env.iter().map(|(k, _)| format!("`{}`", k)).collect::<Vec<_>>().join(" + ")
         };
-        s.push_str(&format!("| {} | {} |\n", ARM_NAMES[arm], flags));
+        let run = if ARM_RUN_LIST.contains(&arm) { "yes" } else { "**N/A (excluded)**" };
+        s.push_str(&format!("| {} | {} | {} |\n", ARM_NAMES[arm], flags, run));
     }
-    s.push_str("| A5 | claim catalog — **N/A (Phase 5 deferred)** |\n\n");
+    s.push_str("| A5 | claim catalog | **N/A (Phase 5 deferred)** |\n\n");
 
-    // Comparison table (A0 = baseline; deltas vs A0).
-    let base_recall = stats.first().map(|a| a.recall_pct()).unwrap_or(0.0);
-    s.push_str("## Comparison (A0 = baseline)\n\n");
-    s.push_str("| Arm | Recall % | Δ vs A0 | contained | partial | absent | NOTHING_RELEVANT | avg sel/label | p50 ms | avg briefing chars | asserts_current | stale_leak | trajectory |\n");
-    s.push_str("|-----|----------|---------|-----------|---------|--------|------------------|---------------|--------|--------------------|-----------------|------------|------------|\n");
+    // ── Per-arm comparison table. ────────────────────────────────────────────────────────
+    let base = stats.iter().find(|a| a.name == "A0");
+    let base_recall = base.map(|a| a.recall_pct()).unwrap_or(0.0);
+    s.push_str("## Per-arm metrics (A0 = baseline)\n\n");
+    s.push_str("| Arm | Recall % | Δ recall | contained | partial | absent | NOTHING_RELEVANT | avg sel/label | p50 ms | p95 ms | avg tok out |\n");
+    s.push_str("|-----|----------|----------|-----------|---------|--------|------------------|---------------|--------|--------|-------------|\n");
     for a in stats {
         let delta = a.recall_pct() - base_recall;
         let delta_str = if a.name == "A0" { "—".to_string() } else { format!("{:+.0}", delta) };
         s.push_str(&format!(
-            "| {} | {:.0}% | {} | {} | {} | {} | {} | {:.1} | {} | {:.0} | {}/{} | {}/{} | {}/{} |\n",
+            "| {} | {:.0}% | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.0} |\n",
             a.name, a.recall_pct(), delta_str,
             a.contained, a.partial, a.absent, a.nothing_relevant,
-            a.avg_selected(), a.p50_latency(), a.avg_briefing_chars(),
-            a.asserts_current, a.n_reversals, a.stale_leak, a.n_reversals, a.trajectory, a.n_reversals,
+            a.avg_selected(), a.p50_latency(), a.p95_latency(), a.avg_tokens_out(),
         ));
     }
-    s.push_str("| A5 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |\n\n");
+    s.push_str("| A3 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |\n");
+    s.push_str("| A5 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |\n\n");
 
-    // Per-kind selection breakdown (union of all kinds seen across arms).
+    // ── Paired stats vs A0 (the variance-killing addition). ───────────────────────────────
+    s.push_str("## Paired stats vs A0 (bootstrap 95% CI)\n\n");
+    s.push_str("Per-label paired delta = score(X) − score(A0), where contained=1.0, partial=0.5, absent=0.0. ");
+    s.push_str(&format!("CI = seeded bootstrap (B={}) over the per-label paired deltas.\n\n", BOOTSTRAP_B));
+    s.push_str("| Arm | mean Δ vs A0 | 95% CI | win/loss/tie | candidate? |\n");
+    s.push_str("|-----|--------------|--------|--------------|-----------|\n");
+
+    // Candidate decision-rule inputs from A0.
+    let base_p95 = base.map(|a| a.p95_latency()).unwrap_or(0);
+    let base_tok = base.map(|a| a.avg_tokens_out()).unwrap_or(0.0);
+    let base_leak = base.map(|a| a.stale_leak).unwrap_or(0);
+
+    let mut verdicts: Vec<(String, String)> = Vec::new(); // (arm, prose verdict)
+    if let Some(base) = base {
+        for a in stats {
+            if a.name == "A0" {
+                s.push_str("| A0 | — (baseline) | — | — | baseline |\n");
+                continue;
+            }
+            let (deltas, w, l, t) = paired_deltas(&a.label_scores, &base.label_scores);
+            let (mean, lo, hi) = bootstrap_ci_mean(&deltas, BOOTSTRAP_B, BOOTSTRAP_SEED);
+
+            // Decision rule: candidate iff CI lower bound > 0 AND stale_leak ≤ A0 AND p95 latency
+            // AND avg tokens within 15% of A0.
+            let ci_gt_zero = lo > 0.0;
+            let leak_ok = a.stale_leak <= base_leak;
+            let lat_ok = base_p95 == 0 || (a.p95_latency() as f64) <= base_p95 as f64 * 1.15;
+            let tok_ok = base_tok == 0.0 || a.avg_tokens_out() <= base_tok * 1.15;
+            let candidate = ci_gt_zero && leak_ok && lat_ok && tok_ok;
+            let cand_str = if candidate { "**CANDIDATE**" } else { "not yet" };
+            s.push_str(&format!(
+                "| {} | {:+.3} | [{:+.3}, {:+.3}] | {}/{}/{} | {} |\n",
+                a.name, mean, lo, hi, w, l, t, cand_str
+            ));
+
+            let mut reasons: Vec<String> = Vec::new();
+            if !ci_gt_zero { reasons.push(format!("CI lower bound {:+.3} ≤ 0", lo)); }
+            if !leak_ok { reasons.push(format!("stale_leak {} > A0 {}", a.stale_leak, base_leak)); }
+            if !lat_ok { reasons.push(format!("p95 {}ms > A0+15% ({:.0}ms)", a.p95_latency(), base_p95 as f64 * 1.15)); }
+            if !tok_ok { reasons.push(format!("avg tok {:.0} > A0+15% ({:.0})", a.avg_tokens_out(), base_tok * 1.15)); }
+            let verdict = if candidate {
+                format!("**{}: default-on CANDIDATE** — paired-delta CI lower bound > 0, stale_leak ≤ A0, p95 latency & avg tokens within 15% of A0.", a.name)
+            } else {
+                format!("**{}: not yet** — {}.", a.name, reasons.join("; "))
+            };
+            verdicts.push((a.name.clone(), verdict));
+        }
+    }
+    s.push_str("| A3 | N/A | N/A | N/A | N/A |\n");
+    s.push_str("| A5 | N/A | N/A | N/A | N/A |\n\n");
+
+    // ── Explicit per-arm verdict prose. ────────────────────────────────────────────────────
+    s.push_str("### Decision rule & per-arm verdict\n\n");
+    s.push_str(
+        "An arm is a **default-on CANDIDATE** iff: (1) its paired-delta 95% CI **lower bound > 0**, \
+         AND (2) its `stale_leak` ≤ A0's, AND (3) its **p95 latency** is within **15%** of A0's, \
+         AND (4) its **avg tokens out** is within **15%** of A0's. Otherwise **not yet**.\n\n",
+    );
+    if verdicts.is_empty() {
+        s.push_str("_No non-baseline arms scored._\n\n");
+    } else {
+        for (_, v) in &verdicts {
+            s.push_str(&format!("- {}\n", v));
+        }
+        s.push('\n');
+    }
+
+    // ── Selection counts by ContentKind. ──────────────────────────────────────────────────
     let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
     for a in stats {
         for k in a.kind_counts.keys() {
@@ -2234,10 +2585,40 @@ fn render_arms_report(
         s.push('\n');
     }
 
+    // ── Stale-leak / trajectory. ───────────────────────────────────────────────────────────
+    s.push_str("## Reversal fidelity (stale-leak / trajectory)\n\n");
+    s.push_str("| Arm | asserts_current | stale_leak (lower better) | trajectory |\n");
+    s.push_str("|-----|-----------------|---------------------------|------------|\n");
+    for a in stats {
+        s.push_str(&format!(
+            "| {} | {}/{} | {}/{} | {}/{} |\n",
+            a.name, a.asserts_current, a.n_reversals, a.stale_leak, a.n_reversals, a.trajectory, a.n_reversals,
+        ));
+    }
+    s.push('\n');
+
+    // ── Latency / tokens. ──────────────────────────────────────────────────────────────────
+    s.push_str("## Latency / tokens\n\n");
+    s.push_str("| Arm | p50 ms | p95 ms | avg tokens out | Δ p95 vs A0 | Δ tok vs A0 |\n");
+    s.push_str("|-----|--------|--------|----------------|-------------|-------------|\n");
+    for a in stats {
+        let dp95 = if base_p95 == 0 { 0.0 } else { (a.p95_latency() as f64 - base_p95 as f64) / base_p95 as f64 * 100.0 };
+        let dtok = if base_tok == 0.0 { 0.0 } else { (a.avg_tokens_out() - base_tok) / base_tok * 100.0 };
+        let dp95_str = if a.name == "A0" { "—".to_string() } else { format!("{:+.0}%", dp95) };
+        let dtok_str = if a.name == "A0" { "—".to_string() } else { format!("{:+.0}%", dtok) };
+        s.push_str(&format!(
+            "| {} | {} | {} | {:.0} | {} | {} |\n",
+            a.name, a.p50_latency(), a.p95_latency(), a.avg_tokens_out(), dp95_str, dtok_str,
+        ));
+    }
+    s.push('\n');
+
     s.push_str(
-        "_Notes: recall = (contained+partial)/labels. `asserts_current`/`trajectory` higher is better; \
-         `stale_leak` lower is better. NOTHING_RELEVANT counts SELECT short-circuits (empty briefing). \
-         A5 (claim catalog) is deferred to Phase 5 and not scored here._\n",
+        "_Notes: recall = (contained+partial)/labels, verdicts majority-voted across judge_k calls. \
+         Paired CI is the trustworthy signal — single-arm recall % is noisy at small n. \
+         `asserts_current`/`trajectory` higher is better; `stale_leak` lower is better. \
+         NOTHING_RELEVANT counts SELECT short-circuits (empty briefing). A3 (research) excluded; \
+         A5 (claim catalog) deferred to Phase 5._\n",
     );
     s
 }
@@ -2245,6 +2626,84 @@ fn render_arms_report(
 #[cfg(test)]
 mod arm_tests {
     use super::*;
+
+    #[test]
+    fn run_list_excludes_a3() {
+        // A3 must be skipped (research corpus too thin); A0,A1,A2,A4 run, A0 first.
+        assert_eq!(ARM_RUN_LIST, [0, 1, 2, 4]);
+        assert!(!ARM_RUN_LIST.contains(&3), "A3 must be excluded from the run list");
+        assert_eq!(ARM_RUN_LIST[0], 0, "A0 must run first (paired baseline)");
+        for &arm in ARM_RUN_LIST.iter() {
+            assert!(arm < ARM_NAMES.len(), "arm index {arm} out of range");
+        }
+    }
+
+    #[test]
+    fn majority_vote_categorical() {
+        // Clear majority → that verdict.
+        assert_eq!(majority_verdict(&["contained".into(), "contained".into(), "absent".into()]), "contained");
+        // All absent → absent.
+        assert_eq!(majority_verdict(&["absent".into(), "absent".into(), "absent".into()]), "absent");
+        // Three-way tie [contained, partial, absent] → conservative rule picks ABSENT
+        // (absent wins ties over partial; partial wins ties over contained).
+        assert_eq!(majority_verdict(&["contained".into(), "partial".into(), "absent".into()]), "absent");
+        // Two-way tie partial vs contained (no absent) → partial (conservative of the two present).
+        assert_eq!(majority_verdict(&["contained".into(), "partial".into()]), "partial");
+        // Partial majority.
+        assert_eq!(majority_verdict(&["partial".into(), "partial".into(), "contained".into()]), "partial");
+    }
+
+    #[test]
+    fn majority_vote_bool() {
+        assert!(majority_bool(&[true, true, false]));
+        assert!(!majority_bool(&[true, false, false]));
+        // Even split → false (requires STRICT majority of trues).
+        assert!(!majority_bool(&[true, false]));
+        assert!(majority_bool(&[true]));
+        assert!(!majority_bool(&[]));
+    }
+
+    #[test]
+    fn bootstrap_ci_is_stable_and_brackets_mean() {
+        // Fixed input + fixed seed → deterministic, sane CI bracketing the sample mean.
+        let deltas = vec![0.5, 1.0, 0.0, 0.5, 1.0, 0.0, 0.5, 0.5, 1.0, 0.0];
+        let sample_mean = deltas.iter().sum::<f64>() / deltas.len() as f64; // 0.5
+
+        let (mean1, lo1, hi1) = bootstrap_ci_mean(&deltas, BOOTSTRAP_B, BOOTSTRAP_SEED);
+        let (mean2, lo2, hi2) = bootstrap_ci_mean(&deltas, BOOTSTRAP_B, BOOTSTRAP_SEED);
+
+        // Reproducible.
+        assert_eq!((mean1, lo1, hi1), (mean2, lo2, hi2), "same seed must give identical CI");
+        // Mean is the exact sample mean.
+        assert!((mean1 - sample_mean).abs() < 1e-9, "mean {mean1} != sample mean {sample_mean}");
+        // CI ordering + bracketing.
+        assert!(lo1 <= mean1 && mean1 <= hi1, "CI [{lo1}, {hi1}] must bracket mean {mean1}");
+        assert!(lo1 < hi1, "CI must be a non-degenerate interval");
+        // CI stays within the data range [0, 1].
+        assert!(lo1 >= 0.0 && hi1 <= 1.0, "CI [{lo1}, {hi1}] escaped data range");
+    }
+
+    #[test]
+    fn bootstrap_ci_empty_is_zero() {
+        assert_eq!(bootstrap_ci_mean(&[], BOOTSTRAP_B, BOOTSTRAP_SEED), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn paired_deltas_win_loss_tie() {
+        let arm = vec![1.0, 0.5, 0.0, 1.0];
+        let base = vec![0.5, 0.5, 1.0, 0.0];
+        let (deltas, w, l, t) = paired_deltas(&arm, &base);
+        assert_eq!(deltas, vec![0.5, 0.0, -1.0, 1.0]);
+        assert_eq!((w, l, t), (2, 1, 1));
+    }
+
+    #[test]
+    fn verdict_score_mapping() {
+        assert_eq!(verdict_score("contained"), 1.0);
+        assert_eq!(verdict_score("partial"), 0.5);
+        assert_eq!(verdict_score("absent"), 0.0);
+        assert_eq!(verdict_score("anything-else"), 0.0);
+    }
 
     #[test]
     fn arm_env_var_mapping() {

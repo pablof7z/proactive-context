@@ -441,6 +441,11 @@ enum Commands {
         /// Cap the number of frozen labels (and reversals) scored per arm, for cheaper runs.
         #[arg(long, value_name = "N")]
         arms_label_cap: Option<usize>,
+
+        /// Number of judge calls per briefing in --select-arms; the categorical/boolean verdicts
+        /// are majority-voted across the K calls to kill single-judge variance (default 3).
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        judge_k: usize,
     },
 }
 
@@ -967,6 +972,7 @@ fn main() -> Result<()> {
             prompt_variant,
             select_arms,
             arms_label_cap,
+            judge_k,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
                 project,
@@ -988,6 +994,7 @@ fn main() -> Result<()> {
                 prompt_variant,
                 select_arms,
                 arms_label_cap,
+                judge_k,
             })?;
         }
 
