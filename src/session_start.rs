@@ -42,7 +42,7 @@ pub fn run_session_start() -> Result<()> {
 
     // Filter out questions that already have a guide; cap at 8 to avoid overwhelming the model
     let unanswered: Vec<&OpenQuestion> = questions.iter()
-        .filter(|q| !wiki_path.join(format!("{}.md", q.slug)).exists())
+        .filter(|q| !crate::wiki::guide_path(&wiki_path, &q.slug).exists())
         .take(8)
         .collect();
 

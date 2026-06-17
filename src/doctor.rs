@@ -903,22 +903,7 @@ fn resolve_output_dir(live_wiki: &Path, args: &DoctorArgs) -> Result<PathBuf> {
 }
 
 fn list_guide_paths(wiki: &Path) -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(wiki) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("md") {
-                continue;
-            }
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.starts_with('_') {
-                continue;
-            }
-            v.push(p);
-        }
-    }
-    v.sort();
-    v
+    crate::wiki::guide_files(wiki)
 }
 
 fn today_str() -> String {
