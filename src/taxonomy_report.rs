@@ -25,6 +25,13 @@ fn flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A flag that DEFAULTS ON (true unless explicitly disabled). Mirrors inject::taxonomy_flag_default_on.
+fn flag_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
+}
+
 fn yn(b: bool) -> &'static str {
     if b {
         "yes"
@@ -104,7 +111,7 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
     // Reflects inject::build_catalog as of the Phase 0 baseline: guides + episode cards +
     // committed markdown are catalog rows; nouns are a separate primer side-channel; research,
     // claims, and realness are not selectable.
-    let typed_catalog = flag_enabled("PC_TYPED_CATALOG");
+    let typed_catalog = flag_default_on("PC_TYPED_CATALOG");
     let research_catalog = flag_enabled("PC_RESEARCH_CATALOG");
     let noun_catalog = flag_enabled("PC_NOUN_CATALOG");
     let claim_catalog = flag_enabled("PC_CLAIM_CATALOG");
@@ -134,8 +141,8 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
 
     // ── Feature flags ───────────────────────────────────────────────────────────────────────
     let flags = [
-        FlagState { name: "PC_TYPED_CATALOG", enabled: typed_catalog, note: "carry ContentKind into the catalog" },
-        FlagState { name: "PC_SELECT_SOURCE_TYPES", enabled: flag_enabled("PC_SELECT_SOURCE_TYPES"), note: "type-aware SELECT/COMPILE instructions" },
+        FlagState { name: "PC_TYPED_CATALOG", enabled: typed_catalog, note: "carry ContentKind into the catalog (DEFAULT ON 2026-06-18)" },
+        FlagState { name: "PC_SELECT_SOURCE_TYPES", enabled: flag_default_on("PC_SELECT_SOURCE_TYPES"), note: "type-aware SELECT instructions (DEFAULT ON 2026-06-18)" },
         FlagState { name: "PC_RESEARCH_CATALOG", enabled: research_catalog, note: "research records selectable" },
         FlagState { name: "PC_NOUN_CATALOG", enabled: noun_catalog, note: "noun entries selectable" },
         FlagState { name: "PC_CLAIM_STATUS", enabled: flag_enabled("PC_CLAIM_STATUS"), note: "persist settled|proposed on claims" },

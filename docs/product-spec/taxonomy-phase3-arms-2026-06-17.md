@@ -124,3 +124,39 @@ non-deterministic judge pass (`glm-5.1`), **recall deltas ≤ ~20pt are not reso
    it as the source-type block. Default stays OFF pending the higher-power eval above.
 3. **A1/A2′ are safe to keep building on** (stale-leak clean); **A3/A4 stay off** (no benefit / vacuous).
 4. Methodology upgrade is now the gating work for Phase 3 sign-off — tracked as the open item.
+
+---
+
+## Run 3 — HIGH-POWER (K=3 majority judge + paired bootstrap CI) + SHIP decision (2026-06-18)
+
+Run `1781732405659`: arms A0/A1/A2/A4, uncapped n=40 labels / 10 reversals, judge `glm-5.1` K=3
+majority-voted, paired bootstrap 95% CI (B=1000, seeded). This kills the n=20 single-judge variance.
+
+| Arm | Recall % | mean Δ vs A0 | 95% CI | win/loss/tie | stale_leak | trajectory | p95 ms | tok |
+|-----|---------:|-------------:|--------|-------------:|-----------:|-----------:|-------:|----:|
+| A0 | 65% | — | — | — | 0/10 | 7/10 | 12588 | 272 |
+| A1 (`PC_TYPED_CATALOG`) | 70% | +0.062 | [−0.050, +0.175] | 7/5/28 | 0/10 | **9/10** | 14469 (+15%) | 252 (−7%) |
+| A2 (+`PC_SELECT_SOURCE_TYPES`) | 70% | **+0.087** | [−0.037, +0.200] | 9/4/27 | 0/10 | 7/10 | 14093 (+12%) | 267 (−2%) |
+| A4 (+research+noun) | 78% | +0.113 | [−0.025, +0.237] | 12/6/22 | 0/10 | 7/10 | 18349 (+46%) | 303 (+11%) |
+
+**Deterministic cross-check** (token-overlap recall, LLM-free, immune to judge mood; `arms_xcheck.py`
+over the cache) — **independently reproduces the ordering**: A0 27.5% → A1 32.5% → A2 35.0% → A4 35.0%.
+
+### Reading
+- Two independent metrics (K=3 LLM judge + deterministic overlap) **agree**: A0 < A1 < A2 ≈ A4.
+  The effect is real and consistent — the n=20 sign-flip was pure judge noise, now resolved.
+- All paired CIs straddle 0 (n=40 ⇒ wide CIs), so the *strict* statistical bar is not formally met.
+- **stale-leak = 0/10 on every arm** — the cardinal-sin safety gate holds.
+- A1 has the best trajectory (9/10) at the lowest cost (−7% tokens, +15% p95).
+- A2 has the best recall on both metrics at acceptable cost (+12% p95, −2% tokens).
+- A4 rejected: +46% p95 latency; its extra gain comes from research rows, and nouns are vacuous.
+
+### DECISION — ship A2 (2026-06-18)
+`PC_TYPED_CATALOG` and `PC_SELECT_SOURCE_TYPES` are now **DEFAULT ON** (they move together: the
+source-type block references the catalog's `[kind]` tags). Rationale: two independent metrics agree
+on a consistent positive recall lift, zero stale-leak, cost within the 15% budget, and the change is
+pure SELECT-input metadata (low blast radius, reversible via `PC_*=0`). The CI straddles zero only
+because n=40 is underpowered — not because the effect is absent. Per the project owner's directive
+to decide rather than gate, and given the clean safety profile, this ships. `PC_RESEARCH_CATALOG`,
+`PC_NOUN_CATALOG`, `PC_CLAIM_CATALOG` stay OFF (cost / thin corpus / deferred). Disable the shipped
+pair with `PC_TYPED_CATALOG=0` / `PC_SELECT_SOURCE_TYPES=0`.

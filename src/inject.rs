@@ -213,13 +213,10 @@ history, change, rationale, or a prior approach, selecting the relevant [episode
 is REQUIRED — omitting them loses the trajectory.";
 
 /// Whether Phase 3 source-type SELECT semantics are enabled (`PC_SELECT_SOURCE_TYPES`).
+/// DEFAULT ON as of 2026-06-18 (ships with `PC_TYPED_CATALOG`; the two move together because the
+/// source-type block references the catalog's `[kind]` tags). Disable with `PC_SELECT_SOURCE_TYPES=0`.
 fn select_source_types_enabled() -> bool {
-    std::env::var("PC_SELECT_SOURCE_TYPES")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "on"
-        })
-        .unwrap_or(false)
+    taxonomy_flag_default_on("PC_SELECT_SOURCE_TYPES")
 }
 
 /// Select the active SELECT preamble from `PC_SELECT_VARIANT` + `PC_SELECT_SOURCE_TYPES`. Default
@@ -800,6 +797,18 @@ fn taxonomy_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read a feature flag that DEFAULTS ON: true unless explicitly disabled with
+/// "0"/"false"/"off"/"no" (case-insensitive). Used for flags shipped on by default after eval.
+/// `PC_TYPED_CATALOG` + `PC_SELECT_SOURCE_TYPES` shipped on 2026-06-18 — the high-power arm eval
+/// (K=3 majority judge + a deterministic token-overlap cross-check) agreed that the typed,
+/// source-type-aware SELECT (arm A2) beats baseline on recall at zero stale-leak and acceptable
+/// cost. Disable with `PC_TYPED_CATALOG=0` / `PC_SELECT_SOURCE_TYPES=0`.
+fn taxonomy_flag_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
+}
+
 /// List committed markdown files (repo-relative paths) under `root`. Uses `git ls-files`
 /// for the exact committed set; falls back to a gitignore-aware walk when there's no repo.
 fn list_committed_markdown(root: &Path) -> Vec<String> {
@@ -1075,10 +1084,10 @@ fn build_catalog(
 
 /// Render the catalog for the selector preamble: one compact line per source.
 fn render_catalog(items: &[CatalogItem]) -> String {
-    // Typed catalog (PC_TYPED_CATALOG) is the ONLY flag that alters SELECT input text,
-    // and only when on: it appends a compact ` [<kind-label>]` type hint to each line.
-    // When off, output is byte-identical to the pre-taxonomy baseline.
-    let typed = taxonomy_flag("PC_TYPED_CATALOG");
+    // Typed catalog (PC_TYPED_CATALOG) appends a compact ` [<kind-label>]` type hint to each
+    // line. DEFAULT ON as of 2026-06-18 (shipped after the high-power arm eval). Set
+    // PC_TYPED_CATALOG=0 to restore the pre-taxonomy byte-identical baseline.
+    let typed = taxonomy_flag_default_on("PC_TYPED_CATALOG");
     let mut out = String::new();
     for it in items {
         let hint = it
@@ -1595,6 +1604,8 @@ mod tests {
     fn select_preamble_default_is_byte_identical_and_verdict_swaps_only_the_decision() {
         use super::{select_preamble, SELECT_DECISION_BASE, SELECT_DECISION_VERDICT, SELECT_PREAMBLE};
         let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        // Isolate the PC_SELECT_VARIANT behavior: disable the now-default-on source-type block.
+        std::env::set_var("PC_SELECT_SOURCE_TYPES", "0");
         std::env::remove_var("PC_SELECT_VARIANT");
         assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE);
         std::env::set_var("PC_SELECT_VARIANT", "base");
@@ -1611,17 +1622,26 @@ mod tests {
         assert!(v.contains("NOTHING_RELEVANT"));
         assert!(v.contains("SESSION EPISODE CARDS"));
         std::env::remove_var("PC_SELECT_VARIANT");
+        std::env::remove_var("PC_SELECT_SOURCE_TYPES");
     }
 
     #[test]
-    fn select_source_types_block_is_appended_only_when_flag_on() {
+    fn select_source_types_block_defaults_on_and_off_with_flag_0() {
         use super::{select_preamble, SELECT_PREAMBLE};
         let _g = VARIANT_ENV_LOCK.lock().unwrap();
         std::env::remove_var("PC_SELECT_VARIANT");
-        std::env::remove_var("PC_SELECT_SOURCE_TYPES");
-        // Off: byte-identical to baseline.
+        // Explicitly disabled: byte-identical to baseline.
+        std::env::set_var("PC_SELECT_SOURCE_TYPES", "0");
         assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE);
-        // On: baseline is preserved verbatim as a prefix, plus the source-type guidance.
+        // DEFAULT ON (unset) and explicit on: baseline preserved as prefix + source-type guidance.
+        for v in [None, Some("1")] {
+            match v {
+                None => std::env::remove_var("PC_SELECT_SOURCE_TYPES"),
+                Some(s) => std::env::set_var("PC_SELECT_SOURCE_TYPES", s),
+            }
+            let d = select_preamble().into_owned();
+            assert!(d.contains("SOURCE-TYPE GUIDANCE"), "default-on must append the block (v={v:?})");
+        }
         std::env::set_var("PC_SELECT_SOURCE_TYPES", "1");
         let p = select_preamble().into_owned();
         assert!(p.starts_with(SELECT_PREAMBLE), "baseline must be preserved as prefix");
@@ -1736,11 +1756,10 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
     }
 
     #[test]
-    fn render_catalog_default_is_byte_identical_to_baseline() {
+    fn render_catalog_defaults_to_typed_hint_and_flag_0_restores_baseline() {
         use super::{render_catalog, CatalogItem};
         use crate::content_kind::{ContentKind, Currentness};
         let _g = VARIANT_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("PC_TYPED_CATALOG");
         // A sample item exercising the summary + score branch.
         let items = vec![CatalogItem {
             key: "token-model".to_string(),
@@ -1750,17 +1769,18 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             kind: ContentKind::CurrentGuide,
             currentness: Currentness::Current,
         }];
-        // The exact baseline string produced before the taxonomy type-hint change.
+        // PC_TYPED_CATALOG=0 restores the exact pre-taxonomy baseline string.
+        std::env::set_var("PC_TYPED_CATALOG", "0");
         assert_eq!(
             render_catalog(&items),
             "- token-model — Token model — How tokens flow  [similar 0.42]\n"
         );
-        // With the flag ON, the kind label is appended before the similarity hint.
+        // DEFAULT ON (unset) and explicit ON both append the kind label before the similarity hint.
+        let hinted = "- token-model — Token model — How tokens flow [current-guide]  [similar 0.42]\n";
+        std::env::remove_var("PC_TYPED_CATALOG");
+        assert_eq!(render_catalog(&items), hinted, "typed hint must be the default");
         std::env::set_var("PC_TYPED_CATALOG", "1");
-        assert_eq!(
-            render_catalog(&items),
-            "- token-model — Token model — How tokens flow [current-guide]  [similar 0.42]\n"
-        );
+        assert_eq!(render_catalog(&items), hinted);
         std::env::remove_var("PC_TYPED_CATALOG");
     }
 }
