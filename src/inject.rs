@@ -181,14 +181,51 @@ worse than injecting nothing.";
 const SELECT_DECISION_BASE: &str =
     "Decide which sources (if any) contain context DIRECTLY relevant to what the user now needs.";
 
-/// Select the active SELECT preamble from `PC_SELECT_VARIANT`. Default (unset / `base` / unknown)
-/// returns `SELECT_PREAMBLE` borrowed unchanged, so default behavior is byte-identical.
+/// Phase 3 — source-type SELECT semantics (`PC_SELECT_SOURCE_TYPES=1`). Appended to the SELECT
+/// preamble so the gate can route by content kind once the catalog carries `[kind]` hints
+/// (`PC_TYPED_CATALOG`). Covers the kinds the base preamble does not yet mention (research,
+/// nouns, claims) and the cross-cutting rule that historical artifacts are not current truth.
+/// Append-only and flag-gated, so with the flag off the preamble is byte-identical to baseline.
+const SELECT_SOURCE_TYPES_BLOCK: &str = "\n\nSOURCE-TYPE GUIDANCE (each catalog line is tagged with its kind in [brackets]):\n\
+- [current-guide]: present-tense project truth. PRIMARY source for how something works now, \
+architecture, and implementation questions.\n\
+- [episode-card] (key `episode:`): a historical decision/reversal/root-cause record. PRIMARY when \
+the prompt asks WHY something changed, what came BEFORE, whether an approach was tried, or for the \
+history/trajectory of a decision.\n\
+- [research-record] (key `research:`): an investigation/validation record — experiments, evidence, \
+method, and findings. PRIMARY for validation, experiment, investigation, and \"what did we learn\" \
+questions.\n\
+- [noun-entry] (key `noun:`): a project-specific entity definition. Select ONLY for entity \
+grounding / first-mention questions about what a specific named thing IS — never as general project \
+truth.\n\
+- [claim] (key `claim:`): an atomic evidence-backed fact. Select for a targeted factual point only \
+when no guide already covers it.\n\
+Do NOT select a historical artifact ([episode-card], [research-record]) as CURRENT truth unless you \
+also select a [current-guide] or [claim] that corroborates it.";
+
+/// Whether Phase 3 source-type SELECT semantics are enabled (`PC_SELECT_SOURCE_TYPES`).
+fn select_source_types_enabled() -> bool {
+    std::env::var("PC_SELECT_SOURCE_TYPES")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Select the active SELECT preamble from `PC_SELECT_VARIANT` + `PC_SELECT_SOURCE_TYPES`. Default
+/// (both unset) returns `SELECT_PREAMBLE` borrowed unchanged, so default behavior is byte-identical.
 pub(crate) fn select_preamble() -> std::borrow::Cow<'static, str> {
-    match std::env::var("PC_SELECT_VARIANT").ok().as_deref() {
+    let base: std::borrow::Cow<'static, str> = match std::env::var("PC_SELECT_VARIANT").ok().as_deref() {
         Some("verdict") => std::borrow::Cow::Owned(
             SELECT_PREAMBLE.replace(SELECT_DECISION_BASE, SELECT_DECISION_VERDICT),
         ),
         _ => std::borrow::Cow::Borrowed(SELECT_PREAMBLE), // "base" | unset | unknown → control
+    };
+    if select_source_types_enabled() {
+        std::borrow::Cow::Owned(format!("{}{}", base, SELECT_SOURCE_TYPES_BLOCK))
+    } else {
+        base
     }
 }
 
@@ -1525,6 +1562,30 @@ mod tests {
         assert!(v.contains("NOTHING_RELEVANT"));
         assert!(v.contains("SESSION EPISODE CARDS"));
         std::env::remove_var("PC_SELECT_VARIANT");
+    }
+
+    #[test]
+    fn select_source_types_block_is_appended_only_when_flag_on() {
+        use super::{select_preamble, SELECT_PREAMBLE};
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_SELECT_VARIANT");
+        std::env::remove_var("PC_SELECT_SOURCE_TYPES");
+        // Off: byte-identical to baseline.
+        assert_eq!(select_preamble().as_ref(), SELECT_PREAMBLE);
+        // On: baseline is preserved verbatim as a prefix, plus the source-type guidance.
+        std::env::set_var("PC_SELECT_SOURCE_TYPES", "1");
+        let p = select_preamble().into_owned();
+        assert!(p.starts_with(SELECT_PREAMBLE), "baseline must be preserved as prefix");
+        assert!(p.contains("SOURCE-TYPE GUIDANCE"));
+        assert!(p.contains("[research-record]") && p.contains("[noun-entry]") && p.contains("[claim]"));
+        assert!(p.contains("Do NOT select a historical artifact"));
+        // Composes with the verdict SELECT variant without losing either piece.
+        std::env::set_var("PC_SELECT_VARIANT", "verdict");
+        let pv = select_preamble().into_owned();
+        assert!(pv.contains("SOURCE-TYPE GUIDANCE"));
+        assert!(pv.contains(super::SELECT_DECISION_VERDICT));
+        std::env::remove_var("PC_SELECT_VARIANT");
+        std::env::remove_var("PC_SELECT_SOURCE_TYPES");
     }
 
     /// Write a minimal episode card into `<wiki>/episodes/<name>.md`.

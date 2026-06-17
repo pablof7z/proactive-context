@@ -379,6 +379,152 @@ pub fn parse_transcript_meta(path: &str) -> Result<Vec<TranscriptMessage>> {
         .collect())
 }
 
+// ─── Canonical transcript substrate (Phase 6) ────────────────────────────────
+//
+// This is the eventual *single* internal model that ALL harnesses (Claude Code,
+// Codex, opencode, TENEX) will feed once Phase 6 lands. Today it is purely
+// additive and INERT: it is not wired into capture/inject, and nothing in the
+// existing parse pipeline produces or consumes it yet. Existing callers keep
+// using the `(role, text)` `(String, String)` pairs and the richer
+// `TranscriptMessage` exactly as before.
+//
+// This increment lands only: the canonical types, a lossless round-trip
+// projection to/from the existing `(role, text)` representation, a `From`
+// adapter that preserves the richer `TranscriptMessage` metadata, and an
+// off-by-default feature flag (`typed_transcript_enabled`). No behavior or
+// signature of any existing function changes.
+
+/// The kind of content a canonical transcript turn carries.
+///
+/// Phase 6 substrate. Most existing turns parse as [`TranscriptContentKind::Message`];
+/// the other variants exist so future harness adapters can preserve tool-call,
+/// tool-result, sub-agent task-result, and system/meta blocks losslessly instead
+/// of flattening everything to plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub enum TranscriptContentKind {
+    /// Ordinary user/assistant prose. The default.
+    #[default]
+    Message,
+    /// An assistant tool/function invocation block.
+    ToolUse,
+    /// The result returned to the model for a tool/function call.
+    ToolResult,
+    /// A sub-agent / Task-tool final report.
+    TaskResult,
+    /// A system / harness-injected instruction block.
+    System,
+    /// A harness meta turn (e.g. `isMeta` lines).
+    Meta,
+    /// Anything not yet modelled by a specific variant.
+    Other,
+}
+
+/// The canonical transcript turn — the Phase 6 substrate.
+///
+/// This is the model every harness will eventually project into. It carries the
+/// role and text (the only fields existing capture relies on today) plus the
+/// per-turn provenance and metadata needed to route, sort, and filter without
+/// losing information: which harness produced the turn, what kind of content it
+/// is, when it occurred, whether it is a sub-agent sidechain or a meta turn, and
+/// the harness-native block type it came from.
+///
+/// **Not yet wired into capture.** Construct it only via the lossless projections
+/// below; existing callers continue to use `(role, text)` pairs and
+/// [`TranscriptMessage`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TranscriptTurn {
+    /// Speaker role, reusing the existing internal [`TranscriptRole`] enum.
+    pub role: TranscriptRole,
+    /// Visible text of the turn.
+    pub text: String,
+    /// Originating harness/dialect (e.g. `"claude-code"`, `"codex"`). Empty when
+    /// unknown — there is no `Harness` enum in the crate yet, so this is a String.
+    pub source_harness: String,
+    /// What kind of content this turn carries.
+    pub content_kind: TranscriptContentKind,
+    /// RFC3339 timestamp from the source line, if any.
+    pub timestamp: Option<String>,
+    /// `true` for sub-agent / Task-tool turns (`isSidechain`).
+    pub is_sidechain: bool,
+    /// `true` for harness-injected meta turns (`isMeta`).
+    pub is_meta: bool,
+    /// The harness-native block/entry type this turn was decoded from
+    /// (e.g. `"input_text"`, `"output_text"`, `"response_item"`), if known.
+    pub original_block_type: Option<String>,
+}
+
+#[allow(dead_code)]
+impl TranscriptTurn {
+    /// Build a canonical turn from the existing `(role, text)` representation,
+    /// filling sensible defaults so the projection is lossless in the round-trip
+    /// `(role, text)` -> `from_role_text` -> [`to_role_text`](Self::to_role_text).
+    ///
+    /// An unrecognized role string defaults to assistant, mirroring how the rest
+    /// of the crate treats unknown roles (see `build_transcript_string` /
+    /// `reduce_turns_to_fit`), so the round-trip is stable for `"user"` and
+    /// `"assistant"` — the only roles the parse pipeline ever emits.
+    pub fn from_role_text(role: &str, text: impl Into<String>) -> Self {
+        let role = TranscriptRole::parse(role).unwrap_or(TranscriptRole::Assistant);
+        Self {
+            role,
+            text: text.into(),
+            source_harness: String::new(),
+            content_kind: TranscriptContentKind::Message,
+            timestamp: None,
+            is_sidechain: false,
+            is_meta: false,
+            original_block_type: None,
+        }
+    }
+
+    /// Project back to the existing `(role, text)` pair shape used by
+    /// `parse_transcript` and friends. Lossless for the role/text the parse
+    /// pipeline produces.
+    pub fn to_role_text(&self) -> (String, String) {
+        (self.role.as_str().to_string(), self.text.clone())
+    }
+}
+
+/// Preserve the richer [`TranscriptMessage`] metadata when projecting into the
+/// canonical model. Unrecognized role strings default to assistant (see
+/// [`TranscriptTurn::from_role_text`]). `source_harness` and
+/// `original_block_type` are left unset here — `TranscriptMessage` does not carry
+/// them; harness adapters will populate them in a later Phase 6 increment.
+#[allow(dead_code)]
+impl From<&TranscriptMessage> for TranscriptTurn {
+    fn from(m: &TranscriptMessage) -> Self {
+        Self {
+            role: TranscriptRole::parse(&m.role).unwrap_or(TranscriptRole::Assistant),
+            text: m.text.clone(),
+            source_harness: String::new(),
+            content_kind: if m.is_meta {
+                TranscriptContentKind::Meta
+            } else {
+                TranscriptContentKind::Message
+            },
+            timestamp: m.timestamp.clone(),
+            is_sidechain: m.is_sidechain,
+            is_meta: m.is_meta,
+            original_block_type: None,
+        }
+    }
+}
+
+/// Feature flag for *future* typed-transcript behavior. Reads `PC_TYPED_TRANSCRIPT`
+/// (`"1"` / `"true"` / `"on"`, case-insensitive). Defined for the Phase 6 wiring to
+/// come; intentionally **not called anywhere yet**.
+#[allow(dead_code)]
+pub fn typed_transcript_enabled() -> bool {
+    std::env::var("PC_TYPED_TRANSCRIPT")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
 // ─── Picker helpers ──────────────────────────────────────────────────────────
 
 /// Return the first `cwd` field surfaced by a transcript line.
@@ -757,5 +903,65 @@ mod tests {
         std::env::set_var("PC_INCLUDE_TASK_RESULTS", "1");
         assert!(extract_text(&content).contains("## Report"));
         std::env::remove_var("PC_INCLUDE_TASK_RESULTS");
+    }
+
+    // ── Canonical transcript substrate (Phase 6) ─────────────────────────────
+
+    #[test]
+    fn role_text_round_trips_losslessly() {
+        for (role, text) in [("user", "remember zinc marker"), ("assistant", "noted.")] {
+            let turn = TranscriptTurn::from_role_text(role, text);
+            assert_eq!(turn.to_role_text(), (role.to_string(), text.to_string()));
+        }
+    }
+
+    #[test]
+    fn from_role_text_fills_inert_defaults() {
+        let turn = TranscriptTurn::from_role_text("user", "hi");
+        assert_eq!(turn.content_kind, TranscriptContentKind::Message);
+        assert_eq!(turn.source_harness, "");
+        assert!(turn.timestamp.is_none());
+        assert!(turn.original_block_type.is_none());
+        assert!(!turn.is_sidechain);
+        assert!(!turn.is_meta);
+    }
+
+    #[test]
+    fn content_kind_default_is_message() {
+        assert_eq!(
+            TranscriptContentKind::default(),
+            TranscriptContentKind::Message
+        );
+    }
+
+    #[test]
+    fn from_transcript_message_preserves_metadata() {
+        let msg = TranscriptMessage {
+            role: "assistant".to_string(),
+            text: "body".to_string(),
+            timestamp: Some("2026-06-17T00:00:00.000Z".to_string()),
+            is_sidechain: true,
+            is_meta: false,
+        };
+        let turn = TranscriptTurn::from(&msg);
+        assert_eq!(turn.to_role_text(), ("assistant".to_string(), "body".to_string()));
+        assert_eq!(turn.timestamp.as_deref(), Some("2026-06-17T00:00:00.000Z"));
+        assert!(turn.is_sidechain);
+        assert_eq!(turn.content_kind, TranscriptContentKind::Message);
+
+        let meta = TranscriptMessage {
+            role: "user".to_string(),
+            text: "m".to_string(),
+            timestamp: None,
+            is_sidechain: false,
+            is_meta: true,
+        };
+        assert_eq!(TranscriptTurn::from(&meta).content_kind, TranscriptContentKind::Meta);
+    }
+
+    #[test]
+    fn typed_transcript_disabled_when_unset() {
+        std::env::remove_var("PC_TYPED_TRANSCRIPT");
+        assert!(!typed_transcript_enabled());
     }
 }
