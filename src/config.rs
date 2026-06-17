@@ -54,6 +54,14 @@ pub struct Config {
     #[serde(default = "default_capture_episode_cards")]
     pub capture_episode_cards: bool,
 
+    /// Clean up an episode card's `## Conversation` section with one LLM pass when
+    /// the card is captured: user messages are kept verbatim but pasted content
+    /// (logs, command output, file dumps) is stripped, and long agent replies are
+    /// abbreviated. Default ON. When off, the conversation is the raw reconstructed
+    /// dialogue. Best-effort — on any LLM/parse failure the raw dialogue is used.
+    #[serde(default = "default_clean_episode_dialogue")]
+    pub clean_episode_dialogue: bool,
+
     /// Enable the entity/noun-layer capture + inject paths (entity-and-orientation-capture spec).
     /// Capture side: a definitional ("X is Y") recognition pass registers project nouns and
     /// persists transcript-cited entity records under <wiki>/nouns/. Inject side: a first-mention
@@ -222,6 +230,15 @@ fn default_capture_episode_cards() -> bool {
     // 0/8 stale leaks, 6/8 asserts-current (vs wiki guides 1/8 trajectory in the
     // same sweep). Phase-2 fixtures: 4/4. One recognition call per session;
     // best-effort, never breaks the normal capture path.
+    true
+}
+
+fn default_clean_episode_dialogue() -> bool {
+    // ON by default: the raw reconstructed conversation is noisy — users paste
+    // logs/command output into prompts (captured verbatim) and agent replies run
+    // long. One cheap cleanup call per captured session keeps user words verbatim,
+    // strips pasted content, and abbreviates agent turns. Best-effort: falls back
+    // to the raw dialogue on any failure, so it never breaks capture.
     true
 }
 
@@ -481,6 +498,7 @@ impl Default for Config {
             capture_enabled: default_capture_enabled(),
             capture_research: default_capture_research(),
             capture_episode_cards: default_capture_episode_cards(),
+            clean_episode_dialogue: default_clean_episode_dialogue(),
             capture_nouns: default_capture_nouns(),
             inject_noun_primer: default_inject_noun_primer(),
             capture_model: default_capture_model(),
