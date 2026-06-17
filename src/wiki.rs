@@ -247,9 +247,68 @@ pub fn wiki_dir(project_root: &Path) -> PathBuf {
     project_root.join("docs").join("wiki")
 }
 
-/// Path for a guide by slug.
+/// Directory holding guide files. Guides used to live flat at the wiki root;
+/// they now live in `<wiki>/guides/` so the root holds only `_index.md` and the
+/// typed subdirs (`episodes/`, `research/`, `nouns/`).
+pub fn guides_dir(wiki_dir: &Path) -> PathBuf {
+    wiki_dir.join("guides")
+}
+
+/// Path for a guide by slug — `<wiki>/guides/<slug>.md`.
 pub fn guide_path(wiki_dir: &Path, slug: &str) -> PathBuf {
-    wiki_dir.join(format!("{}.md", slug))
+    guides_dir(wiki_dir).join(format!("{}.md", slug))
+}
+
+/// All guide files for a wiki, sorted by slug. Reads the canonical `guides/`
+/// subdir AND the legacy flat root (so a not-yet-migrated wiki still resolves);
+/// when a slug exists in both, the `guides/` copy wins. `_`-prefixed files
+/// (`_index`, `_citations`) are skipped.
+pub fn guide_files(wiki_dir: &Path) -> Vec<PathBuf> {
+    let mut by_slug: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    // Legacy root first, then canonical guides/ overrides on slug collision.
+    for dir in [wiki_dir.to_path_buf(), guides_dir(wiki_dir)] {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem.is_empty() || stem.starts_with('_') {
+                continue;
+            }
+            by_slug.insert(stem.to_string(), p);
+        }
+    }
+    by_slug.into_values().collect()
+}
+
+/// Relocate legacy flat guides (`<wiki>/<slug>.md`) into `<wiki>/guides/`.
+/// Idempotent and best-effort: `_`-prefixed files and subdirs stay put, and a
+/// guide already present in `guides/` is never clobbered. Returns the count moved.
+pub fn migrate_guides_to_subdir(wiki_dir: &Path) -> usize {
+    let gdir = guides_dir(wiki_dir);
+    let Ok(rd) = fs::read_dir(wiki_dir) else { return 0 };
+    let mut moved = 0usize;
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.starts_with('_') {
+            continue; // _index, _citations
+        }
+        let dest = gdir.join(name);
+        if dest.exists() {
+            continue;
+        }
+        if fs::create_dir_all(&gdir).is_ok() && fs::rename(&path, &dest).is_ok() {
+            moved += 1;
+        }
+    }
+    moved
 }
 
 // ─── Guide I/O ────────────────────────────────────────────────────────────────
@@ -364,18 +423,9 @@ fn is_valid_slug(s: &str) -> bool {
 /// Returns the count of links added.
 pub fn enforce_bidirectional_links(wiki_dir: &Path, today: &str) -> Result<usize> {
     // Build slug → see-also slugs map
-    let entries = fs::read_dir(wiki_dir)?;
     let mut guides: Vec<(String, Guide, PathBuf)> = Vec::new();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
+    for path in guide_files(wiki_dir) {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        if stem == "_index" {
-            continue;
-        }
         if let Some(guide) = load_guide(&path) {
             guides.push((stem, guide, path));
         }
@@ -503,24 +553,17 @@ pub struct IndexRow {
 pub fn rebuild_index(wiki_dir: &Path, today: &str) -> Result<Vec<IndexRow>> {
     let mut rows: Vec<IndexRow> = Vec::new();
 
-    let entries = match fs::read_dir(wiki_dir) {
-        Ok(e) => e,
-        Err(_) => {
-            // Empty wiki — write empty index
-            write_index_file(wiki_dir, today, &[])?;
-            return Ok(rows);
-        }
-    };
+    // Relocate any legacy flat guides into guides/ so the on-disk layout and the
+    // index links below are uniform (everything resolves under guides/).
+    migrate_guides_to_subdir(wiki_dir);
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        if stem == "_index" {
-            continue;
-        }
+    if !wiki_dir.exists() {
+        // Empty wiki — write empty index
+        write_index_file(wiki_dir, today, &[])?;
+        return Ok(rows);
+    }
+
+    for path in guide_files(wiki_dir) {
         if let Some(guide) = load_guide(&path) {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
@@ -658,7 +701,7 @@ fn write_index_file_with_research(
             let summary = row.summary.replace('|', "\\|");
             let title = row.title.replace('|', "\\|");
             out.push_str(&format!(
-                "| [{}]({}.md) | {} | {} | {} | {} | {} | {} |\n",
+                "| [{}](guides/{}.md) | {} | {} | {} | {} | {} | {} |\n",
                 row.slug, row.slug, title, summary, tags_str, row.volatility, row.verified, topic
             ));
         }
@@ -823,19 +866,7 @@ pub fn read_index(wiki_dir: &Path) -> Vec<IndexRow> {
 /// Inject/statusline keep using the cheap `read_index` cache read to stay within budget.
 pub fn read_index_live(wiki_dir: &Path) -> Vec<IndexRow> {
     let mut rows: Vec<IndexRow> = Vec::new();
-    let entries = match fs::read_dir(wiki_dir) {
-        Ok(e) => e,
-        Err(_) => return rows,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem.starts_with('_') {
-            continue; // skip _index, _citations
-        }
+    for path in guide_files(wiki_dir) {
         if let Some(guide) = load_guide(&path) {
             let fm = &guide.frontmatter;
             rows.push(IndexRow {
@@ -1586,6 +1617,44 @@ More info.
         let slugs: Vec<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
         assert!(slugs.contains(&"embeddings"), "guide row missing from read_index");
         assert!(!slugs.iter().any(|s| s.contains("run-4")), "research record leaked into guide rows: {:?}", slugs);
+    }
+
+    #[test]
+    fn guides_live_in_guides_subdir_and_index_links_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let g = "---\ntitle: Vec\nslug: vector-search\nsummary: ANN over sqlite-vec\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-06-01\nupdated: 2026-06-01\nverified: 2026-06-01\ncompiled-from: conversation\nsources: []\ntopic: search\n---\n\n# Vec\n\nBody.\n";
+
+        // guide_path resolves into guides/, and a guide saved there is found.
+        let p = guide_path(wiki, "vector-search");
+        assert!(p.ends_with("guides/vector-search.md"), "guide_path must point into guides/: {:?}", p);
+        save_guide(&p, &parse_guide(g).unwrap()).unwrap();
+        assert_eq!(guide_files(wiki).len(), 1, "guide_files must find the guide in guides/");
+
+        rebuild_index(wiki, "2026-06-02").unwrap();
+        let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
+        assert!(index.contains("](guides/vector-search.md)"), "index must link into guides/:\n{}", index);
+    }
+
+    #[test]
+    fn legacy_flat_guide_is_migrated_into_guides_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let g = "---\ntitle: Old\nslug: old-guide\nsummary: legacy flat guide\ntags: []\nvolatility: warm\nconfidence: medium\ncreated: 2026-06-01\nupdated: 2026-06-01\nverified: 2026-06-01\ncompiled-from: conversation\nsources: []\ntopic: x\n---\n\n# Old\n\nBody.\n";
+        // A guide written the OLD way, flat at the wiki root.
+        fs::write(wiki.join("old-guide.md"), g).unwrap();
+
+        // guide_files sees it via the legacy fallback even before migration.
+        assert_eq!(guide_files(wiki).len(), 1);
+
+        let moved = migrate_guides_to_subdir(wiki);
+        assert_eq!(moved, 1, "the flat guide must be relocated");
+        assert!(!wiki.join("old-guide.md").exists(), "flat copy must be gone");
+        assert!(guide_path(wiki, "old-guide").exists(), "guide must now live in guides/");
+        // _index and _citations at the root are never moved.
+        fs::write(wiki.join("_citations.log"), "x").unwrap();
+        assert_eq!(migrate_guides_to_subdir(wiki), 0, "second run is a no-op and skips _-files");
+        assert!(wiki.join("_citations.log").exists());
     }
 
     #[test]

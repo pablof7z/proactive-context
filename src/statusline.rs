@@ -386,20 +386,8 @@ pub fn count_guides(wiki_dir: &std::path::Path) -> usize {
     if !rows.is_empty() {
         return rows.len();
     }
-    // Fallback: scan directory
-    std::fs::read_dir(wiki_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| {
-                    let path = e.path();
-                    let is_md = path.extension().and_then(|x| x.to_str()) == Some("md");
-                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    is_md && stem != "_index"
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    // Fallback: scan guide files on disk
+    wiki::guide_files(wiki_dir).len()
 }
 
 // ─── Default log path ─────────────────────────────────────────────────────────

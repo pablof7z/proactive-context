@@ -2095,7 +2095,8 @@ mod tests {
                      # Reranking\n\n\
                      Reranking uses a cross-encoder over the top-k vector hits.\n\
                      Reranking is disabled in inject by default to avoid per-call model load.\n";
-        fs::write(wiki.join("reranking.md"), guide).unwrap();
+        fs::create_dir_all(crate::wiki::guides_dir(&wiki)).unwrap();
+        fs::write(crate::wiki::guide_path(&wiki, "reranking"), guide).unwrap();
         let index_rows = crate::wiki::read_index_live(&wiki);
         let entry = NounEntry {
             slug: "reranking".into(),
