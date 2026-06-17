@@ -71,3 +71,56 @@ Reproduce / extend:
 ```sh
 pc eval --project <repo> --experiment-dir <baseline-r3 dir> --select-arms --arms-label-cap 40
 ```
+
+---
+
+## Run 2 — A2′ prompt tuning + a variance warning (2026-06-18)
+
+After Run 1, the A2 source-type SELECT block was tuned (**A2′**): the misplaced COMPILE-time
+caution ("do not select historical as current truth") was removed from SELECT, and the gate is now
+explicitly told to keep **every** episode card relevant to a why/history/reversal prompt. Re-ran the
+identical arms on the identical frozen labels (n=20/10).
+
+| Arm | Recall % | Δ A0 | NOTHING_REL | avg sel/label | p50 ms | asserts_cur | stale_leak | trajectory |
+|-----|---------:|-----:|------------:|--------------:|-------:|------------:|-----------:|-----------:|
+| A0 | 75% | — | 0 | 2.7 | 6019 | 8/10 | 0/10 | 6/10 |
+| A1 | 50% | −25 | 2 | 2.5 | 5967 | 7/10 | 0/10 | 7/10 |
+| A2′ | 50% | −25 | 0 | 3.1 | 8493 | 8/10 | 0/10 | **8/10** |
+| A3 | 70% | −5 | 0 | 3.4 | 6321 | 8/10 | 0/10 | 7/10 |
+| A4 | 70% | −5 | 1 | 3.4 | 6652 | 8/10 | 0/10 | 8/10 |
+
+Episode-card selections by arm (Run 1 → Run 2): A2 **9 → 25**. The tuning fixed the under-selection.
+
+### The headline finding: recall is noise-dominated at this sample size
+
+Recall **flipped sign** between two identical-input runs:
+
+| Arm | Run 1 recall | Run 2 recall |
+|-----|-------------:|-------------:|
+| A0 | 60% | 75% |
+| A1 | 70% | 50% |
+| A2(′) | 70% | 50% |
+
+A0 itself moved 15pt; A1's delta vs A0 went **+10 → −25**. With n=20 and a single
+non-deterministic judge pass (`glm-5.1`), **recall deltas ≤ ~20pt are not resolvable** — Run 1's
+"A1 is a clean win on recall" does **not** replicate and must be retracted.
+
+### What IS stable across both runs (the trustworthy signals)
+
+- **A2′ fixed the episode regression** — selections recovered 9→25 and trajectory rose to 8/10
+  (≥ A0). This is a *mechanistic* result from near-deterministic selection counts, not judge mood.
+- **stale-leak ≈ 0** under every typed/source-type arm in both runs — no current-truth regression
+  (the most important safety gate) from any flag.
+- **A3 (research selectable)** never helped (thin 4-record corpus; ≤2 research rows ever selected).
+- Token/latency stayed within noise of baseline (no >15% blowup).
+
+### Revised recommendation
+
+1. **Do not flip any default on recall grounds yet** — the metric can't tell the arms apart at
+   n=20/1-judge. Before any default-on decision, the harness needs **n≥40 labels AND 3+ judge
+   passes averaged** (or a deterministic/stronger judge). This is the real prerequisite, not more
+   prompt tuning.
+2. **A2′ is the right prompt** — it removed the episode under-selection with no stale-leak cost; keep
+   it as the source-type block. Default stays OFF pending the higher-power eval above.
+3. **A1/A2′ are safe to keep building on** (stale-leak clean); **A3/A4 stay off** (no benefit / vacuous).
+4. Methodology upgrade is now the gating work for Phase 3 sign-off — tracked as the open item.
