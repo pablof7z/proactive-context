@@ -3021,7 +3021,8 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
 
     let session_id = hook_input.session_id.clone();
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("capture")
+    cmd.arg("hook")
+        .arg("capture")
         .arg("--deferred")
         .arg(&session_id)
         .stdin(std::process::Stdio::null())
