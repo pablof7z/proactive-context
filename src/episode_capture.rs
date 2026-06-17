@@ -86,8 +86,13 @@ pub fn run_episode_capture(
     let captured_at = rfc3339_now();
     let date = captured_at[..captured_at.len().min(10)].to_string();
 
-    // Build the verbatim dialogue once — it is session-level and shared by every card.
-    let dialogue = build_dialogue(transcript_path);
+    // Build the dialogue once — it is session-level and shared by every card. When
+    // enabled, clean it up with one LLM pass (verbatim user words, pasted content
+    // stripped, agent replies abbreviated); best-effort, falls back to the raw dialogue.
+    let mut dialogue = build_dialogue(transcript_path);
+    if cfg.clean_episode_dialogue {
+        dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
+    }
 
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
@@ -174,8 +179,13 @@ pub fn run_episode_stage(
         .map(str::to_string)
         .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
-    // Build the verbatim dialogue once — it is session-level and shared by every card.
-    let dialogue = build_dialogue(transcript_path);
+    // Build the dialogue once — it is session-level and shared by every card. When
+    // enabled, clean it up with one LLM pass (verbatim user words, pasted content
+    // stripped, agent replies abbreviated); best-effort, falls back to the raw dialogue.
+    let mut dialogue = build_dialogue(transcript_path);
+    if cfg.clean_episode_dialogue {
+        dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
+    }
 
     let mut persisted = Vec::new();
     let mut newly_written: Vec<PathBuf> = Vec::new();
@@ -781,19 +791,143 @@ fn extract_dialogue_text(content: &Value, keep_types: &[&str]) -> Option<String>
     }
 }
 
-/// Render the verbatim `## Conversation` section: every literal user message,
-/// each followed by the agent's last reply before the next user turn.
+// ─── Dialogue cleanup (one LLM pass) ─────────────────────────────────────────
+
+const CLEAN_DIALOGUE_SYSTEM: &str = "\
+You clean a raw AI-agent session dialogue into a concise, readable transcript. \
+Follow the rules EXACTLY, never invent content, and output JSON only.";
+
+/// Clean a reconstructed dialogue into a readable episode transcript with ONE LLM
+/// call: user messages are kept VERBATIM but content the user PASTED (logs, command
+/// output, stack traces, file/code dumps) is stripped; long agent replies are
+/// abbreviated. Turn order and roles are preserved, and a user turn that is entirely
+/// pasted content is dropped.
+///
+/// Best-effort: returns the input unchanged on empty input, an LLM error, or
+/// unparseable output, so the Conversation section is never lost.
+pub(crate) fn clean_dialogue(
+    spec: &ModelSpec,
+    openrouter_key: &str,
+    ollama_base: &str,
+    ollama_key: Option<&str>,
+    dialogue: &[DialogueTurn],
+) -> Vec<DialogueTurn> {
+    if dialogue.is_empty() {
+        return Vec::new();
+    }
+    let user_msg = build_clean_dialogue_prompt(dialogue);
+    let raw = match call_model_blocking(
+        spec, openrouter_key, ollama_base, ollama_key, CLEAN_DIALOGUE_SYSTEM, &user_msg,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[episode-capture] dialogue cleanup failed, using raw dialogue: {}", e);
+            return dialogue.to_vec();
+        }
+    };
+    match parse_cleaned_dialogue(&raw) {
+        Some(cleaned) if !cleaned.is_empty() => cleaned,
+        _ => {
+            eprintln!("[episode-capture] dialogue cleanup returned nothing usable, using raw dialogue");
+            dialogue.to_vec()
+        }
+    }
+}
+
+/// Build the cleanup user prompt. The raw dialogue is serialized as a JSON array of
+/// `{role, text}` so quoting/escaping is safe, and the rules are stated strictly.
+fn build_clean_dialogue_prompt(dialogue: &[DialogueTurn]) -> String {
+    let turns: Vec<Value> = dialogue
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "role": if t.is_user { "user" } else { "agent" },
+                "text": t.text,
+            })
+        })
+        .collect();
+    let turns_json = serde_json::to_string_pretty(&Value::Array(turns))
+        .unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "Below is a raw session dialogue as a JSON array of turns, each with a \
+\"role\" (\"user\" or \"agent\") and \"text\".\n\
+\n\
+Clean it into a concise transcript following these rules EXACTLY:\n\
+\n\
+1. Preserve chronological order and each turn's role. Do not merge turns or add commentary.\n\
+2. USER turns: keep the user's own words EXACTLY as written — verbatim. Do NOT paraphrase, \
+reword, fix typos, translate, or summarize. BUT strip out anything the user PASTED rather than \
+typed: terminal/command output, logs, stack traces, file contents, large pasted code blocks, \
+search/query results. Keep only the human's actual sentences, instructions, and questions. \
+If after stripping pasted content a user turn has NO real message left, OMIT that turn entirely.\n\
+3. AGENT turns: abbreviate to a concise 1-2 sentence summary of what the agent did, decided, or \
+answered. Drop step-by-step lists, code blocks, and verification dumps. If an agent turn is already \
+one short sentence, keep it unchanged.\n\
+\n\
+Output ONLY a JSON array of objects {{\"role\": \"user\"|\"agent\", \"text\": \"...\"}} and nothing else.\n\
+\n\
+DIALOGUE:\n{}",
+        turns_json
+    )
+}
+
+/// Parse the model's cleaned-dialogue JSON array back into [`DialogueTurn`]s.
+/// Returns None if the response is not a JSON array; skips items missing text.
+fn parse_cleaned_dialogue(response: &str) -> Option<Vec<DialogueTurn>> {
+    let json = extract_json_value(response);
+    let Value::Array(items) = serde_json::from_str::<Value>(&json).ok()? else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in &items {
+        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(DialogueTurn {
+            is_user: role.eq_ignore_ascii_case("user"),
+            text: text.to_string(),
+        });
+    }
+    Some(out)
+}
+
+// ─── Conversation rendering ──────────────────────────────────────────────────
+
+/// Render the `## Conversation` section as a readable transcript. Each speaker is
+/// clearly marked; the user's (verbatim) words are shown as a blockquote so they
+/// stand out from the agent's abbreviated replies, and exchanges are rule-separated.
 fn render_conversation(dialogue: &[DialogueTurn]) -> String {
     let mut out = String::from("## Conversation\n\n");
     if dialogue.is_empty() {
         out.push_str("*(no conversation captured)*\n\n");
         return out;
     }
-    for turn in dialogue {
-        let label = if turn.is_user { "User" } else { "Agent" };
-        out.push_str(&format!("**{}:**\n\n{}\n\n", label, turn.text.trim()));
+    for (i, turn) in dialogue.iter().enumerate() {
+        if turn.is_user {
+            // Separate exchanges with a rule before each user turn (except the first).
+            if i > 0 {
+                out.push_str("---\n\n");
+            }
+            out.push_str("🧑 **User**\n\n");
+            out.push_str(&blockquote(turn.text.trim()));
+            out.push_str("\n\n");
+        } else {
+            out.push_str("🤖 **Agent**\n\n");
+            out.push_str(turn.text.trim());
+            out.push_str("\n\n");
+        }
     }
     out
+}
+
+/// Prefix every line of `text` with a Markdown blockquote marker.
+fn blockquote(text: &str) -> String {
+    text.lines()
+        .map(|l| if l.is_empty() { ">".to_string() } else { format!("> {}", l) })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ─── Card rendering ───────────────────────────────────────────────────────────
@@ -1742,11 +1876,52 @@ body
         );
 
         let rendered = render_conversation(&dialogue);
-        assert!(rendered.contains("**User:**\n\nfix the bug please"));
-        assert!(rendered.contains("**Agent:**\n\nfinal answer"));
+        assert!(rendered.contains("🧑 **User**\n\n> fix the bug please"), "user rendered as blockquote:\n{}", rendered);
+        assert!(rendered.contains("🤖 **Agent**\n\nfinal answer"), "agent rendered as plain text:\n{}", rendered);
         assert!(!rendered.contains("first attempt"), "intermediate agent chatter must not render");
         assert!(!rendered.contains("system-reminder"), "injected system context must not render");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_cleaned_dialogue_maps_roles_and_skips_empty() {
+        let resp = r#"Here you go:
+```json
+[
+  {"role": "user", "text": "make it fork"},
+  {"role": "agent", "text": "Forked via setsid; parent exits 0."},
+  {"role": "user", "text": "  "},
+  {"role": "AGENT", "text": "Done."}
+]
+```"#;
+        let parsed = parse_cleaned_dialogue(resp).expect("should parse JSON array");
+        let shape: Vec<(bool, &str)> = parsed.iter().map(|t| (t.is_user, t.text.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (true, "make it fork"),
+                (false, "Forked via setsid; parent exits 0."),
+                (false, "Done."), // case-insensitive role; empty-text turn skipped
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cleaned_dialogue_returns_none_for_non_array() {
+        assert!(parse_cleaned_dialogue("not json at all").is_none());
+    }
+
+    #[test]
+    fn clean_dialogue_prompt_carries_roles_and_rules() {
+        let dialogue = vec![
+            DialogueTurn { is_user: true, text: "fix it".to_string() },
+            DialogueTurn { is_user: false, text: "fixed".to_string() },
+        ];
+        let prompt = build_clean_dialogue_prompt(&dialogue);
+        assert!(prompt.contains("verbatim"), "must instruct verbatim user words");
+        assert!(prompt.contains("PASTED"), "must instruct stripping pasted content");
+        assert!(prompt.contains("\"role\": \"user\""), "must serialize roles");
+        assert!(prompt.contains("fix it") && prompt.contains("fixed"), "must include turn text");
     }
 
     // ─── Evidence verification ────────────────────────────────────────────────
