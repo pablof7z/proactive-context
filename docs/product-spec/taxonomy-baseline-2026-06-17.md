@@ -97,4 +97,10 @@ pc eval --project /Users/pablofernandez/src/proactive-context \
   --score-only
 ```
 
-> Probe-metric table: _pending eval completion — appended on finish._
+> Probe-metric table: **not captured in this session.** The baseline eval finished building
+> Store B (claim-tap, 30 history sessions) and was killed partway through building Store A —
+> before label mining / Probe 1-2 scoring — so no probe numbers were produced. The run also hit
+> per-session capture-lock contention from a concurrent capture in the shared environment. The
+> partial experiment dir (`split_manifest.json` + `store-b`) remains at the path above. Re-run the
+> command (ideally when no concurrent capture is active) to populate this table; nothing is
+> default-on, so these metrics gate only a future default-flip, not the landed flagged code.
