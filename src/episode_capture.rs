@@ -93,6 +93,10 @@ pub fn run_episode_capture(
     if cfg.clean_episode_dialogue {
         dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
     }
+    // Persist the cleaned conversation as a standalone transcript JSON shared by every
+    // card from this session; the cards link to it rather than embedding the turns.
+    let conversation_ref =
+        write_clean_transcript(out_dir, &transcript_stem(transcript_path), &dialogue);
 
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
@@ -119,7 +123,7 @@ pub fn run_episode_capture(
             transcript_path,
             arc,
             &verified_evidence,
-            &dialogue,
+            conversation_ref.as_deref(),
             &captured_at,
         );
         fs::write(&card_path, &content)?;
@@ -186,6 +190,10 @@ pub fn run_episode_stage(
     if cfg.clean_episode_dialogue {
         dialogue = clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &dialogue);
     }
+    // Persist the cleaned conversation as a standalone transcript JSON shared by every
+    // card from this session; the cards link to it rather than embedding the turns.
+    let conversation_ref =
+        write_clean_transcript(&episodes_dir, &transcript_stem(transcript_path), &dialogue);
 
     let mut persisted = Vec::new();
     let mut newly_written: Vec<PathBuf> = Vec::new();
@@ -208,7 +216,7 @@ pub fn run_episode_stage(
             transcript_path,
             arc,
             &verified_evidence,
-            &dialogue,
+            conversation_ref.as_deref(),
             &date,
             &captured_at,
         );
@@ -893,41 +901,47 @@ fn parse_cleaned_dialogue(response: &str) -> Option<Vec<DialogueTurn>> {
     Some(out)
 }
 
-// ─── Conversation rendering ──────────────────────────────────────────────────
+// ─── Conversation persistence (separate transcript JSON) ─────────────────────
 
-/// Render the `## Conversation` section as a readable transcript. Each speaker is
-/// clearly marked; the user's (verbatim) words are shown as a blockquote so they
-/// stand out from the agent's abbreviated replies, and exchanges are rule-separated.
-fn render_conversation(dialogue: &[DialogueTurn]) -> String {
-    let mut out = String::from("## Conversation\n\n");
-    if dialogue.is_empty() {
-        out.push_str("*(no conversation captured)*\n\n");
-        return out;
-    }
-    for (i, turn) in dialogue.iter().enumerate() {
-        if turn.is_user {
-            // Separate exchanges with a rule before each user turn (except the first).
-            if i > 0 {
-                out.push_str("---\n\n");
-            }
-            out.push_str("🧑 **User**\n\n");
-            out.push_str(&blockquote(turn.text.trim()));
-            out.push_str("\n\n");
-        } else {
-            out.push_str("🤖 **Agent**\n\n");
-            out.push_str(turn.text.trim());
-            out.push_str("\n\n");
-        }
-    }
-    out
+/// Serialize a cleaned dialogue as a JSON array of `[role, text]` pairs, e.g.
+/// `[["user","hello"],["assistant","..."]]`. Roles are `"user"` / `"assistant"`.
+pub fn dialogue_to_json(dialogue: &[DialogueTurn]) -> String {
+    let arr: Vec<Value> = dialogue
+        .iter()
+        .map(|t| {
+            Value::Array(vec![
+                Value::String(if t.is_user { "user" } else { "assistant" }.to_string()),
+                Value::String(t.text.clone()),
+            ])
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Prefix every line of `text` with a Markdown blockquote marker.
-fn blockquote(text: &str) -> String {
-    text.lines()
-        .map(|l| if l.is_empty() { ">".to_string() } else { format!("> {}", l) })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Write the cleaned conversation for a session to `<base_dir>/transcripts/<stem>.json`
+/// in `[[role, text], ...]` form, and return the card-relative path
+/// (`transcripts/<stem>.json`) to reference from the card.
+///
+/// One transcript per session: all cards from the same transcript share the file.
+/// Immutable — an existing file is not overwritten — but the relative path is still
+/// returned so every card links to it. Returns None when the dialogue is empty or
+/// the write fails (the card then renders no conversation pointer).
+fn write_clean_transcript(base_dir: &Path, stem: &str, dialogue: &[DialogueTurn]) -> Option<String> {
+    if dialogue.is_empty() {
+        return None;
+    }
+    let dir = base_dir.join("transcripts");
+    if fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!("{}.json", stem));
+    if !path.exists() {
+        if let Err(e) = fs::write(&path, dialogue_to_json(dialogue)) {
+            eprintln!("[episode-capture] failed to write transcript {}: {}", path.display(), e);
+            return None;
+        }
+    }
+    Some(format!("transcripts/{}.json", stem))
 }
 
 // ─── Card rendering ───────────────────────────────────────────────────────────
@@ -939,7 +953,7 @@ pub fn render_episode_card(
     transcript_path: &str,
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
-    dialogue: &[DialogueTurn],
+    conversation_ref: Option<&str>,
     captured_at: &str,
 ) -> String {
     render_episode_card_dated(
@@ -947,7 +961,7 @@ pub fn render_episode_card(
         transcript_path,
         arc,
         verified_evidence,
-        dialogue,
+        conversation_ref,
         &captured_at[..captured_at.len().min(10)],
         captured_at,
     )
@@ -963,7 +977,7 @@ pub fn render_episode_card_dated(
     transcript_path: &str,
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
-    dialogue: &[DialogueTurn],
+    conversation_ref: Option<&str>,
     date: &str,
     captured_at: &str,
 ) -> String {
@@ -1059,8 +1073,16 @@ captured_at: {ts}\n\
     }
     out.push('\n');
 
-    // Conversation: verbatim user messages, each with the agent's last reply.
-    out.push_str(&render_conversation(dialogue));
+    // Conversation: a pointer to the separate cleaned transcript JSON
+    // (transcripts/<stem>.json), which holds the [[role, text], ...] dialogue.
+    out.push_str("## Conversation\n\n");
+    match conversation_ref {
+        Some(rel) => out.push_str(&format!(
+            "Cleaned transcript (verbatim user words, abbreviated agent replies): [`{rel}`]({rel})\n",
+            rel = rel
+        )),
+        None => out.push_str("*(no conversation captured)*\n"),
+    }
 
     out
 }
@@ -1678,6 +1700,16 @@ fn derive_session_id(transcript_path: &str) -> String {
         .to_string()
 }
 
+/// The transcript filename stem, used to name the per-session cleaned transcript
+/// JSON (`transcripts/<stem>.json`) so all cards from one session share one file.
+fn transcript_stem(transcript_path: &str) -> String {
+    Path::new(transcript_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string()
+}
+
 fn slugify_arc(title: &str, idx: usize) -> String {
     let base: String = title
         .to_lowercase()
@@ -1774,21 +1806,17 @@ body
             evidence: vec![EvidenceRange { start: 120, end: 145 }],
         };
         let evidence = vec![EvidenceRange { start: 120, end: 145 }];
-        let dialogue = vec![
-            DialogueTurn { is_user: true, text: "make local embeddings the default".to_string() },
-            DialogueTurn { is_user: false, text: "Done — MiniLM is now the default.".to_string() },
-        ];
         let rendered = render_episode_card(
             "sess-abc",
             "/path/t.jsonl",
             &arc,
             &evidence,
-            &dialogue,
+            Some("transcripts/t.json"),
             "2026-06-11T10:00:00Z",
         );
 
         assert!(rendered.contains("## Conversation"), "missing Conversation section");
-        assert!(rendered.contains("make local embeddings the default"), "missing verbatim user message");
+        assert!(rendered.contains("[`transcripts/t.json`](transcripts/t.json)"), "missing transcript pointer");
         assert!(rendered.contains("type: episode-card"), "missing type frontmatter");
         assert!(rendered.contains("date: 2026-06-11"), "missing date");
         assert!(rendered.contains("session: sess-abc"), "missing session");
@@ -1829,14 +1857,14 @@ body
             "/t.jsonl",
             &arc,
             &evidence,
-            &[],
+            None,
             "2026-05-29",               // historical session date
             "2026-06-12T09:00:00Z",     // real processing time
         );
         assert!(rendered.contains("date: 2026-05-29"), "frontmatter date must be historical:\n{}", rendered);
         assert!(rendered.contains("captured_at: 2026-06-12T09:00:00Z"), "captured_at must be processing time");
         // The plain render must keep date == captured_at's date portion.
-        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, &[], "2026-06-12T09:00:00Z");
+        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, None, "2026-06-12T09:00:00Z");
         assert!(live.contains("date: 2026-06-12"), "live render derives date from captured_at");
     }
 
@@ -1875,11 +1903,19 @@ body
              system-reminders, and collapse agent to last reply"
         );
 
-        let rendered = render_conversation(&dialogue);
-        assert!(rendered.contains("🧑 **User**\n\n> fix the bug please"), "user rendered as blockquote:\n{}", rendered);
-        assert!(rendered.contains("🤖 **Agent**\n\nfinal answer"), "agent rendered as plain text:\n{}", rendered);
-        assert!(!rendered.contains("first attempt"), "intermediate agent chatter must not render");
-        assert!(!rendered.contains("system-reminder"), "injected system context must not render");
+        // The cleaned dialogue serializes to a [[role, text], ...] JSON transcript.
+        let json = dialogue_to_json(&dialogue);
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                ["user", "fix the bug please"],
+                ["assistant", "final answer"],
+                ["user", "thanks, ship it"],
+            ]),
+            "transcript JSON must be [role, text] pairs with assistant role:\n{}",
+            json
+        );
         let _ = fs::remove_file(&path);
     }
 
