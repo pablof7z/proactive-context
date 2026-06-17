@@ -184,14 +184,21 @@ const SELECT_DECISION_BASE: &str =
 /// Phase 3 — source-type SELECT semantics (`PC_SELECT_SOURCE_TYPES=1`). Appended to the SELECT
 /// preamble so the gate can route by content kind once the catalog carries `[kind]` hints
 /// (`PC_TYPED_CATALOG`). Covers the kinds the base preamble does not yet mention (research,
-/// nouns, claims) and the cross-cutting rule that historical artifacts are not current truth.
-/// Append-only and flag-gated, so with the flag off the preamble is byte-identical to baseline.
-const SELECT_SOURCE_TYPES_BLOCK: &str = "\n\nSOURCE-TYPE GUIDANCE (each catalog line is tagged with its kind in [brackets]):\n\
+/// nouns, claims). A2′ tuning (2026-06-17): the suppressive "do not select historical as current
+/// truth" caution was removed — that is a COMPILE/presentation concern, not a SELECT one, and it
+/// was causing the gate to under-pick episode cards (24→9 selections), costing reversal-trajectory
+/// recall. SELECT only chooses keys; the source-type guidance here is purely about RELEVANCE by
+/// kind, and now explicitly tells the gate to KEEP every episode card relevant to a why/history
+/// prompt. Append-only and flag-gated, so with the flag off the preamble is byte-identical to baseline.
+const SELECT_SOURCE_TYPES_BLOCK: &str = "\n\nSOURCE-TYPE GUIDANCE (each catalog line is tagged with its kind in [brackets]). This guides RELEVANCE only — you are choosing which keys to read, not judging what is current; selecting a historical card does NOT assert it is current.\n\
 - [current-guide]: present-tense project truth. PRIMARY source for how something works now, \
 architecture, and implementation questions.\n\
-- [episode-card] (key `episode:`): a historical decision/reversal/root-cause record. PRIMARY when \
-the prompt asks WHY something changed, what came BEFORE, whether an approach was tried, or for the \
-history/trajectory of a decision.\n\
+- [episode-card] (key `episode:`): a historical decision/reversal/root-cause record (prior state → \
+what changed → why). PRIMARY whenever the prompt asks WHY something changed, what came BEFORE, \
+whether an approach was tried, or for the history/trajectory of a decision. Select EVERY episode \
+card relevant to such a prompt — do not drop them for precision, and do not omit them just because \
+a [current-guide] also covers the topic; the card carries the prior state and trajectory that the \
+guide does not. Selecting an episode card alongside a guide is the correct pattern, not double-counting.\n\
 - [research-record] (key `research:`): an investigation/validation record — experiments, evidence, \
 method, and findings. PRIMARY for validation, experiment, investigation, and \"what did we learn\" \
 questions.\n\
@@ -200,8 +207,10 @@ grounding / first-mention questions about what a specific named thing IS — nev
 truth.\n\
 - [claim] (key `claim:`): an atomic evidence-backed fact. Select for a targeted factual point only \
 when no guide already covers it.\n\
-Do NOT select a historical artifact ([episode-card], [research-record]) as CURRENT truth unless you \
-also select a [current-guide] or [claim] that corroborates it.";
+For a PURELY present-tense behavior question (no why/history/before/what-was-tried), prefer \
+[current-guide]/[claim] and do not pad with historical cards. But the moment the prompt touches \
+history, change, rationale, or a prior approach, selecting the relevant [episode-card]/[research-record] \
+is REQUIRED — omitting them loses the trajectory.";
 
 /// Whether Phase 3 source-type SELECT semantics are enabled (`PC_SELECT_SOURCE_TYPES`).
 fn select_source_types_enabled() -> bool {
@@ -1618,7 +1627,10 @@ mod tests {
         assert!(p.starts_with(SELECT_PREAMBLE), "baseline must be preserved as prefix");
         assert!(p.contains("SOURCE-TYPE GUIDANCE"));
         assert!(p.contains("[research-record]") && p.contains("[noun-entry]") && p.contains("[claim]"));
-        assert!(p.contains("Do NOT select a historical artifact"));
+        // A2′ tuning: episode cards must be explicitly retained for history/why probes, and the
+        // old suppressive "current truth" caution must be gone from SELECT.
+        assert!(p.contains("Select EVERY episode card"));
+        assert!(!p.contains("as CURRENT truth unless"));
         // Composes with the verdict SELECT variant without losing either piece.
         std::env::set_var("PC_SELECT_VARIANT", "verdict");
         let pv = select_preamble().into_owned();
