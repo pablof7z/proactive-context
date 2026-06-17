@@ -97,10 +97,42 @@ pc eval --project /Users/pablofernandez/src/proactive-context \
   --score-only
 ```
 
-> Probe-metric table: **not captured in this session.** The baseline eval finished building
-> Store B (claim-tap, 30 history sessions) and was killed partway through building Store A —
-> before label mining / Probe 1-2 scoring — so no probe numbers were produced. The run also hit
-> per-session capture-lock contention from a concurrent capture in the shared environment. The
-> partial experiment dir (`split_manifest.json` + `store-b`) remains at the path above. Re-run the
-> command (ideally when no concurrent capture is active) to populate this table; nothing is
-> default-on, so these metrics gate only a future default-flip, not the landed flagged code.
+**Captured** from experiment dir `…/baseline-pre-taxonomy-2026-06-17-r3` (judge
+`ollama:glm-5.1:cloud`; HISTORY 30 sessions, FUTURE 52; 40 verified labels; 10 reversals).
+Store A = wiki guides only (the `current-guide` path); Store B = claims tap.
+
+### Probe 1 — restatement recall (n=40)
+
+| Verdict | Store A (wiki) | Store B (claims) |
+|---|---:|---:|
+| contained | 16 | 12 |
+| partial | 14 | 15 |
+| absent | 10 | 13 |
+| **recall (contained+partial)** | **75%** | **68%** |
+| user-direction recall | 71.4% | 71.4% |
+
+### Probe 2 — direction-change fidelity (n=10)
+
+| Metric | Store A (wiki) | Store B (claims) |
+|---|---:|---:|
+| asserts current (Y) | 10/10 | 8/10 |
+| **leaks stale X as current (SIN)** | **2/10** | 1/10 |
+| trajectory X→Y recoverable | 9/10 | 6/10 |
+
+### Probe 3 — operational
+
+| Metric | Store A (wiki) | Store B (claims) |
+|---|---:|---:|
+| p50 latency (ms) | 5001 | 3778 |
+| p95 latency (ms) | 12727 | 20693 |
+| tokens in | 218051 | 54382 |
+| tokens out | 10562 | 6682 |
+
+**Baseline reference numbers for later phases** (the wiki/current-guide path, Store A):
+guide recall **75%**, user-direction recall **71.4%**, stale-current leak **2/10**, trajectory
+recall **9/10**, p50 **5.0s** / p95 **12.7s**, ~218k tokens in / ~10.6k out.
+
+Re-score later phases against the frozen labels with `--score-only` on this experiment dir.
+Note: the eval auto-writes `docs/product-spec/claims-first-validation-results.md`; that
+overwrite was reverted here to preserve the accumulated Runs 11–12 history — the full machine
+report lives in the experiment dir instead.
