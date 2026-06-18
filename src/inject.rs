@@ -596,6 +596,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 &wiki_path,
                 &wiki_index_rows,
                 &root,
+                &project_context_dir(&root),
                 cfg.inject_max_guides,
                 cfg.inject_max_tokens,
                 cfg.inject_resolve_query,
@@ -905,14 +906,15 @@ fn read_head(path: &Path, cap: usize) -> String {
 
 /// Full content of a catalog source by key. Resolution by key shape:
 ///   - `episode:<stem>`  → `<wiki_dir>/episodes/<stem>.md` (historical episode card)
+///   - `claim:<cluster_id>` → rendered from claims.jsonl records for that cluster (no .md file)
 ///   - `<path>` containing '/' or ending '.md' → `<root>/<path>` (committed project doc)
 ///   - bare slug → `<wiki_dir>/<slug>.md` (wiki guide)
-fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<String> {
+fn read_catalog_content(root: &Path, wiki_dir: &Path, project_dir: &Path, key: &str) -> Option<String> {
     if let Some(stem) = key.strip_prefix(EPISODE_KEY_PREFIX) {
         let path = wiki_dir.join("episodes").join(format!("{}.md", stem));
         return std::fs::read_to_string(path).ok();
     }
-    // New taxonomy prefixes (Phase 2). parse_key dispatches by prefix; episode/guide
+    // New taxonomy prefixes (Phase 2+5). parse_key dispatches by prefix; episode/guide
     // resolution above is unchanged.
     match ContentKind::parse_key(key) {
         (ContentKind::ResearchRecord, stem) => {
@@ -922,6 +924,14 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<Strin
         (ContentKind::NounEntry, slug) => {
             let path = wiki_dir.join("nouns").join(format!("{}.md", slug));
             return std::fs::read_to_string(path).ok();
+        }
+        // Phase 5: claim rows have no backing .md file — content is rendered from ClaimRecords.
+        // load_cluster resolves by cluster_id directly from claims.jsonl (no embedder needed,
+        // no re-retrieval inconsistency risk). Returns None gracefully on a missing cluster.
+        (ContentKind::Claim, cluster_id) => {
+            let cluster = crate::claims::load_cluster(project_dir, cluster_id)?;
+            let rendered = crate::claims::render_clusters_for_compile(&[cluster]);
+            return if rendered.is_empty() { None } else { Some(rendered) };
         }
         _ => {}
     }
@@ -938,15 +948,27 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, key: &str) -> Option<Strin
 /// as historical per the currentness contract in COMPILE_PREAMBLE.
 const EPISODE_KEY_PREFIX: &str = "episode:";
 
+/// How many claim clusters to surface in the catalog when PC_CLAIM_CATALOG=1.
+/// An empty query gives all clusters roughly equal cosine scores — fine for MVP since the
+/// catalog cap (CATALOG_MAX) and subsequent SELECT pruning keep the window manageable.
+const CATALOG_CLAIMS_TOP_K: usize = 20;
+
 /// Build the candidate catalog: wiki guides (free title/summary from the index) ∪ committed
 /// project markdown, annotated with vector-preselect scores, capped at CATALOG_MAX. File
 /// heads are read ONLY for post-cap survivors so a big repo never pays hundreds of opens.
+///
+/// `project_dir` and `embedder` are used only when `PC_CLAIM_CATALOG=1` to retrieve claim
+/// clusters. When the flag is off neither argument is touched — call sites may pass a dummy
+/// `project_dir` and `None` for the embedder with no behavioral difference.
 fn build_catalog(
     root: &Path,
     wiki_dir: &Path,
+    project_dir: &Path,
     index_rows: &[IndexRow],
     hits: &[QueryResult],
     max: usize,
+    current_prompt: &str,
+    mut embedder: Option<Box<dyn crate::embed::Embedder>>,
 ) -> Vec<CatalogItem> {
     // RAG hit → best score, keyed by filename stem for loose matching across path schemes.
     let mut hit_score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -1054,6 +1076,54 @@ fn build_catalog(
         }
     }
 
+    // Claim clusters (`claim:<cluster_id>`): off by default; gated by PC_CLAIM_CATALOG.
+    // Atomic evidence-backed facts (current truth). Clusters are query-retrieved (need embedder)
+    // rather than file-enumerated. An empty query gives all clusters roughly equal score — that
+    // is fine for MVP since SELECT further prunes; CATALOG_CLAIMS_TOP_K caps the retrieval.
+    // When the flag is off or no embedder is available, this block is a no-op.
+    if taxonomy_flag("PC_CLAIM_CATALOG") {
+        if let Some(ref mut emb) = embedder {
+            match crate::claims::retrieve_top_clusters(
+                project_dir,
+                emb.as_mut(),
+                current_prompt,
+                CATALOG_CLAIMS_TOP_K,
+            ) {
+                Ok(clusters) => {
+                    for cluster in clusters {
+                        // Guard: a cluster must have at least one claim (invariant of
+                        // retrieve_top_clusters, but be explicit since claims[0] is indexed).
+                        if cluster.claims.is_empty() {
+                            continue;
+                        }
+                        let current = &cluster.claims[0];
+                        // title = representative (most-recent) assertion.
+                        let title = crate::events::truncate(&current.assertion, 80);
+                        // summary = evidence text; fall back to subject when absent.
+                        let summary_raw = if !current.evidence_text.is_empty() {
+                            current.evidence_text.as_str()
+                        } else {
+                            current.subject.as_str()
+                        };
+                        let summary = crate::events::truncate(summary_raw, 100);
+                        items.push(CatalogItem {
+                            key: ContentKind::Claim.render_key(&cluster.cluster_id),
+                            title,
+                            summary,
+                            score: None, // cosine score from retrieval is not a RAG hit score
+                            kind: ContentKind::Claim,
+                            currentness: Currentness::Current,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal: log and continue without claim rows.
+                    eprintln!("pc: claim catalog retrieval failed: {}", e);
+                }
+            }
+        }
+    }
+
     // Scored entries first (desc), then the rest; cap before any file reads.
     items.sort_by(|a, b| {
         b.score
@@ -1157,13 +1227,36 @@ async fn wiki_navigate_and_compile(
     wiki_dir: &Path,
     index_rows: &[IndexRow],
     root: &Path,
+    project_dir: &Path,
     max_guides: usize,
     max_tokens: usize,
     resolve_query: bool,
     already_injected: &str,
 ) -> Result<NavigateResult> {
     // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
-    let catalog = build_catalog(root, wiki_dir, index_rows, hits, CATALOG_MAX);
+    // PC_CLAIM_CATALOG: when on, build_catalog needs an embedder for cluster retrieval. We build
+    // it lazily here (only when the flag is set) to avoid the ONNX model-load cost on every
+    // inject. The embedder is consumed entirely inside build_catalog and dropped before SELECT.
+    // PC_CLAIM_CATALOG: when on, build_catalog needs an embedder for cluster retrieval. We build
+    // it lazily here (only when the flag is set) to avoid the ONNX model-load cost on every
+    // inject. The owned Box is moved into build_catalog and dropped there.
+    let claim_embedder: Option<Box<dyn crate::embed::Embedder>> = if taxonomy_flag("PC_CLAIM_CATALOG") {
+        crate::config::load_config()
+            .ok()
+            .and_then(|cfg| crate::embed::build_embedder(&cfg).ok())
+    } else {
+        None
+    };
+    let catalog = build_catalog(
+        root,
+        wiki_dir,
+        project_dir,
+        index_rows,
+        hits,
+        CATALOG_MAX,
+        current_prompt,
+        claim_embedder,
+    );
     log_event("wiki.index_read", None, serde_json::json!({ "guide_count": catalog.len() }));
 
     if catalog.is_empty() {
@@ -1251,7 +1344,7 @@ async fn wiki_navigate_and_compile(
     let mut guides: Vec<(String, String)> = Vec::new();
     let mut guides_read: Vec<String> = Vec::new();
     for key in &selected {
-        if let Some(content) = read_catalog_content(root, wiki_dir, key) {
+        if let Some(content) = read_catalog_content(root, wiki_dir, project_dir, key) {
             log_event("guide.read", None, serde_json::json!({ "slug": key }));
             guides.push((key.clone(), content));
             guides_read.push(key.clone());
@@ -1299,6 +1392,10 @@ pub(crate) async fn navigate_and_compile_for_eval(
     max_tokens: usize,
 ) -> Result<NavigateResult> {
     let index_rows = crate::wiki::read_index(wiki_dir);
+    // Eval path: no claim catalog (PC_CLAIM_CATALOG is evaluated inside build_catalog; the eval
+    // corpus has no claims store, so even if the flag were on, retrieve_top_clusters returns []).
+    // Pass a temp dir as project_dir — it will never be read unless the flag is set.
+    let dummy_project_dir = std::env::temp_dir();
     wiki_navigate_and_compile(
         api_key,
         ollama_api_key,
@@ -1311,6 +1408,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
         wiki_dir,
         &index_rows,
         wiki_dir,  // root = wiki dir → no committed-markdown rows
+        &dummy_project_dir,
         max_guides,
         max_tokens,
         false,     // no query resolution
@@ -1690,7 +1788,12 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         );
 
         // No wiki guides, no RAG hits — only the episode card should surface.
-        let catalog = build_catalog(root, &wiki, &[], &[], 150);
+        // PC_CLAIM_CATALOG is off (default) so project_dir/embedder are not touched.
+        let dummy_project_dir = std::env::temp_dir();
+        let catalog = build_catalog(
+            root, &wiki, &dummy_project_dir, &[], &[], 150, "",
+            None::<Box<dyn crate::embed::Embedder>>,
+        );
         let episode_rows: Vec<_> = catalog
             .iter()
             .filter(|c| c.key.starts_with(EPISODE_KEY_PREFIX))
@@ -1713,13 +1816,14 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         fs::create_dir_all(&wiki).unwrap();
         write_episode_card(&wiki, "2026-05-29-1-test", "Test arc", "Adopted Z.");
 
-        let content = read_catalog_content(root, &wiki, "episode:2026-05-29-1-test")
+        let dummy_project_dir = std::env::temp_dir();
+        let content = read_catalog_content(root, &wiki, &dummy_project_dir, "episode:2026-05-29-1-test")
             .expect("episode key must resolve to its file");
         assert!(content.contains("type: episode-card"));
         assert!(content.contains("# Episode: Test arc"));
 
         // A missing episode key resolves to None, not a panic or wrong file.
-        assert!(read_catalog_content(root, &wiki, "episode:does-not-exist").is_none());
+        assert!(read_catalog_content(root, &wiki, &dummy_project_dir, "episode:does-not-exist").is_none());
     }
 
     #[test]
@@ -1782,5 +1886,167 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         std::env::set_var("PC_TYPED_CATALOG", "1");
         assert_eq!(render_catalog(&items), hinted);
         std::env::remove_var("PC_TYPED_CATALOG");
+    }
+
+    // ── Phase 5: claim catalog ────────────────────────────────────────────────────
+
+    /// A deterministic stub embedder for tests. Returns a fixed-dimension vector whose
+    /// first component is 1.0 (all others 0.0) so every embed call succeeds without I/O.
+    struct ConstEmbedder {
+        dim: usize,
+    }
+    impl crate::embed::Embedder for ConstEmbedder {
+        fn embed(&mut self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| {
+                let mut v = vec![0.0f32; self.dim];
+                if !v.is_empty() { v[0] = 1.0; }
+                v
+            }).collect())
+        }
+        fn dimension(&self) -> usize { self.dim }
+    }
+
+    /// Seed a single claim into a project dir's claims store using the stub embedder.
+    fn seed_claim(
+        project_dir: &std::path::Path,
+        cluster_id_hint: &str, // used as claim id so cluster becomes "cl-<id>"
+        assertion: &str,
+        evidence: &str,
+    ) {
+        let mut emb = ConstEmbedder { dim: 4 };
+        crate::claims::append_claim(
+            project_dir,
+            &mut emb,
+            cluster_id_hint,
+            "2026-06-18",
+            "test-session",
+            assertion,
+            "explicit",
+            evidence,
+            &[],
+            None,
+        ).expect("append_claim failed in test seed");
+    }
+
+    /// (a) Catalog includes claim rows when PC_CLAIM_CATALOG=1.
+    #[test]
+    fn catalog_includes_claim_rows_when_flag_on() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        seed_claim(&project_dir, "claim-a1", "The token model uses uint16", "evidence A");
+
+        std::env::set_var("PC_CLAIM_CATALOG", "1");
+        let emb: Box<dyn crate::embed::Embedder> = Box::new(ConstEmbedder { dim: 4 });
+        let catalog = build_catalog(
+            root, &wiki, &project_dir, &[], &[], 150,
+            "token model", Some(emb),
+        );
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let claim_rows: Vec<_> = catalog.iter().filter(|c| c.key.starts_with("claim:")).collect();
+        assert!(!claim_rows.is_empty(), "expected at least one claim catalog row when PC_CLAIM_CATALOG=1");
+        let row = claim_rows[0];
+        assert!(row.key.starts_with("claim:"), "key must use claim: prefix, got {}", row.key);
+        assert_eq!(row.kind, crate::content_kind::ContentKind::Claim,
+            "kind must be Claim");
+        assert_eq!(row.currentness, crate::content_kind::Currentness::Current,
+            "currentness must be Current");
+        assert!(row.title.contains("uint16") || row.title.contains("token model") || !row.title.is_empty(),
+            "title should be the representative assertion, got: {}", row.title);
+    }
+
+    /// (b) Catalog omits claim rows when PC_CLAIM_CATALOG=0 (default).
+    #[test]
+    fn catalog_omits_claim_rows_when_flag_off() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        seed_claim(&project_dir, "claim-b1", "Some claim assertion", "evidence B");
+
+        // Ensure flag is off (default). No embedder passed — flag-off path must be a no-op.
+        std::env::remove_var("PC_CLAIM_CATALOG");
+        let catalog = build_catalog(
+            root, &wiki, &project_dir, &[], &[], 150, "some query",
+            None::<Box<dyn crate::embed::Embedder>>,
+        );
+
+        let claim_rows: Vec<_> = catalog.iter().filter(|c| c.key.starts_with("claim:")).collect();
+        assert!(claim_rows.is_empty(), "expected no claim rows when PC_CLAIM_CATALOG is unset (default off)");
+    }
+
+    /// (c) read_catalog_content resolves a claim key to non-empty content, returns None for missing.
+    #[test]
+    fn read_catalog_content_resolves_claim_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        seed_claim(&project_dir, "claimid-c1", "MiniLM is the default embedder", "evidence C");
+
+        // The cluster_id created by append_claim is "cl-claimid-c1".
+        let cluster_key = "claim:cl-claimid-c1";
+        let content = read_catalog_content(root, &wiki, &project_dir, cluster_key)
+            .expect("claim key must resolve to rendered content");
+        assert!(!content.is_empty(), "rendered content must be non-empty");
+        assert!(content.contains("MiniLM") || content.contains("CLAIM STORE"),
+            "content should include the assertion or header: {}", content);
+
+        // A missing cluster id must return None, not panic.
+        let missing = read_catalog_content(root, &wiki, &project_dir, "claim:cl-does-not-exist");
+        assert!(missing.is_none(), "missing cluster must return None");
+    }
+
+    /// (d) Claim rows carry kind=Claim, currentness=Current, and title=representative assertion.
+    #[test]
+    fn claim_catalog_rows_have_correct_metadata() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let assertion = "The deploy gate requires two approvals";
+        let evidence = "seen in PR description";
+        seed_claim(&project_dir, "claim-d1", assertion, evidence);
+
+        std::env::set_var("PC_CLAIM_CATALOG", "1");
+        let emb: Box<dyn crate::embed::Embedder> = Box::new(ConstEmbedder { dim: 4 });
+        let catalog = build_catalog(
+            root, &wiki, &project_dir, &[], &[], 150,
+            "deploy", Some(emb),
+        );
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let claim_rows: Vec<_> = catalog.iter().filter(|c| c.key.starts_with("claim:")).collect();
+        assert!(!claim_rows.is_empty(), "must have at least one claim row");
+        let row = claim_rows[0];
+
+        // Kind and currentness are set from constants, verify them explicitly.
+        assert_eq!(row.kind, crate::content_kind::ContentKind::Claim);
+        assert_eq!(row.currentness, crate::content_kind::Currentness::Current);
+
+        // Title must be the representative (most-recent) assertion.
+        assert_eq!(row.title, crate::events::truncate(assertion, 80),
+            "title must be the representative assertion, got: {}", row.title);
+
+        // Summary must be the evidence text (truncated).
+        assert_eq!(row.summary, crate::events::truncate(evidence, 100),
+            "summary must be the evidence text, got: {}", row.summary);
     }
 }

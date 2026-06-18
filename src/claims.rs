@@ -690,6 +690,28 @@ fn find_or_create_cluster(
 
 // ─── Retrieval for claims-inject ──────────────────────────────────────────────
 
+/// Load a single cluster by its `cluster_id` directly from `claims.jsonl`, without an embedder.
+/// All claims whose `cluster_id` field matches are collected and sorted most-recent-first.
+/// Returns `None` when the cluster is absent or the store does not exist.
+/// Used by `read_catalog_content` to resolve a `claim:<cluster_id>` key back to rendered text
+/// without requiring a re-embed step (no consistency risk from varying top_k retrieval).
+pub fn load_cluster(project_dir: &Path, cluster_id: &str) -> Option<ClaimCluster> {
+    let jsonl_path = claims_jsonl_path(project_dir);
+    let content = fs::read_to_string(&jsonl_path).ok()?;
+    let mut claims: Vec<ClaimRecord> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<ClaimRecord>(l).ok())
+        .filter(|c| c.cluster_id == cluster_id)
+        .collect();
+    if claims.is_empty() {
+        return None;
+    }
+    // Most-recent first (mirrors retrieve_top_clusters ordering).
+    claims.sort_by(|a, b| b.ts.cmp(&a.ts));
+    Some(ClaimCluster { cluster_id: cluster_id.to_string(), claims, score: 0.0 })
+}
+
 /// Retrieve the top-K most relevant claim clusters for `query`, ranked by:
 /// 1. authority: explicit > implicit (within same sim band, weight +0.1)
 /// 2. cosine similarity to cluster centroid
