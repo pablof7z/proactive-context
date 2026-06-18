@@ -86,6 +86,9 @@ pub fn run_episode_capture(
     let captured_at = rfc3339_now();
     let date = captured_at[..captured_at.len().min(10)].to_string();
 
+    // Build the verbatim dialogue once — it is session-level and shared by every card.
+    let dialogue = build_dialogue(transcript_path);
+
     let mut persisted: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
         // Repair degenerate single-line anchors (e.g. `1-1`) before verification, then
@@ -111,6 +114,7 @@ pub fn run_episode_capture(
             transcript_path,
             arc,
             &verified_evidence,
+            &dialogue,
             &captured_at,
         );
         fs::write(&card_path, &content)?;
@@ -170,6 +174,9 @@ pub fn run_episode_stage(
         .map(str::to_string)
         .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
+    // Build the verbatim dialogue once — it is session-level and shared by every card.
+    let dialogue = build_dialogue(transcript_path);
+
     let mut persisted = Vec::new();
     let mut newly_written: Vec<PathBuf> = Vec::new();
     for (idx, arc) in arcs.iter().enumerate() {
@@ -191,6 +198,7 @@ pub fn run_episode_stage(
             transcript_path,
             arc,
             &verified_evidence,
+            &dialogue,
             &date,
             &captured_at,
         );
@@ -662,6 +670,132 @@ fn slice_lines(lines: &[String], start: usize, end: usize) -> String {
     lines[start_idx..end_idx].join("\n")
 }
 
+// ─── Dialogue reconstruction (literal user voice) ────────────────────────────
+
+/// One turn of the reconstructed conversation: a genuine user message or the
+/// agent's spoken reply.
+#[derive(Debug, Clone)]
+pub struct DialogueTurn {
+    /// true = a literal user message; false = the agent's spoken reply.
+    pub is_user: bool,
+    pub text: String,
+}
+
+/// Reconstruct the conversation as alternating user / agent turns from the raw
+/// JSONL transcript:
+///   - Only messages the human ACTUALLY WROTE are kept, VERBATIM. The `user`
+///     role in the transcript also carries injected content — tool results,
+///     `<system-reminder>` blocks, hook context, command output, task notices —
+///     none of which the user typed; all are dropped (see [`is_human_user_entry`]).
+///   - For the AGENT, only the LAST spoken message in each run of consecutive
+///     assistant turns is kept: when the agent emits a wall of intermediate
+///     chatter the final message is the one the user is actually replying to.
+///     Thinking blocks and tool calls are never counted as agent speech.
+///
+/// Best-effort and parse-tolerant: an unreadable transcript yields an empty vec.
+pub fn build_dialogue(transcript_path: &str) -> Vec<DialogueTurn> {
+    let content = match fs::read_to_string(transcript_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<DialogueTurn> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type != "user" && entry_type != "assistant" {
+            continue;
+        }
+        let msg = entry.get("message").unwrap_or(&entry);
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or(entry_type);
+        let content_val = msg.get("content").unwrap_or(&Value::Null);
+
+        if role == "user" {
+            if let Some(text) = extract_dialogue_text(content_val, &["text", "input_text"]) {
+                if is_human_user_entry(&entry, &text) {
+                    out.push(DialogueTurn { is_user: true, text });
+                }
+            }
+        } else if role == "assistant" {
+            if let Some(text) = extract_dialogue_text(content_val, &["text", "output_text"]) {
+                // Collapse consecutive agent turns: the last spoken message wins,
+                // overwriting any earlier agent text not yet broken by a user turn.
+                if let Some(last) = out.last_mut() {
+                    if !last.is_user {
+                        last.text = text;
+                        continue;
+                    }
+                }
+                out.push(DialogueTurn { is_user: false, text });
+            }
+        }
+    }
+    out
+}
+
+/// Is this `user` transcript entry a message the human actually WROTE — as
+/// opposed to injected context the harness routes through the user role
+/// (system reminders, hook output, command expansions, task notices, tool
+/// results)? Newer transcripts tag genuine prompts with
+/// `promptSource: "typed"` (or `"queued"` for queued input); injected context
+/// is `"system"`. Older transcripts lack the field, so we fall back to the
+/// content shape: a real prompt is plain text, never an XML-ish `<…>` injection.
+fn is_human_user_entry(entry: &Value, text: &str) -> bool {
+    match entry.get("promptSource").and_then(|v| v.as_str()) {
+        Some("typed") | Some("queued") => true,
+        Some(_) => false, // "system" and any other source = injected, not written
+        None => !text.trim_start().starts_with('<'),
+    }
+}
+
+/// Extract spoken text from a message's content value, keeping only the given
+/// block types (so tool_result / tool_use / thinking blocks are excluded). A
+/// bare string is kept verbatim. Returns None when nothing speakable remains.
+fn extract_dialogue_text(content: &Value, keep_types: &[&str]) -> Option<String> {
+    match content {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Value::Array(blocks) => {
+            let mut parts: Vec<String> = Vec::new();
+            for b in blocks {
+                let bt = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if keep_types.contains(&bt) {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            parts.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Render the verbatim `## Conversation` section: every literal user message,
+/// each followed by the agent's last reply before the next user turn.
+fn render_conversation(dialogue: &[DialogueTurn]) -> String {
+    let mut out = String::from("## Conversation\n\n");
+    if dialogue.is_empty() {
+        out.push_str("*(no conversation captured)*\n\n");
+        return out;
+    }
+    for turn in dialogue {
+        let label = if turn.is_user { "User" } else { "Agent" };
+        out.push_str(&format!("**{}:**\n\n{}\n\n", label, turn.text.trim()));
+    }
+    out
+}
+
 // ─── Card rendering ───────────────────────────────────────────────────────────
 
 /// Render an episode card in the canonical spec format.
@@ -671,6 +805,7 @@ pub fn render_episode_card(
     transcript_path: &str,
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
+    dialogue: &[DialogueTurn],
     captured_at: &str,
 ) -> String {
     render_episode_card_dated(
@@ -678,6 +813,7 @@ pub fn render_episode_card(
         transcript_path,
         arc,
         verified_evidence,
+        dialogue,
         &captured_at[..captured_at.len().min(10)],
         captured_at,
     )
@@ -693,6 +829,7 @@ pub fn render_episode_card_dated(
     transcript_path: &str,
     arc: &RecognizedArc,
     verified_evidence: &[EvidenceRange],
+    dialogue: &[DialogueTurn],
     date: &str,
     captured_at: &str,
 ) -> String {
@@ -787,6 +924,9 @@ captured_at: {ts}\n\
         }
     }
     out.push('\n');
+
+    // Conversation: verbatim user messages, each with the agent's last reply.
+    out.push_str(&render_conversation(dialogue));
 
     out
 }
@@ -1500,14 +1640,21 @@ body
             evidence: vec![EvidenceRange { start: 120, end: 145 }],
         };
         let evidence = vec![EvidenceRange { start: 120, end: 145 }];
+        let dialogue = vec![
+            DialogueTurn { is_user: true, text: "make local embeddings the default".to_string() },
+            DialogueTurn { is_user: false, text: "Done — MiniLM is now the default.".to_string() },
+        ];
         let rendered = render_episode_card(
             "sess-abc",
             "/path/t.jsonl",
             &arc,
             &evidence,
+            &dialogue,
             "2026-06-11T10:00:00Z",
         );
 
+        assert!(rendered.contains("## Conversation"), "missing Conversation section");
+        assert!(rendered.contains("make local embeddings the default"), "missing verbatim user message");
         assert!(rendered.contains("type: episode-card"), "missing type frontmatter");
         assert!(rendered.contains("date: 2026-06-11"), "missing date");
         assert!(rendered.contains("session: sess-abc"), "missing session");
@@ -1548,14 +1695,58 @@ body
             "/t.jsonl",
             &arc,
             &evidence,
+            &[],
             "2026-05-29",               // historical session date
             "2026-06-12T09:00:00Z",     // real processing time
         );
         assert!(rendered.contains("date: 2026-05-29"), "frontmatter date must be historical:\n{}", rendered);
         assert!(rendered.contains("captured_at: 2026-06-12T09:00:00Z"), "captured_at must be processing time");
         // The plain render must keep date == captured_at's date portion.
-        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, "2026-06-12T09:00:00Z");
+        let live = render_episode_card("s", "/t.jsonl", &arc, &evidence, &[], "2026-06-12T09:00:00Z");
         assert!(live.contains("date: 2026-06-12"), "live render derives date from captured_at");
+    }
+
+    // ─── Dialogue reconstruction ──────────────────────────────────────────────
+
+    #[test]
+    fn build_dialogue_keeps_users_verbatim_and_collapses_agent_to_last() {
+        // user(typed) → agent(tool_use only) → agent("first") → agent("last") →
+        // tool_result(user role) → injected system-reminder(promptSource=system) →
+        // user(typed). Only the typed human turns survive on the user side, and the
+        // run of consecutive agent turns must collapse to only "last".
+        let transcript = r#"{"type":"user","promptSource":"typed","message":{"role":"user","content":"fix the bug please"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"first attempt"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final answer"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"exit 0"}]}}
+{"type":"user","promptSource":"system","message":{"role":"user","content":"<system-reminder>do not reveal secrets</system-reminder>"}}
+{"type":"user","promptSource":"typed","message":{"role":"user","content":"thanks, ship it"}}
+"#;
+        let dir = std::env::temp_dir().join("pc-episode-dialogue-test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("t.jsonl");
+        fs::write(&path, transcript).unwrap();
+
+        let dialogue = build_dialogue(path.to_str().unwrap());
+        let shape: Vec<(bool, &str)> =
+            dialogue.iter().map(|t| (t.is_user, t.text.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (true, "fix the bug please"),
+                (false, "final answer"), // collapsed: "first attempt" dropped
+                (true, "thanks, ship it"), // tool_result turn dropped
+            ],
+            "dialogue must keep only typed user turns, drop tool results + injected \
+             system-reminders, and collapse agent to last reply"
+        );
+
+        let rendered = render_conversation(&dialogue);
+        assert!(rendered.contains("**User:**\n\nfix the bug please"));
+        assert!(rendered.contains("**Agent:**\n\nfinal answer"));
+        assert!(!rendered.contains("first attempt"), "intermediate agent chatter must not render");
+        assert!(!rendered.contains("system-reminder"), "injected system context must not render");
+        let _ = fs::remove_file(&path);
     }
 
     // ─── Evidence verification ────────────────────────────────────────────────
