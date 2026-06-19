@@ -332,6 +332,11 @@ fn triage_transcript_raw(
         even in a short or mostly-agent-driven session — answer YES. Long agent-driven sessions \
         whose user turns look like short commands often still contain such statements mid-session; \
         weigh the WHOLE conversation, not the apparent thinness of the user's side.\n\n\
+        A project-scoped UI/UX, visual, copy, ordering, output-format, naming, label, or \
+        default-value change \
+        is NEVER 'purely transient operational' merely because it is small, cosmetic, or stated \
+        in one line. If the conversation contains any explicit statement that such a surface \
+        detail should work or look differently, answer YES.\n\n\
         Reply with ONLY 'YES' or 'NO' on the first line.\n\
         'NO' is ONLY for: purely transient operations (git pull, file moved, commit/push with no \
         complications) OR already fully specified in the wiki above.{wiki_note}\n\n\
@@ -628,11 +633,75 @@ desired-state product spec.\n\n\
 - RIGHT (spec):  'Tapping an avatar opens a hovercard with the user details'\n\
 - WRONG (assistant-centric): 'remember to use optimistic locking'\n\
 - RIGHT (spec):  'Profile updates use optimistic locking to prevent race conditions'\n\n\
+## Surface details are product spec\n\
+Visual, cosmetic, copy, ordering, output-format, naming, label-text, default-value, and \
+small UX choices ARE product spec — capture them with the SAME weight as functional \
+behavior. A decision's value does NOT depend on the user giving a rationale; the choice \
+itself is the spec.\n\
+- WRONG (dismissed as too small): 'the user asked for a minor color tweak'\n\
+- RIGHT (surface spec): 'The `pc agents` output is colorized by role'\n\
+- RIGHT (surface spec): 'Card borders use an 8px radius'\n\
+- RIGHT (copy spec):    'The status-line label reads `Project Wiki: 10 guides`'\n\
+Only capture a surface detail when the cited transcript lines explicitly STATE, REQUEST, \
+CHANGE, ACCEPT, or VERIFY that exact choice. Do NOT infer surface specs from code, \
+screenshots, examples, or unstated observation. For a user-requested change, cite the user \
+line only for details it actually states; do not promote assistant-only implementation \
+choices into a user-authored claim.\n\
+GRANULARITY: if several surface details are part of ONE coherent surface decision or local \
+correction thread, prefer ONE cohesive claim about that surface over many tiny \
+per-pixel/per-color claims. Do not split merely because one surface decision names multiple \
+attributes; split only when details belong to different user-visible surfaces or would route \
+to different wiki topics.\n\n\
+## Entity definitions (kind = entity_definition)\n\
+When the transcript contains an explicit, INVESTIGATED, transcript-citable statement of what \
+a project-specific noun IS — a term, component, file, config, or event a newcomer would not \
+recognize — emit a definition claim with kind \"entity_definition\". This captures the \
+knowledge a Q&A or investigation session produces even when no new spec was decided.\n\
+- Form: \"<Entity> is <project-specific role/purpose>.\"\n\
+- RIGHT: 'The tail TUI is the terminal view that streams pc capture and inject events.'\n\
+- RIGHT: 'The catalog is the wiki index the inject SELECT stage reads to choose relevant guides.'\n\
+- WRONG (generic knowledge): 'Rust is a systems programming language.'\n\
+- WRONG (guessed from a name): 'PubkeyDecoderService is probably a service that decodes pubkeys.'\n\
+Do NOT emit BOTH a spec_claim and an entity_definition for the same citable fact. Choose \
+entity_definition when the durable fact is what X IS, means, or is for; choose spec_claim when \
+the durable fact is a requirement, behavior, default, constraint, or UX rule. Split into two only \
+when the transcript states two INDEPENDENT facts that stay useful separately.\n\
+Definition claims must still be positive, project-scoped, atomic, and CITED to the lines that \
+state or confirm the definition in-session. Do NOT define a term from code, filenames, or your \
+own prior knowledge; if a term is used but never investigated or defined in the transcript, \
+emit no definition for it. Do not define generic terms unless this project gives them a \
+project-specific meaning.\n\n\
+## Research seeds (kind = research_seed)\n\
+When the USER substantively probes the product, architecture, domain, pipeline, or design, emit \
+a research_seed capturing the user's AREA OF CONCERN. The user choosing to probe a topic is \
+itself durable signal — it marks where the user has attention, doubt, or open thinking — so a \
+seed is worth keeping EVEN WHEN the same session also settles specs or confirms definitions (a \
+session can yield spec_claim + entity_definition + research_seed together). Never return an empty \
+array for a session where the user meaningfully probed something.\n\
+- Form: \"The user is probing <topic/concern>.\" Capture the CONCERN, never the mechanics of the \
+exchange.\n\
+- RIGHT: 'The user is probing how inject's fast-model stage decides what to surface.'\n\
+- RIGHT: 'The user is probing whether to adopt the Cohere reranker.'\n\
+- WRONG (event log): 'The user asked a question about inject.'\n\
+- WRONG (assistant-centric): 'The assistant explained the fast model.'\n\
+NEVER use the words asked / answered / explained / told / discussed — phrase it as what the user \
+is probing. Cite the USER's question line(s). Emit ONE seed per coherent area of concern (merge \
+several questions about the same thing). A seed captures WHERE the user is probing, NOT the \
+resolved answer: do NOT emit a seed that merely restates a spec_claim or entity_definition you \
+already captured this session — a co-existing seed must add the distinct fact that this area is \
+under the user's active attention.\n\n\
 ## Output: STRICT JSON ARRAY, nothing else\n\
-[{\"assertion\": \"<one atomic spec fact>\", \
+[{\"assertion\": \"<one atomic claim>\", \
+\"kind\": \"spec_claim\"|\"entity_definition\"|\"research_seed\", \
 \"evidence\": [{\"start\": N, \"end\": M}], \
 \"ratified\": true|false}]\n\n\
-- `assertion`: one self-contained statement of how the product SHOULD work.\n\
+- `assertion`: one self-contained statement. For spec_claim, state desired product behavior; for \
+entity_definition, state what the project-specific noun IS; for research_seed, use exactly \
+\"The user is probing <topic/concern>.\"\n\
+- `kind`: \"spec_claim\" for a desired-state product spec (the default — use it unless a rule \
+below says otherwise); \"entity_definition\" for an \"X is Y\" definition of a project-specific \
+noun (see the Entity definitions section); \"research_seed\" for a topic the USER probed when \
+the session settled no spec and confirmed no definition (see the Research seeds section).\n\
 - `evidence`: 1+ transcript line ranges (1-based, inclusive) that SUPPORT the assertion. \
 The cited lines must literally contain the basis for the claim.\n\
 - `ratified`: set TRUE when the user is the authority behind the claim — either (a) the \
@@ -651,7 +720,10 @@ same assertion (e.g. 'X is now verified end-to-end (was failing earlier in the s
 NEVER emit the earlier state as a standalone present-tense claim when a later line \
 supersedes it — sweep forward before finalizing any claim about something that was \
 being actively worked on.\n\
-- Skip transient one-off debugging steps that resolved with no lasting spec implication.\n\
+- Skip a transient one-off debugging step ONLY when it leaves no lasting behavior, policy, \
+product, UX, output-format, default, copy, or implementation constraint. SMALL IS NOT \
+TRANSIENT: a one-line label, color, ordering, radius, default, or output-format change is \
+durable product spec when the transcript states it as desired behavior — capture it.\n\
 - Project-scoped facts only; no global/user-preference entries.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
@@ -766,7 +838,7 @@ facts to match a topic; only emit what the transcript actually supports.\n",
 
 // ─── EXTRACT prompt-variant toggles (A/B, mirrors PC_DELTA_EXTRACT precedent) ───────────────
 //
-// PC_EXTRACT_VARIANT={base|typed|terminal} selects the EXTRACT preamble body. `base` (default /
+// PC_EXTRACT_VARIANT={base|typed} selects the EXTRACT preamble body. `base` (default /
 // unset / unknown) reproduces EXTRACT_PREAMBLE byte-for-byte (control arm C0). The granularity
 // block stays ON in every arm (the preamble body is the only variable). Variants are derived
 // from EXTRACT_PREAMBLE by anchored string surgery so they track future edits to the base.
@@ -789,28 +861,6 @@ const EXTRACT_STATUS_BLOCK_C1: &str = r#"- `status`: "settled" | "proposed".
 
 "#;
 
-/// C2 — replacement-mandate + definitional-lead blocks (`PC_EXTRACT_VARIANT=terminal`). Verbatim
-/// from spec; appended to the base preamble (before the granularity block).
-const EXTRACT_TERMINAL_BLOCK_C2: &str = r#"
-## Replacements, not co-existing capabilities
-When a default, value, or approach CHANGES, you MUST phrase the claim as a REPLACEMENT that makes
-the old value FALSE — never as an added capability that contradicts nothing.
-- WRONG: "The system can use a local embedding provider."  (when local REPLACED OpenAI as the
-  default — this leaves the old default standing and the reversal is lost)
-- RIGHT: "The default embedding provider is now local fastembed (replacing the earlier OpenAI
-  default)."
-Before finalizing ANY claim about a default/value/approach, ask: did this REPLACE a prior value
-in the transcript? If yes, name the prior value and state the new one as its replacement.
-
-## Definitional lead for project-specific nouns
-For each project-specific term, component, file, or config the transcript treats as already-known
-(a name a newcomer would not recognize), emit ONE definitional claim stating what it IS — its role
-or purpose — in addition to any claims about how it behaves: "X is the <role> that <does what>."
-Do not skip this because the term "is obvious in context"; the definition is the unit later
-grounding depends on. This is a COMPLETENESS rule, not a license to split one mechanism into many
-claims — keep one atomic fact each.
-"#;
-
 /// Anchors for C1 string surgery (must match EXTRACT_PREAMBLE exactly).
 const EXTRACT_JSON_SHAPE_BASE: &str = "\"ratified\": true|false}]";
 const EXTRACT_JSON_SHAPE_C1: &str = "\"ratified\": true|false, \"status\": \"settled\"|\"proposed\"}]";
@@ -830,10 +880,6 @@ fn extract_preamble_variant() -> std::borrow::Cow<'static, str> {
                     1,
                 );
             std::borrow::Cow::Owned(s)
-        }
-        Some("terminal") => {
-            // C2: append the replacement-mandate + definitional-lead blocks to the base preamble.
-            std::borrow::Cow::Owned(format!("{}{}", EXTRACT_PREAMBLE, EXTRACT_TERMINAL_BLOCK_C2))
         }
         _ => std::borrow::Cow::Borrowed(EXTRACT_PREAMBLE), // "base" | unset | unknown → control C0
     }
@@ -1102,6 +1148,15 @@ fn extract_json_blob(raw: &str) -> Option<String> {
 #[derive(Debug, Deserialize)]
 struct ExtractedClaim {
     assertion: String,
+    // Stage 2/3: typed-claim discriminator. "spec_claim" (default / absent) = a desired-state
+    // product spec; "entity_definition" = an "X is Y" project-noun definition from in-session
+    // investigation; "research_seed" = a "the user is probing <topic>" attention signal. Optional
+    // so pre-Stage-2 EXTRACT output (no `kind`) still parses → None → treated as spec_claim.
+    // Tolerant deserializer: a malformed non-string `kind` (e.g. `false`, an object) coerces to
+    // None rather than failing the whole-array parse — otherwise one bad value would make the live
+    // path's `unwrap_or_default()` silently drop EVERY claim in the session.
+    #[serde(default, deserialize_with = "deserialize_claim_kind")]
+    kind: Option<String>,
     #[serde(default)]
     evidence: Vec<EvidenceRange>,
     // Advisory only since §5 tag-don't-drop: EXTRACT still emits it, but it no longer
@@ -1130,6 +1185,75 @@ struct AdmittedClaim {
     /// Phase 4 (`PC_CLAIM_STATUS`): adoption status, orthogonal to authority. Always
     /// `Unknown` when the flag is off, so behavior is byte-for-byte baseline.
     status: claims::ClaimStatus,
+    /// Stage 2/3: normalized claim kind ("spec_claim" | "entity_definition" | "research_seed").
+    /// spec_claim and entity_definition flow through ROUTE into guides; research_seed is
+    /// partitioned out before ROUTE so probe-signals never pollute spec guides.
+    kind: &'static str,
+}
+
+/// Tolerant deserializer for the EXTRACT `kind` field: any non-string JSON value (bool, number,
+/// object, array) coerces to `None` instead of erroring. Without this, a single malformed `kind`
+/// would fail `from_str::<Vec<ExtractedClaim>>` and the live path's `unwrap_or_default()` would
+/// silently drop the entire session's claims.
+fn deserialize_claim_kind<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    })
+}
+
+/// Append research-seed signals to `<wiki>/research/seeds.jsonl` (append-only, one JSON object per
+/// line). Seeds are diverted out of the spec pipeline (Stage 3) so they never pollute spec guides;
+/// this durable sink preserves the "what the user probed" signal for later promotion into research
+/// notes. Returns the sink path.
+fn persist_research_seeds(ctx: &WikiAgentCtx, seeds: &[AdmittedClaim]) -> Result<PathBuf> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    // Serialize on the project wiki lock: per-session locking does NOT prevent two sessions in the
+    // same project from appending to the shared sink concurrently and interleaving lines.
+    let _lock = acquire_project_wiki_lock(&ctx.project_key)
+        .context("failed to acquire project wiki lock for research seed sink")?;
+    let research_dir = ctx.wiki_path.join("research");
+    std::fs::create_dir_all(&research_dir)
+        .with_context(|| format!("failed to create research dir {}", research_dir.display()))?;
+    let path = research_dir.join("seeds.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open seeds sink {}", path.display()))?;
+    for s in seeds {
+        let rec = serde_json::json!({
+            "session": ctx.session_id,
+            "date": ctx.today,
+            "topic": s.assertion,
+            "evidence": s.evidence.iter()
+                .map(|e| serde_json::json!({ "start": e.start, "end": e.end }))
+                .collect::<Vec<_>>(),
+            // Verbatim cited slice — lets later auditing catch a spec/definition mislabeled as a seed.
+            "evidence_text": slice_transcript_ranges(&ctx.transcript_lines, &s.evidence),
+        });
+        // One buffered write per record so a concurrent appender can't interleave mid-line.
+        let mut line = serde_json::to_vec(&rec)?;
+        line.push(b'\n');
+        f.write_all(&line)?;
+    }
+    Ok(path)
+}
+
+/// Normalize an EXTRACT `kind` string to one of the three canonical kinds. Absent / unknown /
+/// "spec_claim" → "spec_claim" (the default), so pre-Stage-2 output and malformed values are
+/// treated as ordinary spec claims and behavior stays baseline.
+fn normalize_claim_kind(raw: &Option<String>) -> &'static str {
+    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("entity_definition") => "entity_definition",
+        Some("research_seed") => "research_seed",
+        _ => "spec_claim",
+    }
 }
 
 /// Phase 4 behavior flag (`PC_CLAIM_STATUS={1|true|on}`). OFF by default — status is always
@@ -1205,7 +1329,8 @@ struct ReconcileOp {
 /// is retained for config compatibility but ignored because the pipeline is a fixed
 /// number of single-shot calls, not an agentic loop.
 ///
-/// `claims_dir`: when `Some`, the claim-log tap writes every admitted claim to
+/// `claims_dir`: when `Some`, the claim-log tap writes every ROUTED claim (spec_claim +
+/// entity_definition; research_seeds are partitioned out beforehand into their own sink) to
 /// `<claims_dir>/claims.jsonl` and `<claims_dir>/claims.db`.  When `None` (default),
 /// the tap is a no-op and behavior is byte-identical to the pre-experiment code.
 /// Controlled by the `PC_CLAIMS_LOG=1` feature flag.
@@ -1293,24 +1418,64 @@ async fn run_staged_capture(
             author,
             authority,
             status: map_claim_status(&c.status),
+            kind: normalize_claim_kind(&c.kind),
         });
     }
+    // ── STAGE 3: partition research_seeds OUT of the spec pipeline ─────────────────
+    // A research_seed ("the user is probing <topic>") is an attention signal, not a desired-state
+    // spec. It must never reach ROUTE/RECONCILE — that would pollute spec guides. Divert seeds to
+    // the research-seeds sink here; spec_claim + entity_definition flow on to ROUTE unchanged.
+    let (seeds, admitted_routed): (Vec<AdmittedClaim>, Vec<AdmittedClaim>) =
+        admitted.into_iter().partition(|c| c.kind == "research_seed");
+    admitted = admitted_routed;
+    let n_seeds = seeds.len();
+    if n_seeds > 0 {
+        // Fail-fast: a persist failure must NOT fall through to the outer "mark captured" path —
+        // for a seed-only session that would be silent data loss. Surface the error and abort.
+        let path = persist_research_seeds(&ctx, &seeds)?;
+        eprintln!("capture: research seeds → {} diverted to {}", n_seeds, path.display());
+    }
+    // Safety net: if seed prose leaked into the ROUTED set (e.g. EXTRACT wrote "The user is
+    // probing …" but mistyped/omitted the kind, normalizing it to spec_claim), warn so the leak is
+    // auditable instead of silently shipped into a spec guide.
+    let leaked = admitted
+        .iter()
+        .filter(|c| c.assertion.starts_with("The user is probing "))
+        .count();
+    if leaked > 0 {
+        eprintln!(
+            "capture: WARNING {} routed claim(s) read like research-seed prose but were not typed as seeds",
+            leaked
+        );
+        log_event("capture.seed_leak_warning", None, serde_json::json!({ "leaked": leaked }));
+    }
+    // Recompute authorship tallies over the claims that actually flow downstream (seeds excluded).
+    n_explicit = admitted.iter().filter(|c| c.authority == "explicit").count();
+    n_implicit = admitted.len() - n_explicit;
+    let n_defs = admitted.iter().filter(|c| c.kind == "entity_definition").count();
     eprintln!(
-        "capture: AUTHORITY TAGGING → {} admitted ({} explicit, {} implicit)",
+        "capture: AUTHORITY TAGGING → {} routed ({} explicit, {} implicit; {} definition(s)), {} research seed(s) diverted",
         admitted.len(),
         n_explicit,
-        n_implicit
+        n_implicit,
+        n_defs,
+        n_seeds,
     );
     log_event(
         "capture.authority_tagging",
         None,
         serde_json::json!({
             "admitted": admitted.len(), "extracted": extracted.len(),
-            "explicit": n_explicit, "implicit": n_implicit
+            "explicit": n_explicit, "implicit": n_implicit,
+            "definitions": n_defs, "research_seeds": n_seeds
         }),
     );
     if admitted.is_empty() && !delta_only {
-        return Ok("No evidence-verified claims to capture.".to_string());
+        return Ok(if n_seeds > 0 {
+            format!("Captured {} research seed(s); no spec/definition claims to route.", n_seeds)
+        } else {
+            "No evidence-verified claims to capture.".to_string()
+        });
     }
 
     // Build the embedder once; reused by both the claims-log tap and ROUTE recall below.
@@ -3229,6 +3394,7 @@ pub(crate) fn run_debug_extract(
     writeln!(o, "{}", serde_json::to_string_pretty(
         &extracted.iter().map(|c| serde_json::json!({
             "assertion": c.assertion,
+            "kind": normalize_claim_kind(&c.kind),
             "evidence": c.evidence.iter().map(|e| serde_json::json!({"start": e.start, "end": e.end})).collect::<Vec<_>>(),
             "ratified": c.ratified,
         })).collect::<Vec<_>>()
@@ -3468,6 +3634,82 @@ mod tests {
     // Serialize PC_CLAIM_STATUS env mutations (process-global) for Phase 4 tests.
     static CLAIM_STATUS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The C1 variant rewrites EXTRACT_PREAMBLE by anchored string surgery (extract_preamble_variant).
+    /// Those anchors MUST each occur exactly once inside the base preamble, or replacen would target
+    /// the wrong site. Stage 1's surface-detail section sits before `## Rules`, so guard uniqueness.
+    #[test]
+    fn extract_preamble_c1_anchors_are_unique() {
+        assert_eq!(
+            EXTRACT_PREAMBLE.matches(EXTRACT_RULES_ANCHOR).count(),
+            1,
+            "EXTRACT_RULES_ANCHOR must be unique in EXTRACT_PREAMBLE for C1 string surgery"
+        );
+        assert_eq!(
+            EXTRACT_PREAMBLE.matches(EXTRACT_JSON_SHAPE_BASE).count(),
+            1,
+            "EXTRACT_JSON_SHAPE_BASE must be unique in EXTRACT_PREAMBLE for C1 string surgery"
+        );
+    }
+
+    /// Stage 2: `kind` normalizes across absent/unknown/case/whitespace, and the tolerant
+    /// deserializer coerces malformed NON-string `kind` to None (→ spec_claim) instead of failing
+    /// the whole-array parse (which the live path would silently turn into 0 claims).
+    #[test]
+    fn claim_kind_is_tolerant_and_normalized() {
+        // Normalization of the canonical/edge string cases.
+        assert_eq!(normalize_claim_kind(&None), "spec_claim");
+        assert_eq!(normalize_claim_kind(&Some("entity_definition".into())), "entity_definition");
+        assert_eq!(normalize_claim_kind(&Some("  Entity_Definition ".into())), "entity_definition");
+        assert_eq!(normalize_claim_kind(&Some("research_seed".into())), "research_seed");
+        assert_eq!(normalize_claim_kind(&Some("garbage".into())), "spec_claim");
+
+        // Tolerant deserialize: a NON-string kind must not poison the array parse.
+        let bad = r#"[{"assertion":"a","kind":false,"evidence":[],"ratified":true},
+                      {"assertion":"b","kind":{"x":1},"evidence":[],"ratified":false},
+                      {"assertion":"c","kind":"entity_definition","evidence":[],"ratified":true}]"#;
+        let v: Vec<ExtractedClaim> = serde_json::from_str(bad).expect("malformed kind must not fail parse");
+        assert_eq!(v.len(), 3);
+        assert_eq!(normalize_claim_kind(&v[0].kind), "spec_claim"); // false → None → spec_claim
+        assert_eq!(normalize_claim_kind(&v[1].kind), "spec_claim"); // object → None → spec_claim
+        assert_eq!(normalize_claim_kind(&v[2].kind), "entity_definition");
+    }
+
+    /// Stage 3: research_seeds are persisted to `<wiki>/research/seeds.jsonl` (append-only) with
+    /// the topic, session, and evidence — the durable sink that keeps probe-signals out of guides.
+    #[test]
+    fn research_seeds_persist_to_sink() {
+        use std::io::Read as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = WikiAgentCtx::new(
+            tmp.path().to_path_buf(),
+            "proj".into(),
+            "sess12345".into(),
+            vec![],
+            vec![],
+            "2026-06-19".into(),
+        );
+        let seeds = vec![AdmittedClaim {
+            assertion: "The user is probing how inject decides what to surface.".into(),
+            evidence: vec![EvidenceRange { start: 1, end: 2 }],
+            author: "user".into(),
+            authority: "explicit",
+            status: claims::ClaimStatus::Unknown,
+            kind: "research_seed",
+        }];
+        let path = persist_research_seeds(&ctx, &seeds).unwrap();
+        assert!(path.ends_with("research/seeds.jsonl"));
+        let mut s = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        assert!(s.contains("The user is probing how inject decides what to surface."));
+        assert!(s.contains("sess12345"));
+        assert!(s.contains("\"start\":1"));
+        // Append-only: a second call adds a line, never truncates.
+        persist_research_seeds(&ctx, &seeds).unwrap();
+        let mut s2 = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s2).unwrap();
+        assert_eq!(s2.lines().count(), 2);
+    }
+
     /// (c) ExtractedClaim parses the OLD shape (no `status`) AND the C1 `"status":"settled"` shape.
     #[test]
     fn extracted_claim_parses_old_and_status_shapes() {
@@ -3536,19 +3778,6 @@ mod tests {
         // Granularity stays ON in the assembled system prompt.
         std::env::remove_var("PC_EXTRACT_NO_GRANULARITY");
         assert!(build_extract_system(&[]).contains("Sweep the WHOLE transcript"));
-        std::env::remove_var("PC_EXTRACT_VARIANT");
-    }
-
-    #[test]
-    fn extract_terminal_variant_appends_both_blocks() {
-        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
-        std::env::set_var("PC_EXTRACT_VARIANT", "terminal");
-        let s = extract_preamble_variant().into_owned();
-        assert!(s.starts_with(EXTRACT_PREAMBLE), "terminal must keep the base preamble intact");
-        assert!(s.contains("## Replacements, not co-existing capabilities"), "terminal must add replacement-mandate block");
-        assert!(s.contains("## Definitional lead for project-specific nouns"), "terminal must add definitional-lead block");
-        // No status field leaks into the terminal arm.
-        assert!(!s.contains("\"status\": \"settled\"|\"proposed\""));
         std::env::remove_var("PC_EXTRACT_VARIANT");
     }
 

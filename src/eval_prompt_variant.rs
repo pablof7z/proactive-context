@@ -113,17 +113,6 @@ pub const ARMS: &[PromptVariantArm] = &[
         instruments: &["status-label-accuracy", "restatement-recall"],
         description: "Proposal-vs-settled status typing.",
     },
-    PromptVariantArm {
-        id: "C2",
-        aliases: &["c2", "terminal", "terminal-definitional"],
-        env_var: "PC_EXTRACT_VARIANT",
-        env_val: "terminal",
-        stage: Stage::Capture,
-        primary: "trajectory + stale-leak AND noun-grounding (+15pt)",
-        guards: &["restatement-recall", "attention-efficiency (bloat guard)"],
-        instruments: &["probe2-trajectory", "noun-grounding", "restatement-recall", "attention-efficiency"],
-        description: "Replacement-mandate + definitional-lead EXTRACT preamble.",
-    },
 ];
 
 /// Resolve a CLI arm name (case-insensitive, matched against id or alias) to its arm spec.
@@ -342,7 +331,6 @@ mod tests {
         assert_eq!((resolve_arm("divergence").unwrap().env_var, resolve_arm("divergence").unwrap().env_val), ("PC_COMPILE_VARIANT", "divergence"));
         assert_eq!((resolve_arm("select-verdict").unwrap().env_var, resolve_arm("select-verdict").unwrap().env_val), ("PC_SELECT_VARIANT", "verdict"));
         assert_eq!((resolve_arm("typed").unwrap().env_var, resolve_arm("typed").unwrap().env_val), ("PC_EXTRACT_VARIANT", "typed"));
-        assert_eq!((resolve_arm("terminal").unwrap().env_var, resolve_arm("terminal").unwrap().env_val), ("PC_EXTRACT_VARIANT", "terminal"));
     }
 
     #[test]

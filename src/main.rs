@@ -424,7 +424,7 @@ enum Commands {
 
         /// Prompt-variant A/B arm: run ONE single-variable prompt variant within-run against the
         /// existing instruments. Accepts spec ids or aliases: I0/librarian, I1/verdict,
-        /// I2/divergence, S1/select-verdict, C0/base, C1/typed, C2/terminal. Sets the matching
+        /// I2/divergence, S1/select-verdict, C0/base, C1/typed. Sets the matching
         /// PC_COMPILE_VARIANT / PC_SELECT_VARIANT / PC_EXTRACT_VARIANT toggle, validates the seeded
         /// canary fixtures, and dispatches the Run-13 instrument bundle. Reuses --experiment-dir.
         #[arg(long, value_name = "ARM")]
