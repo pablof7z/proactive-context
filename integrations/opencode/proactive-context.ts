@@ -9,7 +9,7 @@ import { join } from "node:path"
 //
 // Wires the standalone `pc` engine into opencode's plugin lifecycle, mirroring the
 // Claude Code hook integration (UserPromptSubmit→inject, Stop/SessionEnd→capture,
-// SessionStart→open-questions, PostToolUse→awareness).
+// PostToolUse→awareness).
 //
 // opencode runs JS plugin functions rather than spawning shell commands from a
 // settings file, so this shim execs the real `pc` binary and splices its output
@@ -20,7 +20,6 @@ import { join } from "node:path"
 //              prepend a cited briefing). EXPERIMENTAL — expect churn.
 //   capture  → event:session.idle  (debounced via `pc capture --in`, off the hot
 //              path; the detached worker survives opencode exiting).
-//   open-Qs  → event:session.created → folded into the next injection.
 //   awareness→ tool.execute.after (opt-in via PC_AWARENESS=1). This hook cannot
 //              inject, so peer deltas degrade to the next injection — exactly the
 //              degradation the design anticipates.
@@ -60,8 +59,8 @@ export const ProactiveContext: Plugin = async ({ client, directory }) => {
   const briefingByMsg = new Map<string, string>()
   const MAX_CACHE = 8
 
-  // Context produced out-of-band (open-questions, awareness deltas) that has no
-  // injection point of its own; folded into the next injection.
+  // Context produced out-of-band (awareness deltas) that has no injection point of
+  // its own; folded into the next injection.
   let pending: string[] = []
 
   // ── exec pc, feeding the hook JSON on stdin, returning stdout ────────────────
@@ -185,13 +184,8 @@ export const ProactiveContext: Plugin = async ({ client, directory }) => {
       }
     },
 
-    // ── capture + open-questions ──────────────────────────────────────────────
+    // ── capture ───────────────────────────────────────────────────────────────
     event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const ctx = additionalContext(await runPc(["session_start"], { cwd }))
-        if (ctx) pending.push(ctx)
-        return
-      }
       if (event.type === "session.idle") {
         const sessionID = (event as any).properties?.sessionID
         if (!sessionID) return

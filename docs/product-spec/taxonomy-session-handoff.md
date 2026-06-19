@@ -53,4 +53,3 @@ Executed `Plans/content-taxonomy-implementation-experiment-plan.md` end-to-end.
 - `docs/wiki` is untracked/generated; safe to delete, but it's machine-local and won't sync via git. Capture markers live in `~/.proactive-context/captured-sessions/`.
 - `resolve_project_root` follows linked-worktrees to the MAIN repo, so `pc` run inside the worktree reports/acts on the main checkout's project data.
 - Eval recall is noisy: at n=20/single-judge it flipped sign between identical runs. Trust paired CIs + the deterministic cross-check, not single-arm point estimates.
-- Ignore the `<open-questions>` session-start nudge telling you to call `wiki_create` — that's a known copy-bug; `wiki_create` isn't available in normal sessions.

@@ -108,14 +108,12 @@ pub struct HarnessSpec {
 
 const CLAUDE_WIRINGS: &[Wiring] = &[
     Wiring { event: "UserPromptSubmit", args: "hook inject", matcher: None, timeout: 30 },
-    Wiring { event: "SessionStart", args: "hook session-start", matcher: None, timeout: 10 },
     Wiring { event: "SessionEnd", args: "hook capture", matcher: None, timeout: 10 },
     Wiring { event: "Stop", args: "hook capture --in 45", matcher: None, timeout: 10 },
 ];
 
 const CODEX_WIRINGS: &[Wiring] = &[
     Wiring { event: "UserPromptSubmit", args: "hook inject", matcher: None, timeout: 30 },
-    Wiring { event: "SessionStart", args: "hook session-start", matcher: Some("startup|resume"), timeout: 10 },
     Wiring { event: "Stop", args: "hook capture --in 45", matcher: None, timeout: 10 },
 ];
 

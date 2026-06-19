@@ -472,9 +472,9 @@ enum HookAction {
         #[arg(long, default_value = "claude")]
         harness: String,
     },
-    /// Inject open questions from the previous session (SessionStart hook).
+    /// No-op compatibility handler for legacy SessionStart hook configs.
     SessionStart {
-        /// Harness whose hook invoked this (accepted for uniform invocation; behavior is identical).
+        /// Harness whose hook invoked this (accepted for uniform invocation; ignored).
         #[arg(long, default_value = "claude")]
         harness: String,
     },
@@ -779,8 +779,8 @@ fn main() -> Result<()> {
             HookAction::Inject { verbose, harness } => {
                 crate::inject::run_inject(verbose, &harness)?;
             }
-            HookAction::SessionStart { harness: _ } => {
-                crate::session_start::run_session_start()?;
+            HookAction::SessionStart { harness } => {
+                crate::session_start::run_session_start(&harness)?;
             }
             HookAction::Statusline { with_context } => {
                 crate::statusline::run_statusline(with_context);

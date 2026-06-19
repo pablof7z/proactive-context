@@ -11,7 +11,6 @@ binary and splices its output into the message stream.
 |---|---|---|
 | **inject** | `experimental.chat.messages.transform` | Prompt-aware: the hook sees the full message array including the current prompt, reads it, and prepends `pc inject`'s cited briefing to the latest user message. **Experimental** — expect signature churn. |
 | **capture** | `event` → `session.idle` | Debounced via `pc capture --in`, off the hot path. The detached worker survives opencode exiting. Mirrors the Claude Code `Stop` hook. |
-| **open-questions** | `event` → `session.created` | `pc session_start` output is folded into the next injection (the event hook can't inject directly). |
 | **awareness** | `tool.execute.after` | Opt-in (`PC_AWARENESS=1`). This hook can't inject, so peer deltas degrade to the next injection — the degradation the design anticipates. |
 
 ### Why `messages.transform` and not `system.transform`

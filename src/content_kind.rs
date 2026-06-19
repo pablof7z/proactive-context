@@ -30,8 +30,6 @@ pub enum ContentKind {
     RealnessNoun,
     /// A raw session transcript: provenance / recall fallback, not concise memory.
     RawTranscript,
-    /// A known-unresolved question surfaced for context.
-    OpenQuestion,
     /// Repo-authored markdown (e.g. README, docs) — not generated project memory, and the
     /// safe landing spot for any unrecognized `type:` value (degrade, don't panic).
     CommittedMarkdown,
@@ -47,7 +45,6 @@ impl ContentKind {
             Some("research-record") => ContentKind::ResearchRecord,
             Some("noun-entry") => ContentKind::NounEntry,
             Some("realness-noun") => ContentKind::RealnessNoun,
-            Some("open-question") => ContentKind::OpenQuestion,
             Some(_) => ContentKind::CommittedMarkdown,
         }
     }
@@ -62,7 +59,6 @@ impl ContentKind {
             ContentKind::NounEntry => "noun:",
             ContentKind::RealnessNoun => "realness:",
             ContentKind::RawTranscript => "transcript:",
-            ContentKind::OpenQuestion => "question:",
             ContentKind::CommittedMarkdown => "",
         }
     }
@@ -85,7 +81,6 @@ impl ContentKind {
             ContentKind::NounEntry,
             ContentKind::RealnessNoun,
             ContentKind::RawTranscript,
-            ContentKind::OpenQuestion,
         ] {
             let prefix = kind.key_prefix();
             if !prefix.is_empty() {
@@ -107,7 +102,6 @@ impl ContentKind {
             ContentKind::NounEntry => "noun-entry",
             ContentKind::RealnessNoun => "realness-noun",
             ContentKind::RawTranscript => "raw-transcript",
-            ContentKind::OpenQuestion => "open-question",
             ContentKind::CommittedMarkdown => "committed-markdown",
         }
     }

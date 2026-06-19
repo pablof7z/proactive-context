@@ -1378,8 +1378,7 @@ fn extract_json_array(text: &str) -> String {
 /// Verify a definitional claim's evidence against the transcript: every kept range must
 /// slice to non-empty text (Rust-verified, fabrication unreachable). Returns the verified
 /// ranges; a claim whose evidence all fails is dropped by the caller (per R3 — no
-/// uncitable definition is persisted; it becomes an Open Question instead, handled by the
-/// existing extract_open_questions seam).
+/// uncitable definition is persisted).
 pub fn verify_definitional_evidence(raw_lines: &[String], spans: &[TurnSpan], claim: &DefinitionalClaim) -> Vec<(usize, usize)> {
     let _ = spans; // spans available for future snap-to-turn repair (mirrors episode_capture)
     claim
