@@ -1,6 +1,6 @@
 use crate::config::{config_dir, normalize_path, project_context_dir, project_db_path, project_pid_path, Config};
 use crate::db::{content_hash, delete_chunks_for_path, index_stats, indexed_paths, insert_chunks, open_db, open_db_at};
-use crate::embed::{build_embedder, Embedder};
+use crate::embed::{build_embedder, build_sidecar_embedder, Embedder};
 use crate::chunker::chunk_markdown;
 use crate::events::{log_event, new_pass};
 use anyhow::Result;
@@ -449,7 +449,7 @@ pub fn index_single_file(
 /// Start the daemon: acquire lock, do initial index, then watch for changes.
 pub fn run_daemon(root: &Path) -> Result<()> {
     let cfg = crate::config::load_config()?;
-    let mut embedder = build_embedder(&cfg)?;
+    let mut embedder = build_sidecar_embedder(&cfg)?;
 
     // Lock must be acquired before we open the DB (so two inits don't both start watchers)
     try_acquire_lock(root)?;

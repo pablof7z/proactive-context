@@ -36,6 +36,7 @@ mod db;
 mod cross_supersede;
 mod doctor;
 mod embed;
+mod embed_sidecar;
 mod events;
 mod harness;
 mod inject;
@@ -118,6 +119,12 @@ enum Commands {
         /// Refresh continuously (like watch)
         #[arg(long, short)]
         watch: bool,
+    },
+
+    /// Shared embedding sidecar commands.
+    Embed {
+        #[command(subcommand)]
+        action: EmbedAction,
     },
 
     /// Show or edit configuration (~/.proactive-context/config.json)
@@ -487,6 +494,12 @@ enum HookAction {
 }
 
 #[derive(Subcommand)]
+enum EmbedAction {
+    /// Run the shared embedding sidecar in the foreground.
+    Serve,
+}
+
+#[derive(Subcommand)]
 enum DebugAction {
     /// Print the line-numbered transcript EXACTLY as the EXTRACT stage sees it (after the
     /// same preprocessing + 250KB tail-truncation the live capture path applies).
@@ -757,6 +770,12 @@ fn main() -> Result<()> {
                 print_stats(&root, &db_path, &stats, pid, false);
             }
         }
+
+        Commands::Embed { action } => match action {
+            EmbedAction::Serve => {
+                crate::embed_sidecar::run_sidecar()?;
+            }
+        },
 
         Commands::Config { action } => {
             handle_config(action)?;

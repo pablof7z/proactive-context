@@ -1478,13 +1478,12 @@ async fn run_staged_capture(
         });
     }
 
-    // Build the embedder once; reused by both the claims-log tap and ROUTE recall below.
-    // Each build_embedder() call loads the 86 MB ONNX model — ONNX Runtime inflates it to
-    // ~500-800 MB RSS. Building it twice doubled peak RSS to ~1.6 GB unnecessarily.
+    // Build one sidecar-backed embedder wrapper; the ONNX session lives in the shared
+    // sidecar instead of this deferred capture process.
     let shared_cfg = load_config().ok();
     let mut shared_embedder: Option<Box<dyn crate::embed::Embedder>> = shared_cfg
         .as_ref()
-        .and_then(|cfg| crate::embed::build_embedder(cfg).ok());
+        .and_then(|cfg| crate::embed::build_sidecar_embedder(cfg).ok());
 
     // ── CLAIM-LOG TAP (after authority tagging, before ROUTE) ─────────────────────
     // Feature flag: PC_CLAIMS_LOG=1.  When set, persist every admitted claim to
