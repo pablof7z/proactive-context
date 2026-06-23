@@ -1534,9 +1534,11 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
     // citation-log preamble — but keep the leading TITLE: line first so the status bar reads it.
     if resp.contains("[^") {
         let citations_log = wiki_dir.join("_citations.log");
+        let citations_dir = wiki_dir.join("_citations");
         let pre = format!(
-            "Inline [^id] markers cite verbatim source-conversation evidence in {}; \
-             read it to see why a statement exists.\n\n",
+            "Inline [^id] markers cite verbatim source-conversation evidence under {}; \
+             {} is a derived convenience cache.\n\n",
+            citations_dir.display(),
             citations_log.display()
         );
         if let Some(nl) = resp.find('\n') {

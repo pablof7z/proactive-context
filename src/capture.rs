@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ── Claims-log tap (Phase 0 experiment; feature-flagged via PC_CLAIMS_LOG=1) ─
 use crate::claims;
@@ -443,31 +443,72 @@ fn slice_transcript_ranges(lines: &[String], ranges: &[EvidenceRange]) -> String
 
 // ─── Citation ID management ───────────────────────────────────────────────────
 
-/// Scan `_citations.log` to find the highest `n` used for `prefix-n` entries.
-fn scan_citation_counter(wiki_dir: &Path, prefix: &str) -> usize {
-    let log_path = wiki_dir.join("_citations.log");
-    let content = match fs::read_to_string(&log_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let search = format!("{}-", prefix);
-    let mut max_n = 0usize;
-    for line in content.lines() {
-        if let Some(id_end) = line.find(" | ") {
-            let id = &line[..id_end];
-            if let Some(rest) = id.strip_prefix(&search) {
-                if let Ok(n) = rest.parse::<usize>() {
-                    if n > max_n {
-                        max_n = n;
-                    }
-                }
-            }
-        }
-    }
-    max_n
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CitationRecord {
+    id: String,
+    ts: String,
+    session: String,
+    text: String,
 }
 
-/// Append an entry to `_citations.log`.
+fn sha2_hex_prefix(s: &str, chars: usize) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(s.as_bytes());
+    let digest = h.finalize();
+    let mut out = String::with_capacity(chars);
+    for b in digest {
+        out.push_str(&format!("{:02x}", b));
+        if out.len() >= chars {
+            out.truncate(chars);
+            break;
+        }
+    }
+    out
+}
+
+fn citation_prefix(session_id: &str) -> String {
+    let prefix: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(5)
+        .collect();
+    if prefix.is_empty() {
+        "sess".to_string()
+    } else {
+        prefix
+    }
+}
+
+fn citation_id(session_id: &str, ranges: &[EvidenceRange], sliced_text: &str) -> String {
+    let mut material = format!("session:{session_id}\nranges:");
+    for r in ranges {
+        material.push_str(&format!("{}-{};", r.start, r.end));
+    }
+    material.push_str("\ntext:");
+    material.push_str(sliced_text);
+    format!("{}-{}", citation_prefix(session_id), sha2_hex_prefix(&material, 5))
+}
+
+fn sanitize_path_component(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if out.is_empty() { "unknown-session".to_string() } else { out }
+}
+
+fn citation_record_path(wiki_dir: &Path, session_id: &str, id: &str) -> PathBuf {
+    wiki_dir
+        .join("_citations")
+        .join(sanitize_path_component(session_id))
+        .join(format!("{}.json", sanitize_path_component(id)))
+}
+
+/// Append an entry to the citation store.
+///
+/// `_citations/<session>/<id>.json` is the merge-friendly source of truth. The flat
+/// `_citations.log` remains a local, ignored compatibility cache for humans and older docs.
 fn append_citation_log(
     wiki_dir: &Path,
     id: &str,
@@ -475,11 +516,35 @@ fn append_citation_log(
     sliced_text: &str,
 ) -> Result<()> {
     fs::create_dir_all(wiki_dir)?;
+    crate::wiki::ensure_agents_files(wiki_dir)?;
+
+    let rec = CitationRecord {
+        id: id.to_string(),
+        ts: rfc3339_now(),
+        session: session_id.to_string(),
+        text: sliced_text.to_string(),
+    };
+    let record_path = citation_record_path(wiki_dir, session_id, id);
+    if let Some(parent) = record_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if record_path.exists() {
+        let existing = fs::read_to_string(&record_path)?;
+        let existing_rec: CitationRecord = serde_json::from_str(&existing)?;
+        if existing_rec.id != rec.id
+            || existing_rec.session != rec.session
+            || existing_rec.text != rec.text
+        {
+            anyhow::bail!("citation id collision for {} at {}", id, record_path.display());
+        }
+    } else {
+        fs::write(&record_path, format!("{}\n", serde_json::to_string_pretty(&rec)?))?;
+    }
+
     let log_path = wiki_dir.join("_citations.log");
     // Flatten embedded newlines so each entry is exactly one line
     let flat_text = sliced_text.replace('\n', " \\n ");
-    let ts = rfc3339_now();
-    let entry = format!("{} | {} | session:{} | {}\n", id, ts, session_id, flat_text);
+    let entry = format!("{} | {} | session:{} | {}\n", id, rec.ts, session_id, flat_text);
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -502,15 +567,11 @@ struct WikiAgentCtx {
     wiki_path: PathBuf,
     project_key: String,
     session_id: String,
-    /// First 5 chars of session_id (citation prefix)
-    prefix: String,
     /// All transcript lines (0-based for slice; 1-based line numbers in the numbered string)
     transcript_lines: Vec<String>,
     /// Parallel to `transcript_lines`: the role ("user"/"assistant") owning each line.
     /// Used for mechanical authorship attribution (§5) — Rust-owned, never model-claimed.
     transcript_roles: Vec<String>,
-    /// Per-session citation counter (monotonic, seeded from log at startup)
-    counter: Mutex<usize>,
     /// date string "YYYY-MM-DD" for guide frontmatter
     today: String,
 }
@@ -524,16 +585,12 @@ impl WikiAgentCtx {
         transcript_roles: Vec<String>,
         today: String,
     ) -> Self {
-        let prefix: String = session_id.chars().take(5).collect();
-        let counter_start = scan_citation_counter(&wiki_path, &prefix);
         WikiAgentCtx {
             wiki_path,
             project_key,
             session_id,
-            prefix,
             transcript_lines,
             transcript_roles,
-            counter: Mutex::new(counter_start),
             today,
         }
     }
@@ -568,18 +625,11 @@ impl WikiAgentCtx {
             .is_empty()
     }
 
-    /// Mint a new citation ID and increment the counter.
-    fn mint_id(&self) -> String {
-        let mut counter = self.counter.lock().unwrap();
-        *counter += 1;
-        format!("{}-{}", self.prefix, *counter)
-    }
-
     /// Slice verbatim text from the transcript, mint a citation ID, and return
-    /// `(marker_str "[^prefix-n]", sliced_text)`.
+    /// `(marker_str "[^prefix-hash5]", sliced_text)`.
     fn cite(&self, ranges: &[EvidenceRange]) -> (String, String) {
         let sliced = slice_transcript_ranges(&self.transcript_lines, ranges);
-        let id = self.mint_id();
+        let id = citation_id(&self.session_id, ranges, &sliced);
         let marker = format!("[^{}]", id);
         (marker, sliced)
     }
@@ -1087,11 +1137,7 @@ async fn run_stage(
 /// Short deterministic id suffix derived from a string (8 hex chars of SHA-256).
 /// Used to build claim ids in the claim-log tap.
 fn sha2_short(s: &str) -> String {
-    use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    h.update(s.as_bytes());
-    let digest = h.finalize();
-    format!("{:02x}{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2], digest[3])
+    sha2_hex_prefix(s, 8)
 }
 
 /// Extract the first balanced JSON array/object from a model response, tolerating
@@ -1984,9 +2030,10 @@ async fn run_staged_capture(
     ))
 }
 
-/// Apply a single RECONCILE op via the existing wiki primitives, mirroring the tool bodies:
-/// verify evidence → cite → mint marker → apply primitive → append_citation_log. Returns
-/// true if a mutation was applied.
+/// Apply a single RECONCILE op via the existing wiki primitives:
+/// verify evidence, derive a deterministic citation marker, apply the primitive,
+/// then persist the citation receipt only after a successful guide mutation.
+/// Returns true if a mutation was applied.
 fn apply_reconcile_op(
     ctx: &Arc<WikiAgentCtx>,
     slug: &str,
@@ -2076,14 +2123,14 @@ fn apply_reconcile_op(
                     format!("Added to '{}' / '{}'.", safe_slug, section_c),
                 ))
             });
-            if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
-                eprintln!("capture: citation log write failed: {}", e);
-            }
             eprintln!("capture: op {} → {}", op.op, result);
             // Emit wiki.create only when a guide was genuinely created (existing was None).
             // A reconcile that labels many statements of one brand-new guide as "create"
             // otherwise produces N "New guide" feed lines; the rest are add_statement claims.
             if !result.starts_with("Error:") {
+                if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                    eprintln!("capture: citation log write failed: {}", e);
+                }
                 let ev_name = if created_flag.get() {
                     "wiki.create"
                 } else {
@@ -2177,31 +2224,24 @@ fn apply_reconcile_op(
                     }
                 }
             });
-            if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
-                eprintln!("capture: citation log write failed: {}", e);
-            }
             eprintln!("capture: op revise → {}", result);
-            crate::events::log_event(
-                "wiki.revise_statement",
-                None,
-                serde_json::json!({
-                    "slug": &lock_slug,
-                    "section": &section,
-                    "text": crate::events::truncate(&op.text, 300)
-                }),
-            );
+            if !result.starts_with("Error:") {
+                if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                    eprintln!("capture: citation log write failed: {}", e);
+                }
+                crate::events::log_event(
+                    "wiki.revise_statement",
+                    None,
+                    serde_json::json!({
+                        "slug": &lock_slug,
+                        "section": &section,
+                        "text": crate::events::truncate(&op.text, 300)
+                    }),
+                );
+            }
             true
         }
         "remove" => {
-            let (marker, sliced) = if op.evidence.is_empty() {
-                (String::new(), String::new())
-            } else {
-                ctx.cite(&op.evidence)
-            };
-            let id = marker
-                .trim_start_matches("[^")
-                .trim_end_matches(']')
-                .to_string();
             let section_c = section.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
@@ -2220,11 +2260,6 @@ fn apply_reconcile_op(
                     None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
                 }
             });
-            if !id.is_empty() {
-                if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
-                    eprintln!("capture: citation log write failed: {}", e);
-                }
-            }
             eprintln!("capture: op remove → {}", result);
             true
         }
@@ -3661,6 +3696,52 @@ mod tests {
 
     // Serialize PC_CLAIM_STATUS env mutations (process-global) for Phase 4 tests.
     static CLAIM_STATUS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn citation_ids_use_session_prefix_and_five_hash_chars() {
+        let ranges = vec![EvidenceRange { start: 2, end: 4 }];
+        let id = citation_id("abcde12345-session", &ranges, "User: keep this fact");
+        assert!(id.starts_with("abcde-"), "id should keep a short session prefix: {id}");
+        let hash = id.split_once('-').unwrap().1;
+        assert_eq!(hash.len(), 5, "citation hash suffix must stay LLM-token cheap");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            id,
+            citation_id("abcde12345-session", &ranges, "User: keep this fact"),
+            "same evidence should produce the same citation id"
+        );
+        assert_ne!(
+            id,
+            citation_id("abcde12345-session", &ranges, "User: changed fact"),
+            "different evidence should produce a different short hash"
+        );
+    }
+
+    #[test]
+    fn append_citation_log_writes_sharded_record_and_legacy_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let session = "abcde12345-session";
+        let text = "User: citations should be sharded";
+        let id = citation_id(session, &[EvidenceRange { start: 1, end: 1 }], text);
+
+        append_citation_log(wiki, &id, session, text).unwrap();
+
+        let rec_path = citation_record_path(wiki, session, &id);
+        assert!(rec_path.exists(), "missing sharded citation record");
+        let rec: CitationRecord =
+            serde_json::from_str(&std::fs::read_to_string(&rec_path).unwrap()).unwrap();
+        assert_eq!(rec.id, id);
+        assert_eq!(rec.session, session);
+        assert_eq!(rec.text, text);
+
+        let legacy = std::fs::read_to_string(wiki.join("_citations.log")).unwrap();
+        assert!(legacy.contains(&id));
+        assert!(legacy.contains("session:abcde12345-session"));
+
+        assert!(wiki.join("AGENTS.md").exists());
+        assert!(wiki.join("_citations/AGENTS.md").exists());
+    }
 
     /// The C1 variant rewrites EXTRACT_PREAMBLE by anchored string surgery (extract_preamble_variant).
     /// Those anchors MUST each occur exactly once inside the base preamble, or replacen would target

@@ -259,10 +259,134 @@ pub fn guide_path(wiki_dir: &Path, slug: &str) -> PathBuf {
     guides_dir(wiki_dir).join(format!("{}.md", slug))
 }
 
+// ─── Agent guidance files ────────────────────────────────────────────────────
+
+const ROOT_AGENTS: &str = r#"# Agent Notes
+
+This directory is proactive-context generated project memory. It is useful repo
+state, not scratch output.
+
+- Be proactive about committing generated `docs/wiki` changes with the code or
+  docs change they explain. If wiki changes accumulated during your work, include
+  them intentionally or call them out before handing off.
+- Do not hand-edit `_index.md` or `_citations.log`; they are derived caches.
+- `_citations/` is the merge-friendly citation source of truth. Treat existing
+  citation records as immutable evidence receipts.
+- Preserve inline `[^id]` markers in guides. They are the link from prose back to
+  transcript evidence.
+"#;
+
+const GUIDES_AGENTS: &str = r#"# Agent Notes
+
+Guides are the current projected project spec. Edit them only when you are
+intentionally correcting project memory.
+
+- Preserve frontmatter and inline `[^id]` citation markers.
+- Prefer using `pc` capture, doctor, or rebuild flows for generated changes.
+- Do not move guide files back to the wiki root; canonical guides live here.
+"#;
+
+const RESEARCH_AGENTS: &str = r#"# Agent Notes
+
+Research records are immutable investigation artifacts.
+
+- Do not rewrite existing `type: research-record` files to make a newer result fit.
+- Add a new dated record for a new investigation or rerun.
+- `seeds.jsonl` is append-only probe signal. Do not sort, compact, or hand-edit it.
+"#;
+
+const EPISODES_AGENTS: &str = r#"# Agent Notes
+
+Episode cards are historical product-movement records.
+
+- Treat existing cards as immutable history. Do not rewrite them into current spec.
+- Current behavior belongs in guides or committed product docs, with episode cards
+  used as provenance and trajectory.
+- Transcript JSON under `transcripts/` belongs to the card with the same stem.
+"#;
+
+const TRANSCRIPTS_AGENTS: &str = r#"# Agent Notes
+
+These JSON files are generated conversation projections for episode cards.
+
+- Do not hand-edit transcript JSON to improve wording or remove awkward turns.
+- If a card is wrong, create a new card or repair through code, not by rewriting
+  transcript evidence.
+"#;
+
+const RAW_TRANSCRIPTS_AGENTS: &str = r#"# Agent Notes
+
+These raw transcript JSON files preserve less-cleaned conversation evidence.
+
+- Do not edit, summarize, normalize, or redact these files by hand.
+- If a raw transcript is malformed, fix the generator and regenerate or repair in
+  a clearly scoped migration.
+"#;
+
+const NOUNS_AGENTS: &str = r#"# Agent Notes
+
+Noun entries and `realness.jsonl` are generated entity-memory artifacts.
+
+- Do not hand-edit `realness.jsonl`; it is a registry folded from capture-time
+  user stance.
+- Existing extracted noun entries are transcript-cited and should be treated as
+  immutable unless a migration is explicitly correcting format.
+- Derived noun entries may refresh from guides, but the refresh should come from
+  code or `pc`, not casual manual edits.
+"#;
+
+const CITATIONS_AGENTS: &str = r#"# Agent Notes
+
+This directory is the citation source of truth.
+
+- Each JSON file is one immutable evidence receipt for an inline `[^id]` marker.
+- Do not edit existing records. Add a new record for new evidence.
+- Keep both records when branches add different citation files.
+- `_citations.log` at the wiki root is only a local derived cache and should not
+  be committed.
+"#;
+
+fn write_if_changed(path: &Path, content: &str) -> Result<()> {
+    if fs::read_to_string(path).ok().as_deref() == Some(content) {
+        return Ok(());
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+/// Write AGENTS.md files that tell future coding agents how to treat generated
+/// wiki artifacts. Idempotent: unchanged files are left alone.
+pub fn ensure_agents_files(wiki_dir: &Path) -> Result<()> {
+    let entries = [
+        ("", ROOT_AGENTS),
+        ("guides", GUIDES_AGENTS),
+        ("research", RESEARCH_AGENTS),
+        ("episodes", EPISODES_AGENTS),
+        ("episodes/transcripts", TRANSCRIPTS_AGENTS),
+        ("episodes/transcripts/raw", RAW_TRANSCRIPTS_AGENTS),
+        ("nouns", NOUNS_AGENTS),
+        ("_citations", CITATIONS_AGENTS),
+    ];
+    for (rel, body) in entries {
+        let dir = if rel.is_empty() {
+            wiki_dir.to_path_buf()
+        } else {
+            wiki_dir.join(rel)
+        };
+        fs::create_dir_all(&dir)?;
+        write_if_changed(&dir.join("AGENTS.md"), body)?;
+    }
+    Ok(())
+}
+
+fn is_reserved_markdown(stem: &str) -> bool {
+    stem.starts_with('_') || stem == "AGENTS"
+}
+
 /// All guide files for a wiki, sorted by slug. Reads the canonical `guides/`
 /// subdir AND the legacy flat root (so a not-yet-migrated wiki still resolves);
-/// when a slug exists in both, the `guides/` copy wins. `_`-prefixed files
-/// (`_index`, `_citations`) are skipped.
+/// when a slug exists in both, the `guides/` copy wins. Reserved files like
+/// `_index`, `_citations`, and `AGENTS.md` are skipped.
 pub fn guide_files(wiki_dir: &Path) -> Vec<PathBuf> {
     let mut by_slug: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
     // Legacy root first, then canonical guides/ overrides on slug collision.
@@ -274,7 +398,7 @@ pub fn guide_files(wiki_dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.is_empty() || stem.starts_with('_') {
+            if stem.is_empty() || is_reserved_markdown(stem) {
                 continue;
             }
             by_slug.insert(stem.to_string(), p);
@@ -297,8 +421,8 @@ pub fn migrate_guides_to_subdir(wiki_dir: &Path) -> usize {
         }
         let Some(name) = path.file_name() else { continue };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem.starts_with('_') {
-            continue; // _index, _citations
+        if is_reserved_markdown(stem) {
+            continue; // _index, _citations, AGENTS
         }
         let dest = gdir.join(name);
         if dest.exists() {
@@ -670,6 +794,7 @@ fn write_index_file_with_research(
     episodes: &[crate::episode_capture::EpisodeRow],
 ) -> Result<()> {
     fs::create_dir_all(wiki_dir)?;
+    ensure_agents_files(wiki_dir)?;
     let path = wiki_dir.join("_index.md");
 
     let mut out = String::new();
@@ -1655,6 +1780,24 @@ More info.
         fs::write(wiki.join("_citations.log"), "x").unwrap();
         assert_eq!(migrate_guides_to_subdir(wiki), 0, "second run is a no-op and skips _-files");
         assert!(wiki.join("_citations.log").exists());
+    }
+
+    #[test]
+    fn agents_files_are_not_treated_as_guides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+
+        ensure_agents_files(wiki).unwrap();
+
+        assert!(wiki.join("AGENTS.md").exists());
+        assert!(wiki.join("guides/AGENTS.md").exists());
+        assert_eq!(guide_files(wiki).len(), 0, "AGENTS.md must not be a guide");
+        assert_eq!(
+            migrate_guides_to_subdir(wiki),
+            0,
+            "AGENTS.md must not be migrated as a legacy flat guide"
+        );
+        assert!(wiki.join("AGENTS.md").exists(), "root guidance must stay at root");
     }
 
     #[test]

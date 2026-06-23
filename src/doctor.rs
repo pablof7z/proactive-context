@@ -634,7 +634,11 @@ pub fn run_doctor(root: &Path, args: DoctorArgs) -> Result<()> {
         }
     }
 
-    // Copy the citations ledger through unchanged.
+    // Copy citation receipts through unchanged.
+    let cit_dir_src = live_wiki.join("_citations");
+    if cit_dir_src.exists() {
+        let _ = copy_dir_all(&cit_dir_src, &out_dir.join("_citations"));
+    }
     let cit_src = live_wiki.join("_citations.log");
     if cit_src.exists() {
         let _ = std::fs::copy(&cit_src, out_dir.join("_citations.log"));
@@ -654,6 +658,22 @@ pub fn run_doctor(root: &Path, args: DoctorArgs) -> Result<()> {
             "\nNOTE: --apply requested; the consolidated wiki was written directly to {}.",
             live_wiki.display()
         );
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
     }
     Ok(())
 }
