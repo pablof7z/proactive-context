@@ -210,17 +210,19 @@ pub fn run_episode_stage(
         let card_stem = format!("{}-{}", date, slug);
         let filename = format!("{}.md", card_stem);
         let card_path = episodes_dir.join(&filename);
+        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
+        // raw at transcripts/raw/<stem>.json. write_transcript_json is idempotent — it
+        // skips the write if the file already exists — so calling it here is always safe
+        // and backfills missing transcripts for cards created before this feature existed.
+        let conversation_ref =
+            write_transcript_json(&episodes_dir, "", &card_stem, &clean_dialogue_turns);
+        let raw_conversation_ref =
+            write_transcript_json(&episodes_dir, "raw", &card_stem, &raw_dialogue);
         // Immutability: never overwrite an existing card.
         if card_path.exists() {
             persisted.push(card_path);
             continue;
         }
-        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
-        // raw at transcripts/raw/<stem>.json. The card links to both.
-        let conversation_ref =
-            write_transcript_json(&episodes_dir, "", &card_stem, &clean_dialogue_turns);
-        let raw_conversation_ref =
-            write_transcript_json(&episodes_dir, "raw", &card_stem, &raw_dialogue);
         let content = render_episode_card_dated(
             session_id,
             transcript_path,
@@ -1727,6 +1729,99 @@ pub fn backfill_link_episodes(wiki_dir: &Path) -> Result<usize> {
         }
     }
     Ok(links_written)
+}
+
+/// Backfill transcript JSON files for episode cards that have none.
+///
+/// For every `episodes/*.md` card that lacks a corresponding
+/// `episodes/transcripts/<stem>.json`, reads the JSONL transcript path from
+/// the card's frontmatter and writes the transcript file (raw + cleaned, same
+/// as the live capture path). No LLM calls — dialogue reconstruction is pure
+/// text parsing. Idempotent: already-present transcript files are never
+/// overwritten. Returns the count of transcripts written.
+pub fn backfill_episode_transcripts(wiki_dir: &Path) -> Result<usize> {
+    let cfg = load_config()?;
+    let episodes_dir = wiki_dir.join("episodes");
+    if !episodes_dir.exists() {
+        return Ok(0);
+    }
+
+    let spec: ModelSpec = ModelSpec::parse(&cfg.capture_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    let ollama_base = cfg.ollama_base_url.as_str();
+    let ollama_key = cfg.ollama_api_key.as_deref();
+
+    let entries = fs::read_dir(&episodes_dir)?;
+    let mut written = 0usize;
+    let mut missing = 0usize;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        // Check if the transcript already exists.
+        let transcript_path = episodes_dir.join("transcripts").join(format!("{}.json", stem));
+        if transcript_path.exists() {
+            continue;
+        }
+        missing += 1;
+
+        // Parse the card frontmatter to get the source JSONL path.
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[backfill-transcripts] cannot read {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        let fm = match parse_episode_card_frontmatter(&content) {
+            Some(f) => f,
+            None => {
+                eprintln!("[backfill-transcripts] no frontmatter in {}", path.display());
+                continue;
+            }
+        };
+        if fm.transcript.is_empty() {
+            eprintln!("[backfill-transcripts] no transcript path in {}", path.display());
+            continue;
+        }
+
+        let raw_dialogue = build_dialogue(&fm.transcript);
+        if raw_dialogue.is_empty() {
+            eprintln!(
+                "[backfill-transcripts] {} — empty dialogue from {} (file missing?)",
+                stem, fm.transcript
+            );
+            continue;
+        }
+        let clean_dialogue_turns = if cfg.clean_episode_dialogue {
+            clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &raw_dialogue)
+        } else {
+            raw_dialogue.clone()
+        };
+
+        let wrote_clean = write_transcript_json(&episodes_dir, "", &stem, &clean_dialogue_turns).is_some();
+        let wrote_raw = write_transcript_json(&episodes_dir, "raw", &stem, &raw_dialogue).is_some();
+        if wrote_clean || wrote_raw {
+            written += 1;
+        }
+    }
+
+    println!(
+        "backfill-transcripts: {} missing / {} written",
+        missing, written
+    );
+    Ok(written)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
