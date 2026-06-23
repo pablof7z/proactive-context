@@ -8,7 +8,11 @@
 ///     sends parsed Records over an mpsc channel.
 ///   - Main thread: ratatui event loop.  crossterm::event::poll(~100ms) for keys + try_recv
 ///     drains new records each tick.
-///   - Ring buffer: last ~10,000 records; FOLLOWING/PAUSED indicator in status bar.
+///   - Ring buffer: last ~10,000 raw records (truth); a derived Vec<HookRun> is the
+///     render layer — one row per hook invocation (grouped by `req`).
+///
+/// The hook-run view answers, at a glance: what prompt triggered this run, did we
+/// inject (and why / why not), and did we capture anything afterward.
 ///
 /// Safety: a TerminalGuard Drop impl + panic hook restore the terminal on every exit path
 /// including panic and Ctrl-C.
@@ -35,13 +39,153 @@ use ratatui::{
 
 use crate::tail::{
     color_for_project, event_verbosity_tier, format_ts_short, glyph_for, inode_of,
-    render_body, row_segments, short_req_id, should_show, trunc, verbosity_passes,
-    EventLine, Record, SegRole, Verbosity,
+    render_body, should_show, trunc, verbosity_passes,
+    EventLine, Record, Verbosity,
 };
 
 // ─── Ring buffer capacity ─────────────────────────────────────────────────────
 
 const RING_CAP: usize = 10_000;
+
+// ─── Hook-run data model ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Inject,
+    Capture,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum InjectOutcome {
+    InFlight,
+    Compiled,
+    Fallback(String),
+    SkippedTrivial,
+    SkippedNoGuides,
+    SkippedNothingRelevant,
+    Skipped(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CaptureOutcome {
+    #[allow(dead_code)]
+    Pending, // inject compiled, no capture seen yet
+    InFlight,
+    Captured(u32),
+    NoLessons, // capture ran, lesson_count=0 or triage skip
+    #[allow(dead_code)]
+    NotLinked, // inject was skipped/error, no capture expected
+    #[allow(dead_code)]
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    InjectInFlight,
+    CaptureInFlight,
+    Done,
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LlmCallInfo {
+    model: String,
+    lat_ms: Option<u64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cost: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct HitRef {
+    path: String,
+    score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct LessonRef {
+    category: String,
+    slug: String,
+}
+
+#[derive(Debug, Clone)]
+struct InjectArc {
+    guides_found: u32,
+    top_hits: Vec<HitRef>, // cap at 8
+    t1: Option<LlmCallInfo>,
+    t2: Option<LlmCallInfo>,
+    #[allow(dead_code)]
+    briefing_chars: Option<u32>,
+    briefing_summary: Option<String>,
+    outcome: InjectOutcome,
+    out_chars: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureArc {
+    exchanges: Option<u32>,
+    lessons: Vec<LessonRef>,
+    outcome: CaptureOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct HookRun {
+    req: String,
+    session_id: String,
+    project: String,
+    ts_first: String,
+    kind: RunKind,
+    prompt_preview: Option<String>,
+    prompt_chars: Option<u64>,
+    inject: Option<InjectArc>,
+    capture: Option<CaptureArc>,
+    #[allow(dead_code)]
+    linked_capture_req: Option<String>,
+    merged_into: Option<String>, // set on capture runs absorbed into an inject row
+    total_lat_ms: Option<u64>,
+    #[allow(dead_code)]
+    raw_event_idxs: Vec<usize>,
+}
+
+impl HookRun {
+    fn run_state(&self) -> RunState {
+        // error takes precedence
+        if let Some(InjectArc { outcome: InjectOutcome::Error(_), .. }) = &self.inject {
+            return RunState::Error;
+        }
+        if let Some(CaptureArc { outcome: CaptureOutcome::Error(_), .. }) = &self.capture {
+            return RunState::Error;
+        }
+        if let Some(InjectArc { outcome: InjectOutcome::InFlight, .. }) = &self.inject {
+            return RunState::InjectInFlight;
+        }
+        if let Some(CaptureArc { outcome: CaptureOutcome::InFlight, .. }) = &self.capture {
+            return RunState::CaptureInFlight;
+        }
+        match self.kind {
+            RunKind::Inject => match self.inject.as_ref().map(|a| &a.outcome) {
+                Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => RunState::Done,
+                Some(InjectOutcome::SkippedTrivial)
+                | Some(InjectOutcome::SkippedNoGuides)
+                | Some(InjectOutcome::SkippedNothingRelevant)
+                | Some(InjectOutcome::Skipped(_)) => RunState::Skipped,
+                _ => RunState::InjectInFlight,
+            },
+            RunKind::Capture => match self.capture.as_ref().map(|a| &a.outcome) {
+                Some(CaptureOutcome::Captured(_)) => RunState::Done,
+                Some(CaptureOutcome::NoLessons) => RunState::Skipped,
+                _ => RunState::CaptureInFlight,
+            },
+        }
+    }
+}
+
+/// Char-safe truncation: returns at most `max` chars.
+fn char_take(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
 
 // ─── Application state ────────────────────────────────────────────────────────
 
@@ -49,6 +193,13 @@ const RING_CAP: usize = 10_000;
 enum FollowState {
     Following,
     Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindFilter {
+    All,
+    InjectOnly,
+    CaptureOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,17 +220,27 @@ struct AppState {
     records: VecDeque<Record>,
     /// How many records were dropped when the ring was full
     dropped: usize,
+    /// Derived render layer: one row per hook run.
+    runs: Vec<HookRun>,
+    /// req → index in `runs`
+    run_index: HashMap<String, usize>,
+    /// session_id → run idx of nearest unlinked inject (awaiting a capture)
+    session_last_inject: HashMap<String, usize>,
     follow: FollowState,
-    /// Selected row index (into `records`)
+    /// Selected run index (into `runs`)
     selected: Option<usize>,
-    /// Modal: which record index is open
+    /// Modal: which run index is open (references `runs` directly)
     modal: Option<usize>,
+    /// Modal: show raw event stream for the run instead of the narrative view
+    raw_modal: bool,
     /// Modal: vertical scroll offset for the detail pane
     modal_scroll: u16,
-    /// Modal: selected sibling index within the modal trace view
+    /// Modal: selected sibling index within the raw event view
     modal_sibling_sel: usize,
     /// Filter summary string (for status bar)
     filter_summary: String,
+    kind_filter: KindFilter,
+    spinner_phase: u8,
     verbosity: Verbosity,
     ascii: bool,
     interactive_project: String,
@@ -92,12 +253,18 @@ impl AppState {
         AppState {
             records: VecDeque::new(),
             dropped: 0,
+            runs: Vec::new(),
+            run_index: HashMap::new(),
+            session_last_inject: HashMap::new(),
             follow: FollowState::Following,
             selected: None,
             modal: None,
+            raw_modal: false,
             modal_scroll: 0,
             modal_sibling_sel: 0,
             filter_summary,
+            kind_filter: KindFilter::All,
+            spinner_phase: 0,
             verbosity,
             ascii,
             interactive_project: String::new(),
@@ -107,26 +274,394 @@ impl AppState {
     }
 
     fn push_record(&mut self, r: Record) {
-        let passes_view = self.record_passes_view(&r);
         if self.records.len() >= RING_CAP {
             self.records.pop_front();
             self.dropped += 1;
-            if let Some(sel) = self.selected {
-                self.selected = if sel == 0 { None } else { Some(sel - 1) };
-            }
-            if let Some(m) = self.modal {
-                self.modal = if m == 0 { None } else { Some(m - 1) };
-            }
         }
         self.records.push_back(r);
-        if self.follow == FollowState::Following && passes_view {
-            self.selected = Some(self.records.len().saturating_sub(1));
+        let idx = self.records.len() - 1;
+        // fold into the run model (clone to avoid aliasing self.records with &mut self)
+        let rec = self.records[idx].clone();
+        self.fold_into_run(&rec, idx);
+
+        if self.follow == FollowState::Following {
+            let vis = self.visible_run_indices();
+            self.selected = vis.last().copied();
         }
     }
 
+    /// The reducer: folds a single raw record into the derived run model.
+    fn fold_into_run(&mut self, rec: &Record, record_idx: usize) {
+        let ev = &rec.ev;
+        let req = &ev.req;
+
+        // Events with no meaningful req (daemon.index, etc.) — skip.
+        if req.is_empty() || req == "-" {
+            return;
+        }
+
+        let is_inject_event = matches!(
+            ev.event.as_str(),
+            "inject.start"
+                | "inject.done"
+                | "query.start"
+                | "wiki.index_read"
+                | "retrieve.subquery"
+                | "retrieve.hit"
+                | "select.shortcircuit"
+                | "generate.briefing"
+                | "inject.resolve"
+                | "inject.noun_primer"
+                | "guide.read"
+                | "llm.request"
+                | "llm.response"
+                | "llm.error"
+                | "error"
+        );
+        let is_capture_event = matches!(
+            ev.event.as_str(),
+            "capture.start" | "capture.lesson" | "capture.done"
+        );
+
+        if !is_inject_event && !is_capture_event {
+            return;
+        }
+
+        // Look up or create the run for this req.
+        let idx = if let Some(&i) = self.run_index.get(req.as_str()) {
+            self.runs[i].raw_event_idxs.push(record_idx);
+            i
+        } else {
+            let kind = if is_capture_event {
+                RunKind::Capture
+            } else {
+                RunKind::Inject
+            };
+            let run = HookRun {
+                req: req.clone(),
+                session_id: ev.session_id.clone(),
+                project: ev.project.clone(),
+                ts_first: ev.ts.clone(),
+                kind,
+                prompt_preview: None,
+                prompt_chars: None,
+                inject: if kind == RunKind::Inject {
+                    Some(InjectArc {
+                        guides_found: 0,
+                        top_hits: vec![],
+                        t1: None,
+                        t2: None,
+                        briefing_chars: None,
+                        briefing_summary: None,
+                        outcome: InjectOutcome::InFlight,
+                        out_chars: None,
+                    })
+                } else {
+                    None
+                },
+                capture: if kind == RunKind::Capture {
+                    Some(CaptureArc {
+                        exchanges: None,
+                        lessons: vec![],
+                        outcome: CaptureOutcome::InFlight,
+                    })
+                } else {
+                    None
+                },
+                linked_capture_req: None,
+                merged_into: None,
+                total_lat_ms: None,
+                raw_event_idxs: vec![record_idx],
+            };
+            let i = self.runs.len();
+            self.run_index.insert(req.clone(), i);
+            self.runs.push(run);
+            i
+        };
+
+        match ev.event.as_str() {
+            "inject.start" => {
+                let run = &mut self.runs[idx];
+                if let Some(preview) = ev.payload.get("prompt_preview").and_then(|v| v.as_str()) {
+                    run.prompt_preview = Some(preview.to_string());
+                }
+                if let Some(n) = ev.payload.get("prompt_chars").and_then(|v| v.as_u64()) {
+                    run.prompt_chars = Some(n);
+                }
+            }
+            "retrieve.hit" => {
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    arc.guides_found += 1;
+                    if arc.top_hits.len() < 8 {
+                        let path = ev
+                            .payload
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let score = ev.payload.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        arc.top_hits.push(HitRef { path, score });
+                    }
+                }
+            }
+            "llm.request" => {
+                let turn = ev.payload.get("turn").and_then(|v| v.as_u64()).unwrap_or(1);
+                let model = ev
+                    .payload
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    let info = LlmCallInfo { model, ..Default::default() };
+                    if turn == 1 {
+                        arc.t1 = Some(info);
+                    } else {
+                        arc.t2 = Some(info);
+                    }
+                }
+            }
+            "llm.response" => {
+                let turn = ev.payload.get("turn").and_then(|v| v.as_u64()).unwrap_or(1);
+                let lat = ev.lat_ms;
+                let pt = ev.payload.get("prompt_tokens").and_then(|v| v.as_u64());
+                let ct = ev.payload.get("completion_tokens").and_then(|v| v.as_u64());
+                let cost = ev.payload.get("cost").and_then(|v| v.as_f64());
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    let slot = if turn == 1 { &mut arc.t1 } else { &mut arc.t2 };
+                    if let Some(info) = slot {
+                        info.lat_ms = lat;
+                        info.prompt_tokens = pt;
+                        info.completion_tokens = ct;
+                        info.cost = cost;
+                    }
+                }
+            }
+            "select.shortcircuit" => {
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    let reason = ev.payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                    arc.outcome = match reason {
+                        "trivial_prompt" => InjectOutcome::SkippedTrivial,
+                        "no_relevant_guides" => InjectOutcome::SkippedNoGuides,
+                        "nothing_relevant" => InjectOutcome::SkippedNothingRelevant,
+                        other => InjectOutcome::Skipped(other.to_string()),
+                    };
+                }
+            }
+            "generate.briefing" => {
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    arc.briefing_chars = ev
+                        .payload
+                        .get("briefing_chars")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32);
+                    arc.briefing_summary = ev
+                        .payload
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            "inject.done" => {
+                let out_chars = ev
+                    .payload
+                    .get("out_chars")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let outcome_str = ev
+                    .payload
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = ev
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let preview = ev
+                    .payload
+                    .get("prompt_preview")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let lat = ev.lat_ms;
+
+                let should_track = {
+                    let run = &mut self.runs[idx];
+                    if run.prompt_preview.is_none() {
+                        if let Some(p) = preview {
+                            run.prompt_preview = Some(p);
+                        }
+                    }
+                    run.total_lat_ms = lat;
+                    if let Some(arc) = &mut run.inject {
+                        arc.out_chars = out_chars;
+                        arc.outcome = match outcome_str.as_str() {
+                            "compiled" => InjectOutcome::Compiled,
+                            "fallback" => InjectOutcome::Fallback(reason.clone()),
+                            "skipped" | "none" | "empty" => match &arc.outcome {
+                                InjectOutcome::InFlight => InjectOutcome::Skipped(reason.clone()),
+                                other => other.clone(),
+                            },
+                            _ => match &arc.outcome {
+                                InjectOutcome::SkippedTrivial
+                                | InjectOutcome::SkippedNoGuides
+                                | InjectOutcome::SkippedNothingRelevant
+                                | InjectOutcome::Skipped(_) => arc.outcome.clone(),
+                                _ => InjectOutcome::Skipped(reason.clone()),
+                            },
+                        };
+                        matches!(
+                            arc.outcome,
+                            InjectOutcome::Compiled | InjectOutcome::Fallback(_)
+                        )
+                    } else {
+                        false
+                    }
+                };
+                // A compiled/fallback inject may be followed by a capture — register it
+                // for capture-run linkage within the same session.
+                if should_track {
+                    let sid = self.runs[idx].session_id.clone();
+                    self.session_last_inject.insert(sid, idx);
+                }
+            }
+            "llm.error" | "error" => {
+                let msg = ev
+                    .payload
+                    .get("message")
+                    .or_else(|| ev.payload.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.inject {
+                    if arc.outcome == InjectOutcome::InFlight {
+                        arc.outcome = InjectOutcome::Error(msg);
+                    }
+                }
+            }
+            "capture.start" => {
+                {
+                    let run = &mut self.runs[idx];
+                    if let Some(arc) = &mut run.capture {
+                        arc.exchanges = ev
+                            .payload
+                            .get("exchanges")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32);
+                    }
+                }
+                // Link to the nearest unclaimed inject in the same session.
+                let sid = self.runs[idx].session_id.clone();
+                if let Some(&inject_idx) = self.session_last_inject.get(&sid) {
+                    let inject_req = self.runs[inject_idx].req.clone();
+                    let cap_req = self.runs[idx].req.clone();
+                    self.runs[idx].merged_into = Some(inject_req);
+                    self.runs[inject_idx].linked_capture_req = Some(cap_req);
+                    self.session_last_inject.remove(&sid);
+                }
+            }
+            "capture.lesson" => {
+                let run = &mut self.runs[idx];
+                if let Some(arc) = &mut run.capture {
+                    let category = ev
+                        .payload
+                        .get("category")
+                        .or_else(|| ev.payload.get("kind"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let slug = ev
+                        .payload
+                        .get("slug")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !slug.is_empty() {
+                        arc.lessons.push(LessonRef { category, slug });
+                    }
+                }
+            }
+            "capture.done" => {
+                {
+                    let run = &mut self.runs[idx];
+                    run.total_lat_ms = ev.lat_ms;
+                    if let Some(arc) = &mut run.capture {
+                        let n = ev
+                            .payload
+                            .get("lesson_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(arc.lessons.len() as u64);
+                        arc.outcome = if n > 0 {
+                            CaptureOutcome::Captured(n as u32)
+                        } else {
+                            CaptureOutcome::NoLessons
+                        };
+                    }
+                }
+                // Propagate the capture arc to the linked inject row.
+                let merged = self.runs[idx].merged_into.clone();
+                if let Some(merged_req) = merged {
+                    if let Some(&inject_idx) = self.run_index.get(merged_req.as_str()) {
+                        let cap = self.runs[idx].capture.clone();
+                        self.runs[inject_idx].capture = cap;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visible_run_indices(&self) -> Vec<usize> {
+        self.runs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                // Skip capture runs that are merged into an inject row.
+                if r.merged_into.is_some() {
+                    return false;
+                }
+                match self.kind_filter {
+                    KindFilter::InjectOnly => r.kind == RunKind::Inject,
+                    KindFilter::CaptureOnly => r.kind == RunKind::Capture,
+                    KindFilter::All => true,
+                }
+            })
+            .filter(|(_, r)| {
+                if !self.interactive_project.is_empty() {
+                    let p = self.interactive_project.to_lowercase();
+                    let proj = r.project.to_lowercase();
+                    let basename = proj.rsplit('_').next().unwrap_or(&proj);
+                    if !proj.contains(&p) && !basename.contains(&p) {
+                        return false;
+                    }
+                }
+                if !self.interactive_session.is_empty()
+                    && !r
+                        .session_id
+                        .to_lowercase()
+                        .contains(&self.interactive_session.to_lowercase())
+                {
+                    return false;
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn select_up(&mut self) {
-        let vis = self.visible_indices();
-        if vis.is_empty() { return; }
+        let vis = self.visible_run_indices();
+        if vis.is_empty() {
+            return;
+        }
         let new_sel = match self.selected {
             None => *vis.last().unwrap(),
             Some(cur) => {
@@ -139,8 +674,10 @@ impl AppState {
     }
 
     fn select_down(&mut self) {
-        let vis = self.visible_indices();
-        if vis.is_empty() { return; }
+        let vis = self.visible_run_indices();
+        if vis.is_empty() {
+            return;
+        }
         let new_sel = match self.selected {
             None => vis[0],
             Some(cur) => {
@@ -157,23 +694,53 @@ impl AppState {
     }
 
     fn jump_to_bottom(&mut self) {
-        let vis = self.visible_indices();
+        let vis = self.visible_run_indices();
         self.selected = vis.last().copied();
         self.follow = FollowState::Following;
     }
 
     fn jump_to_top(&mut self) {
-        let vis = self.visible_indices();
+        let vis = self.visible_run_indices();
         self.selected = vis.first().copied();
         self.follow = FollowState::Paused;
+    }
+
+    fn cycle_kind_filter(&mut self) {
+        self.kind_filter = match self.kind_filter {
+            KindFilter::All => KindFilter::InjectOnly,
+            KindFilter::InjectOnly => KindFilter::CaptureOnly,
+            KindFilter::CaptureOnly => KindFilter::All,
+        };
+        self.reconcile_selection();
+    }
+
+    /// After a filter change, keep `selected` pointing at a visible run.
+    fn reconcile_selection(&mut self) {
+        let vis = self.visible_run_indices();
+        if self.follow == FollowState::Following {
+            self.selected = vis.last().copied();
+        } else if let Some(sel) = self.selected {
+            if !vis.iter().any(|&i| i == sel) {
+                self.selected = vis.last().copied();
+            }
+        } else {
+            self.selected = vis.last().copied();
+        }
     }
 
     fn open_modal(&mut self) {
         if let Some(sel) = self.selected {
             self.modal = Some(sel);
+            self.raw_modal = false;
             self.modal_scroll = 0;
             self.modal_sibling_sel = 0;
         }
+    }
+
+    fn toggle_raw_modal(&mut self) {
+        self.raw_modal = !self.raw_modal;
+        self.modal_scroll = 0;
+        self.modal_sibling_sel = 0;
     }
 
     fn modal_scroll_up(&mut self, amount: u16) {
@@ -186,36 +753,8 @@ impl AppState {
 
     fn close_modal(&mut self) {
         self.modal = None;
+        self.raw_modal = false;
         self.modal_sibling_sel = 0;
-    }
-
-    fn record_passes_view(&self, rec: &Record) -> bool {
-        if !self.interactive_project.is_empty() {
-            let p = self.interactive_project.to_lowercase();
-            let proj = rec.ev.project.to_lowercase();
-            let basename = proj.rsplit('_').next().unwrap_or(&proj);
-            if !proj.contains(&p) && !basename.contains(&p) {
-                return false;
-            }
-        }
-        if !self.interactive_session.is_empty() {
-            if !rec.ev.session_id.to_lowercase().contains(&self.interactive_session.to_lowercase()) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn visible_indices(&self) -> Vec<usize> {
-        if self.interactive_project.is_empty() && self.interactive_session.is_empty() {
-            return (0..self.records.len()).collect();
-        }
-        self.records
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| self.record_passes_view(r))
-            .map(|(i, _)| i)
-            .collect()
     }
 
     fn open_project_picker(&mut self) {
@@ -237,7 +776,10 @@ impl AppState {
         let sel = if self.interactive_project.is_empty() {
             0
         } else {
-            full_ids.iter().position(|id| id == &self.interactive_project).unwrap_or(0)
+            full_ids
+                .iter()
+                .position(|id| id == &self.interactive_project)
+                .unwrap_or(0)
         };
 
         self.picker = Some(PickerState {
@@ -253,11 +795,14 @@ impl AppState {
         let mut session_data: HashMap<String, (usize, Vec<String>)> = HashMap::new();
         for rec in &self.records {
             let sid = rec.ev.session_id.clone();
-            if sid.is_empty() { continue; }
+            if sid.is_empty() {
+                continue;
+            }
             let entry = session_data.entry(sid).or_default();
             entry.0 += 1;
             if rec.ev.event == "inject.start" {
-                if let Some(preview) = rec.ev.payload.get("prompt_preview").and_then(|v| v.as_str()) {
+                if let Some(preview) = rec.ev.payload.get("prompt_preview").and_then(|v| v.as_str())
+                {
                     if !preview.is_empty() && entry.1.len() < 10 {
                         entry.1.push(preview.to_string());
                     }
@@ -275,7 +820,7 @@ impl AppState {
         let mut full_ids = vec![String::new()];
         let mut previews_list: Vec<Vec<String>> = vec![vec![]];
         for (sid, count, previews) in &sessions {
-            let short = if sid.len() > 12 { &sid[sid.len()-12..] } else { sid };
+            let short = if sid.len() > 12 { &sid[sid.len() - 12..] } else { sid };
             items.push(format!("{}… ({})", short, count));
             full_ids.push(sid.clone());
             previews_list.push(previews.clone());
@@ -284,7 +829,10 @@ impl AppState {
         let sel = if self.interactive_session.is_empty() {
             0
         } else {
-            full_ids.iter().position(|id| id == &self.interactive_session).unwrap_or(0)
+            full_ids
+                .iter()
+                .position(|id| id == &self.interactive_session)
+                .unwrap_or(0)
         };
 
         self.picker = Some(PickerState {
@@ -296,16 +844,13 @@ impl AppState {
         });
     }
 
-    /// Returns the siblings (all records sharing the same req as the modal event)
+    /// Raw events for the open modal's run: all records sharing the run's req.
     fn modal_siblings(&self) -> Vec<(usize, &Record)> {
         let modal_idx = match self.modal {
             Some(m) => m,
             None => return vec![],
         };
-        let modal_req = &self.records[modal_idx].ev.req;
-        if modal_req == "-" || modal_req.is_empty() {
-            return vec![(modal_idx, &self.records[modal_idx])];
-        }
+        let modal_req = &self.runs[modal_idx].req;
         self.records
             .iter()
             .enumerate()
@@ -504,53 +1049,170 @@ fn event_ratatui_style(event: &str) -> Style {
     }
 }
 
-// ─── List row rendering ────────────────────────────────────────────────────────
-//
-// Calls row_segments() from tail.rs — the SINGLE shared source for column ordering
-// and req/project/glyph/body text.  The TUI maps each SegRole to a ratatui Style;
-// no column skeleton is duplicated here.
+// ─── Hook-run summary row rendering ────────────────────────────────────────────
 
-fn record_to_list_item<'a>(rec: &'a Record, selected: bool, state: &AppState) -> ListItem<'a> {
-    let ev = &rec.ev;
-    let event_style = event_ratatui_style(&ev.event);
+fn run_to_list_item(
+    run: &HookRun,
+    selected: bool,
+    ascii: bool,
+    spinner_phase: u8,
+) -> ListItem<'static> {
+    let state = run.run_state();
+
+    // Glyph + color
+    let (glyph, glyph_color) = match state {
+        RunState::InjectInFlight | RunState::CaptureInFlight => {
+            let spinners = if ascii {
+                ["|", "/", "-", "\\"]
+            } else {
+                ["◐", "◓", "◑", "◒"]
+            };
+            (spinners[spinner_phase as usize % 4].to_string(), Color::Cyan)
+        }
+        RunState::Done => (if ascii { "+" } else { "✓" }.to_string(), Color::Green),
+        RunState::Skipped => (if ascii { "." } else { "·" }.to_string(), Color::DarkGray),
+        RunState::Error => (if ascii { "x" } else { "✗" }.to_string(), Color::Red),
+    };
+
+    // Time (HH:MM)
+    let time = if run.ts_first.len() >= 16 {
+        run.ts_first[11..16].to_string()
+    } else {
+        "??:??".to_string()
+    };
+
+    // Prompt preview
+    let prompt_col_width = 42usize;
+    let prompt_display = match &run.prompt_preview {
+        Some(p) => {
+            let p = p.trim();
+            if p.chars().count() > prompt_col_width - 3 {
+                format!("\"{}…\"", char_take(p, prompt_col_width - 3))
+            } else {
+                format!("\"{}\"", p)
+            }
+        }
+        None => "(no prompt)".to_string(),
+    };
+
+    let lat_suffix = |ms: Option<u64>| -> String {
+        ms.map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
+            .unwrap_or_default()
+    };
+
+    // Inject verdict
+    let inject_col = if run.kind == RunKind::Capture {
+        "—".to_string()
+    } else {
+        match run.inject.as_ref().map(|a| &a.outcome) {
+            Some(InjectOutcome::Compiled) => {
+                let chars = run.inject.as_ref().and_then(|a| a.out_chars).unwrap_or(0);
+                let found = run.inject.as_ref().map(|a| a.guides_found).unwrap_or(0);
+                format!(
+                    "{} ch · {} hit{}{}",
+                    chars,
+                    found,
+                    if found == 1 { "" } else { "s" },
+                    lat_suffix(run.total_lat_ms)
+                )
+            }
+            Some(InjectOutcome::Fallback(reason)) => format!(
+                "fallback·{}{}",
+                if reason.is_empty() { "timeout" } else { reason },
+                lat_suffix(run.total_lat_ms)
+            ),
+            Some(InjectOutcome::SkippedTrivial) => "trivial".to_string(),
+            Some(InjectOutcome::SkippedNoGuides) => {
+                format!("no guides{}", lat_suffix(run.total_lat_ms))
+            }
+            Some(InjectOutcome::SkippedNothingRelevant) => {
+                let found = run.inject.as_ref().map(|a| a.guides_found).unwrap_or(0);
+                format!("{}→0 relevant{}", found, lat_suffix(run.total_lat_ms))
+            }
+            Some(InjectOutcome::Skipped(r)) => format!("skipped·{}", r),
+            Some(InjectOutcome::Error(e)) => format!("error·{}", char_take(e, 20)),
+            Some(InjectOutcome::InFlight) => "in flight…".to_string(),
+            None => "—".to_string(),
+        }
+    };
+
+    // Capture verdict
+    let capture_col = match &run.capture {
+        None => match run.inject.as_ref().map(|a| &a.outcome) {
+            Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => {
+                "(pending)".to_string()
+            }
+            _ => "—".to_string(),
+        },
+        Some(arc) => match &arc.outcome {
+            CaptureOutcome::Captured(n) => {
+                let cats: Vec<&str> =
+                    arc.lessons.iter().map(|l| l.category.as_str()).take(2).collect();
+                if cats.is_empty() {
+                    format!("{} lesson{}", n, if *n == 1 { "" } else { "s" })
+                } else {
+                    format!(
+                        "{} lesson{} [{}]",
+                        n,
+                        if *n == 1 { "" } else { "s" },
+                        cats.join(",")
+                    )
+                }
+            }
+            CaptureOutcome::NoLessons => "0 lessons".to_string(),
+            CaptureOutcome::InFlight => "capturing…".to_string(),
+            CaptureOutcome::Pending => "(pending)".to_string(),
+            CaptureOutcome::NotLinked => "—".to_string(),
+            CaptureOutcome::Error(e) => format!("cap error·{}", char_take(e, 15)),
+        },
+    };
+
     let base_style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
     };
-
-    // Larger budget for error messages so they're readable in the list view
-    let body_budget = match ev.event.as_str() {
-        "error" | "llm.error" => 250,
-        _ => 60,
-    };
-    let segs = match row_segments(ev, state.verbosity, body_budget, state.ascii) {
-        Some(s) => s,
-        None => return ListItem::new(Line::default()),
+    let glyph_style = if selected {
+        base_style
+    } else {
+        Style::default().fg(glyph_color)
     };
 
-    let spans: Vec<Span<'static>> = segs
-        .into_iter()
-        .map(|seg| {
-            let text: String = seg.text;
-            match seg.role {
-                SegRole::Ts => Span::styled(
-                    text,
-                    base_style.add_modifier(Modifier::DIM),
-                ),
-                SegRole::Project { ansi_color_code } => {
-                    let proj_color = ansi_code_to_ratatui(ansi_color_code);
-                    Span::styled(text, base_style.fg(proj_color))
-                }
-                SegRole::EventGlyph => Span::styled(
-                    text,
-                    if selected { base_style } else { event_style },
-                ),
-                SegRole::Body => Span::styled(text, base_style),
-                SegRole::Sep => Span::raw(text),
+    let inject_style = if selected {
+        base_style
+    } else {
+        match run.inject.as_ref().map(|a| &a.outcome) {
+            Some(InjectOutcome::Compiled) => Style::default().fg(Color::Green),
+            Some(InjectOutcome::Fallback(_)) => Style::default().fg(Color::Yellow),
+            Some(InjectOutcome::SkippedNoGuides) | Some(InjectOutcome::SkippedNothingRelevant) => {
+                Style::default().fg(Color::Yellow)
             }
-        })
-        .collect();
+            Some(InjectOutcome::Error(_)) => {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+            _ => Style::default().fg(Color::DarkGray),
+        }
+    };
+
+    let capture_style = if selected {
+        base_style
+    } else {
+        match run.capture.as_ref().map(|a| &a.outcome) {
+            Some(CaptureOutcome::Captured(_)) => Style::default().fg(Color::Cyan),
+            Some(CaptureOutcome::Error(_)) => Style::default().fg(Color::Red),
+            _ => Style::default().fg(Color::DarkGray),
+        }
+    };
+
+    let spans = vec![
+        Span::styled(format!("{} ", time), base_style.add_modifier(Modifier::DIM)),
+        Span::styled(format!("{} ", glyph), glyph_style),
+        Span::styled(format!("{:<44}", prompt_display), base_style),
+        Span::styled("  ", base_style),
+        Span::styled(format!("{:<26}", inject_col), inject_style),
+        Span::styled("  ", base_style),
+        Span::styled(capture_col, capture_style),
+    ];
 
     ListItem::new(Line::from(spans))
 }
@@ -558,13 +1220,13 @@ fn record_to_list_item<'a>(rec: &'a Record, selected: bool, state: &AppState) ->
 // ─── Rendering functions ──────────────────────────────────────────────────────
 
 fn render_list(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
-    let vis = state.visible_indices();
+    let vis = state.visible_run_indices();
     let items: Vec<ListItem> = vis
         .iter()
-        .map(|&abs_idx| {
-            let rec = &state.records[abs_idx];
-            let selected = state.selected == Some(abs_idx);
-            record_to_list_item(rec, selected, state)
+        .map(|&run_idx| {
+            let run = &state.runs[run_idx];
+            let selected = state.selected == Some(run_idx);
+            run_to_list_item(run, selected, state.ascii, state.spinner_phase)
         })
         .collect();
 
@@ -596,13 +1258,18 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         ),
     };
 
-    let retained = state.records.len();
+    let run_count = state.visible_run_indices().len();
     let dropped = state.dropped;
-
     let stats = if dropped > 0 {
-        format!(" {} retained, {} dropped", retained, dropped)
+        format!(" {} runs, {} dropped", run_count, dropped)
     } else {
-        format!(" {} retained", retained)
+        format!(" {} runs", run_count)
+    };
+
+    let kind_label = match state.kind_filter {
+        KindFilter::All => "",
+        KindFilter::InjectOnly => " [inject]",
+        KindFilter::CaptureOnly => " [capture]",
     };
 
     let filter_text = {
@@ -611,28 +1278,39 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
             parts.push(state.filter_summary.clone());
         }
         if !state.interactive_project.is_empty() {
-            let short = state.interactive_project.rsplit('_').next()
+            let short = state
+                .interactive_project
+                .rsplit('_')
+                .next()
                 .unwrap_or(&state.interactive_project);
             parts.push(format!("project:{}", short));
         }
         if !state.interactive_session.is_empty() {
             let short = if state.interactive_session.len() > 12 {
-                &state.interactive_session[state.interactive_session.len()-12..]
+                &state.interactive_session[state.interactive_session.len() - 12..]
             } else {
                 &state.interactive_session
             };
             parts.push(format!("session:{}…", short));
         }
-        if parts.is_empty() { String::new() } else { format!(" | {}", parts.join(" ")) }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" | {}", parts.join(" "))
+        }
     };
 
-    let help = "  ↑/k↓/j  Enter:detail  G/f:follow  g:top  p:project  s:session  q:quit";
+    let help = "  ↑/k↓/j  Enter:detail  Tab:filter  G/f:follow  g:top  p:project  s:session  q:quit";
 
     let spans = vec![
         follow_indicator,
         Span::styled(stats, Style::default().fg(Color::DarkGray)),
+        Span::styled(kind_label.to_string(), Style::default().fg(Color::Magenta)),
         Span::styled(filter_text, Style::default().fg(Color::Cyan)),
-        Span::styled(help, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+        Span::styled(
+            help,
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ),
     ];
 
     let para = Paragraph::new(Line::from(spans));
@@ -640,36 +1318,262 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_modal(frame: &mut Frame, state: &AppState) {
-    let modal_idx = match state.modal {
+    if state.modal.is_none() {
+        return;
+    }
+    if state.raw_modal {
+        render_raw_modal(frame, state);
+    } else {
+        render_run_detail(frame, state);
+    }
+}
+
+/// The narrative detail view: what prompt, did we inject (why/why not), did we capture.
+fn render_run_detail(frame: &mut Frame, state: &AppState) {
+    let run_idx = match state.modal {
         Some(m) => m,
         None => return,
     };
-    let rec = &state.records[modal_idx];
-    let ev = &rec.ev;
+    let run = &state.runs[run_idx];
 
-    // Modal area: centered, 80% width, 80% height
     let area = frame.area();
     let modal_area = centered_rect(90, 85, area);
-
     frame.render_widget(Clear, modal_area);
 
+    let kind_label = match run.kind {
+        RunKind::Inject => "INJECT",
+        RunKind::Capture => "CAPTURE",
+    };
     let block = Block::default()
         .title(format!(
-            " Event Detail: {} | req {} ",
-            ev.event,
-            if ev.req.is_empty() || ev.req == "-" {
-                "—".to_string()
-            } else {
-                short_req_id(&ev.req)
-            }
+            " {} · {} · {} ",
+            kind_label,
+            run.ts_first.get(11..19).unwrap_or(""),
+            run.req.get(..12).unwrap_or(&run.req)
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
-    // Split inner: top = event details, bottom = request trace
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = vec![];
+
+    // ── PROMPT ──
+    lines.push(Line::from(Span::styled(
+        "PROMPT",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    )));
+    match &run.prompt_preview {
+        Some(p) => {
+            let chars = run
+                .prompt_chars
+                .map(|n| format!(" ({} chars)", n))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  \"{}\"", p), Style::default().fg(Color::Yellow)),
+                Span::styled(chars, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  (no prompt recorded)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    lines.push(Line::default());
+
+    // ── INJECT ──
+    if let Some(arc) = &run.inject {
+        let verdict_text = match &arc.outcome {
+            InjectOutcome::Compiled => format!(
+                "compiled ✓  {}c  {:.1}s",
+                arc.out_chars.unwrap_or(0),
+                run.total_lat_ms.unwrap_or(0) as f64 / 1000.0
+            ),
+            InjectOutcome::Fallback(r) => format!(
+                "fallback ({})  {:.1}s",
+                r,
+                run.total_lat_ms.unwrap_or(0) as f64 / 1000.0
+            ),
+            InjectOutcome::SkippedTrivial => "skipped — trivial prompt".to_string(),
+            InjectOutcome::SkippedNoGuides => "skipped — no guides retrieved".to_string(),
+            InjectOutcome::SkippedNothingRelevant => format!(
+                "skipped — {} guides retrieved, LLM found nothing relevant",
+                arc.guides_found
+            ),
+            InjectOutcome::Skipped(r) => format!("skipped — {}", r),
+            InjectOutcome::Error(e) => format!("error: {}", e),
+            InjectOutcome::InFlight => "in flight…".to_string(),
+        };
+        let verdict_color = match &arc.outcome {
+            InjectOutcome::Compiled => Color::Green,
+            InjectOutcome::Fallback(_) => Color::Yellow,
+            InjectOutcome::Error(_) => Color::Red,
+            InjectOutcome::InFlight => Color::Cyan,
+            _ => Color::DarkGray,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("── INJECT ── ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                verdict_text,
+                Style::default().fg(verdict_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        if !arc.top_hits.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  retrieved {} guide{}",
+                    arc.guides_found,
+                    if arc.guides_found == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+            for hit in &arc.top_hits {
+                let name = hit.path.rsplit('/').next().unwrap_or(&hit.path);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {:4.2}  ", hit.score),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(name.to_string(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        if let Some(t1) = &arc.t1 {
+            lines.push(llm_call_line("  select (t1) ", t1));
+        }
+        if let Some(t2) = &arc.t2 {
+            lines.push(llm_call_line("  compile (t2) ", t2));
+        }
+
+        if let Some(summary) = &arc.briefing_summary {
+            lines.push(Line::from(vec![
+                Span::styled("  briefing  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("\"{}\"", char_take(summary, 80)),
+                    Style::default().fg(Color::LightBlue),
+                ),
+            ]));
+        }
+
+        lines.push(Line::default());
+    }
+
+    // ── CAPTURE ──
+    let capture_data = run.capture.as_ref();
+    {
+        let (verdict_text, verdict_color) = match capture_data.map(|a| &a.outcome) {
+            None => match run.inject.as_ref().map(|a| &a.outcome) {
+                Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => (
+                    "(pending — waiting for session end)".to_string(),
+                    Color::DarkGray,
+                ),
+                _ => ("not run (inject skipped)".to_string(), Color::DarkGray),
+            },
+            Some(CaptureOutcome::Captured(n)) => (
+                format!("{} lesson{} captured", n, if *n == 1 { "" } else { "s" }),
+                Color::Cyan,
+            ),
+            Some(CaptureOutcome::NoLessons) => {
+                ("ran — nothing worth capturing".to_string(), Color::DarkGray)
+            }
+            Some(CaptureOutcome::InFlight) => ("capturing…".to_string(), Color::Cyan),
+            Some(CaptureOutcome::Pending) => ("(pending)".to_string(), Color::DarkGray),
+            Some(CaptureOutcome::NotLinked) => ("—".to_string(), Color::DarkGray),
+            Some(CaptureOutcome::Error(e)) => (format!("error: {}", e), Color::Red),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("── CAPTURE ── ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                verdict_text,
+                Style::default().fg(verdict_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        if let Some(arc) = capture_data {
+            if let Some(n) = arc.exchanges {
+                lines.push(Line::from(Span::styled(
+                    format!("  {} exchanges reviewed", n),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for lesson in &arc.lessons {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  [{:<9}]  ", lesson.category),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(lesson.slug.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+
+    let para = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.modal_scroll, 0));
+    frame.render_widget(para, chunks[0]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  ↑/↓/j/k: scroll  r: raw events  Esc/q: close",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ))),
+        chunks[1],
+    );
+}
+
+fn llm_call_line(label: &'static str, info: &LlmCallInfo) -> Line<'static> {
+    let lat = info
+        .lat_ms
+        .map(|ms| format!("  {:.1}s", ms as f64 / 1000.0))
+        .unwrap_or_default();
+    let tokens = match (info.prompt_tokens, info.completion_tokens) {
+        (Some(pt), Some(ct)) => format!("  {}pt/{}ct", pt, ct),
+        _ => String::new(),
+    };
+    let cost = info.cost.map(|c| format!("  ${:.5}", c)).unwrap_or_default();
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(info.model.clone(), Style::default().fg(Color::Blue)),
+        Span::styled(
+            format!("{}{}{}", lat, tokens, cost),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// The raw event stream for the open run — the old per-event detail/trace view.
+fn render_raw_modal(frame: &mut Frame, state: &AppState) {
+    let siblings = state.modal_siblings();
+    if siblings.is_empty() {
+        return;
+    }
+    let sel = state.modal_sibling_sel.min(siblings.len() - 1);
+    let (_, rec) = siblings[sel];
+    let ev = &rec.ev;
+
+    let area = frame.area();
+    let modal_area = centered_rect(90, 85, area);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(format!(" Raw Events: {} ", ev.event))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -719,7 +1623,10 @@ fn render_modal_event_detail(
     if let Some(lat) = ev.lat_ms {
         lines.push(Line::from(vec![
             Span::styled("lat_ms:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{} ms ({:.2}s)", lat, lat as f64 / 1000.0), Style::default()),
+            Span::styled(
+                format!("{} ms ({:.2}s)", lat, lat as f64 / 1000.0),
+                Style::default(),
+            ),
         ]));
     }
 
@@ -734,7 +1641,6 @@ fn render_modal_event_detail(
         if line_count >= 25 {
             break;
         }
-        // If the line contains \n escape sequences, split them into separate display lines
         for display_line in json_line.split("\\n") {
             if line_count >= 25 {
                 break;
@@ -759,7 +1665,6 @@ fn render_modal_event_detail(
             )));
         }
         "inject.done" => {
-            // Show per-stage latencies if available in payload
             if let Some(stages) = ev.payload.get("stages") {
                 lines.push(Line::from(Span::styled(
                     "stage latencies:",
@@ -774,21 +1679,25 @@ fn render_modal_event_detail(
                     }
                 }
             }
-            // Show full prompt
             if let Some(prompt_preview) = ev.payload.get("prompt_preview").and_then(|v| v.as_str()) {
-                lines.push(Line::from(Span::styled("prompt:", Style::default().fg(Color::DarkGray))));
-                for chunk in prompt_preview.chars().collect::<Vec<_>>().chunks(area.width as usize - 4) {
+                lines.push(Line::from(Span::styled(
+                    "prompt:",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for chunk in prompt_preview
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .chunks(area.width as usize - 4)
+                {
                     lines.push(Line::from(Span::styled(
                         format!("  {}", chunk.iter().collect::<String>()),
                         Style::default().fg(Color::Yellow),
                     )));
                 }
             }
-            // Show conversation sidecars (t1=select, t2=compile)
             lines.extend(inject_sidecar_lines(&ev.req));
         }
         "retrieve.hit" => {
-            // Re-read chunk from disk if possible
             lines.extend(retrieve_hit_chunk_lines(ev, state));
         }
         _ => {}
@@ -815,26 +1724,33 @@ fn inject_sidecar_lines(req: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let (_, log_path) = crate::events::log_cfg_path_and_req();
     let sidecar_dir = log_path.parent().unwrap_or(log_path.as_path()).join("llm_turns");
-    let safe_req = req.chars()
+    let safe_req = req
+        .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect::<String>();
 
     for (turn, label) in [(1usize, "select"), (2usize, "compile")] {
         let path = sidecar_dir.join(format!("{}-t{}.json", safe_req, turn));
-        if !path.exists() { continue; }
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue; };
-        let Ok(sc) = serde_json::from_str::<serde_json::Value>(&raw) else { continue; };
+        if !path.exists() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(sc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
 
         lines.push(Line::from(Span::styled(
             format!("── {} (turn {}) ──", label, turn),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         )));
 
-        // Show usage/cost
         if let Some(usage) = sc.pointer("/response/usage") {
             let pt = usage["prompt_tokens"].as_u64().unwrap_or(0);
             let ct = usage["completion_tokens"].as_u64().unwrap_or(0);
-            let cost_str = usage["cost"].as_f64()
+            let cost_str = usage["cost"]
+                .as_f64()
                 .map(|c| format!("  ${:.7}", c))
                 .unwrap_or_default();
             lines.push(Line::from(Span::styled(
@@ -843,15 +1759,14 @@ fn inject_sidecar_lines(req: &str) -> Vec<Line<'static>> {
             )));
         }
 
-        // Show all messages (full, no cap)
         if let Some(msgs) = sc.pointer("/request/messages").and_then(|v| v.as_array()) {
             for msg in msgs {
                 let role = msg["role"].as_str().unwrap_or("?");
                 let content = msg["content"].as_str().unwrap_or("");
                 let (label, style) = match role {
                     "system" => ("  [system] ", Style::default().fg(Color::DarkGray)),
-                    "user"   => ("  [user]   ", Style::default().fg(Color::Yellow)),
-                    _        => ("  [other]  ", Style::default()),
+                    "user" => ("  [user]   ", Style::default().fg(Color::Yellow)),
+                    _ => ("  [other]  ", Style::default()),
                 };
                 let mut is_first = true;
                 for content_line in content.lines() {
@@ -867,10 +1782,12 @@ fn inject_sidecar_lines(req: &str) -> Vec<Line<'static>> {
             }
         }
 
-        // Show response (full, no cap)
         if let Some(resp) = sc.pointer("/response/content").and_then(|v| v.as_str()) {
             if !resp.is_empty() {
-                lines.push(Line::from(Span::styled("  response:", Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(Span::styled(
+                    "  response:",
+                    Style::default().fg(Color::DarkGray),
+                )));
                 for resp_line in resp.lines() {
                     for chunk in resp_line.chars().collect::<Vec<_>>().chunks(100) {
                         lines.push(Line::from(Span::styled(
@@ -896,9 +1813,8 @@ fn inject_sidecar_lines(req: &str) -> Vec<Line<'static>> {
 fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    // The sidecar path is stored in the payload of llm.response (not llm.request)
     let sidecar_path = ev.payload.get("sidecar").and_then(|v| v.as_str());
-    let path_to_try = sidecar_path.map(|s| std::path::PathBuf::from(s));
+    let path_to_try = sidecar_path.map(std::path::PathBuf::from);
 
     let sidecar = path_to_try.and_then(|p| {
         std::fs::read_to_string(&p)
@@ -907,21 +1823,17 @@ fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
     });
 
     if let Some(sc) = sidecar {
-        // Show usage + cost
         if let Some(usage) = sc.pointer("/response/usage") {
             let pt = usage["prompt_tokens"].as_u64().unwrap_or(0);
             let ct = usage["completion_tokens"].as_u64().unwrap_or(0);
             let cost = usage["cost"].as_f64();
-            let cost_str = cost
-                .map(|c| format!("  ${:.7}", c))
-                .unwrap_or_default();
+            let cost_str = cost.map(|c| format!("  ${:.7}", c)).unwrap_or_default();
             lines.push(Line::from(Span::styled(
                 format!("  tokens: {}pt / {}ct{}", pt, ct, cost_str),
                 Style::default().fg(Color::LightCyan),
             )));
         }
 
-        // Show request messages
         lines.push(Line::from(Span::styled(
             "prompt messages:",
             Style::default().fg(Color::DarkGray),
@@ -937,7 +1849,6 @@ fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
                     "tool" => Style::default().fg(Color::Green),
                     _ => Style::default(),
                 };
-                // Respect newlines in content; chunk only if a line is too long
                 let mut is_first_line_of_msg = true;
                 for content_line in content.lines() {
                     for chunk in content_line.chars().collect::<Vec<_>>().chunks(120) {
@@ -956,7 +1867,6 @@ fn llm_sidecar_lines(ev: &EventLine) -> Vec<Line<'static>> {
             }
         }
 
-        // Show response content
         if let Some(resp_content) = sc.pointer("/response/content").and_then(|v| v.as_str()) {
             if !resp_content.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -1006,21 +1916,16 @@ fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'stat
         return lines;
     }
 
-    // Resolve path: try absolute, then relative to project root
     let try_paths: Vec<PathBuf> = {
         let mut paths = Vec::new();
         let p = PathBuf::from(path_str);
         if p.is_absolute() {
             paths.push(p);
         } else {
-            // Try relative to home project dir
             if let Some(home) = dirs::home_dir() {
-                let project_root = home
-                    .join(".proactive-context/projects")
-                    .join(&ev.project);
+                let project_root = home.join(".proactive-context/projects").join(&ev.project);
                 paths.push(project_root.join(path_str));
             }
-            // Also try the path as-is relative to CWD (for worktree paths)
             if let Ok(cwd) = std::env::current_dir() {
                 paths.push(cwd.join(path_str));
             }
@@ -1037,7 +1942,6 @@ fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'stat
                         format!("chunk content ({}#{}):", path_str, chunk_index),
                         Style::default().fg(Color::DarkGray),
                     )));
-                    // Show up to 20 lines of the file content
                     for line in content.lines().take(20) {
                         lines.push(Line::from(Span::styled(
                             format!("  {}", line),
@@ -1051,7 +1955,6 @@ fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'stat
         }
     }
 
-    // Fallback: show stored snippet with note
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("stored snippet (file not readable at {}):", path_str),
@@ -1068,11 +1971,10 @@ fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'stat
 }
 
 fn render_modal_divider(frame: &mut Frame, area: Rect, title: &str) {
+    let dashes = (area.width as usize).saturating_sub(title.len() + 5);
     let para = Paragraph::new(Line::from(Span::styled(
-        format!("─── {} {}", title, "─".repeat(area.width as usize - title.len() - 5)),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
+        format!("─── {} {}", title, "─".repeat(dashes)),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
     )));
     frame.render_widget(para, area);
 }
@@ -1100,7 +2002,14 @@ fn render_modal_trace(frame: &mut Frame, area: Rect, state: &AppState) {
                 Span::raw("  "),
                 Span::styled(format!("{} {}", glyph, ev.event), style),
                 Span::raw("  "),
-                Span::styled(body, if is_sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() }),
+                Span::styled(
+                    body,
+                    if is_sel {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                ),
             ]))
         })
         .collect();
@@ -1117,7 +2026,7 @@ fn render_modal_trace(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_modal_help(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
-        "  ↑/↓/j/k: scroll  PgDn/Space: page down  ←/→: siblings  Esc/q: close",
+        "  ↑/↓/j/k: scroll  ←/→: events  r: narrative  Esc/q: close",
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
     )));
     frame.render_widget(para, area);
@@ -1151,16 +2060,24 @@ fn render_project_picker(frame: &mut Frame, pk: &PickerState) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let items: Vec<ListItem> = pk.items.iter().enumerate().map(|(i, item)| {
-        if i == pk.selected {
-            ListItem::new(Line::from(Span::styled(
-                format!(" ▶ {}", item),
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )))
-        } else {
-            ListItem::new(Line::from(Span::raw(format!("   {}", item))))
-        }
-    }).collect();
+    let items: Vec<ListItem> = pk
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if i == pk.selected {
+                ListItem::new(Line::from(Span::styled(
+                    format!(" ▶ {}", item),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )))
+            } else {
+                ListItem::new(Line::from(Span::raw(format!("   {}", item))))
+            }
+        })
+        .collect();
 
     let mut list_state = ListState::default();
     list_state.select(Some(pk.selected));
@@ -1200,34 +2117,45 @@ fn render_session_picker(frame: &mut Frame, pk: &PickerState) {
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(outer[0]);
 
-    // Left: session list
-    let items: Vec<ListItem> = pk.items.iter().enumerate().map(|(i, item)| {
-        if i == pk.selected {
-            ListItem::new(Line::from(Span::styled(
-                format!(" ▶ {}", item),
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )))
-        } else {
-            ListItem::new(Line::from(Span::raw(format!("   {}", item))))
-        }
-    }).collect();
+    let items: Vec<ListItem> = pk
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if i == pk.selected {
+                ListItem::new(Line::from(Span::styled(
+                    format!(" ▶ {}", item),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )))
+            } else {
+                ListItem::new(Line::from(Span::raw(format!("   {}", item))))
+            }
+        })
+        .collect();
 
     let mut list_state = ListState::default();
     list_state.select(Some(pk.selected));
     let session_list = List::new(items)
-        .block(Block::default()
-            .title(" Sessions ")
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(Color::DarkGray)))
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_stateful_widget(session_list, cols[0], &mut list_state);
 
-    // Right: prompt preview
     let preview_width = cols[1].width as usize;
-    let mut preview_lines: Vec<Line> = vec![Line::from(Span::styled(
-        " Prompts seen in this session:",
-        Style::default().fg(Color::DarkGray),
-    )), Line::default()];
+    let mut preview_lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Prompts seen in this session:",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::default(),
+    ];
 
     let prompts = pk.previews.get(pk.selected).map(|v| v.as_slice()).unwrap_or(&[]);
     if prompts.is_empty() {
@@ -1238,12 +2166,15 @@ fn render_session_picker(frame: &mut Frame, pk: &PickerState) {
     } else {
         for p in prompts {
             let max = preview_width.saturating_sub(6);
-            let display = if p.len() > max {
-                format!("  \"{}…\"", &p[..max])
+            let display = if p.chars().count() > max {
+                format!("  \"{}…\"", char_take(p, max))
             } else {
                 format!("  \"{}\"", p)
             };
-            preview_lines.push(Line::from(Span::styled(display, Style::default().fg(Color::Yellow))));
+            preview_lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(Color::Yellow),
+            )));
         }
     }
 
@@ -1252,7 +2183,6 @@ fn render_session_picker(frame: &mut Frame, pk: &PickerState) {
         cols[1],
     );
 
-    // Help
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  ↑/↓/j/k: navigate  Enter: select  Esc: cancel",
@@ -1345,11 +2275,13 @@ pub fn run_tui(
             }
         }
 
+        // Advance spinner once per render cycle (~100ms poll cadence).
+        app.spinner_phase = app.spinner_phase.wrapping_add(1) % 4;
+
         // Draw
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Layout: list takes everything except 1-line status bar
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1380,12 +2312,16 @@ pub fn run_tui(
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             if let Some(ref mut pk) = app.picker {
-                                if pk.selected > 0 { pk.selected -= 1; }
+                                if pk.selected > 0 {
+                                    pk.selected -= 1;
+                                }
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             if let Some(ref mut pk) = app.picker {
-                                if pk.selected + 1 < pk.items.len() { pk.selected += 1; }
+                                if pk.selected + 1 < pk.items.len() {
+                                    pk.selected += 1;
+                                }
                             }
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -1395,14 +2331,7 @@ pub fn run_tui(
                                     PickerKind::Project => app.interactive_project = val,
                                     PickerKind::Session => app.interactive_session = val,
                                 }
-                                let vis = app.visible_indices();
-                                if app.follow == FollowState::Following {
-                                    app.selected = vis.last().copied();
-                                } else if let Some(sel) = app.selected {
-                                    if !vis.iter().any(|&i| i == sel) {
-                                        app.selected = vis.last().copied();
-                                    }
-                                }
+                                app.reconcile_selection();
                             }
                         }
                         _ => {}
@@ -1412,6 +2341,9 @@ pub fn run_tui(
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
                             app.close_modal();
+                        }
+                        KeyCode::Char('r') => {
+                            app.toggle_raw_modal();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.modal_scroll_up(1);
@@ -1425,15 +2357,17 @@ pub fn run_tui(
                         KeyCode::PageDown | KeyCode::Char(' ') => {
                             app.modal_scroll_down(20);
                         }
-                        KeyCode::Left | KeyCode::Char('h') => {
+                        KeyCode::Left | KeyCode::Char('h') if app.raw_modal => {
                             if app.modal_sibling_sel > 0 {
                                 app.modal_sibling_sel -= 1;
+                                app.modal_scroll = 0;
                             }
                         }
-                        KeyCode::Right | KeyCode::Char('l') => {
+                        KeyCode::Right | KeyCode::Char('l') if app.raw_modal => {
                             let siblings_len = app.modal_siblings().len();
                             if app.modal_sibling_sel + 1 < siblings_len {
                                 app.modal_sibling_sel += 1;
+                                app.modal_scroll = 0;
                             }
                         }
                         _ => {}
@@ -1447,7 +2381,8 @@ pub fn run_tui(
                         KeyCode::Down | KeyCode::Char('j') => app.select_down(),
                         KeyCode::Char('G') | KeyCode::Char('f') => app.jump_to_bottom(),
                         KeyCode::Char('g') => app.jump_to_top(),
-                        KeyCode::Enter => app.open_modal(),
+                        KeyCode::Enter | KeyCode::Char(' ') => app.open_modal(),
+                        KeyCode::Tab => app.cycle_kind_filter(),
                         KeyCode::Char('p') => app.open_project_picker(),
                         KeyCode::Char('s') => app.open_session_picker(),
                         _ => {}
@@ -1549,7 +2484,17 @@ pub mod tests {
         )
     }
 
-    // ── Test 1: List view renders event rows ──────────────────────────────────
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    // ── Test 1: List view renders one row per hook run ─────────────────────────
 
     #[test]
     fn test_list_view_renders_event_rows() {
@@ -1558,13 +2503,15 @@ pub mod tests {
 
         let mut state = AppState::new(String::new(), Verbosity::Default, true);
 
-        // Push a few records
         for rec in make_inject_request_records("abc-1234567890") {
             state.push_record(rec);
         }
 
-        let mut list_state = ListState::default();
+        // Exactly one hook run is derived from the 4 same-req records.
+        assert_eq!(state.runs.len(), 1, "4 same-req records → 1 hook run");
+        assert_eq!(state.visible_run_indices().len(), 1);
 
+        let mut list_state = ListState::default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -1577,34 +2524,18 @@ pub mod tests {
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
+        let content = buffer_text(&terminal);
 
-        // Verify event rows appear in the buffer
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
+        // Done state glyph (ascii "+") and compiled inject verdict ("312 ch").
+        assert!(content.contains('+'), "list should show the done run-state glyph");
         assert!(
-            content.contains("inject.start"),
-            "list should contain inject.start row"
+            content.contains("ch"),
+            "list should show the compiled inject verdict (chars)"
         );
-        assert!(
-            content.contains("query.start"),
-            "list should contain query.start row"
-        );
-        assert!(
-            content.contains("inject.done"),
-            "list should contain inject.done row"
-        );
-        assert!(
-            content.contains("FOLLOWING"),
-            "status bar should show FOLLOWING"
-        );
+        assert!(content.contains("FOLLOWING"), "status bar should show FOLLOWING");
     }
 
-    // ── Test 2: Selection highlight ───────────────────────────────────────────
+    // ── Test 2: Selection highlight + PAUSED ───────────────────────────────────
 
     #[test]
     fn test_selection_highlight_and_paused() {
@@ -1616,7 +2547,6 @@ pub mod tests {
             state.push_record(rec);
         }
 
-        // Select up → enters PAUSED
         state.select_up();
         assert_eq!(state.follow, FollowState::Paused);
 
@@ -1633,20 +2563,14 @@ pub mod tests {
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
+        let content = buffer_text(&terminal);
         assert!(
             content.contains("PAUSED"),
             "status bar should show PAUSED when selection is not at bottom"
         );
     }
 
-    // ── Test 3: Detail modal renders stored fields ────────────────────────────
+    // ── Test 3: Narrative detail modal shows the three sections ────────────────
 
     #[test]
     fn test_detail_modal_renders_inject_done() {
@@ -1658,10 +2582,11 @@ pub mod tests {
             state.push_record(rec);
         }
 
-        // Open the modal on the last record (inject.done)
-        state.selected = Some(state.records.len() - 1);
+        // Open the modal on the (single) run.
+        state.selected = Some(0);
         state.open_modal();
         assert!(state.modal.is_some(), "modal should be open");
+        assert!(!state.raw_modal, "modal should open in narrative mode");
 
         terminal
             .draw(|frame| {
@@ -1670,31 +2595,25 @@ pub mod tests {
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(area);
-                render_list(frame, chunks[0], &state, &mut &mut ListState::default());
+                render_list(frame, chunks[0], &state, &mut ListState::default());
                 render_status_bar(frame, chunks[1], &state);
                 render_modal(frame, &state);
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
+        let content = buffer_text(&terminal);
 
-        // Modal should show envelope fields
-        assert!(content.contains("inject.done"), "modal should show event name");
-        assert!(content.contains("project:"), "modal should show project field");
-        assert!(content.contains("req:"), "modal should show req field");
-        // Modal should show request trace siblings (all 4 records share same req)
+        assert!(content.contains("PROMPT"), "narrative modal should show PROMPT section");
+        assert!(content.contains("INJECT"), "narrative modal should show INJECT section");
+        assert!(content.contains("CAPTURE"), "narrative modal should show CAPTURE section");
+        // The compiled briefing summary should appear.
         assert!(
-            content.contains("inject.start"),
-            "modal trace should contain inject.start sibling"
+            content.contains("briefing") || content.contains("Hot path"),
+            "narrative modal should surface briefing info"
         );
     }
 
-    // ── Test 4: Modal for retrieve.hit shows snippet ──────────────────────────
+    // ── Test 4: Raw modal for retrieve.hit shows event/snippet ─────────────────
 
     #[test]
     fn test_detail_modal_retrieve_hit() {
@@ -1708,30 +2627,38 @@ pub mod tests {
         state.selected = Some(0);
         state.open_modal();
 
+        // Narrative view shows the retrieved guide name + score.
         terminal
             .draw(|frame| {
                 render_modal(frame, &state);
             })
             .unwrap();
-
-        let buffer = terminal.backend().buffer().clone();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
+        let narrative = buffer_text(&terminal);
         assert!(
-            content.contains("retrieve.hit"),
-            "modal should show retrieve.hit event name"
+            narrative.contains("tail-ux") || narrative.contains("0.81") || narrative.contains("INJECT"),
+            "narrative modal should surface the retrieved guide"
+        );
+
+        // Switch to raw events view.
+        state.toggle_raw_modal();
+        assert!(state.raw_modal);
+        terminal
+            .draw(|frame| {
+                render_modal(frame, &state);
+            })
+            .unwrap();
+        let raw = buffer_text(&terminal);
+        assert!(
+            raw.contains("retrieve.hit"),
+            "raw modal should show the retrieve.hit event name"
         );
         assert!(
-            content.contains("score:") || content.contains("0.81") || content.contains("chunk"),
-            "modal should show payload fields"
+            raw.contains("score") || raw.contains("0.81") || raw.contains("chunk"),
+            "raw modal should show payload fields"
         );
     }
 
-    // ── Test 5: Modal for generate.briefing shows honest note ────────────────
+    // ── Test 5: Narrative modal surfaces briefing summary ──────────────────────
 
     #[test]
     fn test_detail_modal_generate_briefing_note() {
@@ -1757,34 +2684,24 @@ pub mod tests {
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
+        let content = buffer_text(&terminal);
+        assert!(content.contains("INJECT"), "modal should show INJECT section");
         assert!(
-            content.contains("generate.briefing"),
-            "modal should show event name"
-        );
-        assert!(
-            content.contains("not persisted") || content.contains("session"),
-            "modal should contain honest note about briefing not being persisted"
+            content.contains("briefing") || content.contains("Hot path"),
+            "modal should surface the briefing summary"
         );
     }
 
-    // ── Test 6: Request trace siblings ───────────────────────────────────────
+    // ── Test 6: Raw modal siblings (shared req grouping) ───────────────────────
 
     #[test]
     fn test_request_trace_siblings() {
         let mut state = AppState::new(String::new(), Verbosity::Default, true);
         let records = make_inject_request_records("shared-req-999");
-        let _req = records[0].ev.req.clone();
         for rec in records {
             state.push_record(rec);
         }
-        // Push an unrelated record with different req
+        // Push an unrelated record with a different req (and a non-run event).
         state.push_record(make_record(
             "2026-05-28T14:05:00.000Z",
             "Users_pablo_src_other",
@@ -1794,15 +2711,16 @@ pub mod tests {
             json!({"phase": "full", "files": 10, "chunks": 50}),
         ));
 
-        state.selected = Some(3); // inject.done
+        // Only one hook run exists (daemon.index does not form a run).
+        assert_eq!(state.runs.len(), 1);
+        state.selected = Some(0);
         state.open_modal();
 
         let siblings = state.modal_siblings();
-        // All 4 inject_request records share the same req; daemon.index does not
         assert_eq!(
             siblings.len(),
             4,
-            "should find 4 siblings for shared req (inject.start, query.start, briefing, inject.done)"
+            "should find 4 raw events for the run's shared req"
         );
     }
 
@@ -1811,7 +2729,6 @@ pub mod tests {
     #[test]
     fn test_ring_buffer_drops_when_full() {
         let mut state = AppState::new(String::new(), Verbosity::Default, true);
-        // Fill beyond capacity
         for i in 0..RING_CAP + 5 {
             let rec = make_record(
                 "2026-05-28T00:00:00.000Z",
@@ -1837,30 +2754,107 @@ pub mod tests {
         }
         assert_eq!(state.follow, FollowState::Following, "should start in Following");
 
-        // select_up → Paused
         state.select_up();
         assert_eq!(state.follow, FollowState::Paused);
 
-        // jump_to_bottom → Following
         state.jump_to_bottom();
         assert_eq!(state.follow, FollowState::Following);
 
-        // jump_to_top → Paused
         state.jump_to_top();
         assert_eq!(state.follow, FollowState::Paused);
     }
 
-    // ── Test 9: --no-follow (streaming path) unchanged ────────────────────────
-    //
-    // We prove the streaming path is byte-for-byte unchanged by running the
-    // actual run_streaming_printer through the golden formatter tests in tail.rs.
-    // Here we just verify the non-TTY streaming path doesn't invoke the TUI.
+    // ── Test 9: capture run linkage into the inject row ────────────────────────
+
+    #[test]
+    fn test_capture_links_into_inject_run() {
+        let mut state = AppState::new(String::new(), Verbosity::Default, true);
+
+        let sid = "session-xyz";
+        let mk = |ts: &str, req: &str, event: &str, lat: Option<u64>, payload: serde_json::Value| {
+            let ev = EventLine {
+                ts: ts.to_string(),
+                project: "proj".to_string(),
+                session_id: sid.to_string(),
+                req: req.to_string(),
+                event: event.to_string(),
+                lat_ms: lat,
+                payload,
+            };
+            Record { raw: String::new(), ev }
+        };
+
+        state.push_record(mk(
+            "2026-05-28T14:00:00.000Z",
+            "inj-1",
+            "inject.start",
+            None,
+            json!({"prompt_preview": "how do hooks work?", "prompt_chars": 18}),
+        ));
+        state.push_record(mk(
+            "2026-05-28T14:00:02.000Z",
+            "inj-1",
+            "inject.done",
+            Some(2000),
+            json!({"outcome": "compiled", "out_chars": 400}),
+        ));
+
+        state.push_record(mk(
+            "2026-05-28T14:05:00.000Z",
+            "cap-1",
+            "capture.start",
+            None,
+            json!({"exchanges": 3}),
+        ));
+        state.push_record(mk(
+            "2026-05-28T14:05:01.000Z",
+            "cap-1",
+            "capture.lesson",
+            None,
+            json!({"category": "decision", "slug": "hooks-are-blocking"}),
+        ));
+        state.push_record(mk(
+            "2026-05-28T14:05:02.000Z",
+            "cap-1",
+            "capture.done",
+            Some(1500),
+            json!({"lesson_count": 1}),
+        ));
+
+        // Two runs exist, but only the inject row is visible (capture merged in).
+        assert_eq!(state.runs.len(), 2);
+        let vis = state.visible_run_indices();
+        assert_eq!(vis.len(), 1, "capture run should be merged into the inject row");
+
+        let inject_run = &state.runs[vis[0]];
+        assert_eq!(inject_run.kind, RunKind::Inject);
+        let cap = inject_run
+            .capture
+            .as_ref()
+            .expect("inject row should inherit the capture arc");
+        assert_eq!(cap.outcome, CaptureOutcome::Captured(1));
+        assert_eq!(cap.lessons.len(), 1);
+        assert_eq!(cap.lessons[0].slug, "hooks-are-blocking");
+    }
+
+    // ── Test 10: kind filter cycling ──────────────────────────────────────────
+
+    #[test]
+    fn test_kind_filter_cycle() {
+        let mut state = AppState::new(String::new(), Verbosity::Default, true);
+        assert_eq!(state.kind_filter, KindFilter::All);
+        state.cycle_kind_filter();
+        assert_eq!(state.kind_filter, KindFilter::InjectOnly);
+        state.cycle_kind_filter();
+        assert_eq!(state.kind_filter, KindFilter::CaptureOnly);
+        state.cycle_kind_filter();
+        assert_eq!(state.kind_filter, KindFilter::All);
+    }
+
+    // ── TUI activation gate tests (unchanged) ─────────────────────────────────
 
     #[test]
     fn test_streaming_path_does_not_activate_tui_when_not_tty() {
-        // When is_tty=false (simulated by checking the condition directly), the
-        // TUI branch should be skipped.  We verify the gate logic without actually
-        // calling run_tail (which would hit a real TTY check).
         let is_tty = false;
         let follow = false;
         let json = false;
