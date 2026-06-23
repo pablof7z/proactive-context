@@ -1735,21 +1735,15 @@ pub fn backfill_link_episodes(wiki_dir: &Path) -> Result<usize> {
 ///
 /// For every `episodes/*.md` card that lacks a corresponding
 /// `episodes/transcripts/<stem>.json`, reads the JSONL transcript path from
-/// the card's frontmatter and writes the transcript file (raw + cleaned, same
-/// as the live capture path). No LLM calls — dialogue reconstruction is pure
-/// text parsing. Idempotent: already-present transcript files are never
-/// overwritten. Returns the count of transcripts written.
+/// the card's frontmatter and writes the transcript file. Uses raw dialogue
+/// only — no LLM calls — so this is fast and works even when the model
+/// endpoint is unavailable. Idempotent: already-present transcript files are
+/// never overwritten. Returns the count of transcripts written.
 pub fn backfill_episode_transcripts(wiki_dir: &Path) -> Result<usize> {
-    let cfg = load_config()?;
     let episodes_dir = wiki_dir.join("episodes");
     if !episodes_dir.exists() {
         return Ok(0);
     }
-
-    let spec: ModelSpec = ModelSpec::parse(&cfg.capture_model);
-    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
-    let ollama_base = cfg.ollama_base_url.as_str();
-    let ollama_key = cfg.ollama_api_key.as_deref();
 
     let entries = fs::read_dir(&episodes_dir)?;
     let mut written = 0usize;
@@ -1769,7 +1763,7 @@ pub fn backfill_episode_transcripts(wiki_dir: &Path) -> Result<usize> {
             None => continue,
         };
 
-        // Check if the transcript already exists.
+        // Skip if the (clean) transcript already exists.
         let transcript_path = episodes_dir.join("transcripts").join(format!("{}.json", stem));
         if transcript_path.exists() {
             continue;
@@ -1804,16 +1798,13 @@ pub fn backfill_episode_transcripts(wiki_dir: &Path) -> Result<usize> {
             );
             continue;
         }
-        let clean_dialogue_turns = if cfg.clean_episode_dialogue {
-            clean_dialogue(&spec, openrouter_key, ollama_base, ollama_key, &raw_dialogue)
-        } else {
-            raw_dialogue.clone()
-        };
 
-        let wrote_clean = write_transcript_json(&episodes_dir, "", &stem, &clean_dialogue_turns).is_some();
+        // Use raw dialogue for both slots — no LLM cleanup on backfill.
+        let wrote_clean = write_transcript_json(&episodes_dir, "", &stem, &raw_dialogue).is_some();
         let wrote_raw = write_transcript_json(&episodes_dir, "raw", &stem, &raw_dialogue).is_some();
         if wrote_clean || wrote_raw {
             written += 1;
+            eprintln!("[backfill-transcripts] wrote {}", stem);
         }
     }
 
