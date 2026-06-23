@@ -623,6 +623,7 @@ pub(crate) fn render_line(
 pub(crate) fn should_show(
     ev: &EventLine,
     project_filter: &Option<String>,
+    session_filter: &Option<String>,
     since_ms: Option<u64>,
     event_filters: &[String],
     grep: Option<&str>,
@@ -633,6 +634,13 @@ pub(crate) fn should_show(
         let proj_lower = ev.project.to_lowercase();
         let basename = proj_lower.rsplit('_').next().unwrap_or(&proj_lower);
         if !proj_lower.contains(&pf_lower) && !basename.contains(&pf_lower) {
+            return false;
+        }
+    }
+
+    // --session filter
+    if let Some(sf) = session_filter {
+        if !sf.is_empty() && !ev.session_id.to_lowercase().contains(&sf.to_lowercase()) {
             return false;
         }
     }
@@ -709,6 +717,7 @@ pub(crate) fn stdout_is_tty() -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn run_tail(
     project: Option<String>,
+    session: Option<String>,
     since: Option<String>,
     json: bool,
     follow: bool,
@@ -779,6 +788,7 @@ pub fn run_tail(
         return crate::tui::run_tui(
             log_path,
             project_filter,
+            session,
             since_ms,
             event_filters,
             grep,
@@ -791,6 +801,7 @@ pub fn run_tail(
     run_streaming_printer(
         log_path,
         project_filter,
+        session,
         since_ms,
         event_filters,
         grep,
@@ -805,6 +816,7 @@ pub fn run_tail(
 fn run_streaming_printer(
     log_path: PathBuf,
     project_filter: Option<String>,
+    session_filter: Option<String>,
     since_ms: Option<u64>,
     event_filters: Vec<String>,
     grep: Option<String>,
@@ -855,12 +867,12 @@ fn run_streaming_printer(
             if json {
                 // Passthrough mode: parse to filter, then print raw line
                 if let Ok(ev) = serde_json::from_str::<EventLine>(line) {
-                    if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                    if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                         let _ = writeln!(out, "{}", line);
                     }
                 }
             } else if let Ok(ev) = serde_json::from_str::<EventLine>(line) {
-                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                     if let Some(rendered) =
                         render_line(&ev, use_color, ascii_mode, verbosity, terminal_width)
                     {
@@ -932,13 +944,13 @@ fn run_streaming_printer(
 
             if json {
                 if let Ok(ev) = serde_json::from_str::<EventLine>(&line) {
-                    if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                    if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                         let _ = writeln!(out, "{}", line);
                         let _ = out.flush();
                     }
                 }
             } else if let Ok(ev) = serde_json::from_str::<EventLine>(&line) {
-                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                     if let Some(rendered) =
                         render_line(&ev, use_color, ascii_mode, verbosity, terminal_width)
                     {
@@ -1206,7 +1218,7 @@ mod tests {
         // We test the should_show filter + raw line emission logic by simulating it.
         let raw = r#"{"ts":"2026-05-28T20:53:56.334Z","project":"proj","session_id":"","req":"abc-123","event":"query.start","payload":{}}"#;
         let ev: EventLine = serde_json::from_str(raw).unwrap();
-        assert!(should_show(&ev, &None, None, &[], None));
+        assert!(should_show(&ev, &None, &None, None, &[], None));
         // Passthrough: raw line is unchanged
         let output = format!("{}", raw);
         assert_eq!(output, raw);
@@ -1223,11 +1235,11 @@ mod tests {
             json!({}),
         );
         // Should not match "proactive"
-        assert!(!should_show(&ev, &Some("proactive".to_string()), None, &[], None));
+        assert!(!should_show(&ev, &Some("proactive".to_string()), &None, None, &[], None));
         // Should match "web-app"
-        assert!(should_show(&ev, &Some("web-app".to_string()), None, &[], None));
+        assert!(should_show(&ev, &Some("web-app".to_string()), &None, None, &[], None));
         // No filter matches everything
-        assert!(should_show(&ev, &None, None, &[], None));
+        assert!(should_show(&ev, &None, &None, None, &[], None));
     }
 
     #[test]
@@ -1241,8 +1253,8 @@ mod tests {
             json!({}),
         );
         let filters = vec!["inject".to_string()];
-        assert!(should_show(&ev, &None, None, &filters, None));
+        assert!(should_show(&ev, &None, &None, None, &filters, None));
         let filters2 = vec!["capture".to_string()];
-        assert!(!should_show(&ev, &None, None, &filters2, None));
+        assert!(!should_show(&ev, &None, &None, None, &filters2, None));
     }
 }

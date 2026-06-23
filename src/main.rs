@@ -198,47 +198,6 @@ enum Commands {
         reset: bool,
     },
 
-    /// Follow the proactive-context event log live across all projects.
-    Tail {
-        /// Only show events for this project (matched against normalized cwd; accepts a path or a substring)
-        #[arg(long)]
-        project: Option<String>,
-        /// Only show events at or after this time (RFC3339, or a relative like "10m", "1h")
-        #[arg(long)]
-        since: Option<String>,
-        /// Emit raw JSONL lines instead of the rendered view (passthrough)
-        #[arg(long)]
-        json: bool,
-        /// Print existing matching events and exit instead of following (follow is the default).
-        #[arg(long, action = clap::ArgAction::SetTrue)]
-        no_follow: bool,
-        /// Quiet: one line per request (inject.start + inject.done + errors only)
-        #[arg(short = 'q', long)]
-        quiet: bool,
-        /// Verbose: adds retrieve.subquery, individual hits, per-stage latency
-        #[arg(short = 'v', long)]
-        verbose: bool,
-        /// Very verbose: adds full prompts, full briefings, raw sub-query dumps
-        #[arg(long = "vv")]
-        very_verbose: bool,
-        /// Show only lines matching this pattern (checked against req id + body)
-        #[arg(long)]
-        grep: Option<String>,
-        /// Comma-list of event names or prefixes to include (e.g. inject.*,error)
-        #[arg(long)]
-        event: Option<String>,
-        /// Force-disable ANSI color even on a TTY (also: NO_COLOR env var)
-        #[arg(long)]
-        no_color: bool,
-        /// Use ASCII glyph fallbacks (auto-detected for non-Unicode terminals)
-        #[arg(long)]
-        ascii: bool,
-        /// Force the non-interactive streaming printer even on a TTY (escape hatch; disables TUI)
-        #[arg(long)]
-        plain: bool,
-    },
-
-
     /// Hook adapter commands called by agent harnesses.
     /// Reads the harness's hook JSON from stdin.
     /// Use `pc hook --help` to list subcommands.
@@ -586,6 +545,49 @@ enum DebugAction {
         #[arg(long, value_name = "DIR")]
         wiki_dir: Option<PathBuf>,
     },
+
+    /// Follow the proactive-context event log live (replaces top-level `pc tail`).
+    Tail {
+        /// Only show events for this project (substring match against normalized path)
+        #[arg(long)]
+        project: Option<String>,
+        /// Only show events for this session ID (substring match)
+        #[arg(long)]
+        session: Option<String>,
+        /// Only show events at or after this time (RFC3339, or relative like "10m", "1h")
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit raw JSONL lines instead of the rendered view
+        #[arg(long)]
+        json: bool,
+        /// Print existing matching events and exit (default is to follow)
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_follow: bool,
+        /// Quiet: one line per request (inject.start + inject.done + errors only)
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Verbose: adds retrieve.subquery, individual hits, per-stage latency
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Very verbose: adds full prompts, full briefings, raw sub-query dumps
+        #[arg(long = "vv")]
+        very_verbose: bool,
+        /// Show only lines matching this pattern
+        #[arg(long)]
+        grep: Option<String>,
+        /// Comma-list of event names or prefixes to include (e.g. inject.*,error)
+        #[arg(long)]
+        event: Option<String>,
+        /// Force-disable ANSI color even on a TTY
+        #[arg(long)]
+        no_color: bool,
+        /// Use ASCII glyph fallbacks
+        #[arg(long)]
+        ascii: bool,
+        /// Force the non-interactive streaming printer even on a TTY
+        #[arg(long)]
+        plain: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -861,6 +863,37 @@ fn main() -> Result<()> {
                 let proj_dir = project_context_dir(&root);
                 crate::taxonomy_report::run(&root, &wiki, &proj_dir)?;
             }
+            DebugAction::Tail {
+                project,
+                session,
+                since,
+                json,
+                no_follow,
+                quiet,
+                verbose,
+                very_verbose,
+                grep,
+                event,
+                no_color,
+                ascii,
+                plain,
+            } => {
+                crate::tail::run_tail(
+                    project,
+                    session,
+                    since,
+                    json,
+                    !no_follow,
+                    quiet,
+                    verbose,
+                    very_verbose,
+                    grep,
+                    event,
+                    no_color,
+                    ascii,
+                    plain,
+                )?;
+            }
         },
 
         Commands::Archeologist {
@@ -886,37 +919,6 @@ fn main() -> Result<()> {
                 reset,
             })?;
         }
-
-        Commands::Tail {
-            project,
-            since,
-            json,
-            no_follow,
-            quiet,
-            verbose,
-            very_verbose,
-            grep,
-            event,
-            no_color,
-            ascii,
-            plain,
-        } => {
-            crate::tail::run_tail(
-                project,
-                since,
-                json,
-                !no_follow, // follow is on by default
-                quiet,
-                verbose,
-                very_verbose,
-                grep,
-                event,
-                no_color,
-                ascii,
-                plain,
-            )?;
-        }
-
 
         Commands::Research { transcript, out_dir, session_id, dump_transcript } => {
             let out_dir = out_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/research-capture-experiment"));

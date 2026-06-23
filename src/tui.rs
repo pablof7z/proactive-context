@@ -51,6 +51,13 @@ enum FollowState {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    None,
+    Project,
+    Session,
+}
+
 struct AppState {
     records: VecDeque<Record>,
     /// How many records were dropped when the ring was full
@@ -68,6 +75,10 @@ struct AppState {
     filter_summary: String,
     verbosity: Verbosity,
     ascii: bool,
+    filter_mode: FilterMode,
+    interactive_project: String,
+    interactive_session: String,
+    filter_input: String,
 }
 
 impl AppState {
@@ -83,14 +94,18 @@ impl AppState {
             filter_summary,
             verbosity,
             ascii,
+            filter_mode: FilterMode::None,
+            interactive_project: String::new(),
+            interactive_session: String::new(),
+            filter_input: String::new(),
         }
     }
 
     fn push_record(&mut self, r: Record) {
+        let passes_view = self.record_passes_view(&r);
         if self.records.len() >= RING_CAP {
             self.records.pop_front();
             self.dropped += 1;
-            // Adjust selected index
             if let Some(sel) = self.selected {
                 self.selected = if sel == 0 { None } else { Some(sel - 1) };
             }
@@ -99,35 +114,37 @@ impl AppState {
             }
         }
         self.records.push_back(r);
-        if self.follow == FollowState::Following {
+        if self.follow == FollowState::Following && passes_view {
             self.selected = Some(self.records.len().saturating_sub(1));
         }
     }
 
     fn select_up(&mut self) {
-        if self.records.is_empty() {
-            return;
-        }
+        let vis = self.visible_indices();
+        if vis.is_empty() { return; }
         let new_sel = match self.selected {
-            None => self.records.len() - 1,
-            Some(0) => 0,
-            Some(n) => n - 1,
+            None => *vis.last().unwrap(),
+            Some(cur) => {
+                let pos = vis.partition_point(|&i| i < cur);
+                if pos == 0 { vis[0] } else { vis[pos - 1] }
+            }
         };
         self.selected = Some(new_sel);
         self.follow = FollowState::Paused;
     }
 
     fn select_down(&mut self) {
-        if self.records.is_empty() {
-            return;
-        }
+        let vis = self.visible_indices();
+        if vis.is_empty() { return; }
         let new_sel = match self.selected {
-            None => 0,
-            Some(n) => (n + 1).min(self.records.len() - 1),
+            None => vis[0],
+            Some(cur) => {
+                let pos = vis.partition_point(|&i| i <= cur);
+                if pos >= vis.len() { *vis.last().unwrap() } else { vis[pos] }
+            }
         };
         self.selected = Some(new_sel);
-        // If we've reached the bottom, re-arm following
-        if self.selected == Some(self.records.len() - 1) {
+        if Some(new_sel) == vis.last().copied() {
             self.follow = FollowState::Following;
         } else {
             self.follow = FollowState::Paused;
@@ -135,16 +152,14 @@ impl AppState {
     }
 
     fn jump_to_bottom(&mut self) {
-        self.selected = if self.records.is_empty() {
-            None
-        } else {
-            Some(self.records.len() - 1)
-        };
+        let vis = self.visible_indices();
+        self.selected = vis.last().copied();
         self.follow = FollowState::Following;
     }
 
     fn jump_to_top(&mut self) {
-        self.selected = if self.records.is_empty() { None } else { Some(0) };
+        let vis = self.visible_indices();
+        self.selected = vis.first().copied();
         self.follow = FollowState::Paused;
     }
 
@@ -167,6 +182,47 @@ impl AppState {
     fn close_modal(&mut self) {
         self.modal = None;
         self.modal_sibling_sel = 0;
+    }
+
+    fn record_passes_view(&self, rec: &Record) -> bool {
+        let eff_project = match self.filter_mode {
+            FilterMode::Project => &self.filter_input,
+            _ => &self.interactive_project,
+        };
+        let eff_session = match self.filter_mode {
+            FilterMode::Session => &self.filter_input,
+            _ => &self.interactive_session,
+        };
+        if !eff_project.is_empty() {
+            let p = eff_project.to_lowercase();
+            let proj = rec.ev.project.to_lowercase();
+            let basename = proj.rsplit('_').next().unwrap_or(&proj);
+            if !proj.contains(&p) && !basename.contains(&p) {
+                return false;
+            }
+        }
+        if !eff_session.is_empty() {
+            let s = eff_session.to_lowercase();
+            if !rec.ev.session_id.to_lowercase().contains(&s) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.interactive_project.is_empty()
+            && self.interactive_session.is_empty()
+            && self.filter_mode == FilterMode::None
+        {
+            return (0..self.records.len()).collect();
+        }
+        self.records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| self.record_passes_view(r))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Returns the siblings (all records sharing the same req as the modal event)
@@ -217,19 +273,21 @@ impl Drop for TerminalGuard {
 fn spawn_tailer(
     log_path: PathBuf,
     project_filter: Option<String>,
+    session_filter: Option<String>,
     since_ms: Option<u64>,
     event_filters: Vec<String>,
     grep: Option<String>,
     tx: mpsc::SyncSender<Record>,
 ) {
     std::thread::spawn(move || {
-        tailer_thread(log_path, project_filter, since_ms, event_filters, grep, tx);
+        tailer_thread(log_path, project_filter, session_filter, since_ms, event_filters, grep, tx);
     });
 }
 
 fn tailer_thread(
     log_path: PathBuf,
     project_filter: Option<String>,
+    session_filter: Option<String>,
     since_ms: Option<u64>,
     event_filters: Vec<String>,
     grep: Option<String>,
@@ -261,7 +319,7 @@ fn tailer_thread(
                 continue;
             }
             if let Ok(ev) = serde_json::from_str::<EventLine>(line) {
-                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                     let rec = Record {
                         raw: line.to_string(),
                         ev,
@@ -322,7 +380,7 @@ fn tailer_thread(
             }
 
             if let Ok(ev) = serde_json::from_str::<EventLine>(&line) {
-                if should_show(&ev, &project_filter, since_ms, &event_filters, grep.as_deref()) {
+                if should_show(&ev, &project_filter, &session_filter, since_ms, &event_filters, grep.as_deref()) {
                     let rec = Record { raw: line, ev };
                     let _ = tx.try_send(rec);
                 }
@@ -429,15 +487,18 @@ fn record_to_list_item<'a>(rec: &'a Record, selected: bool, state: &AppState) ->
 // ─── Rendering functions ──────────────────────────────────────────────────────
 
 fn render_list(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
-    let items: Vec<ListItem> = state
-        .records
+    let vis = state.visible_indices();
+    let items: Vec<ListItem> = vis
         .iter()
-        .enumerate()
-        .map(|(i, rec)| record_to_list_item(rec, Some(i) == state.selected, state))
+        .map(|&abs_idx| {
+            let rec = &state.records[abs_idx];
+            let selected = state.selected == Some(abs_idx);
+            record_to_list_item(rec, selected, state)
+        })
         .collect();
 
-    // Sync the ratatui ListState with our selected index
-    list_state.select(state.selected);
+    let sel_display_pos = state.selected.and_then(|s| vis.iter().position(|&i| i == s));
+    list_state.select(sel_display_pos);
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
@@ -468,26 +529,38 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let dropped = state.dropped;
 
     let stats = if dropped > 0 {
-        format!(
-            " {} retained, {} dropped",
-            retained, dropped
-        )
+        format!(" {} retained, {} dropped", retained, dropped)
     } else {
         format!(" {} retained", retained)
     };
 
-    let filter_text = if state.filter_summary.is_empty() {
-        String::new()
-    } else {
-        format!(" | {}", state.filter_summary)
+    let filter_text = match state.filter_mode {
+        FilterMode::None => {
+            let mut parts = Vec::new();
+            if !state.filter_summary.is_empty() {
+                parts.push(state.filter_summary.clone());
+            }
+            if !state.interactive_project.is_empty() {
+                parts.push(format!("project:{}", state.interactive_project));
+            }
+            if !state.interactive_session.is_empty() {
+                parts.push(format!("session:{}", state.interactive_session));
+            }
+            if parts.is_empty() { String::new() } else { format!(" | {}", parts.join(" ")) }
+        }
+        FilterMode::Project => format!(" | project filter: {}▌", state.filter_input),
+        FilterMode::Session => format!(" | session filter: {}▌", state.filter_input),
     };
 
-    let help = "  ↑/k↓/j:select  Enter:detail  G/f:follow  g:top  q:quit";
+    let help = match state.filter_mode {
+        FilterMode::None => "  ↑/k↓/j  Enter:detail  G/f:follow  g:top  p:project  s:session  q:quit",
+        FilterMode::Project | FilterMode::Session => "  type to filter  Enter:set  Esc:cancel  Ctrl+U:clear",
+    };
 
     let spans = vec![
         follow_indicator,
         Span::styled(stats, Style::default().fg(Color::DarkGray)),
-        Span::styled(filter_text, Style::default().fg(Color::DarkGray)),
+        Span::styled(filter_text, Style::default().fg(Color::Cyan)),
         Span::styled(help, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
     ];
 
@@ -1003,6 +1076,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 pub fn run_tui(
     log_path: PathBuf,
     project_filter: Option<String>,
+    session_filter: Option<String>,
     since_ms: Option<u64>,
     event_filters: Vec<String>,
     grep: Option<String>,
@@ -1037,6 +1111,7 @@ pub fn run_tui(
     spawn_tailer(
         log_path,
         project_filter,
+        session_filter,
         since_ms,
         event_filters,
         grep,
@@ -1084,13 +1159,45 @@ pub fn run_tui(
                 let modifiers = key.modifiers;
                 let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
-                if app.modal.is_some() {
+                if app.filter_mode != FilterMode::None {
+                    // ── Filter input mode ──
+                    match key.code {
+                        KeyCode::Enter => {
+                            match app.filter_mode {
+                                FilterMode::Project => app.interactive_project = app.filter_input.clone(),
+                                FilterMode::Session => app.interactive_session = app.filter_input.clone(),
+                                FilterMode::None => {}
+                            }
+                            app.filter_mode = FilterMode::None;
+                            let vis = app.visible_indices();
+                            if app.follow == FollowState::Following {
+                                app.selected = vis.last().copied();
+                            } else if let Some(sel) = app.selected {
+                                if !vis.iter().any(|&i| i == sel) {
+                                    app.selected = vis.last().copied();
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.filter_mode = FilterMode::None;
+                        }
+                        KeyCode::Char('u') if ctrl => {
+                            app.filter_input.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.filter_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.filter_input.push(c);
+                        }
+                        _ => {}
+                    }
+                } else if app.modal.is_some() {
                     // ── Modal key handling ──
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
                             app.close_modal();
                         }
-                        // Scroll detail pane
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.modal_scroll_up(1);
                         }
@@ -1103,7 +1210,6 @@ pub fn run_tui(
                         KeyCode::PageDown | KeyCode::Char(' ') => {
                             app.modal_scroll_down(20);
                         }
-                        // Navigate siblings in the trace section
                         KeyCode::Left | KeyCode::Char('h') => {
                             if app.modal_sibling_sel > 0 {
                                 app.modal_sibling_sel -= 1;
@@ -1120,23 +1226,21 @@ pub fn run_tui(
                 } else {
                     // ── List key handling ──
                     match key.code {
-                        // Quit
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if ctrl => break,
-
-                        // Navigation
                         KeyCode::Up | KeyCode::Char('k') => app.select_up(),
                         KeyCode::Down | KeyCode::Char('j') => app.select_down(),
-
-                        // Jump to bottom + re-arm follow
                         KeyCode::Char('G') | KeyCode::Char('f') => app.jump_to_bottom(),
-
-                        // Jump to top
                         KeyCode::Char('g') => app.jump_to_top(),
-
-                        // Open detail modal
                         KeyCode::Enter => app.open_modal(),
-
+                        KeyCode::Char('p') => {
+                            app.filter_mode = FilterMode::Project;
+                            app.filter_input = app.interactive_project.clone();
+                        }
+                        KeyCode::Char('s') => {
+                            app.filter_mode = FilterMode::Session;
+                            app.filter_input = app.interactive_session.clone();
+                        }
                         _ => {}
                     }
                 }
