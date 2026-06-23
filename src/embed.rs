@@ -15,6 +15,26 @@ pub trait Embedder: Send + Sync {
     fn dimension(&self) -> usize;
 }
 
+pub fn configured_dimension(cfg: &Config) -> Result<usize> {
+    match cfg.embed_provider.as_str() {
+        "local" => Ok(match cfg.embed_model.as_str() {
+            "all-MiniLM-L6-v2" | "minilm" => 384,
+            "bge-small-en-v1.5" | "bge-small" => 384,
+            "bge-base-en-v1.5" => 768,
+            "snowflake-arctic-embed-s" => 384,
+            "nomic-embed-text-v1" | "nomic" => 768,
+            _ => 384,
+        }),
+        "openrouter" => Ok(match cfg.embed_model.as_str() {
+            "openai/text-embedding-3-small" => 1536,
+            "openai/text-embedding-3-large" => 3072,
+            "openai/text-embedding-ada-002" => 1536,
+            _ => 1536,
+        }),
+        other => anyhow::bail!("Unknown embed_provider: {}", other),
+    }
+}
+
 /// Local embeddings via fastembed (ONNX + HuggingFace models, fully offline after download).
 pub struct LocalEmbedder {
     model: TextEmbedding,
@@ -179,6 +199,30 @@ impl Embedder for OpenRouterEmbedder {
     }
 }
 
+pub struct SidecarEmbedder {
+    cfg: Config,
+    dim: usize,
+}
+
+impl SidecarEmbedder {
+    pub fn new(cfg: &Config) -> Result<Self> {
+        Ok(Self {
+            cfg: cfg.clone(),
+            dim: configured_dimension(cfg)?,
+        })
+    }
+}
+
+impl Embedder for SidecarEmbedder {
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        crate::embed_sidecar::embed_via_sidecar(texts, &self.cfg)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
 /// Factory that builds the right embedder from config.
 pub fn build_embedder(cfg: &Config) -> Result<Box<dyn Embedder>> {
     match cfg.embed_provider.as_str() {
@@ -195,4 +239,8 @@ pub fn build_embedder(cfg: &Config) -> Result<Box<dyn Embedder>> {
         }
         other => anyhow::bail!("Unknown embed_provider: {}", other),
     }
+}
+
+pub fn build_sidecar_embedder(cfg: &Config) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(SidecarEmbedder::new(cfg)?))
 }
