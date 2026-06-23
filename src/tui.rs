@@ -12,7 +12,7 @@
 ///
 /// Safety: a TerminalGuard Drop impl + panic hook restore the terminal on every exit path
 /// including panic and Ctrl-C.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -52,10 +52,17 @@ enum FollowState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterMode {
-    None,
+enum PickerKind {
     Project,
     Session,
+}
+
+struct PickerState {
+    kind: PickerKind,
+    items: Vec<String>,         // display names shown in the list
+    full_ids: Vec<String>,      // actual filter values; empty string = clear filter
+    selected: usize,
+    previews: Vec<Vec<String>>, // per-item prompt lines (session picker only)
 }
 
 struct AppState {
@@ -75,10 +82,9 @@ struct AppState {
     filter_summary: String,
     verbosity: Verbosity,
     ascii: bool,
-    filter_mode: FilterMode,
     interactive_project: String,
     interactive_session: String,
-    filter_input: String,
+    picker: Option<PickerState>,
 }
 
 impl AppState {
@@ -94,10 +100,9 @@ impl AppState {
             filter_summary,
             verbosity,
             ascii,
-            filter_mode: FilterMode::None,
             interactive_project: String::new(),
             interactive_session: String::new(),
-            filter_input: String::new(),
+            picker: None,
         }
     }
 
@@ -185,25 +190,16 @@ impl AppState {
     }
 
     fn record_passes_view(&self, rec: &Record) -> bool {
-        let eff_project = match self.filter_mode {
-            FilterMode::Project => &self.filter_input,
-            _ => &self.interactive_project,
-        };
-        let eff_session = match self.filter_mode {
-            FilterMode::Session => &self.filter_input,
-            _ => &self.interactive_session,
-        };
-        if !eff_project.is_empty() {
-            let p = eff_project.to_lowercase();
+        if !self.interactive_project.is_empty() {
+            let p = self.interactive_project.to_lowercase();
             let proj = rec.ev.project.to_lowercase();
             let basename = proj.rsplit('_').next().unwrap_or(&proj);
             if !proj.contains(&p) && !basename.contains(&p) {
                 return false;
             }
         }
-        if !eff_session.is_empty() {
-            let s = eff_session.to_lowercase();
-            if !rec.ev.session_id.to_lowercase().contains(&s) {
+        if !self.interactive_session.is_empty() {
+            if !rec.ev.session_id.to_lowercase().contains(&self.interactive_session.to_lowercase()) {
                 return false;
             }
         }
@@ -211,10 +207,7 @@ impl AppState {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        if self.interactive_project.is_empty()
-            && self.interactive_session.is_empty()
-            && self.filter_mode == FilterMode::None
-        {
+        if self.interactive_project.is_empty() && self.interactive_session.is_empty() {
             return (0..self.records.len()).collect();
         }
         self.records
@@ -223,6 +216,84 @@ impl AppState {
             .filter(|(_, r)| self.record_passes_view(r))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn open_project_picker(&mut self) {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for rec in &self.records {
+            *counts.entry(rec.ev.project.clone()).or_default() += 1;
+        }
+        let mut projects: Vec<(String, usize)> = counts.into_iter().collect();
+        projects.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut items = vec!["(all projects)".to_string()];
+        let mut full_ids = vec![String::new()];
+        for (proj, count) in &projects {
+            let short = proj.rsplit('_').next().unwrap_or(proj);
+            items.push(format!("{} ({})", short, count));
+            full_ids.push(proj.clone());
+        }
+
+        let sel = if self.interactive_project.is_empty() {
+            0
+        } else {
+            full_ids.iter().position(|id| id == &self.interactive_project).unwrap_or(0)
+        };
+
+        self.picker = Some(PickerState {
+            kind: PickerKind::Project,
+            items,
+            full_ids,
+            selected: sel,
+            previews: vec![],
+        });
+    }
+
+    fn open_session_picker(&mut self) {
+        let mut session_data: HashMap<String, (usize, Vec<String>)> = HashMap::new();
+        for rec in &self.records {
+            let sid = rec.ev.session_id.clone();
+            if sid.is_empty() { continue; }
+            let entry = session_data.entry(sid).or_default();
+            entry.0 += 1;
+            if rec.ev.event == "inject.start" {
+                if let Some(preview) = rec.ev.payload.get("prompt_preview").and_then(|v| v.as_str()) {
+                    if !preview.is_empty() && entry.1.len() < 10 {
+                        entry.1.push(preview.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut sessions: Vec<(String, usize, Vec<String>)> = session_data
+            .into_iter()
+            .map(|(id, (count, previews))| (id, count, previews))
+            .collect();
+        sessions.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut items = vec!["(all sessions)".to_string()];
+        let mut full_ids = vec![String::new()];
+        let mut previews_list: Vec<Vec<String>> = vec![vec![]];
+        for (sid, count, previews) in &sessions {
+            let short = if sid.len() > 12 { &sid[sid.len()-12..] } else { sid };
+            items.push(format!("{}… ({})", short, count));
+            full_ids.push(sid.clone());
+            previews_list.push(previews.clone());
+        }
+
+        let sel = if self.interactive_session.is_empty() {
+            0
+        } else {
+            full_ids.iter().position(|id| id == &self.interactive_session).unwrap_or(0)
+        };
+
+        self.picker = Some(PickerState {
+            kind: PickerKind::Session,
+            items,
+            full_ids,
+            selected: sel,
+            previews: previews_list,
+        });
     }
 
     /// Returns the siblings (all records sharing the same req as the modal event)
@@ -534,28 +605,28 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         format!(" {} retained", retained)
     };
 
-    let filter_text = match state.filter_mode {
-        FilterMode::None => {
-            let mut parts = Vec::new();
-            if !state.filter_summary.is_empty() {
-                parts.push(state.filter_summary.clone());
-            }
-            if !state.interactive_project.is_empty() {
-                parts.push(format!("project:{}", state.interactive_project));
-            }
-            if !state.interactive_session.is_empty() {
-                parts.push(format!("session:{}", state.interactive_session));
-            }
-            if parts.is_empty() { String::new() } else { format!(" | {}", parts.join(" ")) }
+    let filter_text = {
+        let mut parts = Vec::new();
+        if !state.filter_summary.is_empty() {
+            parts.push(state.filter_summary.clone());
         }
-        FilterMode::Project => format!(" | project filter: {}▌", state.filter_input),
-        FilterMode::Session => format!(" | session filter: {}▌", state.filter_input),
+        if !state.interactive_project.is_empty() {
+            let short = state.interactive_project.rsplit('_').next()
+                .unwrap_or(&state.interactive_project);
+            parts.push(format!("project:{}", short));
+        }
+        if !state.interactive_session.is_empty() {
+            let short = if state.interactive_session.len() > 12 {
+                &state.interactive_session[state.interactive_session.len()-12..]
+            } else {
+                &state.interactive_session
+            };
+            parts.push(format!("session:{}…", short));
+        }
+        if parts.is_empty() { String::new() } else { format!(" | {}", parts.join(" ")) }
     };
 
-    let help = match state.filter_mode {
-        FilterMode::None => "  ↑/k↓/j  Enter:detail  G/f:follow  g:top  p:project  s:session  q:quit",
-        FilterMode::Project | FilterMode::Session => "  type to filter  Enter:set  Esc:cancel  Ctrl+U:clear",
-    };
+    let help = "  ↑/k↓/j  Enter:detail  G/f:follow  g:top  p:project  s:session  q:quit";
 
     let spans = vec![
         follow_indicator,
@@ -1052,6 +1123,145 @@ fn render_modal_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_picker(frame: &mut Frame, state: &AppState) {
+    let pk = match &state.picker {
+        Some(p) => p,
+        None => return,
+    };
+    match pk.kind {
+        PickerKind::Project => render_project_picker(frame, pk),
+        PickerKind::Session => render_session_picker(frame, pk),
+    }
+}
+
+fn render_project_picker(frame: &mut Frame, pk: &PickerState) {
+    let area = frame.area();
+    let popup_area = centered_rect(40, 65, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" Select Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = pk.items.iter().enumerate().map(|(i, item)| {
+        if i == pk.selected {
+            ListItem::new(Line::from(Span::styled(
+                format!(" ▶ {}", item),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )))
+        } else {
+            ListItem::new(Line::from(Span::raw(format!("   {}", item))))
+        }
+    }).collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(pk.selected));
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::NONE))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    frame.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  ↑/↓/j/k: navigate  Enter: select  Esc: cancel",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ))),
+        chunks[1],
+    );
+}
+
+fn render_session_picker(frame: &mut Frame, pk: &PickerState) {
+    let area = frame.area();
+    let popup_area = centered_rect(84, 72, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" Select Session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(outer[0]);
+
+    // Left: session list
+    let items: Vec<ListItem> = pk.items.iter().enumerate().map(|(i, item)| {
+        if i == pk.selected {
+            ListItem::new(Line::from(Span::styled(
+                format!(" ▶ {}", item),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )))
+        } else {
+            ListItem::new(Line::from(Span::raw(format!("   {}", item))))
+        }
+    }).collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(pk.selected));
+    let session_list = List::new(items)
+        .block(Block::default()
+            .title(" Sessions ")
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    frame.render_stateful_widget(session_list, cols[0], &mut list_state);
+
+    // Right: prompt preview
+    let preview_width = cols[1].width as usize;
+    let mut preview_lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Prompts seen in this session:",
+        Style::default().fg(Color::DarkGray),
+    )), Line::default()];
+
+    let prompts = pk.previews.get(pk.selected).map(|v| v.as_slice()).unwrap_or(&[]);
+    if prompts.is_empty() {
+        preview_lines.push(Line::from(Span::styled(
+            "  (no prompts recorded)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        for p in prompts {
+            let max = preview_width.saturating_sub(6);
+            let display = if p.len() > max {
+                format!("  \"{}…\"", &p[..max])
+            } else {
+                format!("  \"{}\"", p)
+            };
+            preview_lines.push(Line::from(Span::styled(display, Style::default().fg(Color::Yellow))));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(preview_lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        cols[1],
+    );
+
+    // Help
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  ↑/↓/j/k: navigate  Enter: select  Esc: cancel",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ))),
+        outer[1],
+    );
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1151,6 +1361,9 @@ pub fn run_tui(
             if app.modal.is_some() {
                 render_modal(frame, &app);
             }
+            if app.picker.is_some() {
+                render_picker(frame, &app);
+            }
         })?;
 
         // Poll for key events (~100ms timeout doubles as redraw cadence)
@@ -1159,36 +1372,38 @@ pub fn run_tui(
                 let modifiers = key.modifiers;
                 let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
-                if app.filter_mode != FilterMode::None {
-                    // ── Filter input mode ──
+                if app.picker.is_some() {
+                    // ── Picker popup key handling ──
                     match key.code {
-                        KeyCode::Enter => {
-                            match app.filter_mode {
-                                FilterMode::Project => app.interactive_project = app.filter_input.clone(),
-                                FilterMode::Session => app.interactive_session = app.filter_input.clone(),
-                                FilterMode::None => {}
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.picker = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(ref mut pk) = app.picker {
+                                if pk.selected > 0 { pk.selected -= 1; }
                             }
-                            app.filter_mode = FilterMode::None;
-                            let vis = app.visible_indices();
-                            if app.follow == FollowState::Following {
-                                app.selected = vis.last().copied();
-                            } else if let Some(sel) = app.selected {
-                                if !vis.iter().any(|&i| i == sel) {
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(ref mut pk) = app.picker {
+                                if pk.selected + 1 < pk.items.len() { pk.selected += 1; }
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some(pk) = app.picker.take() {
+                                let val = pk.full_ids[pk.selected].clone();
+                                match pk.kind {
+                                    PickerKind::Project => app.interactive_project = val,
+                                    PickerKind::Session => app.interactive_session = val,
+                                }
+                                let vis = app.visible_indices();
+                                if app.follow == FollowState::Following {
                                     app.selected = vis.last().copied();
+                                } else if let Some(sel) = app.selected {
+                                    if !vis.iter().any(|&i| i == sel) {
+                                        app.selected = vis.last().copied();
+                                    }
                                 }
                             }
-                        }
-                        KeyCode::Esc => {
-                            app.filter_mode = FilterMode::None;
-                        }
-                        KeyCode::Char('u') if ctrl => {
-                            app.filter_input.clear();
-                        }
-                        KeyCode::Backspace => {
-                            app.filter_input.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.filter_input.push(c);
                         }
                         _ => {}
                     }
@@ -1233,14 +1448,8 @@ pub fn run_tui(
                         KeyCode::Char('G') | KeyCode::Char('f') => app.jump_to_bottom(),
                         KeyCode::Char('g') => app.jump_to_top(),
                         KeyCode::Enter => app.open_modal(),
-                        KeyCode::Char('p') => {
-                            app.filter_mode = FilterMode::Project;
-                            app.filter_input = app.interactive_project.clone();
-                        }
-                        KeyCode::Char('s') => {
-                            app.filter_mode = FilterMode::Session;
-                            app.filter_input = app.interactive_session.clone();
-                        }
+                        KeyCode::Char('p') => app.open_project_picker(),
+                        KeyCode::Char('s') => app.open_session_picker(),
                         _ => {}
                     }
                 }
