@@ -18,14 +18,8 @@
 //!     selects definition-only / +prompt-filtered-facts / +user-intent. The composer
 //!     emits a SEPARATE block the inject path prepends to the briefing — placement is
 //!     HELD CONSTANT and retrieval is NOT blended (spec F16).
-//!   - **C1 — definitional EXTRACT bucket (deferred, gated):** a "X is Y" recognition
-//!     pass that registers transcript-cited definitions. Built flagged-off behind
-//!     `capture_nouns`; off the experiment critical path (gated to Run 16).
-//!
-//! ## Feature flag
-//! Everything here is inert unless `capture_nouns` (config, default false) or the
-//! `PC_NOUNS` env override is set. When off, capture and inject behavior is
-//! byte-identical to the pre-entity-layer pipeline.
+//!   - **C1 — definitional EXTRACT bucket:** a "X is Y" recognition pass that registers
+//!     transcript-cited definitions. Always on.
 
 use crate::wiki::{read_index_live, IndexRow};
 use serde::{Deserialize, Serialize};
@@ -33,34 +27,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-// ─── Feature flag ──────────────────────────────────────────────────────────────
-
-/// True when the noun layer's INJECT side should run. Default ON (Run-14: ship the primer
-/// default-on at level `facts`). The `PC_NOUNS` env override takes precedence in BOTH
-/// directions — `PC_NOUNS=0|false|off` is the clean off-switch (inject output then
-/// byte-identical to the pre-primer pipeline); `PC_NOUNS=1|true|on` forces it on regardless
-/// of config. Absent any env override, the caller's `config_flag` (`inject_noun_primer`,
-/// default true) decides. NOTE: this gates only INJECT; the C1 capture stage is gated
-/// separately by `capture_nouns` (default off, deferred).
-pub fn nouns_inject_enabled(config_flag: bool) -> bool {
-    nouns_inject_enabled_with(config_flag, std::env::var("PC_NOUNS").ok().as_deref())
-}
-
-/// Pure core of `nouns_inject_enabled` (env value injected) so the precedence logic is unit-
-/// testable without racing the process-global environment.
-fn nouns_inject_enabled_with(config_flag: bool, env: Option<&str>) -> bool {
-    if let Some(v) = env {
-        let v = v.trim();
-        if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
-            return false;
-        }
-        if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
-            return true;
-        }
-    }
-    config_flag
-}
 
 // ─── Primer content level (the experiment's content seam — I2) ──────────────────
 
@@ -335,8 +301,7 @@ pub fn build_registry_from_disk(wiki_dir: &Path, project_dir: &Path) -> Vec<Noun
 //
 //  This gate is the inject-side seam. The user-stance realness scores are computed at CAPTURE time
 //  (the LLM stance pass is off the hot path) and PERSISTED as a small registry the inject path reads;
-//  the surfacing transform here is pure and LLM-free. Flagged (`PC_NOUNS_REALNESS`, default OFF):
-//  when off, the primer sources the C3 registry exactly as before (byte-identical).
+//  the surfacing transform here is pure and LLM-free.
 
 /// A user-stance noun with its accumulated Approach-A realness, persisted at capture time and read by
 /// the inject surfacing gate. Sourced from USER TURNS (never guide titles), alias-normalized
@@ -377,30 +342,6 @@ impl RealnessNoun {
     pub fn is_real(&self) -> bool {
         self.signed >= crate::realness::REAL_THRESHOLD
     }
-}
-
-/// The inject-side realness gate flag. Default ON (Phase-4 landing): the primer's population is the
-/// USER-STANCE realness registry, NOT guide titles — so a synthesized guide title like
-/// `fabric-provider` can never prime unless the USER actually made it real. `PC_NOUNS_REALNESS`
-/// overrides in both directions: `=0|false|off` reverts to the legacy C3 guide-title population;
-/// `=1|true|on` forces the gate on; absent/unrecognized → the default (on). NOTE: the gate is moot
-/// when the primer itself is off (`PC_NOUNS=0` / `inject_noun_primer=false`) — then nothing primes
-/// at all, byte-identical to the pre-primer pipeline.
-pub fn realness_gate_enabled() -> bool {
-    realness_gate_enabled_with(std::env::var("PC_NOUNS_REALNESS").ok().as_deref())
-}
-
-fn realness_gate_enabled_with(env: Option<&str>) -> bool {
-    if let Some(v) = env {
-        let v = v.trim().to_lowercase();
-        if v == "0" || v == "false" || v == "off" {
-            return false;
-        }
-        if v == "1" || v == "true" || v == "on" {
-            return true;
-        }
-    }
-    true
 }
 
 /// Index a C3 registry by canonical key (alias-normalized) for enrichment lookup. Both the entry's
@@ -651,8 +592,6 @@ pub fn run_realness_stage(
 /// and return the paths written. C3-derived entries are refreshed (the wiki is the source
 /// of truth and may have changed); C1-extracted entries (origin "extracted") are NEVER
 /// overwritten (transcript-cited, immutable per spec R3).
-///
-/// Gated by the caller (`capture_nouns`); does the work unconditionally once called.
 pub fn persist_registry(wiki_dir: &Path, entries: &[NounEntry]) -> std::io::Result<Vec<PathBuf>> {
     let nouns_dir = wiki_dir.join("nouns");
     fs::create_dir_all(&nouns_dir)?;
@@ -1258,8 +1197,8 @@ fn is_word_byte(b: u8) -> bool {
 //  (explicit/implicit) is a SURFACING tag, never a capture gate. We do NOT feed the wiki
 //  index into this prompt (finding F: that caused 0-claim EXTRACT failures).
 //
-//  Built flagged-off (capture_nouns). Pure parsing/verification is unit-tested; the live
-//  recognition call is exercised only by `pc debug nouns --transcript` and the gated stage.
+//  Pure parsing/verification is unit-tested; the live recognition call is exercised by
+//  `pc debug nouns --transcript` and the capture stage.
 
 use crate::research_capture::{build_research_transcript_with_spans, TurnSpan};
 
@@ -1443,9 +1382,9 @@ pub fn recognize_definitions(transcript_path: &str) -> anyhow::Result<Vec<NounEn
     Ok(entries)
 }
 
-/// Gated C1 capture stage: recognize transcript-cited definitions and persist them as
+/// C1 capture stage: recognize transcript-cited definitions and persist them as
 /// immutable `extracted` registry entries under `<wiki>/nouns/`. Best-effort. Called from
-/// the capture pipeline ONLY when `capture_nouns` is on (default off) — a no-op otherwise.
+/// the capture pipeline.
 pub fn run_definitional_stage(wiki_dir: &Path, transcript_path: &str) -> anyhow::Result<Vec<PathBuf>> {
     let entries = recognize_definitions(transcript_path)?;
     if entries.is_empty() {
@@ -1475,8 +1414,7 @@ pub struct PrimerResult {
 const MAX_PRIME_PER_TURN: usize = 6;
 
 /// Build the first-mention primer for one inject turn — the single entry point inject.rs
-/// calls. Fully self-contained and flagged: when the flag/`PC_NOUNS` is off this is a cheap
-/// no-op returning an empty result, so inject behavior is byte-identical.
+/// calls. Always on.
 ///
 /// Steps: derive the C3 registry from disk → read the per-session primed-ledger → detect
 /// first-mentioned nouns in `prompt` (not already in `recent`, not already primed) → for the
@@ -1486,7 +1424,6 @@ const MAX_PRIME_PER_TURN: usize = 6;
 /// Placement is the caller's responsibility and is HELD CONSTANT (a separate prepended block);
 /// this function never blends into retrieval (spec F16) and makes NO model call on the hot path.
 pub fn build_inject_primer(
-    config_flag: bool,
     wiki_dir: &Path,
     project_dir: &Path,
     session_id: &str,
@@ -1494,20 +1431,11 @@ pub fn build_inject_primer(
     recent: &str,
 ) -> PrimerResult {
     let level = PrimerLevel::from_env();
-    if !nouns_inject_enabled(config_flag) {
-        return PrimerResult { block: None, primed_slugs: Vec::new(), level };
-    }
-    // Population source. Default (gate OFF): the C3 derived registry, byte-identical to the shipped
-    // primer. Gate ON (`PC_NOUNS_REALNESS`): the USER-STANCE realness registry — only nouns the user
-    // made REAL prime, C3 guides supply DEFINITIONS only (the model Pablo accepted). When the gate is
-    // on but no realness registry has been persisted yet, the population is empty (prime nothing)
-    // rather than silently falling back to guide titles.
+    // Population source: the USER-STANCE realness registry — only nouns the user made REAL prime,
+    // C3 guides supply DEFINITIONS only. When no realness registry has been persisted yet, the
+    // population is empty (prime nothing) rather than silently falling back to guide titles.
     let c3 = build_registry_from_disk(wiki_dir, project_dir);
-    let registry: Vec<NounEntry> = if realness_gate_enabled() {
-        realness_gated_registry(&read_realness_registry(wiki_dir), &c3)
-    } else {
-        c3
-    };
+    let registry: Vec<NounEntry> = realness_gated_registry(&read_realness_registry(wiki_dir), &c3);
     if registry.is_empty() {
         return PrimerResult { block: None, primed_slugs: Vec::new(), level };
     }
@@ -1598,7 +1526,7 @@ mod tests {
     use super::*;
     use crate::wiki::IndexRow;
 
-    /// Serializes tests that mutate the process-global `PC_NOUNS_REALNESS` env var so they don't race
+    /// Serializes tests that mutate the process-global `PC_PRIMER_LEVEL` env var so they don't race
     /// each other under the default multi-threaded test runner. Poison-tolerant.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1838,22 +1766,6 @@ mod tests {
         assert!(out.contains("disabled in inject"), "highest-overlap fact first, got: {}", out);
     }
 
-    #[test]
-    fn nouns_inject_enabled_defaults_on_with_env_off_switch() {
-        // Default ON when config flag true and no env.
-        assert!(nouns_inject_enabled_with(true, None));
-        // PC_NOUNS=0 / false / off is the clean off-switch (overrides config).
-        assert!(!nouns_inject_enabled_with(true, Some("0")));
-        assert!(!nouns_inject_enabled_with(true, Some("false")));
-        assert!(!nouns_inject_enabled_with(true, Some("off")));
-        // PC_NOUNS=1 / true / on forces on even if config is false.
-        assert!(nouns_inject_enabled_with(false, Some("1")));
-        assert!(nouns_inject_enabled_with(false, Some("true")));
-        // Unrecognized env value falls through to config.
-        assert!(!nouns_inject_enabled_with(false, Some("maybe")));
-        assert!(nouns_inject_enabled_with(true, Some("maybe")));
-    }
-
     // ─── Approach-A surfacing gate (Phase 3 Move 2) ───
 
     #[test]
@@ -1870,21 +1782,6 @@ mod tests {
         assert!(!sup.is_real());
         // canonical collapses the phrasings → same accumulation key.
         assert_eq!(real.canonical, sup.canonical);
-    }
-
-    #[test]
-    fn realness_gate_flag_defaults_on() {
-        // Default ON (Phase-4 landing): absent / unrecognized env → the user-stance population.
-        assert!(realness_gate_enabled_with(None));
-        assert!(realness_gate_enabled_with(Some("maybe")));
-        // Explicit disable reverts to the legacy C3 guide-title population.
-        assert!(!realness_gate_enabled_with(Some("0")));
-        assert!(!realness_gate_enabled_with(Some("false")));
-        assert!(!realness_gate_enabled_with(Some("off")));
-        // Explicit force-on.
-        assert!(realness_gate_enabled_with(Some("1")));
-        assert!(realness_gate_enabled_with(Some("true")));
-        assert!(realness_gate_enabled_with(Some("ON")));
     }
 
     #[test]
@@ -1943,9 +1840,8 @@ mod tests {
 
     #[test]
     fn build_inject_primer_realness_gate_replaces_guide_population() {
-        // With the gate ON, a guide-title noun the user NEVER made real must NOT prime, while a
-        // user-REAL noun does — proving the population source switched from guide titles to user
-        // stance. (Contrast with the gate-OFF behavior in the test below.)
+        // A guide-title noun the user NEVER made real must NOT prime, while a user-REAL noun does —
+        // proving the population source is user stance, not guide titles.
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pc-gate-on-{}", std::process::id()));
         let wiki = dir.join("wiki");
@@ -1968,11 +1864,9 @@ mod tests {
         ]).unwrap();
         std::env::remove_var("PC_PRIMER_LEVEL");
 
-        // Gate ON: prompt names BOTH; only the user-real one primes.
-        std::env::set_var("PC_NOUNS_REALNESS", "1");
+        // Prompt names BOTH; only the user-real one primes.
         let prompt = "how does the fabric provider interact with context injection?";
-        let on = build_inject_primer(true, &wiki, &proj, "sess-gate-on", prompt, "");
-        std::env::remove_var("PC_NOUNS_REALNESS");
+        let on = build_inject_primer(&wiki, &proj, "sess-gate-on", prompt, "");
         let block = on.block.expect("real noun should prime");
         assert!(block.contains("Context Injection") || block.contains("context injection"), "block: {}", block);
         assert!(!block.to_lowercase().contains("fabric provider"), "suppressed confab must NOT prime: {}", block);
@@ -1981,7 +1875,9 @@ mod tests {
     }
 
     #[test]
-    fn build_inject_primer_off_switch_is_byte_identical_and_fires_when_on() {
+    fn build_inject_primer_fires_on_natural_phrasing() {
+        // The alias matcher fires on natural separate-word phrasing (not the whole slug phrase)
+        // and a Facts-level block is composed. A user-REAL noun primes.
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pc-primer-gate-{}", std::process::id()));
         let wiki = dir.join("wiki");
@@ -1994,34 +1890,26 @@ mod tests {
             "---\ntitle: Code Grounding Staleness\nsummary: A staleness detector demotes guides whose cited files no longer exist.\n---\n\n# Code Grounding Staleness\n\nThe staleness detector demotes guides whose cited files no longer exist.\n",
         )
         .unwrap();
+        // Mark the noun REAL so it primes under the user-stance population. The name matches
+        // the guide title so it canonicalizes to the same key and enriches the definition.
+        write_realness_registry(&wiki, &[RealnessNoun::new("Code Grounding Staleness", 3)]).unwrap();
         // Natural phrasing: separate words, NOT the whole slug phrase (the Run-13 gap).
         let prompt = "what does the staleness detector do?";
         std::env::remove_var("PC_PRIMER_LEVEL");
-        // The realness gate now DEFAULTS ON, so to exercise the legacy C3 guide-title path this test
-        // must explicitly disable it (=0 reverts to the C3 population).
-        std::env::set_var("PC_NOUNS_REALNESS", "0");
 
-        // Disabled (config flag false): byte-identical no-op — empty block, nothing primed.
-        let off = build_inject_primer(false, &wiki, &proj, "sess-gate", prompt, "");
-        assert!(off.block.is_none(), "disabled primer must emit no block");
-        assert!(off.primed_slugs.is_empty());
-
-        // Enabled (config flag true): the alias matcher fires and a Facts-level block is composed.
-        let on = build_inject_primer(true, &wiki, &proj, "sess-gate", prompt, "");
-        std::env::remove_var("PC_NOUNS_REALNESS");
-        let block = on.block.expect("enabled primer should fire on natural phrasing");
+        let on = build_inject_primer(&wiki, &proj, "sess-gate", prompt, "");
+        let block = on.block.expect("primer should fire on natural phrasing");
         assert!(block.contains("Code Grounding Staleness"));
         assert!(on.primed_slugs.contains(&"code-grounding-staleness".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn build_inject_primer_gate_on_empty_realness_is_inert() {
-        // THE SAFETY INVARIANT (Phase-4 landing): with the realness gate ON but NO accrued stance
-        // (empty realness.jsonl), the gate suppresses everything → the primer is INERT → it can NEVER
-        // prime a confabulation, even when a guide title of that exact name exists on disk. This is
-        // what makes flipping the gate default-on safe before the capture-time writer has run: a
-        // fresh project primes NOTHING until real user stance accumulates.
+    fn build_inject_primer_empty_realness_is_inert() {
+        // THE SAFETY INVARIANT: with NO accrued stance (empty realness.jsonl), the gate suppresses
+        // everything → the primer is INERT → it can NEVER prime a confabulation, even when a guide
+        // title of that exact name exists on disk. A fresh project primes NOTHING until real user
+        // stance accumulates.
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pc-gate-inert-{}", std::process::id()));
         let wiki = dir.join("wiki");
@@ -2029,7 +1917,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&wiki).unwrap();
         fs::create_dir_all(&proj).unwrap();
-        // A guide title that the OLD population would have primed (the rejected `fabric-provider`).
+        // A guide title that would have primed under the old guide-title population.
         fs::write(
             wiki.join("fabric-provider.md"),
             "---\ntitle: Fabric Provider\nsummary: A provider abstraction nobody asked for.\n---\n\n# Fabric Provider\n\nA provider abstraction.\n",
@@ -2038,12 +1926,10 @@ mod tests {
         // NO realness registry is written → read_realness_registry returns empty.
         assert!(read_realness_registry(&wiki).is_empty());
         std::env::remove_var("PC_PRIMER_LEVEL");
-        std::env::set_var("PC_NOUNS_REALNESS", "1"); // gate ON
 
         let prompt = "how does the fabric provider work?";
-        let res = build_inject_primer(true, &wiki, &proj, "sess-inert", prompt, "");
-        std::env::remove_var("PC_NOUNS_REALNESS");
-        // Gate-on + empty registry → population is empty → nothing primes (not the guide title).
+        let res = build_inject_primer(&wiki, &proj, "sess-inert", prompt, "");
+        // Empty registry → population is empty → nothing primes (not the guide title).
         assert!(res.block.is_none(), "empty realness registry must prime NOTHING, got: {:?}", res.block);
         assert!(res.primed_slugs.is_empty());
         let _ = fs::remove_dir_all(&dir);

@@ -150,8 +150,6 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
         FlagState { name: "PC_TYPED_TRANSCRIPT", enabled: flag_enabled("PC_TYPED_TRANSCRIPT"), note: "canonical transcript substrate" },
         // Pre-existing, behavior-affecting toggles, surfaced for a full baseline picture.
         FlagState { name: "PC_CLAIMS_LOG", enabled: claims_log_on(), note: "append-only claim tap (default on)" },
-        FlagState { name: "PC_NOUNS", enabled: nouns_primer_on(), note: "noun primer block (default on)" },
-        FlagState { name: "PC_NOUNS_REALNESS", enabled: flag_enabled("PC_NOUNS_REALNESS"), note: "realness-gated priming" },
     ];
     println!("── taxonomy feature flags ─────────────────────────────────");
     for f in &flags {
@@ -176,17 +174,6 @@ fn count_claims(project_dir: &Path) -> Option<usize> {
 /// Mirror of `PC_CLAIMS_LOG` semantics (default on unless explicitly disabled).
 fn claims_log_on() -> bool {
     match std::env::var("PC_CLAIMS_LOG") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    }
-}
-
-/// Mirror of `PC_NOUNS` semantics (default on unless explicitly disabled).
-fn nouns_primer_on() -> bool {
-    match std::env::var("PC_NOUNS") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")

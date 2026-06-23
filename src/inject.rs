@@ -628,14 +628,12 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 return Ok(());
             }
 
-            // ── Noun first-mention primer (entity-layer, default ON since Run 14) ──
+            // ── Noun first-mention primer (entity-layer) ──
             // Additive: a SEPARATE block prepended to the briefing body, placement held
-            // constant, retrieval NOT blended (spec F16). No-op (byte-identical) when
-            // `inject_noun_primer` is false or `PC_NOUNS=0`. Computed here so it rides the
-            // same commit. Fact retrieval is LLM-free (the noun's source guides/claims,
-            // lexically filtered to the prompt) — no per-noun model call on the hot path.
+            // constant, retrieval NOT blended (spec F16). Fact retrieval is LLM-free (the
+            // noun's source guides/claims, lexically filtered to the prompt) — no per-noun
+            // model call on the hot path.
             let primer = crate::nouns::build_inject_primer(
-                cfg.inject_noun_primer,
                 &wiki_path,
                 &project_context_dir(&root),
                 &input.session_id,

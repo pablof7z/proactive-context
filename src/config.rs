@@ -62,24 +62,6 @@ pub struct Config {
     #[serde(default = "default_clean_episode_dialogue")]
     pub clean_episode_dialogue: bool,
 
-    /// Enable the entity/noun-layer capture + inject paths (entity-and-orientation-capture spec).
-    /// Capture side: a definitional ("X is Y") recognition pass registers project nouns and
-    /// persists transcript-cited entity records under <wiki>/nouns/. Inject side: a first-mention
-    /// primer block surfaces a noun's definition the first time it is referenced in a session.
-    /// Default OFF — when off, both paths are no-ops and capture/inject behavior is byte-identical
-    /// to the pre-entity-layer pipeline. See docs/product-spec/entity-and-orientation-capture.md.
-    #[serde(default = "default_capture_nouns")]
-    pub capture_nouns: bool,
-
-    /// Enable the INJECT-side noun first-mention primer (independent of `capture_nouns`, which
-    /// gates only the deferred C1 definitional-EXTRACT *capture* stage). Default ON since the
-    /// Run-14 validation (def + prompt-filtered facts lifted idiosyncratic-noun grounding
-    /// B0 28.6% → 57.1%, +28.6pt, zero drift, no P1 regression). The primer is a separate,
-    /// retrieval-free block prepended to the briefing; off-switch is `PC_NOUNS=0` (env) or this
-    /// flag. When off, inject output is byte-identical to the pre-primer pipeline.
-    #[serde(default = "default_inject_noun_primer")]
-    pub inject_noun_primer: bool,
-
     /// Model used for lesson distillation and synthesis (a reasoning task — use a capable model).
     #[serde(default = "default_capture_model")]
     pub capture_model: String,
@@ -239,22 +221,6 @@ fn default_clean_episode_dialogue() -> bool {
     // long. One cheap cleanup call per captured session keeps user words verbatim,
     // strips pasted content, and abbreviates agent turns. Best-effort: falls back
     // to the raw dialogue on any failure, so it never breaks capture.
-    true
-}
-
-fn default_capture_nouns() -> bool {
-    // OFF by default: this gates the C1 definitional-EXTRACT *capture* stage (one LLM call per
-    // session), which the Run-14 verdict deferred ("C3 is sufficient — do NOT build C1"). The
-    // INJECT primer is gated separately by `inject_noun_primer` (default ON). Byte-identical
-    // capture behavior when false.
-    false
-}
-
-fn default_inject_noun_primer() -> bool {
-    // ON by default since the Run-14 validation (docs/product-spec/run14-noun-primer-results.md):
-    // the noun primer at level `facts` cleared all six pre-registered bars on the pc corpus —
-    // +28.6pt noun grounding, zero G-correct drift, no restatement-P1 regression. Cheap, LLM-free
-    // on the hot path (C3 registry from disk + lexical fact retrieval). Disable via `PC_NOUNS=0`.
     true
 }
 
@@ -499,8 +465,6 @@ impl Default for Config {
             capture_research: default_capture_research(),
             capture_episode_cards: default_capture_episode_cards(),
             clean_episode_dialogue: default_clean_episode_dialogue(),
-            capture_nouns: default_capture_nouns(),
-            inject_noun_primer: default_inject_noun_primer(),
             capture_model: default_capture_model(),
             capture_triage_model: default_capture_triage_model(),
             // Observability

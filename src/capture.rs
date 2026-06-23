@@ -2641,53 +2641,44 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
-    // Definitional-noun stage (C1, feature-flagged via `capture_nouns`, default OFF and
-    // gated to a later experiment run). Recognizes transcript-cited "X is Y" definitions and
+    // Definitional-noun stage (C1). Recognizes transcript-cited "X is Y" definitions and
     // persists them as immutable `extracted` entries under <wiki>/nouns/. Independent of the
     // normal pass; best-effort — a failure here never breaks capture. Does NOT feed the wiki
-    // index into its prompt (finding F: that caused 0-claim EXTRACT failures). No-op when off.
-    if cfg.capture_nouns {
-        match crate::nouns::run_definitional_stage(&wiki_path, &input.transcript_path) {
-            Ok(paths) if !paths.is_empty() => {
-                log_event(
-                    "capture.nouns",
-                    None,
-                    serde_json::json!({ "entries": paths.len() }),
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("capture: definitional-noun stage failed: {}", e);
-            }
+    // index into its prompt (finding F: that caused 0-claim EXTRACT failures).
+    match crate::nouns::run_definitional_stage(&wiki_path, &input.transcript_path) {
+        Ok(paths) if !paths.is_empty() => {
+            log_event(
+                "capture.nouns",
+                None,
+                serde_json::json!({ "entries": paths.len() }),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("capture: definitional-noun stage failed: {}", e);
         }
     }
 
     // User-stance realness stage (Approach A) — the LIVE writer for the noun-primer's realness gate.
-    // It runs only when the primer is enabled AND the gate sources its population from user stance
-    // (both default-on post-Phase-4). Mirrors the stages above: independent of the normal pass,
-    // BEST-EFFORT (errors logged, never break capture), and OFF the inject hot path. Per session it
-    // reads the USER turns, batch-classifies each entity noun reference's stance (thinking-ON), and
-    // folds the signed deltas into <wiki>/nouns/realness.jsonl so real nouns accumulate past +3 over
-    // sessions while confabulations stay suppressed (≤ −2) and never prime. No-op (byte-identical to
-    // legacy) when the primer is off (`PC_NOUNS=0`) or the gate is explicitly off (`PC_NOUNS_REALNESS=0`).
-    if crate::nouns::nouns_inject_enabled(cfg.inject_noun_primer)
-        && crate::nouns::realness_gate_enabled()
-    {
-        match crate::nouns::run_realness_stage(
-            &wiki_path,
-            &input.transcript_path,
-            &capture_spec,
-            &openrouter_api_key,
-            &ollama_base_url,
-            ollama_api_key.as_deref(),
-        ) {
-            Ok(n) if n > 0 => {
-                log_event("capture.realness", None, serde_json::json!({ "nouns": n }));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("capture: realness stage failed: {}", e);
-            }
+    // Mirrors the stages above: independent of the normal pass, BEST-EFFORT (errors logged, never
+    // break capture), and OFF the inject hot path. Per session it reads the USER turns,
+    // batch-classifies each entity noun reference's stance (thinking-ON), and folds the signed
+    // deltas into <wiki>/nouns/realness.jsonl so real nouns accumulate past +3 over sessions while
+    // confabulations stay suppressed (≤ −2) and never prime.
+    match crate::nouns::run_realness_stage(
+        &wiki_path,
+        &input.transcript_path,
+        &capture_spec,
+        &openrouter_api_key,
+        &ollama_base_url,
+        ollama_api_key.as_deref(),
+    ) {
+        Ok(n) if n > 0 => {
+            log_event("capture.realness", None, serde_json::json!({ "nouns": n }));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("capture: realness stage failed: {}", e);
         }
     }
 
