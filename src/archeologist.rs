@@ -67,7 +67,9 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
     }
 
     // Collect all project metadata from ~/.claude/projects/
+    eprint!("archeologist: scanning Claude Code sessions...");
     let mut projects = scan_claude_projects(&args.since)?;
+    eprintln!(" {} project(s)", projects.len());
 
     // Auto-detect and merge all other known conversation sources.
     // Each scanner checks whether its path exists before doing any work; silently returns
@@ -80,30 +82,33 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
                 .prefix("pc-tenex-")
                 .tempdir()
                 .context("failed to create temp dir for TENEX synthesis")?;
+            eprint!("archeologist: scanning TENEX sessions...");
             match crate::tenex::scan_tenex_projects(&cfg, &args.since, tmp.path(), args.output_dir.as_ref()) {
                 Ok(p) if !p.is_empty() => {
-                    println!("archeologist: tenex: found {} project(s)", p.len());
+                    eprintln!(" {} project(s)", p.len());
                     projects.extend(p);
                     Some(tmp)
                 }
-                Ok(_) => None,
-                Err(e) => { eprintln!("archeologist: tenex scan failed: {e}"); None }
+                Ok(_) => { eprintln!(" none"); None }
+                Err(e) => { eprintln!(" failed: {e}"); None }
             }
         }
         None => None,
     };
 
     // Codex (~/.codex/sessions/ or ~/.codex/archived_sessions/ must exist)
+    eprint!("archeologist: scanning Codex sessions...");
     match crate::codex::scan_codex_sessions(&args.since, args.output_dir.as_ref()) {
         Ok(p) if !p.is_empty() => {
-            println!("archeologist: codex: found {} project(s)", p.len());
+            eprintln!(" {} project(s)", p.len());
             projects.extend(p);
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("archeologist: codex scan failed: {e}"),
+        Ok(_) => eprintln!(" none"),
+        Err(e) => eprintln!(" failed: {e}"),
     }
 
     // opencode (~/.local/share/opencode/opencode.db must exist)
+    eprint!("archeologist: scanning opencode sessions...");
     let _opencode_tmp = {
         let tmp = tempfile::Builder::new()
             .prefix("pc-opencode-")
@@ -111,12 +116,12 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
             .context("failed to create temp dir for opencode synthesis")?;
         match crate::opencode::scan_opencode_sessions(&args.since, tmp.path(), args.output_dir.as_ref()) {
             Ok(p) if !p.is_empty() => {
-                println!("archeologist: opencode: found {} project(s)", p.len());
+                eprintln!(" {} project(s)", p.len());
                 projects.extend(p);
                 Some(tmp)
             }
-            Ok(_) => None,
-            Err(e) => { eprintln!("archeologist: opencode scan failed: {e}"); None }
+            Ok(_) => { eprintln!(" none"); None }
+            Err(e) => { eprintln!(" failed: {e}"); None }
         }
     };
 

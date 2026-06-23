@@ -49,6 +49,16 @@ pub fn scan_opencode_sessions(
 
     let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
 
+    // Count how many need synthesis so we can show a progress counter.
+    let new_count = sessions
+        .iter()
+        .filter(|s| !archeologist_is_already_captured(&s.id, marker_dir.as_ref()))
+        .count();
+    if new_count > 0 {
+        eprintln!("opencode: synthesizing {new_count} new session(s)...");
+    }
+    let mut synth_n = 0usize;
+
     let mut project_map: HashMap<String, (String, Vec<SessionInfo>)> = HashMap::new();
 
     for session in sessions {
@@ -76,6 +86,13 @@ pub fn scan_opencode_sessions(
         let (jsonl_path, size_bytes) = if already_captured {
             (PathBuf::new(), 0u64)
         } else {
+            synth_n += 1;
+            eprintln!(
+                "opencode: [{}/{}] {}",
+                synth_n,
+                new_count,
+                session.title.as_deref().unwrap_or(&session.id[..session.id.len().min(12)]),
+            );
             let path = tmp_dir.join(format!("{}.jsonl", session.id));
             match synthesize_session_jsonl(&conn, &session, &path) {
                 Ok(()) => {}
