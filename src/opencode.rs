@@ -10,6 +10,7 @@
 ///
 /// Synthesis layout: `{"role":"user"|"assistant","content":"..."}` per JSONL line.
 /// First user turn is prefixed with an opencode preamble for capture-agent attribution.
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -48,7 +49,6 @@ pub fn scan_opencode_sessions(
 
     let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
 
-    use std::collections::HashMap;
     let mut project_map: HashMap<String, (String, Vec<SessionInfo>)> = HashMap::new();
 
     for session in sessions {
@@ -68,27 +68,35 @@ pub fn scan_opencode_sessions(
             .unwrap_or(&directory)
             .to_string();
 
-        let jsonl_path = tmp_dir.join(format!("{}.jsonl", session.id));
+        // Skip synthesis for already-captured sessions — we still include them in the
+        // project list so the picker can show accurate "new vs total" counts, but we
+        // don't spend time writing JSONL files that will never be processed.
+        let already_captured = archeologist_is_already_captured(&session.id, marker_dir.as_ref());
 
-        match synthesize_session_jsonl(&conn, &session, &jsonl_path) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "opencode: skipping session {} ({}): {}",
-                    &session.id[..session.id.len().min(12)],
-                    session.title.as_deref().unwrap_or("?"),
-                    e
-                );
+        let (jsonl_path, size_bytes) = if already_captured {
+            (PathBuf::new(), 0u64)
+        } else {
+            let path = tmp_dir.join(format!("{}.jsonl", session.id));
+            match synthesize_session_jsonl(&conn, &session, &path) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "opencode: skipping session {} ({}): {}",
+                        &session.id[..session.id.len().min(12)],
+                        session.title.as_deref().unwrap_or("?"),
+                        e
+                    );
+                    continue;
+                }
+            }
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                // Synthesized file is empty — no text turns to capture
+                let _ = std::fs::remove_file(&path);
                 continue;
             }
-        }
-
-        let size_bytes = jsonl_path.metadata().map(|m| m.len()).unwrap_or(0);
-        if size_bytes == 0 {
-            // Synthesized file is empty — no text turns to capture
-            let _ = std::fs::remove_file(&jsonl_path);
-            continue;
-        }
+            (path, size)
+        };
 
         let entry = project_map
             .entry(routing_key.clone())
@@ -227,7 +235,7 @@ fn synthesize_session_jsonl(
     session: &SessionMeta,
     out_path: &Path,
 ) -> Result<()> {
-    // Get messages with their text parts, ordered by creation time
+    // Fetch messages in one query
     let mut stmt = conn.prepare(
         "SELECT m.id, m.data, m.time_created
          FROM message m
@@ -248,6 +256,28 @@ fn synthesize_session_jsonl(
 
     if messages.is_empty() {
         return Ok(());
+    }
+
+    // Batch-fetch all text parts for this session in one query instead of one per message.
+    let mut parts_stmt = conn.prepare(
+        "SELECT p.message_id, p.data
+         FROM part p
+         WHERE p.session_id = ?1
+         ORDER BY p.time_created ASC",
+    )?;
+
+    let mut parts_by_message: HashMap<String, Vec<String>> = HashMap::new();
+    let rows = parts_stmt.query_map([&session.id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows.filter_map(|r| r.ok()) {
+        let (msg_id, data_str) = row;
+        let v: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
+        if v.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                parts_by_message.entry(msg_id).or_default().push(text.to_string());
+            }
+        }
     }
 
     let mut file = std::fs::File::create(out_path)?;
@@ -271,8 +301,10 @@ fn synthesize_session_jsonl(
             continue;
         }
 
-        // Collect text parts for this message
-        let text = collect_text_parts(conn, msg_id)?;
+        let text = parts_by_message
+            .get(msg_id)
+            .map(|parts| parts.join("\n"))
+            .unwrap_or_default();
         let text = text.trim();
         if text.is_empty() {
             continue;
@@ -298,28 +330,6 @@ fn synthesize_session_jsonl(
     }
 
     Ok(())
-}
-
-fn collect_text_parts(conn: &Connection, message_id: &str) -> Result<String> {
-    let mut stmt = conn.prepare(
-        "SELECT data FROM part WHERE message_id = ?1 ORDER BY time_created ASC",
-    )?;
-
-    let parts: Vec<String> = stmt
-        .query_map([message_id], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .filter_map(|data_str| {
-            let v: Value = serde_json::from_str(&data_str).ok()?;
-            if v.get("type").and_then(|t| t.as_str())? != "text" {
-                return None;
-            }
-            v.get("text")
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-        })
-        .collect();
-
-    Ok(parts.join("\n"))
 }
 
 // ─── Timestamp conversion ─────────────────────────────────────────────────────
