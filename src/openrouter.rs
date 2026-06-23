@@ -139,6 +139,7 @@ pub async fn chat_once(
     let resp = client
         .post("https://openrouter.ai/api/v1/chat/completions")
         .bearer_auth(api_key)
+        .header("HTTP-Referer", "https://github.com/pablof7z/proactive-context")
         .header("X-Title", "proactive-context")
         .json(&body)
         .send()
