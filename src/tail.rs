@@ -580,6 +580,8 @@ pub(crate) fn render_line(
     let body_budget = terminal_width.saturating_sub(60).max(30);
     let segs = row_segments(ev, verbosity, body_budget, ascii)?;
 
+    let indent = "    ";
+
     if use_color {
         // Serialize segments → ANSI string using the locked column format.
         // The segment order from row_segments IS the column order; we just color each role.
@@ -611,11 +613,160 @@ pub(crate) fn render_line(
                 }
             }
         }
-        Some(out)
+
+        // Wrap the output if it exceeds terminal_width
+        wrap_and_indent_ansi(&out, terminal_width, indent, Some((&dim, reset)))
     } else {
         // No-color: just concatenate text fields (column order matches row_segments)
-        Some(segs.into_iter().map(|s| s.text).collect::<Vec<_>>().join(""))
+        let line = segs.into_iter().map(|s| s.text).collect::<Vec<_>>().join("");
+
+        // Wrap the output if it exceeds terminal_width
+        wrap_and_indent_plain(&line, terminal_width, indent)
     }
+}
+
+fn wrap_and_indent_plain(text: &str, terminal_width: usize, indent: &str) -> Option<String> {
+    if text.len() <= terminal_width {
+        return Some(text.to_string());
+    }
+
+    let mut result = String::new();
+    let indent_width = indent.len();
+    let available = terminal_width.saturating_sub(indent_width).max(20);
+
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            result.push('\n');
+        }
+
+        if line.len() <= terminal_width {
+            result.push_str(line);
+            continue;
+        }
+
+        // Wrap this line to multiple output lines
+        let mut word_start = 0;
+        let line_chars: Vec<char> = line.chars().collect();
+        let mut first_line = true;
+
+        while word_start < line_chars.len() {
+            let limit = if first_line { terminal_width } else { available };
+            first_line = false;
+
+            let end = (word_start + limit).min(line_chars.len());
+
+            // Try to break at whitespace if possible
+            let mut break_point = end;
+            if end < line_chars.len() && line_chars[end] != ' ' {
+                // Search backwards for last space
+                for i in (word_start..end).rev() {
+                    if line_chars[i] == ' ' {
+                        break_point = i;
+                        break;
+                    }
+                }
+            }
+
+            if break_point == word_start && end > word_start {
+                break_point = end;
+            }
+
+            let chunk: String = line_chars[word_start..break_point].iter().collect();
+            let trimmed = chunk.trim_end();
+
+            if word_start > 0 {
+                result.push('\n');
+                result.push_str(indent);
+            }
+            result.push_str(trimmed);
+
+            word_start = break_point;
+            while word_start < line_chars.len() && line_chars[word_start] == ' ' {
+                word_start += 1;
+            }
+        }
+    }
+
+    Some(result)
+}
+
+fn wrap_and_indent_ansi(text: &str, terminal_width: usize, indent: &str, ansi_codes: Option<(&str, &str)>) -> Option<String> {
+    // For ANSI-colored text, we need to count visible characters while preserving codes
+    let visible_len = count_visible_chars(text);
+
+    if visible_len <= terminal_width {
+        return Some(text.to_string());
+    }
+
+    let (dim, reset) = ansi_codes.unwrap_or(("", ""));
+    let indent_width = indent.len();
+    let available = terminal_width.saturating_sub(indent_width).max(20);
+
+    let mut result = String::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    let mut first_line = true;
+
+    while i < bytes.len() {
+        let limit = if first_line { terminal_width } else { available };
+        first_line = false;
+
+        // Skip ANSI codes at start of line
+        while i < bytes.len() && bytes[i] == b'\x1b' {
+            let end = text[i..].find('m').unwrap_or(bytes.len() - i);
+            result.push_str(&text[i..i + end + 1]);
+            i += end + 1;
+        }
+
+        let line_start = i;
+        let mut line_visible = 0;
+
+        // Collect one line's worth of visible content
+        while i < bytes.len() && line_visible < limit {
+            if bytes[i] == b'\x1b' {
+                // Skip ANSI code but don't count it
+                let end = text[i..].find('m').unwrap_or(bytes.len() - i);
+                i += end + 1;
+            } else {
+                line_visible += 1;
+                i += 1;
+            }
+        }
+
+        // Add the line content
+        result.push_str(&text[line_start..i]);
+
+        if i < bytes.len() {
+            result.push('\n');
+            result.push_str(dim);
+            result.push_str(indent);
+            result.push_str(reset);
+        }
+    }
+
+    Some(result)
+}
+
+fn count_visible_chars(s: &str) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' {
+            // Skip ANSI escape sequence
+            if let Some(end) = s[i..].find('m') {
+                i += end + 1;
+            } else {
+                i += 1;
+            }
+        } else {
+            count += 1;
+            i += 1;
+        }
+    }
+
+    count
 }
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
