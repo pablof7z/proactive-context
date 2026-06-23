@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 
 use crate::capture::{
     archeologist_captured_sessions_dir, archeologist_is_already_captured, archeologist_project_dir,
-    run_capture_for_archeologist, run_structural_maintenance,
+    run_capture_for_archeologist, run_episode_repair_for_session, run_structural_maintenance,
 };
 use crate::config::{normalize_path, resolve_project_root};
 use crate::transcript::{transcript_cwd, transcript_first_ts, transcript_message_count};
@@ -738,30 +738,39 @@ struct WorkItem {
     checkpoint_after: bool,
     /// true → this is the last session of its project (final checkpoint runs after)
     project_last: bool,
+    /// true → this session was already captured; run ONLY the cheap episode-repair
+    /// pass (backfill missing transcripts, no TRIAGE/EXTRACT, no recognition LLM).
+    /// These items are silent in the line-log and never trigger checkpoints.
+    episode_repair_only: bool,
     /// Forwarded from ArcheologistArgs::output_dir
     output_dir: Option<std::path::PathBuf>,
 }
 
 /// Build the flattened, ordered work-list across all selected projects.
-/// Filters already-captured sessions; computes checkpoint flags from `synth_every`.
+///
+/// Includes ALL sessions in chronological order so the archeologist is a true replay:
+/// uncaptured sessions run the full pipeline; already-captured sessions are emitted as
+/// cheap `episode_repair_only` items that only backfill missing episode transcripts (no
+/// TRIAGE/EXTRACT, no recognition LLM). The progress counts and checkpoint cadence are
+/// driven by NEW sessions only — repair-only items are not counted as new work and never
+/// trigger a checkpoint (they don't mutate guides or the index).
+///
 /// `routing_cwd`: when `Some`, all sessions write to that project's wiki instead of their
 /// own per-session cwd. Used by the interactive picker to merge multiple source paths into
 /// the current project.
 fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Option<&std::path::PathBuf>, routing_cwd: Option<&str>) -> Vec<WorkItem> {
     let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
+    let is_captured =
+        |s: &SessionInfo| archeologist_is_already_captured(&s.session_id, marker_dir.as_ref());
     let mut plan = Vec::new();
     for (proj_idx, project) in projects.iter().enumerate() {
-        let work_list: Vec<&SessionInfo> = project
-            .sessions
-            .iter()
-            .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
-            .collect();
-        let n_new = work_list.len();
-        for (sess_idx, session) in work_list.iter().enumerate() {
-            let is_last = sess_idx == n_new - 1;
-            let checkpoint_after = synth_every > 0
-                && ((sess_idx + 1) % synth_every == 0)
-                && !is_last;
+        let n_new = project.sessions.iter().filter(|s| !is_captured(s)).count();
+        // Absolute index (within project.sessions) of the last NEW session — it owns the
+        // mandatory final checkpoint. None when the project has no new work.
+        let last_new_abs = project.sessions.iter().rposition(|s| !is_captured(s));
+
+        let mut new_seen = 0usize; // running count of NEW sessions emitted so far
+        for (abs_idx, session) in project.sessions.iter().enumerate() {
             let date = session
                 .first_ts
                 .as_ref()
@@ -770,6 +779,32 @@ fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Opt
             let cwd = routing_cwd
                 .unwrap_or_else(|| session.cwd.as_deref().unwrap_or(""))
                 .to_string();
+
+            if is_captured(session) {
+                // Repair-only: silent, never checkpoints. session_in_project carries the
+                // count of new work done so far purely for a stable (if unused) value.
+                plan.push(WorkItem {
+                    project_idx: proj_idx,
+                    session_in_project: new_seen,
+                    project_new_count: n_new,
+                    session_id: session.session_id.clone(),
+                    cwd,
+                    path: session.path.to_string_lossy().to_string(),
+                    date,
+                    message_count: session.message_count,
+                    checkpoint_after: false,
+                    project_last: false,
+                    episode_repair_only: true,
+                    output_dir: output_dir.cloned(),
+                });
+                continue;
+            }
+
+            let sess_idx = new_seen; // 0-based among NEW sessions
+            let is_last_new = last_new_abs == Some(abs_idx);
+            let checkpoint_after = synth_every > 0
+                && ((sess_idx + 1) % synth_every == 0)
+                && !is_last_new;
             plan.push(WorkItem {
                 project_idx: proj_idx,
                 session_in_project: sess_idx,
@@ -780,9 +815,11 @@ fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Opt
                 date,
                 message_count: session.message_count,
                 checkpoint_after,
-                project_last: is_last,
+                project_last: is_last_new,
+                episode_repair_only: false,
                 output_dir: output_dir.cloned(),
             });
+            new_seen += 1;
         }
     }
     plan
@@ -817,6 +854,26 @@ fn replay_worker(
     for item in plan.iter() {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Already-captured session: run ONLY the cheap episode-repair pass (backfill
+        // missing transcripts, no TRIAGE/EXTRACT, no recognition LLM). Stay silent —
+        // no SessionStart/Done so it is not counted as "seen" work in either driver.
+        // Best-effort: errors are logged, never fatal.
+        if item.episode_repair_only {
+            if let Err(e) = run_episode_repair_for_session(
+                &item.session_id,
+                &item.cwd,
+                &item.path,
+                item.output_dir.clone(),
+            ) {
+                eprintln!(
+                    "archeologist: episode-repair failed for {}: {}",
+                    &item.session_id[..item.session_id.len().min(8)],
+                    e
+                );
+            }
+            continue;
         }
 
         let _ = tx.send(WorkerMsg::SessionStart { item: item.clone() });

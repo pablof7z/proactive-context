@@ -156,8 +156,63 @@ pub fn run_episode_stage(
     transcript_path: &str,
     session_id: &str,
     date_override: Option<&str>,
+    repair_only: bool,
 ) -> Result<Vec<PathBuf>> {
     let episodes_dir = wiki_dir.join("episodes");
+
+    // ── Idempotency fast-path (no LLM) ───────────────────────────────────────
+    // If episode cards already exist on disk for this session, the recognition
+    // stage has already run for it. Re-running the LLM would be redundant (and
+    // immutability would discard any new arcs anyway), so instead we just make the
+    // artifact set whole: backfill any missing transcript JSON files for those
+    // cards via pure file I/O. This is what makes `pc archeologist` naturally
+    // idempotent — a re-run converges to a complete set without paying for LLM
+    // calls on sessions it has already processed.
+    let existing_cards = cards_for_session(&episodes_dir, session_id);
+    if !existing_cards.is_empty() {
+        for card_path in &existing_cards {
+            let Some(stem) = card_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let stem = stem.to_string();
+            // The cleaned transcript is the canonical artifact the card links to.
+            let clean_path = episodes_dir
+                .join("transcripts")
+                .join(format!("{}.json", stem));
+            if clean_path.exists() {
+                continue; // already whole — nothing to repair for this card
+            }
+            // Prefer the card's own recorded source-transcript path; fall back to the
+            // one we were handed (they normally match for the live session).
+            let src = fs::read_to_string(card_path)
+                .ok()
+                .and_then(|c| parse_episode_card_frontmatter(&c))
+                .map(|fm| fm.transcript)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| transcript_path.to_string());
+            let raw_dialogue = build_dialogue(&src);
+            if raw_dialogue.is_empty() {
+                eprintln!(
+                    "[episode-capture] repair: empty dialogue for {} (source {} missing?)",
+                    stem, src
+                );
+                continue;
+            }
+            // No LLM cleanup on the repair path — raw dialogue fills both slots.
+            let _ = write_transcript_json(&episodes_dir, "", &stem, &raw_dialogue);
+            let _ = write_transcript_json(&episodes_dir, "raw", &stem, &raw_dialogue);
+        }
+        // Session already recognized — skip the recognition LLM entirely.
+        return Ok(existing_cards);
+    }
+
+    // No cards exist yet for this session. In repair-only mode we never run the
+    // recognition LLM — the original episode stage already ran for an
+    // already-captured session and simply produced nothing to record.
+    if repair_only {
+        return Ok(Vec::new());
+    }
+
     let cfg = load_config()?;
     let spec: ModelSpec = ModelSpec::parse(&cfg.capture_model);
     let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
@@ -210,19 +265,17 @@ pub fn run_episode_stage(
         let card_stem = format!("{}-{}", date, slug);
         let filename = format!("{}.md", card_stem);
         let card_path = episodes_dir.join(&filename);
-        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
-        // raw at transcripts/raw/<stem>.json. write_transcript_json is idempotent — it
-        // skips the write if the file already exists — so calling it here is always safe
-        // and backfills missing transcripts for cards created before this feature existed.
-        let conversation_ref =
-            write_transcript_json(&episodes_dir, "", &card_stem, &clean_dialogue_turns);
-        let raw_conversation_ref =
-            write_transcript_json(&episodes_dir, "raw", &card_stem, &raw_dialogue);
         // Immutability: never overwrite an existing card.
         if card_path.exists() {
             persisted.push(card_path);
             continue;
         }
+        // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
+        // raw at transcripts/raw/<stem>.json. The card links to both.
+        let conversation_ref =
+            write_transcript_json(&episodes_dir, "", &card_stem, &clean_dialogue_turns);
+        let raw_conversation_ref =
+            write_transcript_json(&episodes_dir, "raw", &card_stem, &raw_dialogue);
         let content = render_episode_card_dated(
             session_id,
             transcript_path,
@@ -1731,91 +1784,35 @@ pub fn backfill_link_episodes(wiki_dir: &Path) -> Result<usize> {
     Ok(links_written)
 }
 
-/// Backfill transcript JSON files for episode cards that have none.
-///
-/// For every `episodes/*.md` card that lacks a corresponding
-/// `episodes/transcripts/<stem>.json`, reads the JSONL transcript path from
-/// the card's frontmatter and writes the transcript file. Uses raw dialogue
-/// only — no LLM calls — so this is fast and works even when the model
-/// endpoint is unavailable. Idempotent: already-present transcript files are
-/// never overwritten. Returns the count of transcripts written.
-pub fn backfill_episode_transcripts(wiki_dir: &Path) -> Result<usize> {
-    let episodes_dir = wiki_dir.join("episodes");
-    if !episodes_dir.exists() {
-        return Ok(0);
-    }
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-    let entries = fs::read_dir(&episodes_dir)?;
-    let mut written = 0usize;
-    let mut missing = 0usize;
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+/// Return the paths of all episode cards in `episodes_dir` whose frontmatter
+/// `session:` field matches `session_id`. Used by the idempotency fast-path to
+/// discover which cards already belong to a session (so their transcripts can be
+/// backfilled without an LLM call). Returns empty if the directory is missing.
+pub fn cards_for_session(episodes_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(episodes_dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        // Skip if the (clean) transcript already exists.
-        let transcript_path = episodes_dir.join("transcripts").join(format!("{}.json", stem));
-        if transcript_path.exists() {
+        let Ok(content) = fs::read_to_string(&path) else {
             continue;
-        }
-        missing += 1;
-
-        // Parse the card frontmatter to get the source JSONL path.
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[backfill-transcripts] cannot read {}: {}", path.display(), e);
-                continue;
+        };
+        if let Some(fm) = parse_episode_card_frontmatter(&content) {
+            if fm.session == session_id {
+                out.push(path);
             }
-        };
-        let fm = match parse_episode_card_frontmatter(&content) {
-            Some(f) => f,
-            None => {
-                eprintln!("[backfill-transcripts] no frontmatter in {}", path.display());
-                continue;
-            }
-        };
-        if fm.transcript.is_empty() {
-            eprintln!("[backfill-transcripts] no transcript path in {}", path.display());
-            continue;
-        }
-
-        let raw_dialogue = build_dialogue(&fm.transcript);
-        if raw_dialogue.is_empty() {
-            eprintln!(
-                "[backfill-transcripts] {} — empty dialogue from {} (file missing?)",
-                stem, fm.transcript
-            );
-            continue;
-        }
-
-        // Use raw dialogue for both slots — no LLM cleanup on backfill.
-        let wrote_clean = write_transcript_json(&episodes_dir, "", &stem, &raw_dialogue).is_some();
-        let wrote_raw = write_transcript_json(&episodes_dir, "raw", &stem, &raw_dialogue).is_some();
-        if wrote_clean || wrote_raw {
-            written += 1;
-            eprintln!("[backfill-transcripts] wrote {}", stem);
         }
     }
-
-    println!(
-        "backfill-transcripts: {} missing / {} written",
-        missing, written
-    );
-    Ok(written)
+    out.sort();
+    out
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn derive_session_id(transcript_path: &str) -> String {
     Path::new(transcript_path)
@@ -2424,11 +2421,103 @@ Z adopted.
             transcript.to_str().unwrap(),
             "sess-empty",
             None,
+            false,
         );
         assert!(result.is_ok(), "empty transcript must be a clean no-op");
         assert!(result.unwrap().is_empty(), "no cards from empty transcript");
         // No episodes dir is created when there is nothing to persist.
         assert!(!wiki.join("episodes").exists(), "must not create episodes/ on no-op");
+    }
+
+    // ─── Idempotency: episode-repair fast-path (no LLM) ───────────────────────
+
+    #[test]
+    fn cards_for_session_matches_only_the_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let episodes = tmp.path().join("episodes");
+        fs::create_dir_all(&episodes).unwrap();
+        let card = |session: &str| {
+            format!(
+                "---\ntype: episode-card\ndate: 2026-06-01\nsession: {session}\n\
+                 transcript: /t.jsonl\nsalience: reversal\nstatus: active\n\
+                 subjects:\n  - x\ncaptured_at: 2026-06-01T00:00:00Z\n---\nbody\n"
+            )
+        };
+        fs::write(episodes.join("2026-06-01-1-a.md"), card("s1")).unwrap();
+        fs::write(episodes.join("2026-06-01-2-b.md"), card("s1")).unwrap();
+        fs::write(episodes.join("2026-06-01-3-c.md"), card("s2")).unwrap();
+        fs::write(episodes.join("not-a-card.md"), "no frontmatter").unwrap();
+
+        let found = cards_for_session(&episodes, "s1");
+        assert_eq!(found.len(), 2, "exactly the two s1 cards: {:?}", found);
+        assert!(found.iter().all(|p| p.to_string_lossy().contains("-a.md")
+            || p.to_string_lossy().contains("-b.md")));
+        assert!(cards_for_session(&episodes, "missing").is_empty());
+        // Missing dir is a clean empty result, not a panic.
+        assert!(cards_for_session(&tmp.path().join("nope"), "s1").is_empty());
+    }
+
+    #[test]
+    fn run_episode_stage_repair_backfills_missing_transcript_without_llm() {
+        // A card exists for the session but its transcript JSON is missing. The repair
+        // fast-path must regenerate the transcript from the source JSONL via pure file
+        // I/O and return WITHOUT any network/LLM call. (If it fell through to recognition
+        // it would try to hit a model and the test would hang/fail — proving no LLM.)
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let episodes = wiki.join("episodes");
+        fs::create_dir_all(&episodes).unwrap();
+
+        let transcript = tmp.path().join("sess.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"role\":\"user\",\"content\":\"ship it\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+        )
+        .unwrap();
+
+        let stem = "2026-06-01-1-arc";
+        let card = format!(
+            "---\ntype: episode-card\ndate: 2026-06-01\nsession: sess-x\n\
+             transcript: {}\nsalience: reversal\nstatus: active\n\
+             subjects:\n  - x\ncaptured_at: 2026-06-01T00:00:00Z\n---\nbody\n",
+            transcript.to_str().unwrap()
+        );
+        fs::write(episodes.join(format!("{stem}.md")), card).unwrap();
+
+        let clean = episodes.join("transcripts").join(format!("{stem}.json"));
+        let raw = episodes.join("transcripts").join("raw").join(format!("{stem}.json"));
+        assert!(!clean.exists(), "precondition: transcript missing");
+
+        let out = run_episode_stage(&wiki, transcript.to_str().unwrap(), "sess-x", None, true)
+            .expect("repair must succeed");
+        assert_eq!(out.len(), 1, "returns the one existing card");
+        assert!(clean.exists(), "repair backfilled the cleaned transcript");
+        assert!(raw.exists(), "repair backfilled the raw transcript");
+
+        // Idempotent: a second repair run is a no-op that still reports the card.
+        let again = run_episode_stage(&wiki, transcript.to_str().unwrap(), "sess-x", None, true)
+            .expect("second repair must succeed");
+        assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn run_episode_stage_repair_only_with_no_cards_is_noop() {
+        // Repair-only mode + a session that produced no episode cards must be a pure
+        // no-op (no LLM, no files) — the original episode stage already ran for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let transcript = tmp.path().join("sess.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let out = run_episode_stage(&wiki, transcript.to_str().unwrap(), "unseen", None, true)
+            .expect("repair-only no-card path must succeed");
+        assert!(out.is_empty(), "no cards → empty result");
+        assert!(!wiki.join("episodes").exists(), "must not create episodes/ on repair no-op");
     }
 
     // ─── Fix #1: cross-card supersedes linker ─────────────────────────────────

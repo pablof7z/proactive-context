@@ -2625,6 +2625,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
             &input.transcript_path,
             &input.session_id,
             Some(&today_str),
+            false,
         ) {
             Ok(cards) if !cards.is_empty() => {
                 log_event(
@@ -2891,6 +2892,43 @@ pub(crate) fn run_capture_for_archeologist(
         filter_sidechains,
         output_dir,
     })
+}
+
+/// Episode-only idempotency pass for the archeologist's already-captured sessions.
+///
+/// Backfills any missing episode-transcript JSON files for a session WITHOUT
+/// re-running the expensive TRIAGE+EXTRACT pipeline (or the episode recognition
+/// LLM). It resolves the same redirected wiki path that `run_capture_for_archeologist`
+/// would use, then defers to `run_episode_stage` in `repair_only` mode — which is a
+/// near-instant no-op when every card already has its transcript, and pure file I/O
+/// when some are missing. This is what lets `pc archeologist` re-runs converge to a
+/// complete artifact set cheaply. Best-effort.
+pub(crate) fn run_episode_repair_for_session(
+    session_id: &str,
+    cwd: &str,
+    transcript_path: &str,
+    output_dir: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    // Mirror run_capture_from_input's wiki-path derivation so repair writes land in
+    // the same place capture wrote the cards (redirected under output_dir when set).
+    let proj_dir = if let Some(ref out) = output_dir {
+        let normalized = normalize_path(&resolve_project_root(&PathBuf::from(cwd)));
+        out.join("projects").join(normalized)
+    } else {
+        project_dir_from_cwd(cwd)
+    };
+    let wiki_path = if output_dir.is_some() {
+        proj_dir.join("docs").join("wiki")
+    } else {
+        wiki_dir(&resolve_project_root(&PathBuf::from(cwd)))
+    };
+    crate::episode_capture::run_episode_stage(
+        &wiki_path,
+        transcript_path,
+        session_id,
+        None,
+        true, // repair_only — never runs the recognition LLM
+    )
 }
 
 /// Expose `project_dir_from_cwd` for `archeologist`'s checkpoint maintenance calls.

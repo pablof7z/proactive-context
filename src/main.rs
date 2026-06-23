@@ -664,21 +664,6 @@ enum WikiAction {
         wiki_dir: Option<PathBuf>,
     },
 
-    /// Backfill transcript JSON files for episode cards that have none.
-    ///
-    /// For every episodes/*.md card lacking a transcripts/<stem>.json, reads the
-    /// JSONL path from the card frontmatter and writes the transcript. No LLM
-    /// calls — pure text extraction. Idempotent: existing transcripts are never
-    /// overwritten. Use after an archeologist replay that predated transcript
-    /// creation, or after the fix to episode_capture.rs that moved write_transcript_json
-    /// before the card-existence check.
-    BackfillTranscripts {
-        /// Wiki directory whose `episodes/` subdir holds the cards. Defaults to
-        /// the discovered project wiki for the current repo (docs/wiki).
-        #[arg(long, value_name = "DIR")]
-        wiki_dir: Option<PathBuf>,
-    },
-
     /// Backfill a typed taxonomy index (`<wiki>/taxonomy-index.json`) by scanning
     /// existing on-disk artifacts (guides, episodes, research, nouns, realness).
     /// Idempotent + non-destructive: re-running over an unchanged corpus produces
@@ -1130,11 +1115,7 @@ fn main() -> Result<()> {
                     println!("link-episodes: {} supersession link(s) written; index rebuilt", n);
                 }
             }
-            WikiAction::BackfillTranscripts { wiki_dir } => {
-                let wp = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
-                let n = crate::episode_capture::backfill_episode_transcripts(&wp)?;
-                println!("backfill-transcripts: {} transcript(s) written", n);
-            }
+
             WikiAction::BackfillTaxonomy { write, wiki_dir } => {
                 let wp = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
                 crate::taxonomy_backfill::run(&root, &wp, &project_context_dir(&root), write)?;
