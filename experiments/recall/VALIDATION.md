@@ -50,10 +50,19 @@ Surfaced genuine, verbatim nuance with exact citations, e.g.:
   were a kernel projection"* `[claude/podcast-player/14943b9b/L14479]`
 - Doctrine D0–D8, FlatBuffers FFI (F-10), Bevy DefaultPlugins composition.
 
-**Prompt-cache leverage (Pablo's insight):** the spine prefix is byte-identical
-across questions, so ollama reuses its KV-cache (model kept loaded via
-`keep_alive`). Follow-up questions skip the 12s prefill. `/reset` clears the Q&A
-history but keeps the cached spine — ask a totally different question cheaply.
+**Prompt-cache leverage (Pablo's insight) — proven:** the spine prefix is
+byte-identical across questions, so ollama reuses its KV-cache (model kept loaded
+via `keep_alive`). Two-question REPL session:
+
+| | first-call prefill (137K spine) | total | citations |
+|---|---|---|---|
+| Q1 "event-driven design" | **2.8s** | 96.1s | 14/14 ✅ |
+| `/reset` (clears Q&A, keeps cached spine) | | | |
+| Q2 "typesafety & rust opinions" (different topic) | **3.3s** | 77.0s | 13/13 ✅ |
+
+The 137K spine is prefilled once (~12s on cold load), then every question — even a
+different one after `/reset` — reuses the cached prefix at ~3s. Generalizes beyond
+the example query (Q2 also 100% valid citations).
 
 ## Variant D — query-time agentic map-reduce + coverage ledger
 
