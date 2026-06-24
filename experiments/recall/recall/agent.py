@@ -10,12 +10,15 @@ Streams structured events so the UI can show thinking + tool calls live.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from . import glm
 from .store import Store
-from .tools import TOOL_SCHEMAS, dispatch
+from .tools import TOOL_SCHEMAS, dispatch, _resolve
+
+CITE_RE = re.compile(r"\[((?:claude|codex)/[^\]\s]+?/L\d+)\]")
 
 SYSTEM_TMPL = """You are `recall`: the user's perfect memory of everything THEY \
 (the human) ever said to their coding agents, across every project and session.
@@ -39,8 +42,11 @@ was actually built/decided) before you trust your interpretation.
 - Prefer the user's exact words; quote distinctive phrasing.
 
 Every claim in your final answer MUST carry a citation like \
-[claude/proactive-context/7dbaca41/L42]. Group the answer by theme. End with a \
-"Sessions consulted" list. If the user changed their mind over time, show the arc.
+[claude/proactive-context/7dbaca41/L42], copied VERBATIM from a search/expand \
+result (never invent or guess an ID). Group the answer by theme. If the user \
+changed their mind over time, show the arc. Do NOT write a "sessions consulted" \
+list yourself — the tool harness tracks that for you. End the answer when the \
+themes are covered; do not pad.
 
 === CORPUS SPINE (every session; titles only) ===
 {spine}
@@ -74,7 +80,8 @@ def run_turn(store: Store, messages: list, emit: Callable[[Event], None],
         tool_calls = []
         usage = {}
         for chunk in glm.chat(messages, tools=TOOL_SCHEMAS, stream=True,
-                              think=think, num_ctx=num_ctx):
+                              think=think, num_ctx=num_ctx,
+                              options_extra={"num_predict": 8000, "repeat_penalty": 1.3}):
             msg = chunk.get("message") or {}
             if msg.get("thinking"):
                 thinking += msg["thinking"]
@@ -99,6 +106,7 @@ def run_turn(store: Store, messages: list, emit: Callable[[Event], None],
         if not tool_calls:
             final_text = content
             emit(Event("final", text=content))
+            _emit_sources(store, content, emit)
             return final_text
 
         # execute tools, append results
@@ -118,4 +126,20 @@ def run_turn(store: Store, messages: list, emit: Callable[[Event], None],
             messages.append({"role": "tool", "name": name, "content": result})
     final_text = final_text or "(stopped: max tool steps reached)"
     emit(Event("final", text=final_text))
+    _emit_sources(store, final_text, emit)
     return final_text
+
+
+def _emit_sources(store: Store, answer: str, emit: Callable[[Event], None]):
+    """Validate the citations the model actually wrote — honest provenance.
+    Each cited ID is checked against the store (tolerant resolve)."""
+    ids = []
+    seen = set()
+    for cid in CITE_RE.findall(answer):
+        if cid in seen:
+            continue
+        seen.add(cid)
+        ok = bool(_resolve(store, cid))
+        ids.append((cid, ok))
+    valid = sum(1 for _, ok in ids if ok)
+    emit(Event("sources", meta={"cited": ids, "valid": valid, "total": len(ids)}))

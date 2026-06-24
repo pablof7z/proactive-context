@@ -15,14 +15,18 @@ MODEL = os.environ.get("RECALL_MODEL", "glm-5.1:cloud")
 
 
 def chat(messages, tools=None, model=MODEL, num_ctx=131072, temperature=0.2,
-         stream=False, think=False, timeout=600, keep_alive="30m"):
+         stream=False, think=False, timeout=600, keep_alive="30m",
+         options_extra=None):
+    opts = {"num_ctx": num_ctx, "temperature": temperature}
+    if options_extra:
+        opts.update(options_extra)
     body = {
         "model": model,
         "messages": messages,
         "stream": stream,
         "think": think,
         "keep_alive": keep_alive,  # keep model loaded so the spine prefix KV-cache is reused
-        "options": {"num_ctx": num_ctx, "temperature": temperature},
+        "options": opts,
     }
     if tools:
         body["tools"] = tools
