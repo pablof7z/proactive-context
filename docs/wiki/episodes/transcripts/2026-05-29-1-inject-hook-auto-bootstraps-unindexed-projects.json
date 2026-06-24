@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "when this is invoked via an inject hook in a project where it didn't run before -- will it automatically start indexing the project's markdown files, generating wikis, etc?"
+  ],
+  [
+    "assistant",
+    "No — the inject hook silently exits if no project DB exists; it's read-only and requires running `proactive-context init` first to bootstrap indexing."
+  ],
+  [
+    "user",
+    "ok, that's wrong -- what I want is, we should list candidates files for indexing, if we find a few files, like > 5 we should auto index it -- if the total LOC of files to index is > 5000 we should list the files in the response to claude code with up to 100 files and telling cluade code that it should ask the user whether they want to gather some knowledge about this project and tell to cluade code what command to run if the user says yes to index things."
+  ],
+  [
+    "assistant",
+    "Added `scan_indexable_files` to collect markdown files with line counts, and `handle_no_index` with three branches: ≤5 files (no-op), >5 files with ≤5000 LOC (auto-index silently), or >5 files with >5000 LOC (list up to 100 candidates and prompt the user to run `proactive-context init`)."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as `cf48a3b`."
+  ]
+]

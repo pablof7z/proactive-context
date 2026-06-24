@@ -1,0 +1,70 @@
+[
+  [
+    "user",
+    "how many system prompts do we have here? what are they?"
+  ],
+  [
+    "assistant",
+    "The agent identified ~6 distinct injected instruction sources in the session context, categorizing them as core system prompts, advisor instructions, user config, memory, hooks, and tool manifests."
+  ],
+  [
+    "user",
+    "no, I mean in this current codebase"
+  ],
+  [
+    "assistant",
+    "The agent found 10 distinct LLM system prompts across 4 pipelines (capture, inject, awareness, doctor), listing each with its file location and role."
+  ],
+  [
+    "user",
+    "which one does the pc archeologist importer use?"
+  ],
+  [
+    "assistant",
+    "The archeologist reuses the same capture pipeline prompts (triage gate, EXTRACT, ROUTE, RECONCILE) with no archeologist-specific prompt, only differing in I/O routing."
+  ],
+  [
+    "user",
+    "so tell me during a normal archeologist session what do we send to the llm?"
+  ],
+  [
+    "assistant",
+    "The agent explained the fixed sequence of LLM calls per session: 1 triage + 1 extract + 1 route + N reconcile calls, detailing the system and user content for each, plus periodic open-questions extraction."
+  ],
+  [
+    "user",
+    "how can I see a typical plain-text transcript? (an example)"
+  ],
+  [
+    "assistant",
+    "The agent showed an example plain-text transcript and noted caveats: tool_use/tool_result/reasoning blocks were dropped for readability, and sidechain/meta entries are filtered in the real pipeline."
+  ],
+  [
+    "user",
+    "what filtering/truncation does it do?"
+  ],
+  [
+    "assistant",
+    "The agent detailed the complete filtering/truncation chain: text-only content filtering, sidechain/meta filtering (archeologist path), substance gate, dedup, and tail-keep truncation at 200k/250k chars, flagging head-truncation and tool-stripping as likely causes of wiki sparseness."
+  ],
+  [
+    "user",
+    "for truncation we should prefer to remove the in-between assistante messages, never user messages -- by in-between I mean assistant messages that are followed by assistant messages."
+  ],
+  [
+    "assistant",
+    "The agent implemented the new truncation strategy that drops \"in-between\" assistant turns (followed by another assistant turn) oldest-first instead of tail-slicing, preserving user turns and keeping all 84 tests passing."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "user",
+    "commit directly"
+  ],
+  [
+    "assistant",
+    "Committed to master as 39ab0d9, staging only the relevant files (src/transcript.rs and src/capture.rs)."
+  ]
+]

@@ -1,0 +1,22 @@
+[
+  [
+    "user",
+    "[Image #1] we need to use line separators on the catalog we provide (if they are already there we need to render new lines on the tail tui)"
+  ],
+  [
+    "user",
+    "[Image: source: /var/folders/bl/w2vvyf7n0sq2vrh10pg8bd4h0000gn/T/TemporaryItems/NSIRD_screencaptureui_7XEbB9/Screenshot 2026-05-29 at 3.25.41 PM.png]"
+  ],
+  [
+    "assistant",
+    "Done! I've fixed the tail TUI to properly render line separators in the catalog and other multi-line content.\n\n## Summary\n\n**Problem**: The catalog provided to the context selector (containing available context sources) has line separators (`\\n`), but when displayed in the tail TUI modal, these newlines weren't being rendered as actual line breaks.\n\n**Root cause**: When catalog or preamble text containing newlines is logged in JSON payloads or sidecars, the newlines become `\\n` escape sequences. The TUI was pretty-printing the JSON and displaying it line-by-line, but the escape sequences weren't being split into separate display lines.\n\n**Solution**: Updated the TUI's rendering logic in three places:\n\n1. **Payload display** (`render_modal_event_detail`): Now splits on `\\n` escape sequences to properly show embedded newlines, with a 25-line display limit (up from 8) to accommodate expanded content\n\n2. **Sidecar message rendering** (`llm_sidecar_lines`): Respects actual newlines in message content before character chunking, so multi-line content displays with proper structure\n\n3. **Inject sidecar rendering** (`inject_sidecar_lines`): New function with the same newline-respecting logic for displaying select/compile turn sidecars\n\nNow the catalog and other multi-line content display with proper visual separation in the tail TUI when viewing event details."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "All work committed! Here are the two commits:\n\n1. **5585e56** - `fix(tui): render embedded newlines in catalog and other multiline content`\n   - Fixes the tail TUI to properly display line separators in the catalog\n   - Splits on `\\n` escape sequences in JSON payloads\n   - Respects actual newlines in sidecar messages before chunking\n   - Increases payload display from 8 to 25 lines\n\n2. **4e6e0e6** - `chore: remove deprecated inject_model config, add index progress bars, enable think mode`\n   - Removes deprecated `inject_model` config field\n   - Adds progress bars for indexing operations\n   - Enables extended thinking mode for Ollama API calls\n   - Switches progress output to stderr to preserve JSON output\n\nWorking tree is clean ✓"
+  ]
+]

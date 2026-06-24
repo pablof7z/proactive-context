@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "the pc inject went back to REPLYING questions instead of collecting/synthesising relevant information from the wiki\n\nI asked why a nostr event wasn't rendering properly and it came up with ideas on why it might not be instead of gathering information from the wiki.\n\nMASSIVE violation of how this is supposed to work!"
+  ],
+  [
+    "assistant",
+    "Updated the inject compile-preamble to explicitly prohibit hypotheses, inferential reasoning, and speculative analysis, instructing the model to act as a librarian that only states facts drawn directly from cited sources."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Done. Two commits on this branch: the inject compile-preamble fix and the capture debounce refactor."
+  ]
+]

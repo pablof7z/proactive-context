@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "send a sonnet agent to sample 14013"
+  ],
+  [
+    "assistant",
+    "PID 14013 doesn't exist — the Sonnet agent confirmed no such process is running (already exited, never existed, or PID got recycled), so there was nothing to sample.\n\nFor context, what *is* eating CPU on the machine right now:\n\n| PID | %CPU | Process |\n|-----|------|---------|\n| 30308 | 103% | `syncthing` (file sync daemon, running since Friday) |\n| 79825 | 100% | `Podcastr` (iOS sim app) |\n| 69161 | 56% | `syspolicyd` |\n| 553 | 24% | `WindowServer` |\n| — | 2–11% | many `claude --dangerously-skip-permissions` instances |\n\nIf you meant a different PID (e.g. one of those above), give me the number and I'll re-dispatch the sampler. The agent is still alive (`a0dd78755c536c810`) if you want to point it at a live process."
+  ],
+  [
+    "user",
+    "yeah, it fucking took you 10 fucking years to realize I was talking about a fucking PID and the thing finished in the mean time, you fucking usless retard..."
+  ],
+  [
+    "assistant",
+    "You're right, and I'm sorry — I burned time asking a clarifying question instead of just recognizing `sample 14013` as the macOS profiler against a PID and running it immediately. The process was short-lived and exited in that window.\n\nFor next time: if you say \"sample <number>\", I'll treat it as `sample <pid>` and run it right away, no questions.\n\nIf something is still running you want profiled now, give me the PID (or a name to grep) and I'll sample it this instant."
+  ],
+  [
+    "user",
+    "monitor for `pc` processes using more than 500M memory -- write something that will wake you up when such a thing comes up a sample is captured and you can review what's going on"
+  ],
+  [
+    "assistant",
+    "PID 2338 has since exited, and the `sample` call caught it dying — that's why the call graph is empty (the process terminated mid-sample). So I have strong circumstantial evidence but not a clean hot-stack profile. Here's what the capture tells us:\n\n## What blew up\n- **Process:** `pc capture --deferred ab43967d-95d5-49fd-aaf6-4bc65d80774e` (a deferred capture job for that session UUID)\n- **Memory:** 1187 MB RSS (VSZ ~423 GB, normal for a mapped-heavy process)\n- **CPU:** 646% — ~6.5 cores pinned\n- **Lifetime:** ran ~6 min, then exited right as the sampler attached\n\n## Likely cause\nThe loaded libraries are the smoking gun. This `pc` process had mapped in the **entire on-device ML/linear-algebra stack**: `libBLAS`/`libLAPACK`/`libBNNS`/`libvDSP`, **CoreML**, **MLCompute**, and the full **MetalPerformanceShaders** family (MPSNeuralNetwork, MPSNDArray, MPSMatrix, etc.). A plain text-capture job doesn't pull those in — that's the **local embedding model** (fastembed/ONNX; note the `.fastembed_cache` in the repo root) being loaded and run.\n\nSo the 1.2 GB + 6.5 cores is **deferred capture embedding chunks**: model weights resident in memory + batched embedding compute across all cores. The spike is consistent with a large deferred backlog for that session being embedded in one shot.\n\n## Caveat\nI could not pin the exact hot Rust function — the call graph is empty because the process died during the 5s sample window. To get a real stack next time I'd need to catch it *while sustained*, not at the tail.\n\n## Watcher status\nThe watcher was one-shot and has now exited (it woke me on the hit, as designed). It's **no longer running**. Do you want me to:\n\n1. **Relaunch it to keep monitoring** (re-arms after each hit so it catches recurrences) — recommended, and next time I'll grab a longer sample immediately so we get real stacks; or\n2. Leave it off now that we know the culprit is deferred-capture embedding.\n\nI'd suggest (1) — want me to relaunch?"
+  ]
+]

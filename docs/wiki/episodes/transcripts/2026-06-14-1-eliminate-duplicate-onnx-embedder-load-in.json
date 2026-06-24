@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "sample process 14013"
+  ],
+  [
+    "assistant",
+    "Asked for clarification on what the user wants to do with process 14013."
+  ],
+  [
+    "user",
+    "why is it using so much memory?"
+  ],
+  [
+    "assistant",
+    "Explained that process 14013 is a `pc capture` command using 1.66 GB RSS with high VSZ from memory-mapping, and offered options to investigate further."
+  ],
+  [
+    "user",
+    "you tell me!"
+  ],
+  [
+    "assistant",
+    "Identified the root cause as `build_embedder()` being called twice, loading the ONNX model twice and doubling peak RSS; fixed by creating a shared embedder built once, cutting peak RSS roughly in half."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as `db42605`."
+  ]
+]

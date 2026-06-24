@@ -1,0 +1,50 @@
+[
+  [
+    "user",
+    "docs/wiki/episodes/transcripts has a lot of missing sessions -- like even the oldest session is not anywhere close to the first session I had writing about this project -- why is that?"
+  ],
+  [
+    "assistant",
+    "Transcripts only exist for sessions in this directory's ~/.claude folder that generated episode cards; earlier sessions are under different directory keys (like ~/Work/proactive-context) or have aged out entirely."
+  ],
+  [
+    "user",
+    "how do you know these other claude directories have sessions about proactive-context?"
+  ],
+  [
+    "assistant",
+    "Most of those guesses were wrong—only ~/Work/proactive-context genuinely contains pc sessions; the others had no real project conversations. Offered to search more precisely by date or actual dialogue content."
+  ],
+  [
+    "user",
+    "review the sessions that DIDNT create an episode card -- do they really not contain anything worth preserving about pc?"
+  ],
+  [
+    "assistant",
+    "Most no-card sessions were correctly skipped, two had knowledge already captured as guides, and two genuinely uncaptured findings were identified: inject lacks a triage gate and the statusline is display-only."
+  ],
+  [
+    "user",
+    "1. pablo asking questions about the design is also of value: it means pablo is poking, the questions are data unto themselves, the data gathered should be captured as deep-research or topic entries or something\n\n2. correct, any operational work like git stuff, deploy, or explicit commands are not worth preserving\n\n3. \"colorize output\" not worth preserving??! of course its worth preserving! it adds to the nuance of the product! if the end-goal is to be able to one-shot any type of app, no matter how complex and nuanced, of course we also want to capture the smallest of details! even if the user says \"oh, I don't like the border rounded to 10px, let's go to 8px instead\" then that's a very nuanced and tiny product decision but for sure MUST be captured!\n\n\nI don't want to fix this particular wiki, I want `pc` to capture any project's nuance properly, which would have the byproduct of capturing the missed nuance in `pc`"
+  ],
+  [
+    "assistant",
+    "Proposed a three-stage plan: Stage 1 widens capture to include cosmetic/micro decisions via prompt edits, Stage 2 adds an entity/definition bucket for cited answers, Stage 3 routes inquiry-dominated sessions as research seeds."
+  ],
+  [
+    "user",
+    "consult with `codex exec` on the plan and the prompts. tell codex to load a prompt engineering via `npx skills search`"
+  ],
+  [
+    "assistant",
+    "The Codex consult completed and validated the staging, adding three sharpenings: a trust-invariant guardrail, a granularity guardrail, and a kind discriminator for claim types."
+  ],
+  [
+    "user",
+    "build all three stages, with codex reviews in between and with running real tests and evaluating the results (using proactive-context conversations)"
+  ],
+  [
+    "assistant",
+    "Still clean: 1 cohesive claim, `explicit/user`, `ratified: true`. Stage 1 is complete and reviewed. Moving to Stage 2."
+  ]
+]

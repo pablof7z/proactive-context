@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "there aere 253 conversations in this project, or more, yet I think the docs/wiki that was just re-generated from scratch with pc archeologist captured what looks like very little information -- what gives?"
+  ],
+  [
+    "assistant",
+    "Agent encountered a socket connection error."
+  ],
+  [
+    "user",
+    "continue"
+  ],
+  [
+    "assistant",
+    "Agent explained the wiki appears sparse for three reasons: it's designed as a deduplicated distillate (not a dump), the richest sessions timed out and were incorrectly marked as captured (a bug preventing retry), and the \"253 conversations\" count includes excluded subagent sidechains—only ~61 are real main-thread transcripts."
+  ],
+  [
+    "user",
+    "where are these open-questions coming from?"
+  ],
+  [
+    "assistant",
+    "Agent traced open-questions to `extract_open_questions()` which runs after each capture, flagging nouns not in the wiki index. Three structural problems cause noise: a self-perpetuating loop (injected questions get re-extracted), an ungrounded extractor (never checks the actual codebase), and an append-only file with no pruning, causing it to grow to 74KB of mixed real and fabricated entries."
+  ]
+]

@@ -1,0 +1,62 @@
+[
+  [
+    "user",
+    "in this session we are going to be doing a taxonomy cleanup work"
+  ],
+  [
+    "assistant",
+    "Let me read the central topic-management guide and check the retopic tooling, since that's where the taxonomy problem is documented."
+  ],
+  [
+    "user",
+    "what session id are you on?"
+  ],
+  [
+    "assistant",
+    "I'm `developer` on session **`f58412`** (host: laptop, status: working) on the tenex-edge fabric."
+  ],
+  [
+    "assistant",
+    "Executed the taxonomy plan across Phases 0–7 (7 commits, 300 tests green), with all behavior-changing flags defaulting to OFF; deferred Phase 5 claim catalog and Phase 3 A0–A5 eval arms pending user decision."
+  ],
+  [
+    "user",
+    "when you have an update like that, use tenex-edge chat write to mention it to everybody on the team"
+  ],
+  [
+    "assistant",
+    "Broadcast Phase 0 baseline results (75% guide recall, 2/10 stale-leak) to team chat; found and reverted an eval harness bug that clobbered history; remaining work is validation/rollout decisions."
+  ],
+  [
+    "user",
+    "give me the tldr of what we did thus far and any results or experiments observed"
+  ],
+  [
+    "assistant",
+    "Built the full 8-phase taxonomy plan (Phases 0–4, 6, 7 committed, 300 tests green, all flags default-OFF); baseline eval shows 75% guide recall and 2/10 stale-leak; flagged an eval harness overwrite bug and a multi-agent wiki volatility hazard."
+  ],
+  [
+    "user",
+    "continue"
+  ],
+  [
+    "assistant",
+    "Ran Phase 3 eval arms A0–A4; A1 (typed catalog) initially appeared as a clean win but was later retracted as noise; A2's source-type guidance over-suppressed episode cards; all flags stay default-OFF pending stronger eval methodology."
+  ],
+  [
+    "user",
+    "Tune A2"
+  ],
+  [
+    "assistant",
+    "Tuned A2 prompt, recovering episode-card selections (9→25) and trajectory (8/10) with stale-leak still at 0; retracted earlier A1 recall claim as noise at small n; recommends a higher-power eval (n≥40, multi-judge) before flipping any defaults."
+  ],
+  [
+    "user",
+    "A session-scoped Stop hook is now active with condition: \"first thing: consult with `codex exec` to get a sense of what to do next -- and go from there, whether it is continuing with building the higher-power eval,  building phase 5 claim catalog or whatever it is. I'm going to sleep, so don't ask any more questions -- keep driving tests, experimenting, improving, don't let go, don't rationalize yourself into laziness, don't leave a \"flag gate\" -- be bold and make the call of what strategy to pursue -- gates are for cowards -- use codex exec as your thinking partner and researcher assistant -- use it contunously and help it direct your work, what to test, what to do next, how to improve, etc.\n\nOnce you are comfortable with results, nuke the docs/wiki of podcast player project, nostr-multi-platform project and ~/Work/hl project too, as well as ~/src/tenex-edge project and regenerate via the archeologist for each project -- (yes, you should DELETE the docs/wiki of each one of those projects, reset their counter to the archeologist indexes from the beginning of those projects) -- don't run these imports in parallel since it will nuke the llm if you do that in parallel -- do one by one.\". Briefly acknowledge the goal, then immediately start (or continue) working toward it — treat the condition itself as your directive and do not pause to ask the user what to do. The hook will block stopping until the condition holds. It auto-clears once the condition is met — do not tell the user to run `/goal clear` after success; that's only for clearing a goal early."
+  ],
+  [
+    "assistant",
+    "Broadcast the plan; now waiting on the running eval to complete before applying decision rules and launching sequential wiki regenerations for hl, tenex-edge, podcast-player, and nostr-multi-platform."
+  ]
+]

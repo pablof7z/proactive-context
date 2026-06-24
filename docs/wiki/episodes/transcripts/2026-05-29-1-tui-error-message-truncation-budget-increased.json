@@ -1,0 +1,10 @@
+[
+  [
+    "user",
+    "on the tail tui I literally see an error and I can't even fucking see what the error is becuase everything is stupidly trimmed down"
+  ],
+  [
+    "assistant",
+    "Updated the tail TUI to display up to 250 characters for error messages before truncating them."
+  ]
+]

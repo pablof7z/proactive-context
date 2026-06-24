@@ -1,0 +1,58 @@
+[
+  [
+    "user",
+    "one of the things I feel like its always missing from the capture path is a higher-level of what the overall thing is and what the individual components are, like, the nouns seem to be undefined to me.\n\nFor example I'm giving you here\n1) the transcripts of a project\nand 2) the extract assertions that were generated from that project\n\n[...pasted terminal output with transcripts, extract results, and wiki content stripped...]\n\nbut none of these documents explain, what *is* this project about? Or perhaps wiki/nostr-wallet-cashu.md gets close to it?\n\n[...pasted wiki markdown document stripped...]\n\nNot sure, give me some thoughts on the output we generated -- what the wiki that gets compiled results is the most important piece of this project and I don't feel we are quite there yet"
+  ],
+  [
+    "assistant",
+    "The core problem is that the pipeline captures behavioral spec facts but discards definitions and ontology — even when they're present and citable in the transcript (transcript 3's glossary block produced zero definitional claims). Facts need a subject/entity to attach to, and definitions need their own capture bucket in EXTRACT."
+  ],
+  [
+    "user",
+    "give me 5 opus agent's take on how to make this better (at a very high-level, not implementation specific)"
+  ],
+  [
+    "assistant",
+    "Five perspectives converge on: entities should be first-class and discovered (not authored), scoped to project-specific surprise only (not re-describing what the model already knows), sourced from specs and in-session reads rather than re-described domain knowledge, with definitions given their own provenance tier — but the top-level orientation may need a tiny human-authored seed since atomic extraction structurally cannot produce it."
+  ],
+  [
+    "user",
+    "add another opus agent to review https://github.com/nvk/llm-wiki since it has deep research prompts that structure a wiki for this type of understanding, so it might be useful, maybe. be skeptical, but consider it."
+  ],
+  [
+    "assistant",
+    "Launched a sixth Opus agent to review the nvk/llm-wiki repo, reading its research/compile prompts with a skeptical frame since llm-wiki researches from web sources while pc distills session transcripts."
+  ],
+  [
+    "user",
+    "looks like the agent died"
+  ],
+  [
+    "assistant",
+    "The llm-wiki review found one transferable mechanism: its concept/fact/relationship extraction split at capture time — structurally separating nouns from claims about them. But entity bodies can't come from transcripts (which lack definitions); they must come from code/specs/model-priors. The rest of llm-wiki's approach doesn't transfer because its inputs are already definitional by construction."
+  ],
+  [
+    "user",
+    "so what do you recommend overall?"
+  ],
+  [
+    "assistant",
+    "Build a code-anchored entity spine that session-facts attach to. Adopt the concept/fact split from llm-wiki structurally, but source entity bodies from specs and in-session reads with their own provenance tier. Priority order: (1) pull noun-set from code, (2) entity/claim split in EXTRACT, (3) definition provenance tiers, (4) delta-scope entity bodies, (5) human orientation seed."
+  ],
+  [
+    "user",
+    "inferring from code is problematic for a few reasons: it creates an ontological definition from implementation, so it would be user+assistant english => code implemented (maybe wrong?) => code reading/extrapolation (maybe wrong?) => ontological definition --> risk of massive deviation (bad implementation, bad interpretation); it also requires a larger powerful model to infer what the thing is, it also risks over-defining what implementation specific nouns are (wiki on \"PubkeyDecoderService\", which might be a requirement to build a \"TUI Client\" but should not be automatically picked up (unless it's something the user incorporates into their conversation (\"what is the PubkeyDecoderService? how does it work?\" or \"we need to ensure the PubkeyDecoderService is idempotent\")\n\nOne approach that might work is if at some point we raise questions from the injection trigger that asks questions to undelying agent harness:\n\nUser: We need to ensure the TUI client is locked so that two versions can't write into the LMDB database at once\n--> fact: the user wants the lmdb database to be locked\n--> fact: there is a tui client and lmdb database involved in this project\n--> question: what is the tui client? --> since its not a known noun on the wiki we raise it to the underlying agent and during capture we persist the concept and the relationships\n\nor perhaps the raising of questions should come up after we see Stop hook during capture?\n\nUser: Add NIP60 support to the cli\n--> fact the CLI needs to have NIP60 support\n....\nUpon Stop() hook firing we see that the agent investigated what \"NIP60\" means and we persist that noun. Any noun the user refers to explicitly MUST be captured.\n\nUser: how does NIP60 work in the CLI? how do we choose the mint?\n\nHere the agent might investigate this and capture() should persist this specific investigation over this (now) known nouns with a deep research guide that details what the agent investigated.\n\n\nThoughts?"
+  ],
+  [
+    "assistant",
+    "Agrees to drop code-inference entirely. The dominant problem is present-and-dropped definitions (the EXTRACT taxonomy has no definition bucket), not absent ones — fix the bucket first, then build the loop for the absent tail. User-uttered nouns should use the existing explicit/implicit tag for promotion, not a new drop gate. The open-question loop should persist undefined nouns at Stop and surface them as nudges at injection, never as synchronous interrupts. Definitions the agent states in-session stay transcript-cited, preserving the verbatim-slice invariant without a new trust tier."
+  ],
+  [
+    "user",
+    "create a durable spec document in docs/product-spec/ describing this problem from a high-level/product-spec/requirement perspective"
+  ],
+  [
+    "assistant",
+    "Created `docs/product-spec/entity-and-orientation-capture.md` (Proposed v0.5) covering the problem, requirements R1–R7 (entities first-class, promotion via explicit/implicit tag, transcript-cited definitions, open-question loop, deep-research guides, delta-scoped bodies, human orientation seed), sequencing, rejected approaches including code-inference, and open questions."
+  ]
+]

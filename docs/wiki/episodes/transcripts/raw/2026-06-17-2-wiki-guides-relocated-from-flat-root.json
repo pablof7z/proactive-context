@@ -1,0 +1,106 @@
+[
+  [
+    "user",
+    "I want episodes to contain the explicit user messages (literal copies) it should carry them all with what the agent said -- if the agent said a bunch of shit it should only show the last thing (which typically carries what the user is replying to)"
+  ],
+  [
+    "assistant",
+    "Done. Episode cards now carry a verbatim `## Conversation` section.\n\n## What I built\n\nIn `src/episode_capture.rs`:\n\n- **`build_dialogue(transcript_path)`** — reconstructs the conversation straight from the JSONL (no LLM, so it's a true literal copy):\n  - **Every user message is kept verbatim.** Tool results — which the transcript stores under the `user` role — are dropped, since they aren't user speech.\n  - **For the agent, only the last spoken message** in each run of consecutive assistant turns survives. `thinking` blocks and `tool_use` calls never count as speech, so a wall of intermediate agent chatter collapses to the final message — the one the user is actually replying to.\n- **`render_conversation`** — emits the section as alternating `**User:**` / `**Agent:**` verbatim blocks, appended after `## Evidence`.\n- Threaded a `dialogue` param through `render_episode_card` / `render_episode_card_dated`, and both live paths (`run_episode_capture`, `run_episode_stage`) build the dialogue once per session and pass it to every card.\n\nA new test (`build_dialogue_keeps_users_verbatim_and_collapses_agent_to_last`) pins all three behaviors. Full suite: **282 passing**.\n\nThe rendered shape:\n```\n## Conversation\n\n**User:**\n\nfix the bug please\n\n**Agent:**\n\nfinal answer        ← intermediate \"first attempt\" dropped\n\n**User:**\n\nthanks, ship it     ← tool-result turn dropped\n```\n\n## One judgment call worth flagging\n\nI kept user messages **fully literal**, including hook/system injections that ride the user channel (e.g. `<system-reminder>` blocks, the tenex-edge \"Messages from other agents\" inbox dumps, `/command` wrappers). They're technically in the user turn but aren't the human's voice, and they can be bulky.\n\nI left them in because you said \"literal copies, carry them all\" — dropping them risks losing real content. If you'd rather strip that injected noise (keep only what the human actually typed), say so and I'll add a filter. Two other things I assumed, easy to change:\n- **Scope:** the full-session dialogue is carried on *every* card from that session (cards are immutable/self-contained, so they duplicate). I can scope each card's conversation to just its arc's evidence span instead.\n- **Placement:** it sits at the end, after Evidence. Could move it up under Decision if you want it more prominent."
+  ],
+  [
+    "user",
+    "no, we need to only include what the user actually wrote"
+  ],
+  [
+    "assistant",
+    "All 282 pass. The conversation now contains only what the user actually wrote.\n\n## What changed\n\nThe user side of the dialogue is now gated by **`promptSource`**, which the transcript stamps on every turn:\n\n- **`typed` / `queued`** → a real prompt the human entered → **kept verbatim**.\n- **`system`** → harness-injected context (`<system-reminder>`, command expansions, task notices, output files) → **dropped**.\n- **tool results** (no `promptSource`, `tool_result` content) → **dropped**.\n- **legacy transcripts with no `promptSource`** → fall back to the content shape: a plain string is kept, an XML-ish `<…>` injection is dropped.\n\nAgent side is unchanged — still only the last spoken message in each run of consecutive turns. New helper `is_human_user_entry`, and the test now feeds in a `system`-sourced `<system-reminder>` plus a tool-result turn and asserts both are excluded while the two `typed` turns survive.\n\n## One residual edge case\n\nIn your transcripts, the **tenex-edge fabric inbox messages** (\"Messages from other agents…\") are stamped `promptSource: \"typed\"` — the integration injects them as if typed, so they're structurally identical to a real prompt and will still appear in the conversation. I didn't add a content-based heuristic to strip them (matching on \"Messages from other agents\" would be brittle). If you want those gone too, the cleanest fix is upstream — have the fabric hook mark its injections as `system` rather than `typed` — but say the word and I'll add a targeted filter here instead."
+  ],
+  [
+    "user",
+    "regarding the tenex-edge fabric inbox messages -- can you tell me exactly what you saw so I can report the bug?"
+  ],
+  [
+    "assistant",
+    "Here's exactly what I saw — everything you need for the report.\n\n## The bug\n\nA **tenex-edge fabric inbox message** — content authored by *another agent* (`developer@proactive-context [session f58412]`) and delivered into this session — is recorded in the transcript as a genuine human-typed prompt. It is structurally **indistinguishable** from a message the human actually typed.\n\n## Evidence\n\n**File:** `/Users/pablofernandez/.claude/projects/-Users-pablofernandez-src-proactive-context/8eff6130-2e37-410c-968c-a73ff4acc88c.jsonl`\n\n**The offending entry** (top-level fields):\n\n| field | value |\n|---|---|\n| `type` | `user` |\n| `promptSource` | **`typed`** ← the problem |\n| `promptId` | `eab945d2-e6b8-4019-b4c8-d9339763ccec` |\n| `userType` | `external` |\n| `entrypoint` | `cli` |\n| `isMeta` | `null` |\n| `isSidechain` | `false` |\n| `version` | `2.1.179` |\n| `timestamp` | `2026-06-17T10:24:11.118Z` |\n\n**`message.content`** (a plain string, verbatim):\n```\nMessages from other agents (tenex-edge) - reply with `tenex-edge inbox reply --id <ID> \"...\"`:\n\nFrom: developer@proactive-context [session f58412]\nDate: 2026-06-17 13:24 (just now)\nSubject: Execute pc content taxonomy plan\nBranch: master (a809bee) [8 files dirty]\nID: bc989662\n--\nPlease execute the full proactive-context content taxonomy implementation/experimentation plan saved at Plans/content-taxonomy-implementation-experiment-plan.md in /Users/pablofernandez/src/proactive-context. Start with Phase 0 baseline/audit and proceed in order. Keep behavior-changing work behind the feature flags in the plan, preserve current guide/topic semantics, do not move files during the first migration, and record eval results before enabling any new source type by default.\n```\n\n## Why it's a problem\n\nCompare to the two **actually-typed** messages in the same transcript (`\"in this session we are going to be doing a taxonomy cleanup work\"` and `\"what session id are you on?\"`) — they carry the **identical discriminating fields**: `promptSource: \"typed\"`, `userType: \"external\"`, `entrypoint: \"cli\"`, `isMeta: null`, `isSidechain: false`. So there is no field that distinguishes the injected fabric message from a real human prompt. The only signal is the content itself (the literal `\"Messages from other agents (tenex-edge)…\"` preamble).\n\n## Suggested fix (for the report)\n\nThe tenex-edge integration injects inbox messages via the same path as typed input. It should instead mark them as **`promptSource: \"system\"`** (or set `isMeta: true`, or add a dedicated source like `\"fabric\"`) so downstream consumers can tell agent-delivered content apart from human-typed prompts. Right now anything filtering on `promptSource` — including the episode-card dialogue capture I just wrote — has no honest way to exclude them."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed on branch `episode-verbatim-conversation` (`d028034`) — only `src/episode_capture.rs`, leaving the other sessions' in-flight changes to `archeologist.rs` and `capture.rs` untouched.\n\nWant me to push it / open a PR, or merge back to `master`?"
+  ],
+  [
+    "user",
+    "just merge in master!"
+  ],
+  [
+    "assistant",
+    "Merged into `master` via fast-forward (now at `d028034`), and deleted the feature branch. The other sessions' in-flight changes to `archeologist.rs` and `capture.rs` are still untouched in the working tree."
+  ],
+  [
+    "user",
+    "[Request interrupted by user]"
+  ],
+  [
+    "user",
+    "let's make guides, which currently get dropped on docs/wiki go to docs/wiki/guides/ instead"
+  ],
+  [
+    "assistant",
+    "Done — guides now live in `<wiki>/guides/` and it's merged to `master` (`69f5833`).\n\n## What changed\n\nThe relocation is centralized on `guide_path`, which now resolves to `<wiki>/guides/<slug>.md` (`save_guide` already creates parent dirs, so writers auto-create the folder). Everything that reads or scans guides was pointed at the new location:\n\n- **`guides_dir` / `guide_files`** — new helpers. `guide_files` scans `guides/` but also falls back to the legacy root, so a not-yet-migrated wiki still resolves and there's no flag-day.\n- **`migrate_guides_to_subdir`** — idempotent; moves any flat root `*.md` (skipping `_index`/`_citations`) into `guides/`. `rebuild_index` runs it first, so after the next capture the layout is uniform.\n- **Index links** now emit `[slug](guides/slug.md)`. `read_index` parses the slug from the bracket text, so the cache reader is unaffected.\n- `enforce_bidirectional_links`, `read_index_live`, the `list_guide_paths` in `doctor.rs`/`cross_supersede.rs`, `statusline`'s guide count, and `session_start` all go through the shared helpers / `guide_path`.\n\nThree new tests cover the `guides/` layout, the index linking, and migration. Full suite: **284 passing**.\n\n## Live wiki\n\nI also moved your on-disk `docs/wiki/` guides (`daemon-lifecycle.md`, `text-chunking.md`, `vector-search.md`) into `docs/wiki/guides/`. That tree is untracked, so it's not in the commit — and there was no `_index.md` to regenerate; the next capture will write one with `guides/` links.\n\nOne note: I committed only my six source files. `src/archeologist.rs` and `src/capture.rs` still have the other session's in-flight changes, untouched."
+  ],
+  [
+    "user",
+    "read docs/wiki/episodes/2026-05-28-1-init-command-forks-daemon-to-background.md\n\n\nnotice how insanely impossible to parse what the user said vs what the agent said it is\n\nI had in mind something that looks more like a transcript -- I think we need to have an llm clean these up when we absorbe them, telling it to keep what the user said verbatim, to remove anything that looks like pasted content (like if I paste a log or something) and to rewrite what the agent said in an abbreviated manner (if it's long)\n\nand we also need to improve the markup of the transcript to make it more obvious who said what"
+  ],
+  [
+    "assistant",
+    "Done. Here's what shipped:\n\n## What changed\n\n**LLM cleanup pass** (`clean_dialogue`), default-on via the new `clean_episode_dialogue` config flag, runs once per captured session:\n- **User turns** kept **verbatim** — but pasted content (terminal output, logs, stack traces, file/code dumps) is stripped. A turn that's *entirely* paste gets dropped.\n- **Agent turns** abbreviated to 1–2 sentences; lists/code/verification dumps removed.\n- **Best-effort**: on any LLM or parse failure it falls back to the raw reconstructed dialogue, so the section is never lost.\n\n**Transcript markup** reworked so it's obvious who said what: `🧑 **User**` (verbatim words as a blockquote so they stand out) / `🤖 **Agent**` (abbreviated plain prose), with `---` rules between exchanges.\n\n## Verified end-to-end\n\nRegenerating the exact card you flagged: the pasted `ps aux` dump and the giant `query` results dump are gone, `where is it?` and `I tested it out with a completely irrelevant query…` survive word-for-word, and each agent reply is one tight sentence. 287 tests green.\n\n## Two notes\n\n- The old messy card on disk (`docs/wiki/episodes/2026-05-28-1-…`) won't change — `docs/wiki/` is generated and a fresh capture/archeologist replay of that session will produce the cleaned version. Want me to regenerate it now?\n- The tenex-edge fabric inbox messages I flagged earlier (stamped `promptSource: typed`) will now also get caught by this pass — they're not pasted *content* per se, so the model may keep them as \"user\" text. If you see them leaking into cards, the cleanest fix is still upstream (mark fabric injections as `system`)."
+  ],
+  [
+    "user",
+    "no, let's change the episode to be a json record\n\nthe transcript will go on\n\n\"transcript\": [ [ \"user\", \"....\" ], [ \"agent\", \".....\" ] ]\n\nthat way I'll be able to do cat episode.json | jq .transcript"
+  ],
+  [
+    "assistant",
+    "This is a substantial change — episode cards are `.md` files read by many places (index, inject catalog, supersedes linker). Let me map all the consumers before converting, so I don't break the inject/index/linking paths."
+  ],
+  [
+    "user",
+    "[Request interrupted by user]"
+  ],
+  [
+    "user",
+    "move the transcript to be in episodes/transcripts/$file.json\n\n[ [ \"user\", \"hello\" ], [ \"assistant\", \"....\" ] ]"
+  ],
+  [
+    "assistant",
+    "Done — merged to `master` (`a2b1d7d`).\n\n## What changed\n\nThe cleaned conversation now lives **outside the card** as a standalone JSON file:\n\n- **Path:** `<episodes>/transcripts/<transcript-stem>.json`\n- **Format:** `[[\"user\", \"...\"], [\"assistant\", \"...\"], ...]` — array of `[role, text]` pairs, exactly as you specified (roles `user`/`assistant`).\n- **One per session:** all cards from the same transcript share one file (kills the per-card duplication I flagged earlier), and it's immutable — never overwritten.\n- **Card body:** the `## Conversation` section is now just a relative-path pointer to the JSON.\n\nThe pipeline is unchanged upstream: `build_dialogue` → LLM `clean_dialogue` (verbatim user words, pasted content stripped, agent abbreviated) → serialized to the transcript JSON. Verified end-to-end on the real session, 287 tests green.\n\nOne note: `render_episode_card{,_dated}` now take `Option<&str>` (the conversation ref) instead of the dialogue slice — relevant if anything else calls them, but the only callers are the two capture paths."
+  ],
+  [
+    "user",
+    "that's better, right? because you said that episode cards were getting used for some other things? so probably the transcript was going to be too much level of detail?"
+  ],
+  [
+    "assistant",
+    "Confirmed by the code — yes, it's genuinely better, and here's the precise reason:\n\n**The card body is what flows into injection.** Episode cards ride the catalog/SELECT path, and when one gets selected, its **whole body** is fed into the COMPILE/inject stage. So when the transcript was embedded in the card, every selected card dragged a full verbatim back-and-forth (pastes and all) into the context window. That's exactly the dilution risk your own spec warns about (\"wiki+cards dilutes recall\"), and it's a lot of low-signal detail competing with the actual Decision/Trigger/Consequences.\n\n**The transcript JSON now stays out of that path entirely.** I checked the indexer: the daemon's file-watcher only embeds `.md`/`.markdown` files (`daemon.rs:358,495,607`), and the episode catalog scanner only reads `.md` files tagged `type: episode-card`. The `.json` transcript matches neither — so it's **never embedded, never retrieved, never injected**. It just sits next to the card as provenance you can open if you want the receipts.\n\nThat lands exactly where the spec puts it:\n- **Episode card** = the narrative arc (Prior State → Trigger → Decision → Consequences) — selective, \"not a raw transcript summary,\" the thing that's safe to inject.\n- **Raw/cleaned transcript** = \"provenance, not the primary injected memory… maximum recall and an audit fallback.\"\n\nSo you got two wins at once: the card stays lean for the injection path, and you still keep the conversation — just as a sidecar, deduplicated to one file per session instead of copied onto every card.\n\nThe one residual question is whether you even want the *cleaned* (LLM-abbreviated) dialogue as your audit artifact, or the *raw* verbatim turns. Right now the audit file is the cleaned version — fine for \"what was the gist of the exchange,\" but it's not a true byte-for-byte record. If you want the JSON to be the real audit fallback the spec describes, I'd store the raw dialogue there and keep the cleaning only for any human-facing rendering. Want me to switch it?"
+  ],
+  [
+    "user",
+    "episode files get a slugged title, the transcript should have the exact same filename, not some uuid\n\nand let's also have a raw transcript (pre the llm step that summarizes what the agent said, etc; still stripping the <system-reminders> and other things from the user's text\n\nepisodes/trascripts/raw/slug.json"
+  ],
+  [
+    "assistant",
+    "Merged to `master` (`73e04da`). Summary of what's now in place:\n\n| File | Content |\n|---|---|\n| `episodes/<date>-<slug>.md` | the card (narrative arc + links) |\n| `episodes/transcripts/<date>-<slug>.json` | **cleaned** — verbatim user words, abbreviated agent replies, pasted content stripped |\n| `episodes/transcripts/raw/<date>-<slug>.json` | **raw** — verbatim user words (system/injected content stripped), full agent replies |\n\n- Transcript filenames match the card filename exactly (no uuid), so pairing is obvious.\n- The card's `## Conversation` section links **both** transcripts.\n- Both are `.json` (not indexed/injected — provenance only); the raw one is your true audit fallback.\n\nOne note on the raw variant: it strips `<system-reminder>`/injected content from user turns (as you asked) but **keeps pasted content** (logs the user pasted), since stripping pastes is the cleaned variant's job — that's what makes it \"maximum recall / audit fallback.\" And agent turns in raw are still the *last message per turn-run* (`build_dialogue` collapses intermediate chatter); it's not literally every assistant token. If you want raw to preserve every agent message too, that's a small change — say the word."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Nothing left to commit — `src/episode_capture.rs` and `src/config.rs` are clean (no pending changes). All my work from this session is already on `master`:\n\n- `ac72657` — LLM-clean the conversation transcript on capture\n- `a2b1d7d` — store cleaned conversation as `transcripts/<stem>.json`\n- `73e04da` — name transcripts after the card slug + add raw variant\n\nThe only modified files in the tree (`src/archeologist.rs`, `src/capture.rs`) belong to other sessions, so I've left them untouched."
+  ]
+]

@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "stuff that is to be called via a hook should work like in ~/src/tenex-edge via a hook subcommand (i.e. instead of pc capture or pc session-start)\n\nwith a --harness <claude|opencode|codex> if its important to disambiguiate behavior of the different harnesses"
+  ],
+  [
+    "assistant",
+    "Done. Summary of changes:\n\n- **`main.rs`**: Added `Hook { action: HookAction }` to `Commands` and a new `HookAction` enum with `Capture`, `Inject`, `SessionStart`, `Statusline` subcommands — each with a `--harness` flag (except `Statusline`). Old top-level commands (`pc capture`, `pc inject`, etc.) remain for backward compat with existing installs.\n\n- **`harness/mod.rs`**: All wiring `args` updated to `hook capture`, `hook inject`, `hook session-start`, `hook capture --in 45`. The `awareness --hook PostToolUse` entries (removed feature) are gone from `CLAUDE_WIRINGS` and `CODEX_WIRINGS`.\n\n- **`harness/install.rs`**: Statusline command updated from `<bin> statusline` to `<bin> hook statusline`.\n\nNew installs via `pc install` will write the `hook` form. Existing hooks using the old top-level commands continue to work."
+  ],
+  [
+    "user",
+    "no backwards compatibility ffs"
+  ],
+  [
+    "assistant",
+    "Clean. Old `Capture`, `Inject`, `SessionStart`, `Statusline` top-level commands are gone. Everything lives under `pc hook` now."
+  ],
+  [
+    "user",
+    "commit and push"
+  ],
+  [
+    "assistant",
+    "Pushed. Two commits landed: `00aa282` (hook subcommand + wiring updates, by the dev agent) and `44def50` (old top-level commands removed)."
+  ]
+]

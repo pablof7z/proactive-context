@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "[Image #1] we need to use line separators on the catalog we provide (if they are already there we need to render new lines on the tail tui)"
+  ],
+  [
+    "assistant",
+    "Fixed the tail TUI to properly render embedded newlines in catalog and multi-line content by splitting on escape sequences in JSON payloads and respecting actual newlines in sidecar messages."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Created two commits: one fixing TUI newline rendering and another removing deprecated config, adding progress bars, and enabling think mode."
+  ]
+]

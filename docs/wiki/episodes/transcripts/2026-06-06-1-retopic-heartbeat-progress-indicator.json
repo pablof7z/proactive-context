@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "when I run this it takes ages and it doesn't do anything -- can I get some insight into what its doing while its running?"
+  ],
+  [
+    "assistant",
+    "Added a heartbeat spinner to the retopic LLM call in `src/doctor.rs` that prints elapsed time to stderr while waiting, so you can tell it's still thinking rather than stuck."
+  ],
+  [
+    "user",
+    "is it multistep? or does it literally take all that long in a single call? how many tokens do we send?"
+  ],
+  [
+    "assistant",
+    "It's a single call sending only ~1,700 tokens; the delay is entirely model-side reasoning (chain-of-thought) and cloud queueing, not payload size."
+  ]
+]

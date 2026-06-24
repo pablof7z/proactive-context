@@ -1,0 +1,58 @@
+[
+  [
+    "user",
+    "in all those 2m I didn't see a single log update, I had no idea what the thing was doing -- I want it to tell me what its going on more proactively"
+  ],
+  [
+    "assistant",
+    "Diagnosed that the TUI was silent during the dominant LLM call, and added live phase labels in the headline, lifecycle events in the feed, and truthful interrupt/too-short counters to archeologist.rs."
+  ],
+  [
+    "user",
+    "Continue from where you left off."
+  ],
+  [
+    "assistant",
+    "No response requested."
+  ],
+  [
+    "user",
+    "it shows me new guide lines a bunch of times, but it doesn't show me any of the claims that were discovered\n\nwhen it shows me reading conversation xxx I would like to select that item and on the detail pane see the transcript of the conversation as we are sending it to the llm\n\nalso, selecting is weird, instead of showing the row selected it stops-rendering the rows under the current row -- its very strange"
+  ],
+  [
+    "assistant",
+    "Fixed the duplicate \"New guide\" lines by detecting genuine guide creation, added a scrollable transcript overlay when selecting a \"Reading conversation\" line, and fixed the selection rendering bug where rows below the cursor vanished."
+  ],
+  [
+    "user",
+    "when I scroll past the viewport I don't see the position since the container doesn't scroll down"
+  ],
+  [
+    "assistant",
+    "Fixed live-update scroll drift by holding position during live feeds, added a \"feed · line N/M\" position indicator, and refactored window math into a tested helper."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed to master as 77d3389, applying cleanly on top of a peer's commit; all prior first-round work was already swept in by a peer merge."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "assistant",
+    "Committed the gitignore for .DS_Store and derived wiki caches, plus the 9 dogfooded wiki guides, and pushed everything cleanly to origin/master."
+  ],
+  [
+    "user",
+    "git pull"
+  ],
+  [
+    "assistant",
+    "Reported that local and remote master are already in sync with nothing to pull; the dirty working tree is from a concurrent agent's wiki regeneration, left untouched."
+  ]
+]

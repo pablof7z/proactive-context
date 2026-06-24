@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "we have a 5 minute gate, for capture, right?"
+  ],
+  [
+    "assistant",
+    "Confirmed there's a 5-minute (300s) trailing debounce gate on capture (`capture_debounce_secs`) plus a separate 5-minute agent timeout for wiki capture execution."
+  ],
+  [
+    "user",
+    "is there a hook we could use so that when the agent stops running it runs capture 1 minute after? or is that something we're already doing?"
+  ],
+  [
+    "assistant",
+    "You already have a Stop hook that fires `pc capture --in 300`; to make it fire 1 minute after the agent stops, just change `capture_debounce_secs` in config from 300 to 60."
+  ],
+  [
+    "user",
+    "why is there both a --in 300 and a debounce_secs 300?"
+  ],
+  [
+    "assistant",
+    "The `300` in `--in 300` is dead—it's never read; only `Some` vs `None` matters to route into the debounced path. The actual delay comes solely from `capture_debounce_secs` in config, making the `--in` number a misleading vestigial flag."
+  ],
+  [
+    "user",
+    "1"
+  ],
+  [
+    "assistant",
+    "Implemented option 1: `--in` now honors an explicit override value, otherwise defaults to `capture_debounce_secs` from config; the Stop hook is now `pc capture --in` with no number, eliminating the footgun. The delay is still 300s—want me to set `capture_debounce_secs: 60` and commit the changes?"
+  ]
+]

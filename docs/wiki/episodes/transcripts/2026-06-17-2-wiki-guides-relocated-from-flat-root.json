@@ -1,0 +1,98 @@
+[
+  [
+    "user",
+    "I want episodes to contain the explicit user messages (literal copies) it should carry them all with what the agent said -- if the agent said a bunch of shit it should only show the last thing (which typically carries what the user is replying to)"
+  ],
+  [
+    "assistant",
+    "Built a `build_dialogue` function that keeps user messages verbatim and collapses consecutive agent turns to only the last spoken message, rendered as a `## Conversation` section on episode cards."
+  ],
+  [
+    "user",
+    "no, we need to only include what the user actually wrote"
+  ],
+  [
+    "assistant",
+    "Updated the dialogue to only include human-typed messages by filtering on `promptSource`, keeping `typed`/`queued` entries and dropping `system` and tool-result turns."
+  ],
+  [
+    "user",
+    "regarding the tenex-edge fabric inbox messages -- can you tell me exactly what you saw so I can report the bug?"
+  ],
+  [
+    "assistant",
+    "Provided a detailed bug report showing that tenex-edge fabric inbox messages are recorded with `promptSource: \"typed\"`, making them structurally indistinguishable from real human input, and suggested marking them as `system` upstream."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed on branch `episode-verbatim-conversation` (`d028034`), only touching `src/episode_capture.rs`."
+  ],
+  [
+    "user",
+    "just merge in master!"
+  ],
+  [
+    "assistant",
+    "Merged into `master` via fast-forward (now at `d028034`) and deleted the feature branch."
+  ],
+  [
+    "user",
+    "let's make guides, which currently get dropped on docs/wiki go to docs/wiki/guides/ instead"
+  ],
+  [
+    "assistant",
+    "Relocated guides to `<wiki>/guides/` with backward-compatible fallback and migration helper, updated all consumers, and merged to `master` (`69f5833`)."
+  ],
+  [
+    "user",
+    "read docs/wiki/episodes/2026-05-28-1-init-command-forks-daemon-to-background.md\n\n\nnotice how insanely impossible to parse what the user said vs what the agent said it is\n\nI had in mind something that looks more like a transcript -- I think we need to have an llm clean these up when we absorbe them, telling it to keep what the user said verbatim, to remove anything that looks like pasted content (like if I paste a log or something) and to rewrite what the agent said in an abbreviated manner (if it's long)\n\nand we also need to improve the markup of the transcript to make it more obvious who said what"
+  ],
+  [
+    "assistant",
+    "Added an LLM cleanup pass (`clean_dialogue`) that strips pasted content from user turns and abbreviates agent turns, plus reworked transcript markup with `🧑 **User**` / `🤖 **Agent**` labels."
+  ],
+  [
+    "user",
+    "no, let's change the episode to be a json record\n\nthe transcript will go on\n\n\"transcript\": [ [ \"user\", \"....\" ], [ \"agent\", \".....\" ] ]\n\nthat way I'll be able to do cat episode.json | jq .transcript"
+  ],
+  [
+    "assistant",
+    "Noted this is a substantial change since episode cards are `.md` files read by many consumers, and offered to map all consumers before converting."
+  ],
+  [
+    "user",
+    "move the transcript to be in episodes/transcripts/$file.json\n\n[ [ \"user\", \"hello\" ], [ \"assistant\", \"....\" ] ]"
+  ],
+  [
+    "assistant",
+    "Stored the cleaned conversation as a standalone JSON transcript at `<episodes>/transcripts/<stem>.json` in the specified `[role, text]` array format, with the card body containing just a relative-path pointer. Merged to `master` (`a2b1d7d`)."
+  ],
+  [
+    "user",
+    "that's better, right? because you said that episode cards were getting used for some other things? so probably the transcript was going to be too much level of detail?"
+  ],
+  [
+    "assistant",
+    "Confirmed the separation is better because card bodies flow into injection context, while the transcript JSON is never embedded or retrieved since the daemon only indexes `.md` files."
+  ],
+  [
+    "user",
+    "episode files get a slugged title, the transcript should have the exact same filename, not some uuid\n\nand let's also have a raw transcript (pre the llm step that summarizes what the agent said, etc; still stripping the <system-reminders> and other things from the user's text\n\nepisodes/trascripts/raw/slug.json"
+  ],
+  [
+    "assistant",
+    "Set up a three-tier structure: episode card `.md`, cleaned transcript JSON, and raw transcript JSON in `transcripts/raw/`, all sharing the same slug-based filename. Merged to `master` (`73e04da`)."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Nothing left to commit; all work from this session is already on `master` across three prior commits."
+  ]
+]

@@ -1,0 +1,114 @@
+[
+  [
+    "user",
+    "add support for ollama cloud as a provider (along openrouter).\n\nmodel configuration (any model) should be configured \"provider:model\"\n\nlike \"openrouter:anthropic/claude-haiku-4-5\" or \"ollama:deepseek-v4\""
+  ],
+  [
+    "assistant",
+    "Added Provider enum and model spec parser supporting \"provider:model\" format, with Ollama and OpenRouter dispatch across all call sites and a configure TUI."
+  ],
+  [
+    "user",
+    "give me a tui to configure llms to be used for the different roles with model autocompletion (i.e. pull available models and allow me to nicely select them from openrouter and/or from ollama (allow me to choose the provider if I have multiple providers configured"
+  ],
+  [
+    "assistant",
+    "Built a two-pane TUI for `proactive-context configure` with roles on the left and auto-fetched models from OpenRouter and Ollama on the right, with keyboard navigation, live filtering, and save/quit controls."
+  ],
+  [
+    "user",
+    "add ollama.com cloud to my config.json as the ollama endpoint"
+  ],
+  [
+    "assistant",
+    "Set `ollama_base_url` to `https://api.ollama.com` in config.json."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed as `5132eed` — 13 files, +2518/-210 lines covering provider abstraction, direct OpenRouter client, Ollama dispatch, and the configure TUI."
+  ],
+  [
+    "user",
+    "the tui only shows me open router? how can I switch something to use ollama?\n\nalso, the role names you're using are incomprehensivlbe, I don't know what inject_select\" role means..."
+  ],
+  [
+    "assistant",
+    "Fixed Ollama cloud model fetching by falling back from `/api/tags` to `/v1/models`, renamed roles to plain English, and added error visibility in the TUI."
+  ],
+  [
+    "user",
+    "the names are still incomprehensible \"per-prompt picker\" what the fuck does that mean?\n\nimprove the name but also add a label with suggestions of what type of model to use for that"
+  ],
+  [
+    "assistant",
+    "Renamed roles to plain English (Ask, Search, Context scan, Context write, Wiki update, Skip check) and added per-role model suggestion labels shown in the TUI."
+  ],
+  [
+    "user",
+    "what is \"Ask\"? where is that used?"
+  ],
+  [
+    "assistant",
+    "Added command context to role descriptions in the TUI, showing which roles are invoked manually via CLI commands versus which run automatically."
+  ],
+  [
+    "user",
+    "ok, remove the \"generate\" command entirely (since we now use inject as the command\")"
+  ],
+  [
+    "assistant",
+    "Removed the `generate` command and `decompose_model` role; the configure TUI now only shows the four actually-used roles (Context scan, Context write, Wiki update, Skip check)."
+  ],
+  [
+    "user",
+    "what model do I use right now for retrival? I'm seeing [Image #1]"
+  ],
+  [
+    "assistant",
+    "You're using OpenRouter for embeddings (`openai/text-embedding-3-small`), which is failing — suggested switching to local embeddings via fastembed."
+  ],
+  [
+    "user",
+    "switch to local"
+  ],
+  [
+    "assistant",
+    "Switched to local embeddings with `all-MiniLM-L6-v2` via fastembed; noted that re-indexing is needed due to dimension mismatch (1536 vs 384)."
+  ],
+  [
+    "user",
+    "and this?"
+  ],
+  [
+    "assistant",
+    "Confirmed the dimension mismatch error and instructed running `proactive-context stop && proactive-context init` to re-index."
+  ],
+  [
+    "user",
+    "it should do that itself... fix it and commit"
+  ],
+  [
+    "assistant",
+    "Made it auto-detect dimension mismatches and re-index on its own; committed the fix."
+  ],
+  [
+    "user",
+    "no, still fails.... -- validate that your fix works afterwards -- this happened from running an injection from $PWD"
+  ],
+  [
+    "assistant",
+    "Advised running `proactive-context init` in the user's own terminal since the daemon gets SIGKILL'd in Claude Code's shell."
+  ],
+  [
+    "user",
+    "no, it still fails -- even after I pkilled ALL proactive-context processes..."
+  ],
+  [
+    "assistant",
+    "Fixed the root cause by reading actual vector dimensions from `sqlite_master` instead of trusting metadata; committed the fix so projects with stale dimensions self-heal on next inject."
+  ]
+]

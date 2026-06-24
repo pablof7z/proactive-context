@@ -1,0 +1,62 @@
+[
+  [
+    "user",
+    "we are supposed to have some kind of stats or status command but I don't see it wired up"
+  ],
+  [
+    "assistant",
+    "Connected the existing `index_stats` function to the CLI by adding a `Stats` variant to the `Commands` enum and a match arm in `main()`."
+  ],
+  [
+    "assistant",
+    "Fixed the \"no such module: vec0\" error by making `ensure_vec_extension()` public and calling it before the connection in the Stats handler."
+  ],
+  [
+    "user",
+    "try if it works"
+  ],
+  [
+    "assistant",
+    "Confirmed `stats` command works and returns file/chunk counts."
+  ],
+  [
+    "user",
+    "is the product complete or it has gaps?"
+  ],
+  [
+    "assistant",
+    "Identified it as a working v0.1 with core RAG loop functional, but noted gaps: thin stats command, missing OpenRouter embeddings and local LLM for generate, minimal tests, reranker scores discarded, and destructive error on dimension mismatch."
+  ],
+  [
+    "user",
+    "add embed on openrouter and test that it works"
+  ],
+  [
+    "assistant",
+    "Implemented OpenRouter embedding support in `src/embed.rs` using reqwest, and confirmed both local and OpenRouter embedding paths work end-to-end."
+  ],
+  [
+    "user",
+    "configure it"
+  ],
+  [
+    "assistant",
+    "Asked whether the user wants the config file switched to OpenRouter embeddings or the code's configuration handling updated."
+  ],
+  [
+    "user",
+    "openrouter embeddings"
+  ],
+  [
+    "assistant",
+    "Updated config to use OpenRouter embeddings with text-embedding-3-small, rebuilt the index, and confirmed query works."
+  ],
+  [
+    "user",
+    "what is \"onnx/model.onnx [00:00:07]\"? when I try to use generate it downloads that thing"
+  ],
+  [
+    "assistant",
+    "Explained it's the BGE reranker ONNX model downloaded by fastembed on first use for reranking in `generate`, and offered to add a `--no-rerank` flag to skip it."
+  ]
+]

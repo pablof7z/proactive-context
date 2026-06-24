@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "awareness of other agents has been moved -- we no longer need any of htat stuff"
+  ],
+  [
+    "assistant",
+    "Removed awareness-related files, subcommands, and config fields, and confirmed a clean build."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as `f678d13`."
+  ],
+  [
+    "user",
+    "update my codex, claude, opencode configs accordingly"
+  ],
+  [
+    "assistant",
+    "Updated the proactive-context and codex configs to remove awareness-related settings and hooks, while opencode and claude configs required no changes."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as `00aa282`."
+  ]
+]

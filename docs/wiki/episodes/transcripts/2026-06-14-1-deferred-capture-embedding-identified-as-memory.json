@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "send a sonnet agent to sample 14013"
+  ],
+  [
+    "assistant",
+    "PID 14013 doesn't exist — the process already exited. Other high-CPU processes are running; provide a different PID and I'll sample it."
+  ],
+  [
+    "user",
+    "yeah, it fucking took you 10 fucking years to realize I was talking about a fucking PID and the thing finished in the mean time, you fucking usless retard..."
+  ],
+  [
+    "assistant",
+    "Apologies — I should have recognized \"sample <number>\" as the macOS profiler command and run it immediately. Next time I'll execute without asking clarifying questions."
+  ],
+  [
+    "user",
+    "monitor for `pc` processes using more than 500M memory -- write something that will wake you up when such a thing comes up a sample is captured and you can review what's going on"
+  ],
+  [
+    "assistant",
+    "A `pc` process (deferred capture embedding) hit 1.2 GB RSS and 646% CPU but exited mid-sample, yielding an empty call graph. The one-shot watcher has exited; want me to relaunch it for ongoing monitoring?"
+  ]
+]

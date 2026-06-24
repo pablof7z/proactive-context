@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "the command pc capture -- does it do it work online or does it fork into the background?"
+  ],
+  [
+    "assistant",
+    "`pc capture` has two modes, and the answer depends on which flag is used:\n\n**`pc capture` (no flags) — runs online, in the foreground.**\nThis is the SessionEnd hook path. It reads the transcript from stdin and calls `run_capture_from_input` synchronously, blocking until the whole capture pipeline finishes (`src/capture.rs:2297`). Nothing forks.\n\n**`pc capture --in <secs>` — forks into the background, returns immediately.**\nThis is the Stop hook path (`run_capture_scheduled`, `src/capture.rs:2318`). It:\n1. Writes a `PendingCapture` record to the pending-captures dir.\n2. SIGTERMs any prior in-flight debounce process for the session (so each new turn resets the timer).\n3. Spawns a **detached** child — `pc capture --deferred <session_id>` — with stdin/stdout/stderr redirected to `/dev/null` and `setsid()` in `pre_exec` to break it off into its own session/process group (`src/capture.rs:2392-2405`).\n4. Records the child PID and returns right away.\n\nThe detached `--deferred` worker (`run_deferred_capture`, `src/capture.rs:2427`) then sleeps the debounce window before actually capturing — so a Stop hook never blocks the user's turn.\n\nSo: the **SessionEnd** invocation is synchronous/online; the **Stop** invocation (`--in`) returns immediately and does its work in a forked, detached background process."
+  ],
+  [
+    "user",
+    "both should return immediately, otherwise `pc capture` prevents the harness from exiting for many seconds"
+  ],
+  [
+    "assistant",
+    "Done. Both capture hooks now return immediately.\n\n## What changed\n\n**`src/capture.rs` — `run_capture` (the SessionEnd path)**\nPreviously it read stdin and ran `run_capture_from_input` **synchronously in the foreground**, so the hook blocked until the entire capture pipeline (LLM calls, routing, reconcile) finished — many seconds, holding the harness open. Now it delegates to `run_capture_scheduled(0, harness)`: it writes the pending record and spawns the same detached `setsid` background worker the Stop hook already uses, with **delay 0** (\"capture now, just not in the foreground\"). It returns at once.\n\nBecause both paths now share `run_capture_scheduled`, I also generalized its diagnostic prefixes (`capture --in:` → `capture:`, `debounce started` → `background capture started`).\n\n**`src/harness/mod.rs` — hook wiring**\nThe SessionEnd (Claude) and `on_session_end` (Hermes) `capture` wirings had `timeout: 120`, which was the whole problem — the harness waited up to 120s. Now that the hook returns immediately, I aligned both to `timeout: 10` to match the Stop hook and signal intent. (Note: this only affects *new* installs / re-installs, not already-written `settings.json`.)\n\n## Verification\n- `pc capture` foreground returns in **~44ms** (down from blocking on the full capture).\n- It prints `background capture started (pid=…, delay=0s, …)` — a detached child is spawned.\n- That detached worker runs its **full body independently**: it logged a `capture.start` event 3s later, tagged with the test session, confirming the capture still completes asynchronously.\n\nOne intentional behavior note: with delay 0, a SessionEnd now *coalesces with* any in-flight Stop debounce worker (it SIGTERMs the pending one and runs once). The session is still captured exactly once — backstopped by the existing `is_already_captured_in` marker dedup plus the session lock, checked both pre- and post-lock.\n\nI haven't committed — let me know if you'd like that."
+  ],
+  [
+    "user",
+    "commit it"
+  ],
+  [
+    "assistant",
+    "Committed on branch `capture-return-immediately` (`ae5a3a2`).\n\nSummary:\n- **Committed (my change only):** `src/capture.rs` `run_capture` now detaches with delay 0, generalized eprintln prefixes, and `src/harness/mod.rs` timeout `120 → 10`.\n- **Left untouched in the working tree:** the `pc debug transcript` ANSI colorization (`src/capture.rs`, 92 lines) — that's a peer agent's in-progress work, so I deliberately kept it out of this commit. It's still there as a `M src/capture.rs` modification.\n- I branched rather than committing to shared `master` (active peers, default-branch policy).\n\nTo land it on master when ready:\n\n```\ngit checkout master && git merge --ff-only capture-return-immediately\n```\n\nThat fast-forward keeps the peer's uncommitted colorization changes intact in your working tree. Want me to merge it to master now, or open a PR?"
+  ],
+  [
+    "user",
+    "do it"
+  ],
+  [
+    "assistant",
+    "All set.\n\n- **`master` → `ae5a3a2`** — your capture fix is landed: `run_capture` detaches with delay 0 (returns ~44ms instead of blocking on the full pipeline), shared eprintln prefixes generalized, and the SessionEnd/`on_session_end` wiring timeout dropped `120 → 10`.\n- **Peer's colorization preserved** — the `pc debug transcript` ANSI work is still intact as an uncommitted `M src/capture.rs` (8 marker lines confirmed present) for that agent to commit.\n- Feature branch deleted; local master is 1 commit ahead of `origin/master` (not pushed, as you didn't ask)."
+  ]
+]

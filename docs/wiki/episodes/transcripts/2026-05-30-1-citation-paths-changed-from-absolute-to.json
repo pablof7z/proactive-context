@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "let's make paths in the inject flow be relative to the current dir\n\n/Users/pablofernandez/src/proactive-context/docs/wiki/capture-destination-event-sourced-projections.md:31 becomes ./docs/wiki/capture-destination-event-sourced-projections.md:31"
+  ],
+  [
+    "assistant",
+    "Made three changes to use cwd-relative paths instead of absolute ones: updated `compile_briefing` to strip the root prefix, removed \"absolute\" from `COMPILE_PREAMBLE`, and updated a comment in `render_guides_for_select`."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Done. Committed as `4e5a9a1` — bundles the relative citation paths change with the rest of the in-flight work (wiki path migration, fastembed cache dir, capture debounce fix, colored awareness board)."
+  ]
+]

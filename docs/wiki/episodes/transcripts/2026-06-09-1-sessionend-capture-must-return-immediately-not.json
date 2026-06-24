@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "the command pc capture -- does it do it work online or does it fork into the background?"
+  ],
+  [
+    "assistant",
+    "`pc capture` without flags runs synchronously in the foreground; `pc capture --in <secs>` forks into a detached background process and returns immediately."
+  ],
+  [
+    "user",
+    "both should return immediately, otherwise `pc capture` prevents the harness from exiting for many seconds"
+  ],
+  [
+    "assistant",
+    "Changed `run_capture` (SessionEnd path) to delegate to `run_capture_scheduled` with delay 0, so it spawns a detached background worker and returns immediately. Also adjusted harness hook timeouts from 120 to 10 seconds."
+  ],
+  [
+    "user",
+    "commit it"
+  ],
+  [
+    "assistant",
+    "Committed on branch `capture-return-immediately` (`ae5a3a2`), excluding a peer's uncommitted colorization work."
+  ],
+  [
+    "user",
+    "do it"
+  ],
+  [
+    "assistant",
+    "Merged to `master` and deleted the feature branch; the peer's colorization changes remain uncommitted in the working tree."
+  ]
+]

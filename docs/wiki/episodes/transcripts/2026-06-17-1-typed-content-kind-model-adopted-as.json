@@ -1,0 +1,54 @@
+[
+  [
+    "user",
+    "in this session we are going to be doing a taxonomy cleanup work"
+  ],
+  [
+    "assistant",
+    "Let me read the central topic-management guide and check the retopic tooling, since that's where the taxonomy problem is documented."
+  ],
+  [
+    "user",
+    "what session id are you on?"
+  ],
+  [
+    "assistant",
+    "I'm on session f58412 on the tenex-edge fabric."
+  ],
+  [
+    "assistant",
+    "Executed the taxonomy plan Phases 0–4, 6, 7 in an isolated worktree with 300 tests green and all behavior-changing flags default-off; Phase 5 and Phase 3 eval arms deferred pending explicit decisions."
+  ],
+  [
+    "user",
+    "when you have an update like that, use tenex-edge chat write to mention it to everybody on the team"
+  ],
+  [
+    "assistant",
+    "Phase 0 baseline eval completed with frozen metrics (75% guide recall, 2/10 stale-leak); discovered and reverted an eval harness bug that overwrote ~1475 lines of accumulated history."
+  ],
+  [
+    "user",
+    "give me the tldr of what we did thus far and any results or experiments observed"
+  ],
+  [
+    "assistant",
+    "Built typed-catalog infrastructure across 7 commits (all flags default-off, 300 tests green), measured a baseline showing the research corpus is largely invisible to the selector, and identified an eval harness overwrite bug plus a multi-agent wiki regeneration hazard."
+  ],
+  [
+    "user",
+    "continue"
+  ],
+  [
+    "assistant",
+    "Ran Phase 3 A0–A4 eval arms: A1 (typed catalog) is a clean win, A2 over-suppresses episode cards hurting trajectory recall, A3/A4 showed no benefit."
+  ],
+  [
+    "user",
+    "Tune A2"
+  ],
+  [
+    "assistant",
+    "Diagnosed A2's regression as misplaced COMPILE-time caution in the SELECT prompt, rewrote it to retain episode cards for history probes, committed the fix, and launched a validation re-run."
+  ]
+]

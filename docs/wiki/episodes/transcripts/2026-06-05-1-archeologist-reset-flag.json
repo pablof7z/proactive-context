@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "[Image #1] what does \"new:9\" mean?"
+  ],
+  [
+    "assistant",
+    "Confirmed that `NEW:9` means the number of sessions not yet captured by the archeologist—it's a backlog count, and 9 of 52 total sessions for that project haven't been processed yet."
+  ],
+  [
+    "user",
+    "I need a way to reset it for when I deleted docs/wiki to start over"
+  ],
+  [
+    "assistant",
+    "Added `pc archeologist --reset` which clears the capture ledger so sessions count as new again; supports full reset or per-project reset via `--project`, with confirmation prompts and non-TTY safety guards."
+  ]
+]

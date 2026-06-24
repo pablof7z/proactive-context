@@ -1,0 +1,10 @@
+[
+  [
+    "user",
+    "wherever this runs we leave a .fastembed_cache behind! that thing should be in the ~/.proac... directory!"
+  ],
+  [
+    "assistant",
+    "Done. Both the embedding model and reranker now cache to `~/Library/Caches/proactive-context/fastembed/` instead of dropping `.fastembed_cache` wherever the binary runs. Existing binaries are killed so the new build takes over."
+  ]
+]

@@ -346,6 +346,58 @@ fn render_raw_reminder(project_name: &str, hits: &[QueryResult]) -> String {
 
 // ─── Activation gate ─────────────────────────────────────────────────────────
 
+/// Strip XML-like blocks (<tag>...</tag> and <tag />) from a prompt using a simple
+/// state machine, returning only the non-tag text remainder.
+pub(crate) fn strip_xml_content(prompt: &str) -> String {
+    let bytes = prompt.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'<' {
+            // Peek ahead: must start with a letter to be an XML tag
+            let peek = i + 1;
+            if peek < len && bytes[peek].is_ascii_alphabetic() {
+                // Find the end of the opening tag
+                if let Some(gt) = bytes[i..].iter().position(|&b| b == b'>') {
+                    let tag_end = i + gt; // index of '>'
+                    let tag_inner = &prompt[i + 1..tag_end]; // e.g. "task-notification" or "tag attr=x"
+                    // Extract the tag name (up to first space or '/')
+                    let tag_name: &str = tag_inner
+                        .split(|c: char| c == ' ' || c == '/')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if !tag_name.is_empty() {
+                        // Check if self-closing (ends with /)
+                        let self_closing = tag_inner.trim_end().ends_with('/');
+                        if self_closing {
+                            // Skip the self-closing tag entirely
+                            i = tag_end + 1;
+                            out.push(' ');
+                            continue;
+                        }
+                        // Look for closing </tag_name>
+                        let close_tag = format!("</{}>", tag_name);
+                        if let Some(close_pos) = prompt[tag_end + 1..].find(&close_tag) {
+                            // Skip everything from '<' through '</tag>'
+                            i = tag_end + 1 + close_pos + close_tag.len();
+                            out.push(' ');
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // Not a recognized XML tag — emit the character
+        out.push(prompt[i..].chars().next().unwrap_or(' '));
+        i += prompt[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Returns true if the prompt should be skipped (trivial / too short).
 fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
     let lower = prompt.trim().to_lowercase();
@@ -355,14 +407,28 @@ fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
         return true;
     }
 
-    // Word count gate
-    let word_count = prompt.split_whitespace().count();
+    // Strip XML system tags and evaluate what the human actually typed
+    let human_text = strip_xml_content(prompt);
+    let human_lower = human_text.trim().to_lowercase();
+
+    // If after stripping XML there's nothing left, skip
+    if human_text.trim().is_empty() {
+        return true;
+    }
+
+    // If after stripping XML the remainder is itself a trivial phrase, skip
+    if TRIVIAL_PHRASES.contains(&human_lower.as_str()) {
+        return true;
+    }
+
+    // Word count gate (applied to the XML-stripped text)
+    let word_count = human_text.split_whitespace().count();
     if word_count < min_words {
         return true;
     }
 
-    // Very short character check
-    if prompt.trim().len() < 8 {
+    // Very short character check (applied to the XML-stripped text)
+    if human_text.trim().len() < 8 {
         return true;
     }
 

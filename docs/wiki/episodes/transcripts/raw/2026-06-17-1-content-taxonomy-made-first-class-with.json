@@ -1,0 +1,38 @@
+[
+  [
+    "user",
+    "in this session we are going to be doing a taxonomy cleanup work"
+  ],
+  [
+    "assistant",
+    "Let me read the central topic-management guide and check the retopic tooling, since that's where the taxonomy problem is documented."
+  ],
+  [
+    "user",
+    "[Request interrupted by user]"
+  ],
+  [
+    "user",
+    "what session id are you on?"
+  ],
+  [
+    "assistant",
+    "I'm `developer` on session **`f58412`** (host: laptop, status: working) on the tenex-edge fabric."
+  ],
+  [
+    "user",
+    "Messages from other agents (tenex-edge) - reply with `tenex-edge inbox reply --id <ID> \"...\"`:\n\nFrom: developer@proactive-context [session f58412]\nDate: 2026-06-17 13:24 (just now)\nSubject: Execute pc content taxonomy plan\nBranch: master (a809bee) [8 files dirty]\nID: bc989662\n--\nPlease execute the full proactive-context content taxonomy implementation/experimentation plan saved at Plans/content-taxonomy-implementation-experiment-plan.md in /Users/pablofernandez/src/proactive-context. Start with Phase 0 baseline/audit and proceed in order. Keep behavior-changing work behind the feature flags in the plan, preserve current guide/topic semantics, do not move files during the first migration, and record eval results before enabling any new source type by default."
+  ],
+  [
+    "assistant",
+    "Here's where things stand. I set up an isolated worktree (`../proactive-context-taxonomy`, branch `taxonomy-work`) per your request and the GC hazard in memory, then executed the plan in order — fanning out parallel agents over disjoint files.\n\n## Landed & committed (5 commits, all 300 tests green)\n\n| Phase | What | Status |\n|---|---|---|\n| **0** | `pc debug taxonomy` audit + baseline doc | ✅ inventory done; probe metrics pending eval |\n| **1** | `content_kind.rs` — ContentKind/Currentness/Authority/ClaimOp/GuideKind | ✅ done (7 tests) |\n| **2** | Typed catalog: `CatalogItem` gains kind/currentness; `PC_TYPED_CATALOG`/`PC_RESEARCH_CATALOG`/`PC_NOUN_CATALOG`; research:/noun: key resolution | ✅ done |\n| **3** | `PC_SELECT_SOURCE_TYPES` source-type SELECT guidance | ✅ code done; eval arms deferred |\n| **4** | `ClaimStatus{Settled,Proposed,Unknown}` stored on ClaimRecord; `PC_CLAIM_STATUS` gates Proposed-out-of-prose | ✅ done |\n| **6** | Canonical `TranscriptTurn` + lossless projection (additive increment) | ✅ done |\n| **7** | `pc wiki backfill-taxonomy` — idempotent, non-destructive typed index | ✅ done + verified byte-identical on rerun |\n\n**Every behavior-changing flag defaults OFF and is byte-identical to baseline when off** — verified by tests, including a literal byte-identical assertion on the SELECT preamble and catalog render.\n\n## In flight / deferred\n- **Baseline eval** running in background (Probe 1/2 against real session history, isolated `--experiment-dir`). Still on the first store build. It'll re-invoke me on completion and I'll append the probe metrics to the baseline doc.\n- **Phase 5 (claim catalog) — deferred** by the plan's own rule: don't add `claim:` rows until cluster summaries have stable currentness and pass review.\n- **Phase 3 A0–A5 eval arms — deferred.** These are six full eval runs (~hours of cloud inference each). Since nothing is default-on, that cost is only warranted when you want to flip a default. I did **not** burn it unprompted.\n\n## One thing worth flagging\n`docs/wiki/` is **untracked/generated** state. A concurrent peer session regenerated the live wiki mid-run (57→3 guides, 100→0 research), and both peers have since left the fabric. My work is unaffected (all in `src/`, committed on an isolated branch), and the eval is unaffected (isolated stores). I noted the snapshot volatility in the baseline doc.\n\nTwo decisions are yours when you're ready: **(1)** run the A0–A5 arms to validate Phase 3 / flip a default, and **(2)** whether to build Phase 5. I'll hold unless you say otherwise; the eval result will land regardless."
+  ],
+  [
+    "user",
+    "when you have an update like that, use tenex-edge chat write to mention it to everybody on the team"
+  ],
+  [
+    "assistant",
+    "The Phase 0 baseline broadcast landed (chat `49a6561f`). \n\n## Phase 0 complete — baseline frozen\n\nThe eval finished cleanly (your two accidental kills only stopped the process; nothing was lost). Baseline reference numbers, now committed to `docs/product-spec/taxonomy-baseline-2026-06-17.md`:\n\n| Metric (Store A = wiki / current-guide path) | Baseline |\n|---|---|\n| Guide restatement recall | **75%** |\n| User-direction recall | **71.4%** |\n| Stale-current leak (the \"sin\") | **2/10** |\n| Trajectory X→Y recoverable | **9/10** |\n| Latency p50 / p95 | **5.0s / 12.7s** |\n| Tokens in / out | ~218k / ~10.6k |\n\nFrozen labels + reversals are reusable, so later phases can re-score cheaply with `--score-only` instead of re-mining.\n\n**One thing I caught and reverted:** the eval auto-writes `docs/product-spec/claims-first-validation-results.md`, and doing so **clobbered ~1475 lines of accumulated Runs 11–12 history down to 59**. I restored it and flagged it to the team — anyone running `pc eval` will hit the same overwrite. That's a real bug worth fixing in the eval harness (it should append/version, not overwrite).\n\n## Where the plan stands\n\n- **Done & committed** (7 commits on `taxonomy-work`, 300 tests green, all flags default-off): Phases **0, 1, 2, 3, 4, 6, 7**.\n- **Deferred (your call):** Phase **5** (claim catalog — plan says wait for reviewed cluster summaries); Phase **3 A0–A5 eval arms** (six full eval runs like the one that just took ~2h — the gate for flipping any default on).\n\nThe full plan is implemented end-to-end as inert, flag-gated infrastructure with a measured baseline to validate against. The remaining work is **validation/rollout decisions**, not core build-out. Want me to kick off the A0–A5 arms now (now that the labels are frozen, each arm is `--score-only` and much cheaper than the baseline build), or pick up Phase 5?"
+  ]
+]

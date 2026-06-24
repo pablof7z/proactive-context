@@ -802,7 +802,11 @@ pub fn build_dialogue(transcript_path: &str) -> Vec<DialogueTurn> {
         if role == "user" {
             if let Some(text) = extract_dialogue_text(content_val, &["text", "input_text"]) {
                 if is_human_user_entry(&entry, &text) {
-                    out.push(DialogueTurn { is_user: true, text });
+                    // Strip system-injected XML blocks; skip turn if nothing human remains.
+                    let human_text = crate::inject::strip_xml_content(&text);
+                    if !human_text.trim().is_empty() {
+                        out.push(DialogueTurn { is_user: true, text: human_text });
+                    }
                 }
             }
         } else if role == "assistant" {

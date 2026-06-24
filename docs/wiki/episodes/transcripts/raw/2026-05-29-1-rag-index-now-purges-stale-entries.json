@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "we watch files right? so if a markdown file is deleted, do we delete it from the RAG?"
+  ],
+  [
+    "assistant",
+    "Yes, deletions are handled correctly. When the watcher fires and the file no longer exists (`!abs_path.exists()`), it calls `delete_chunks_for_path` to remove it from the RAG index.\n\nHowever, there's a gap: this only works **while the daemon is running**. If the daemon was stopped when the file was deleted, those stale chunks persist until the next `full_index` run — and the hash-based dedup in `full_index` only skips re-embedding existing files, it doesn't sweep for DB entries whose files have vanished.\n\nSo the short answer: **yes for live deletions, no for deletions that happen while the daemon is offline**."
+  ],
+  [
+    "user",
+    "fix it"
+  ],
+  [
+    "assistant",
+    "Clean build. The fix adds an `indexed_paths` function to `db.rs` and calls it at the start of `full_index` — any DB entry whose file no longer exists on disk gets purged before the walk begins. Combined with the existing live-deletion handler in the watcher, all cases are now covered."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed as `0abe38d`. The pre-existing `embed.rs` and `query.rs` changes remain unstaged."
+  ]
+]

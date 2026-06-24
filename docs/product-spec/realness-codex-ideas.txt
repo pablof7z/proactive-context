@@ -1,0 +1,293 @@
+Reading additional input from stdin...
+2026-06-15T20:30:00.226001Z ERROR codex_core::session::session: failed to load skill /Users/pablofernandez/.agents/skills/voice-capture-sheet/SKILL.md: invalid YAML: mapping values are not allowed in this context at line 2 column 116
+OpenAI Codex v0.139.0
+--------
+workdir: /private/tmp
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eccfa-0d70-7461-aefe-975d93f9a80b
+--------
+user
+# Brief: design how to implement NOUN REALNESS in proactive-context (`pc`, Rust)
+
+CONTEXT: `pc` captures knowledge from AI-coding-agent sessions and injects relevant context before
+each prompt. We are building a "noun primer": when a session first mentions a project noun, inject a
+short primer of what it is + relevant facts. A prior implementation WRONGLY sourced nouns from wiki
+guide titles (the agent's own filing system) — it primed confabulations the user never named.
+
+THE CORRECT MODEL (this is the design target):
+A noun becomes REAL when the USER references it, and realness ACCUMULATES with the STANCE of each
+user reference over time:
+- "what is the fabric-provider?" / "I never asked for a fabric-provider, stupid idea" → user does
+  NOT own it (likely agent confabulation) → NEGATIVE realness → suppress.
+- "the fabric-provider has a bug, let's fix it" → user OPERATES ON it as a real owned thing →
+  POSITIVE realness → valid project noun.
+- Realness is a running SIGNED score, NOT binary, NOT frequency. It EVOLVES and is RECOVERABLE
+  (a rejected noun climbs back if the user later wields it as real).
+- Reading stance (own/operate-on vs question-existence/reject vs neutral) REQUIRES an LLM;
+  mechanical inference is blind to it. The LLM is essential, not an optimization.
+
+Pipeline stages to design: (1) mine candidate nouns from USER turns across sessions; (2) score
+realness per reference via stance, accumulate per noun, threshold for "real", support recovery;
+(3) define real nouns transcript-cited from in-session explanation; (4) first-mention prime only
+above-threshold nouns. Constraints: integrity-by-construction (transcript-cited, never code-
+inferred), keep-all (register all, stance controls surfacing), inject is system-driven push, $0
+local Ollama for eval. Existing assets: a definitional "X is Y" EXTRACT prompt (correct, currently
+gated off), a first-mention primer composer (sound), frozen eval corpora + a within-run judge harness.
+
+DELIVER (be concrete and opinionated):
+1. THREE genuinely distinct implementation approaches for the realness scorer — differ on the
+   real axis (e.g. per-reference signed deltas accumulated vs. holistic per-noun re-judgment over
+   all references vs. a state-machine of noun lifecycle states; batch-at-capture vs. incremental;
+   where the score lives; how recovery/decay works). For each: the data model, where the LLM call
+   sits, cost shape, and the main failure mode.
+2. For EACH approach, 1-2 concrete TEST designs to run — what to measure, the metric, the
+   pre-registered pass bar, and how it would be falsified. Bias toward cheap, falsifiable tests on
+   real session history where the stance signal lives.
+3. A one-paragraph recommendation: which approach you'd run first and why.
+Keep it tight and decision-grade.
+
+Answer from this brief only; do not read files. Output the design memo directly, tightly.
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+**Design Memo: NOUN REALNESS**
+
+Common invariant for all approaches: candidate nouns come only from USER turns. Every noun mention is registered, but surfacing is controlled by stance-derived realness. Definitions must come from transcript-cited in-session explanation, never code/wiki inference. Priming is system-pushed only on first mention, and only when noun realness is above threshold.
+
+**Approach 1: Per-Reference Signed Delta Ledger**
+
+Data model:
+- `noun_candidate`: `noun_id`, `canonical_name`, aliases, first_seen_user_turn, created_at.
+- `noun_reference`: `noun_id`, session_id, turn_id, user_span, local_context, stance, delta, confidence, rationale_short.
+- `noun_realness`: `noun_id`, signed_score, positive_refs, negative_refs, neutral_refs, last_scored_at, status.
+- Suggested deltas: `operate_on = +2`, `own_or_assign = +2`, `asks_how_to_use = +1`, `neutral_mention = 0`, `questions_existence = -2`, `rejects_or_disowns = -3`.
+- Real threshold: `score >= +3`; suppress threshold: `score <= -2`. Recovery is automatic because later positive deltas add back.
+
+LLM call:
+- At capture/index time, batch user turns through local Ollama.
+- Input: user turn, small preceding conversational context, candidate noun spans.
+- Output: per noun mention stance + delta + cited user span.
+- No LLM call during injection except primer composition/definition if noun is already real.
+
+Cost shape:
+- Linear in user noun mentions. Cheap and incremental. Easy to cache forever because references are append-only.
+
+Main failure mode:
+- Bad stance calls accumulate. A few false positive `operate_on` labels can make confabulations real. Alias fragmentation also splits score across variants.
+
+Tests:
+1. Stance calibration test:
+   - Sample real user-turn noun references from session history, including rejected/questioned nouns.
+   - Measure macro-F1 across `positive`, `negative`, `neutral`; separately track negative precision.
+   - Pass bar: macro-F1 >= 0.80 and negative precision >= 0.90.
+   - Falsified if rejected/confabulated nouns are classified positive more than 5% of the time.
+
+2. Recovery test:
+   - Build sequences where the same noun is first rejected, then later operated on.
+   - Metric: score trajectory and final real/suppressed status.
+   - Pass bar: rejected noun starts suppressed within 1 reference, then becomes real after two strong positive operate-on references.
+   - Falsified if negative labels permanently block recovery or if one weak neutral mention recovers it.
+
+**Approach 2: Holistic Per-Noun Rejudgment**
+
+Data model:
+- `noun_candidate`: canonical noun + aliases from user mentions.
+- `noun_evidence_bundle`: all user references for the noun, ordered, each with session_id, turn_id, span, nearby context.
+- `noun_realness_judgment`: `noun_id`, `score`, `status`, `summary_reason`, `supporting_positive_refs`, `supporting_negative_refs`, `last_judged_at`, `model_version`.
+- Score is assigned directly by the LLM on a bounded scale, e.g. `-5..+5`, after reading all references.
+
+LLM call:
+- Periodic or on-demand batch job after capture.
+- For each noun, give the LLM all user references and ask: does the user treat this as owned/operational reality, reject it, merely ask what it is, or remain ambiguous?
+- The LLM returns score, status, and transcript citations.
+
+Cost shape:
+- Higher than per-reference scoring because each rejudgment rereads the evidence bundle.
+- Cost grows with references per noun, but can be capped by summarizing old judged evidence plus recent raw references.
+- Good fit for nightly local Ollama evaluation.
+
+Main failure mode:
+- The LLM can over-smooth contradictory evidence and invent coherence. It may also let later references dominate too much unless explicitly asked to preserve rejection history.
+
+Tests:
+1. End-state noun truth test:
+   - Select nouns from real history with known outcomes: real project nouns, rejected agent inventions, ambiguous asks.
+   - Metric: final status accuracy: `real`, `suppressed`, `ambiguous`.
+   - Pass bar: >= 90% accuracy on suppressing known confabulations and >= 85% recall on known operated-on nouns.
+   - Falsified if any guide-title/wiki-only noun becomes real without user operational references.
+
+2. Contradiction handling test:
+   - Use nouns with mixed evidence: “what is X?”, “I never asked for X”, later “X has a bug”.
+   - Metric: judgment cites both negative and positive references and final score matches latest accumulated ownership.
+   - Pass bar: >= 80% of mixed cases include citations from both sides and classify recovery correctly.
+   - Falsified if the model ignores earlier rejection or treats a definition question as ownership.
+
+**Approach 3: Noun Lifecycle State Machine**
+
+Data model:
+- `noun_candidate`: canonical noun + aliases.
+- `noun_event`: user reference event with stance: `introduced`, `questioned`, `rejected`, `operated_on`, `assigned_work`, `defined_by_user`, `neutral`.
+- `noun_lifecycle`: current state, signed_score, last_transition, transition_history.
+- States:
+  - `unproven`: seen but not real.
+  - `suspect`: questioned/rejected; never prime.
+  - `candidate`: weak positive evidence.
+  - `real`: enough operate-on/owning evidence.
+  - `suppressed`: strong rejection.
+  - `recovered`: previously suppressed, now real through later operational use.
+- Transitions are explicit and conservative. Example: `suppressed -> recovered` requires two later positive operational references or one strong user definition plus one operation.
+
+LLM call:
+- LLM classifies each user reference into lifecycle event type.
+- Deterministic Rust transition logic updates state and score.
+- Definitions are only attached when state is `real` or `recovered` and the definition extractor finds cited “X is Y” evidence.
+
+Cost shape:
+- Same broad cost as Approach 1: linear in user references.
+- Slightly more engineering work, but cheaper to reason about and easier to audit.
+
+Main failure mode:
+- Transition rules become policy debt. If too conservative, real nouns prime late. If too permissive, one misclassified event can jump state incorrectly.
+
+Tests:
+1. Transition table conformance test:
+   - Frozen corpus of ordered noun timelines with expected state after each user reference.
+   - Metric: exact state trajectory match, not just final status.
+   - Pass bar: >= 90% exact transition accuracy; 100% for hard rejection cases staying non-primeable.
+   - Falsified if `questioned` or `rejected` can transition directly to `real` without later operate-on evidence.
+
+2. Primer eligibility test:
+   - Replay real sessions and simulate first-mention injection.
+   - Metric: false-prime rate for suppressed/suspect nouns and missed-prime rate for known real nouns.
+   - Pass bar: false-prime rate <= 2%; known-real first eligible prime rate >= 75% after sufficient evidence exists.
+   - Falsified if any noun sourced only from guide/wiki titles becomes eligible.
+
+**Recommendation**
+
+Run Approach 1 first, with Approach 3’s state labels available as diagnostics but not as the primary policy surface. The signed delta ledger is the cleanest match to the product model: realness accumulates, remains recoverable, and preserves every user reference as evidence. It is cheap enough for local Ollama, naturally append-only, and easy to test against frozen corpora. If the delta score proves hard to control, promote it into the lifecycle state machine later; do not start with holistic rejudgment, because it is less auditable and more likely to smooth away exactly the stance history this feature depends on.
+hook: Stop
+hook: Stop Completed
+tokens used
+18,644
+**Design Memo: NOUN REALNESS**
+
+Common invariant for all approaches: candidate nouns come only from USER turns. Every noun mention is registered, but surfacing is controlled by stance-derived realness. Definitions must come from transcript-cited in-session explanation, never code/wiki inference. Priming is system-pushed only on first mention, and only when noun realness is above threshold.
+
+**Approach 1: Per-Reference Signed Delta Ledger**
+
+Data model:
+- `noun_candidate`: `noun_id`, `canonical_name`, aliases, first_seen_user_turn, created_at.
+- `noun_reference`: `noun_id`, session_id, turn_id, user_span, local_context, stance, delta, confidence, rationale_short.
+- `noun_realness`: `noun_id`, signed_score, positive_refs, negative_refs, neutral_refs, last_scored_at, status.
+- Suggested deltas: `operate_on = +2`, `own_or_assign = +2`, `asks_how_to_use = +1`, `neutral_mention = 0`, `questions_existence = -2`, `rejects_or_disowns = -3`.
+- Real threshold: `score >= +3`; suppress threshold: `score <= -2`. Recovery is automatic because later positive deltas add back.
+
+LLM call:
+- At capture/index time, batch user turns through local Ollama.
+- Input: user turn, small preceding conversational context, candidate noun spans.
+- Output: per noun mention stance + delta + cited user span.
+- No LLM call during injection except primer composition/definition if noun is already real.
+
+Cost shape:
+- Linear in user noun mentions. Cheap and incremental. Easy to cache forever because references are append-only.
+
+Main failure mode:
+- Bad stance calls accumulate. A few false positive `operate_on` labels can make confabulations real. Alias fragmentation also splits score across variants.
+
+Tests:
+1. Stance calibration test:
+   - Sample real user-turn noun references from session history, including rejected/questioned nouns.
+   - Measure macro-F1 across `positive`, `negative`, `neutral`; separately track negative precision.
+   - Pass bar: macro-F1 >= 0.80 and negative precision >= 0.90.
+   - Falsified if rejected/confabulated nouns are classified positive more than 5% of the time.
+
+2. Recovery test:
+   - Build sequences where the same noun is first rejected, then later operated on.
+   - Metric: score trajectory and final real/suppressed status.
+   - Pass bar: rejected noun starts suppressed within 1 reference, then becomes real after two strong positive operate-on references.
+   - Falsified if negative labels permanently block recovery or if one weak neutral mention recovers it.
+
+**Approach 2: Holistic Per-Noun Rejudgment**
+
+Data model:
+- `noun_candidate`: canonical noun + aliases from user mentions.
+- `noun_evidence_bundle`: all user references for the noun, ordered, each with session_id, turn_id, span, nearby context.
+- `noun_realness_judgment`: `noun_id`, `score`, `status`, `summary_reason`, `supporting_positive_refs`, `supporting_negative_refs`, `last_judged_at`, `model_version`.
+- Score is assigned directly by the LLM on a bounded scale, e.g. `-5..+5`, after reading all references.
+
+LLM call:
+- Periodic or on-demand batch job after capture.
+- For each noun, give the LLM all user references and ask: does the user treat this as owned/operational reality, reject it, merely ask what it is, or remain ambiguous?
+- The LLM returns score, status, and transcript citations.
+
+Cost shape:
+- Higher than per-reference scoring because each rejudgment rereads the evidence bundle.
+- Cost grows with references per noun, but can be capped by summarizing old judged evidence plus recent raw references.
+- Good fit for nightly local Ollama evaluation.
+
+Main failure mode:
+- The LLM can over-smooth contradictory evidence and invent coherence. It may also let later references dominate too much unless explicitly asked to preserve rejection history.
+
+Tests:
+1. End-state noun truth test:
+   - Select nouns from real history with known outcomes: real project nouns, rejected agent inventions, ambiguous asks.
+   - Metric: final status accuracy: `real`, `suppressed`, `ambiguous`.
+   - Pass bar: >= 90% accuracy on suppressing known confabulations and >= 85% recall on known operated-on nouns.
+   - Falsified if any guide-title/wiki-only noun becomes real without user operational references.
+
+2. Contradiction handling test:
+   - Use nouns with mixed evidence: “what is X?”, “I never asked for X”, later “X has a bug”.
+   - Metric: judgment cites both negative and positive references and final score matches latest accumulated ownership.
+   - Pass bar: >= 80% of mixed cases include citations from both sides and classify recovery correctly.
+   - Falsified if the model ignores earlier rejection or treats a definition question as ownership.
+
+**Approach 3: Noun Lifecycle State Machine**
+
+Data model:
+- `noun_candidate`: canonical noun + aliases.
+- `noun_event`: user reference event with stance: `introduced`, `questioned`, `rejected`, `operated_on`, `assigned_work`, `defined_by_user`, `neutral`.
+- `noun_lifecycle`: current state, signed_score, last_transition, transition_history.
+- States:
+  - `unproven`: seen but not real.
+  - `suspect`: questioned/rejected; never prime.
+  - `candidate`: weak positive evidence.
+  - `real`: enough operate-on/owning evidence.
+  - `suppressed`: strong rejection.
+  - `recovered`: previously suppressed, now real through later operational use.
+- Transitions are explicit and conservative. Example: `suppressed -> recovered` requires two later positive operational references or one strong user definition plus one operation.
+
+LLM call:
+- LLM classifies each user reference into lifecycle event type.
+- Deterministic Rust transition logic updates state and score.
+- Definitions are only attached when state is `real` or `recovered` and the definition extractor finds cited “X is Y” evidence.
+
+Cost shape:
+- Same broad cost as Approach 1: linear in user references.
+- Slightly more engineering work, but cheaper to reason about and easier to audit.
+
+Main failure mode:
+- Transition rules become policy debt. If too conservative, real nouns prime late. If too permissive, one misclassified event can jump state incorrectly.
+
+Tests:
+1. Transition table conformance test:
+   - Frozen corpus of ordered noun timelines with expected state after each user reference.
+   - Metric: exact state trajectory match, not just final status.
+   - Pass bar: >= 90% exact transition accuracy; 100% for hard rejection cases staying non-primeable.
+   - Falsified if `questioned` or `rejected` can transition directly to `real` without later operate-on evidence.
+
+2. Primer eligibility test:
+   - Replay real sessions and simulate first-mention injection.
+   - Metric: false-prime rate for suppressed/suspect nouns and missed-prime rate for known real nouns.
+   - Pass bar: false-prime rate <= 2%; known-real first eligible prime rate >= 75% after sufficient evidence exists.
+   - Falsified if any noun sourced only from guide/wiki titles becomes eligible.
+
+**Recommendation**
+
+Run Approach 1 first, with Approach 3’s state labels available as diagnostics but not as the primary policy surface. The signed delta ledger is the cleanest match to the product model: realness accumulates, remains recoverable, and preserves every user reference as evidence. It is cheap enough for local Ollama, naturally append-only, and easy to test against frozen corpora. If the delta score proves hard to control, promote it into the lifecycle state machine later; do not start with holistic rejudgment, because it is less auditable and more likely to smooth away exactly the stance history this feature depends on.
