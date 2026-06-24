@@ -33,7 +33,10 @@ def tool_search(store: Store, query: str, project: Optional[str] = None,
 def tool_get_line(store: Store, turn_id: str) -> str:
     r = store.get(turn_id)
     if not r:
-        return f"No such line {turn_id}"
+        rr = _resolve(store, turn_id)
+        if not rr:
+            return f"No such line {turn_id}"
+        return f"[{rr[0]}] {rr[5][:19]} ({rr[2]})\n{rr[6]}"
     return f"[{r[0]}] {r[5][:19]} ({r[2]})\n{r[6]}"
 
 
@@ -107,10 +110,33 @@ def _codex_render(o: dict) -> Optional[str]:
     return None
 
 
-def tool_expand(store: Store, turn_id: str, before: int = 6, after: int = 8) -> str:
+def _resolve(store: Store, turn_id: str):
+    """Tolerant id resolver: the model often guesses the source or line number.
+    Fall back to the same session (any source) and the nearest line."""
     r = store.get(turn_id)
+    if r:
+        return r
+    m = re.match(r"(?:(\w+)/)?(.+)/([0-9a-fA-F]{6,})/L(\d+)$", turn_id)
+    if not m:
+        # maybe project/session without source
+        m2 = re.match(r"(.+)/([0-9a-fA-F]{6,})/L(\d+)$", turn_id)
+        if not m2:
+            return None
+        project, sess8, line = m2.group(1), m2.group(2), int(m2.group(3))
+    else:
+        project, sess8, line = m.group(2), m.group(3), int(m.group(4))
+    rows = store.conn.execute(
+        "SELECT id, source, project, session, line, ts, text, raw_path FROM turns "
+        "WHERE project=? AND session LIKE ? ORDER BY ABS(line-?) LIMIT 1",
+        [project, sess8 + "%", line]).fetchall()
+    return rows[0] if rows else None
+
+
+def tool_expand(store: Store, turn_id: str, before: int = 6, after: int = 8) -> str:
+    r = _resolve(store, turn_id)
     if not r:
-        return f"No such line {turn_id}"
+        return (f"No such line {turn_id}. Use exact IDs copied verbatim from "
+                f"search results (including the claude/ or codex/ prefix).")
     _id, source, project, session, line, ts, text, raw_path = r
     p = Path(raw_path)
     if not p.exists():

@@ -59,6 +59,15 @@ class Printer:
             dur = (m.get("total_duration") or 0) / 1e9
             sys.stdout.write(f"\n{GREY}    ({pe} prompt-tok, {ec} gen-tok, {dur:.1f}s){RESET}")
             self.mode = None
+        elif ev.kind == "sources":
+            m = ev.meta or {}
+            valid, total = m.get("valid", 0), m.get("total", 0)
+            bad = [c for c, ok in m.get("cited", []) if not ok]
+            mark = GRN if valid == total else YEL
+            sys.stdout.write(f"\n\n{mark}✓ {valid}/{total} citations validated against corpus{RESET}")
+            if bad:
+                sys.stdout.write(f"\n{YEL}  unverified: {', '.join(bad[:6])}{RESET}")
+            self.mode = None
         elif ev.kind == "final":
             self.mode = None
         sys.stdout.flush()
