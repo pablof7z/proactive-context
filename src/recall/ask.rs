@@ -60,8 +60,18 @@ pub struct Answer {
 }
 
 pub fn validate_citations(store: &Store, text: &str) -> (usize, usize) {
-    let re = regex::Regex::new(r"\[((?:claude|codex)/[^\]\s]+?/L\d+)\]").unwrap();
-    let ids: BTreeSet<String> = re.captures_iter(text).map(|c| c[1].to_string()).collect();
+    // Models format citations inconsistently: `[a;b;c]` multi-id brackets, spaces,
+    // L-ranges, and fancy unicode dashes inside ids. Normalize dashes and match ids
+    // anywhere (not just tidy single `[id]` brackets).
+    let norm: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
+            _ => c,
+        })
+        .collect();
+    let re = regex::Regex::new(r"(?:claude|codex)/[^\s\[\];,]+?/L\d+").unwrap();
+    let ids: BTreeSet<String> = re.find_iter(&norm).map(|m| m.as_str().to_string()).collect();
     let valid = ids.iter().filter(|id| store.resolve(id).is_some()).count();
     (valid, ids.len())
 }
