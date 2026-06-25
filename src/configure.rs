@@ -144,6 +144,22 @@ pub fn fetch_models_async(
     std::thread::spawn(move || {
         let mut all: Vec<ModelEntry> = Vec::new();
 
+        // ── Claude CLI (static entries — always available if `claude` is in PATH) ──
+        for (model, display, ctx_len) in [
+            ("opus",   "Claude Opus (latest)",   Some(1_000_000u64)),
+            ("sonnet", "Claude Sonnet (latest)", Some(1_000_000u64)),
+            ("haiku",  "Claude Haiku (latest)",  Some(1_000_000u64)),
+        ] {
+            all.push(ModelEntry {
+                spec: format!("claude-cli:{model}"),
+                display: format!("claude-cli · {display}"),
+                ctx_len,
+                price_prompt: None,
+                size_gb: None,
+                provider: Provider::ClaudeCli,
+            });
+        }
+
         // ── OpenRouter ────────────────────────────────────────────────────────
         if let Some(ref key) = openrouter_api_key {
             if !key.is_empty() {
