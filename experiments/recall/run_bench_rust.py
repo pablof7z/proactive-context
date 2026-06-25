@@ -11,10 +11,11 @@ from bench import QUESTIONS, gold_coverage
 PC = "/Users/pablofernandez/src/proactive-context/target/debug/pc"
 # Free path: chunked map-reduce on free gpt-oss-120b (131K) — reads 100% of the
 # corpus in chunks, so it works without 1M context or paid credits.
-MODEL = os.environ.get("RECALL_BENCH_MODEL", "openrouter:openai/gpt-oss-120b:free")
+MODEL = os.environ.get("RECALL_BENCH_MODEL", "openrouter:qwen/qwen3-coder:free")
 CHUNK = os.environ.get("RECALL_BENCH_CHUNK", "1") == "1"
+CHUNK_TOK = os.environ.get("RECALL_BENCH_CHUNK_TOK", "200000")
 ENV = {**os.environ, "RECALL_OLLAMA": "http://localhost:11434"}
-EXTRA = ["--chunk", "--chunk-tokens", "100000"] if CHUNK else []
+EXTRA = ["--chunk", "--chunk-tokens", CHUNK_TOK] if CHUNK else []
 
 print(f"{'Q':<50} cites valid gold   s", flush=True)
 rows = []
