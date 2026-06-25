@@ -6,6 +6,7 @@
 //! (gemini-cloud re-prefills per question; OpenRouter reports cost + cached tokens.)
 
 use anyhow::Result;
+use colored::Colorize;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
@@ -25,6 +26,72 @@ use crate::provider::ModelSpec;
 const GATE_DEFAULT: &str = "openrouter:deepseek/deepseek-v4-flash";
 const PROMPT: &str = "recall> ";
 
+fn color_enabled() -> bool {
+    io::stdout().is_terminal()
+}
+
+fn configure_color() {
+    colored::control::set_override(color_enabled());
+}
+
+fn accent(s: impl AsRef<str>) -> String {
+    let s = s.as_ref();
+    if color_enabled() {
+        s.cyan().bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn command(s: impl AsRef<str>) -> String {
+    let s = s.as_ref();
+    if color_enabled() {
+        s.green().bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn command_col(s: &str, width: usize) -> String {
+    let padded = format!("{s:<width$}");
+    command(padded)
+}
+
+fn dim(s: impl AsRef<str>) -> String {
+    let s = s.as_ref();
+    if color_enabled() {
+        s.dimmed().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn warn(s: impl AsRef<str>) -> String {
+    let s = s.as_ref();
+    if color_enabled() {
+        s.yellow().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn err(s: impl AsRef<str>) -> String {
+    let s = s.as_ref();
+    if color_enabled() {
+        s.red().bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn prompt() -> String {
+    if color_enabled() {
+        PROMPT.cyan().bold().to_string()
+    } else {
+        PROMPT.to_string()
+    }
+}
+
 fn label(s: &ModelSpec) -> String {
     format!(
         "{}:{}",
@@ -33,35 +100,85 @@ fn label(s: &ModelSpec) -> String {
     )
 }
 
+fn model_label(s: &ModelSpec) -> String {
+    accent(label(s))
+}
+
 fn help() {
-    println!("Ask a question in plain English, or use a command:");
-    println!("  /model [spec]   pick or set the processing model");
-    println!("  /gate [spec]    pick or set the gate model used by `pc recall gate`");
-    println!("  /brief          toggle terse agent-facing answers");
-    println!("  /full           switch back to full answers");
-    println!("  /last           ask the previous question again");
-    println!("  /status         show corpus, models, and answer mode");
-    println!("  /usage          token / cost / cache breakdown for this session");
-    println!("  /examples       show useful recall questions");
-    println!("  /clear          clear the screen");
-    println!("  /help           this help");
-    println!("  /quit           exit (Ctrl-D also exits)");
+    println!(
+        "{}",
+        accent("Ask a question in plain English, or use a command:")
+    );
+    println!(
+        "  {} {}",
+        command_col("/model [spec]", 17),
+        dim("pick or set the processing model")
+    );
+    println!(
+        "  {} {}",
+        command_col("/gate [spec]", 17),
+        dim("pick or set the gate model used by `pc recall gate`")
+    );
+    println!(
+        "  {} {}",
+        command_col("/brief", 17),
+        dim("toggle terse agent-facing answers")
+    );
+    println!(
+        "  {} {}",
+        command_col("/full", 17),
+        dim("switch back to full answers")
+    );
+    println!(
+        "  {} {}",
+        command_col("/last", 17),
+        dim("ask the previous question again")
+    );
+    println!(
+        "  {} {}",
+        command_col("/status", 17),
+        dim("show corpus, models, and answer mode")
+    );
+    println!(
+        "  {} {}",
+        command_col("/usage", 17),
+        dim("token / cost / cache breakdown for this session")
+    );
+    println!(
+        "  {} {}",
+        command_col("/examples", 17),
+        dim("show useful recall questions")
+    );
+    println!(
+        "  {} {}",
+        command_col("/clear", 17),
+        dim("clear the screen")
+    );
+    println!("  {} {}", command_col("/help", 17), dim("this help"));
+    println!(
+        "  {} {}",
+        command_col("/quit", 17),
+        dim("exit (Ctrl-D also exits)")
+    );
     println!();
-    println!("Shortcuts: ↑/↓ history, Ctrl-C cancels the current line.");
+    println!(
+        "{}",
+        dim("Shortcuts: ↑/↓ history, Ctrl-C cancels the current line.")
+    );
 }
 
 fn examples() {
-    println!("Examples:");
+    println!("{}", accent("Examples:"));
     println!("  what are my current preferences for iOS UI?");
     println!("  what did I decide about raw transcripts vs claims?");
     println!("  summarize reversals around OpenRouter and local models");
     println!("  for podcast-player, what architecture boundaries did I insist on?");
-    println!("  /brief");
+    println!("  {}", command("/brief"));
     println!("  what should an agent remember before touching proactive-context?");
 }
 
 fn select(title: &str, current: &ModelSpec) -> Option<ModelSpec> {
-    eprintln!("fetching models…");
+    eprintln!("{}", dim("fetching models…"));
     let entries = picker::fetch_models();
     match picker::pick(title, &label(current), &entries) {
         Ok(Some(spec)) => Some(ModelSpec::parse(&spec)),
@@ -116,31 +233,63 @@ struct CorpusView {
 }
 
 fn print_banner(state: &ReplState, corpus: &CorpusView) {
-    println!("recall");
+    println!("{}", accent("recall"));
     println!(
-        "  corpus: {} messages · {} dupes collapsed · ~{}k tokens",
-        corpus.messages, corpus.dupes, corpus.token_est
+        "  {} {} messages · {} dupes collapsed · ~{}k tokens",
+        dim("corpus:"),
+        corpus.messages,
+        corpus.dupes,
+        corpus.token_est
     );
-    println!("  processing: {}", label(&state.proc_spec));
-    println!("  answer mode: {}", state.mode.label());
-    println!("  database: {}", corpus.db_path.display());
+    println!("  {} {}", dim("processing:"), model_label(&state.proc_spec));
+    println!("  {} {}", dim("answer mode:"), accent(state.mode.label()));
+    println!(
+        "  {} {}",
+        dim("database:"),
+        dim(corpus.db_path.display().to_string())
+    );
     println!();
-    println!("Ask a question, or type /help. Use ↑/↓ for history, /brief for terse answers, /quit to exit.");
+    println!(
+        "Ask a question, or type {}. Use {} for history, {} for terse answers, {} to exit.",
+        command("/help"),
+        dim("↑/↓"),
+        command("/brief"),
+        command("/quit")
+    );
     println!();
 }
 
 fn print_status(state: &ReplState, corpus: &CorpusView) {
-    println!("status");
+    println!("{}", accent("status"));
     println!(
-        "  corpus: {} messages · {} dupes collapsed · ~{}k tokens",
-        corpus.messages, corpus.dupes, corpus.token_est
+        "  {} {} messages · {} dupes collapsed · ~{}k tokens",
+        dim("corpus:"),
+        corpus.messages,
+        corpus.dupes,
+        corpus.token_est
     );
-    println!("  processing model: {}", label(&state.proc_spec));
-    println!("  gate model:       {}", label(&state.gate_spec));
-    println!("  answer mode:      {}", state.mode.label());
-    println!("  database:         {}", corpus.db_path.display());
+    println!(
+        "  {} {}",
+        dim("processing model:"),
+        model_label(&state.proc_spec)
+    );
+    println!(
+        "  {}       {}",
+        dim("gate model:"),
+        model_label(&state.gate_spec)
+    );
+    println!(
+        "  {}      {}",
+        dim("answer mode:"),
+        accent(state.mode.label())
+    );
+    println!(
+        "  {}         {}",
+        dim("database:"),
+        dim(corpus.db_path.display().to_string())
+    );
     if let Some(q) = &state.last_question {
-        println!("  last question:    {}", q);
+        println!("  {}    {}", dim("last question:"), q);
     }
 }
 
@@ -180,32 +329,32 @@ fn handle_command(
             print!("{}", ledger.detailed());
             println!(
                 "models — processing: {} · gate: {}",
-                label(&state.proc_spec),
-                label(&state.gate_spec)
+                model_label(&state.proc_spec),
+                model_label(&state.gate_spec)
             );
             Command::Continue
         }
         "/brief" | "/b" => {
             state.mode = AnswerMode::Brief;
-            println!("answer mode → {}", state.mode.label());
+            println!("{} {}", dim("answer mode →"), accent(state.mode.label()));
             Command::Continue
         }
         "/full" | "/f" => {
             state.mode = AnswerMode::Full;
-            println!("answer mode → {}", state.mode.label());
+            println!("{} {}", dim("answer mode →"), accent(state.mode.label()));
             Command::Continue
         }
         "/last" | "/again" => {
             if let Some(q) = &state.last_question {
                 Command::Ask(q.clone())
             } else {
-                println!("No previous question yet.");
+                println!("{}", warn("No previous question yet."));
                 Command::Continue
             }
         }
         "/ask" => {
             if arg.is_empty() {
-                println!("usage: /ask <question>");
+                println!("{} {}", dim("usage:"), command("/ask <question>"));
                 Command::Continue
             } else {
                 Command::Ask(arg.to_string())
@@ -215,11 +364,19 @@ fn handle_command(
             if arg.is_empty() {
                 if let Some(s) = select("select PROCESSING model", &state.proc_spec) {
                     state.proc_spec = s;
-                    println!("processing model → {}", label(&state.proc_spec));
+                    println!(
+                        "{} {}",
+                        dim("processing model →"),
+                        model_label(&state.proc_spec)
+                    );
                 }
             } else {
                 state.proc_spec = ModelSpec::parse(arg);
-                println!("processing model → {}", label(&state.proc_spec));
+                println!(
+                    "{} {}",
+                    dim("processing model →"),
+                    model_label(&state.proc_spec)
+                );
             }
             Command::Continue
         }
@@ -228,15 +385,19 @@ fn handle_command(
                 if let Some(s) = select("select GATE model", &state.gate_spec) {
                     state.gate_spec = s;
                     println!(
-                        "gate model → {} (used by `pc recall gate`)",
-                        label(&state.gate_spec)
+                        "{} {} {}",
+                        dim("gate model →"),
+                        model_label(&state.gate_spec),
+                        dim("(used by `pc recall gate`)")
                     );
                 }
             } else {
                 state.gate_spec = ModelSpec::parse(arg);
                 println!(
-                    "gate model → {} (used by `pc recall gate`)",
-                    label(&state.gate_spec)
+                    "{} {} {}",
+                    dim("gate model →"),
+                    model_label(&state.gate_spec),
+                    dim("(used by `pc recall gate`)")
                 );
             }
             Command::Continue
@@ -248,7 +409,13 @@ fn handle_command(
             Command::Continue
         }
         unknown if unknown.starts_with('/') => {
-            println!("Unknown command: {unknown}. Type /help for commands, or ask without a leading slash.");
+            println!(
+                "{} {} {}",
+                warn(format!("Unknown command: {unknown}.")),
+                dim("Type"),
+                command("/help")
+            );
+            println!("{}", dim("Or ask without a leading slash."));
             Command::Continue
         }
         _ => Command::Ask(trimmed.to_string()),
@@ -376,7 +543,7 @@ fn submit_line(out: &mut io::Stdout, buf: &[char]) -> Result<Input> {
         terminal::Clear(ClearType::CurrentLine)
     )?;
     let line: String = buf.iter().collect();
-    writeln!(out, "{PROMPT}{line}")?;
+    writeln!(out, "{}{line}", prompt())?;
     out.flush()?;
     Ok(Input::Line(line))
 }
@@ -388,7 +555,7 @@ fn render_line(out: &mut io::Stdout, buf: &[char], cursor_pos: usize) -> Result<
         cursor::MoveToColumn(0),
         terminal::Clear(ClearType::CurrentLine)
     )?;
-    write!(out, "{PROMPT}{line}")?;
+    write!(out, "{}{line}", prompt())?;
     execute!(
         out,
         cursor::MoveToColumn((PROMPT.chars().count() + cursor_pos) as u16)
@@ -409,24 +576,26 @@ fn remember(history: &mut Vec<String>, line: &str) {
 
 fn friendly_error(e: &anyhow::Error) {
     let msg = e.to_string();
-    eprintln!("error: {msg}");
+    eprintln!("{} {msg}", err("error:"));
     if msg.contains("no OpenRouter key") {
-        eprintln!("hint: run `pc configure`, set OPENROUTER_API_KEY, or switch with `/model ollama:<model>`.");
+        eprintln!("{} run `pc configure`, set OPENROUTER_API_KEY, or switch with `/model ollama:<model>`.", warn("hint:"));
     } else if msg.contains("429") || msg.contains("rate") {
-        eprintln!("hint: the provider is throttling; try again, switch models with /model, or use a local Ollama model.");
+        eprintln!("{} the provider is throttling; try again, switch models with /model, or use a local Ollama model.", warn("hint:"));
     } else if msg.contains("context")
         || msg.contains("maximum context")
         || msg.contains("too many tokens")
     {
-        eprintln!("hint: this REPL loads the whole corpus each question; use a 1M-context model here, or `pc recall ask --chunk` for small-context models.");
+        eprintln!("{} this REPL loads the whole corpus each question; use a 1M-context model here, or `pc recall ask --chunk` for small-context models.", warn("hint:"));
     } else if msg.contains("Ollama") {
         eprintln!(
-            "hint: check `ollama list`, start Ollama, or set RECALL_OLLAMA=http://host:11434."
+            "{} check `ollama list`, start Ollama, or set RECALL_OLLAMA=http://host:11434.",
+            warn("hint:")
         );
     }
 }
 
 pub fn run(spec: &ModelSpec) -> Result<()> {
+    configure_color();
     let store = Store::open()?;
     if store.count()? == 0 {
         anyhow::bail!("recall index is empty — run `pc recall index` first");
@@ -469,9 +638,10 @@ pub fn run(spec: &ModelSpec) -> Result<()> {
         let t = std::time::Instant::now();
         state.last_question = Some(q.clone());
         eprintln!(
-            "asking {} ({})…",
-            label(&state.proc_spec),
-            state.mode.label()
+            "{} {} {}",
+            dim("asking"),
+            model_label(&state.proc_spec),
+            dim(format!("({})…", state.mode.label()))
         );
         match ask::ask(
             &state.proc_spec,
@@ -489,22 +659,25 @@ pub fn run(spec: &ModelSpec) -> Result<()> {
                     String::new()
                 };
                 println!(
-                    "\n[{}/{} citations valid · {}↑ {}↓ tok · {} cached{} · {:.0}s]",
-                    a.cites_valid,
-                    a.cites_total,
-                    super::usage::fmt_tok(a.usage.prompt_tokens),
-                    super::usage::fmt_tok(a.usage.completion_tokens),
-                    super::usage::fmt_tok(a.usage.cached_tokens),
-                    cost,
-                    secs
+                    "\n{}",
+                    dim(format!(
+                        "[{}/{} citations valid · {}↑ {}↓ tok · {} cached{} · {:.0}s]",
+                        a.cites_valid,
+                        a.cites_total,
+                        super::usage::fmt_tok(a.usage.prompt_tokens),
+                        super::usage::fmt_tok(a.usage.completion_tokens),
+                        super::usage::fmt_tok(a.usage.cached_tokens),
+                        cost,
+                        secs
+                    ))
                 );
                 ledger.record(&label(&state.proc_spec), &a.usage, secs);
-                println!("{}\n", ledger.statusbar());
+                println!("{}\n", dim(ledger.statusbar()));
             }
             Err(e) => friendly_error(&e),
         }
     }
-    println!("bye.");
+    println!("{}", dim("bye."));
     Ok(())
 }
 
