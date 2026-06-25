@@ -75,29 +75,41 @@ def _parse_findings(txt: str):
 MODEL = "gemini-3-flash-preview:cloud"  # real ~1M context (GLM cloud caps at 203K)
 
 
-def map_page(page, query, num_ctx, model=MODEL):
+def _norm_id(s: str) -> str:
+    return (s or "").strip().strip("[]").strip()
+
+
+def map_page(page, query, num_ctx, model=MODEL, retries=2):
     t = time.time()
     sys_prompt = MAP_SYS.replace("{page}", page.text)
-    try:
-        r = glm.chat(
-            [{"role": "system", "content": sys_prompt},
-             {"role": "user", "content": f"QUERY: {query}"}],
-            model=model, stream=False, think=False, num_ctx=num_ctx,
-            temperature=0.1, keep_alive="60m",
-            options_extra={"num_predict": 16000})
-        content = (r.get("message") or {}).get("content", "")
-        pe = r.get("prompt_eval_count")
-        findings = _parse_findings(content)
-        # keep only findings whose id resolves
-        return {"page": page.n, "findings": findings, "dt": time.time() - t,
-                "prompt_tok": pe, "err": None}
-    except Exception as e:
-        return {"page": page.n, "findings": [], "dt": time.time() - t,
-                "prompt_tok": None, "err": str(e)}
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = glm.chat(
+                [{"role": "system", "content": sys_prompt},
+                 {"role": "user", "content": f"QUERY: {query}"}],
+                model=model, stream=False, think=False, num_ctx=num_ctx,
+                temperature=0.1, keep_alive="60m",
+                options_extra={"num_predict": 16000})
+            content = (r.get("message") or {}).get("content", "")
+            findings = _parse_findings(content)
+            for f in findings:
+                if isinstance(f, dict):
+                    f["id"] = _norm_id(f.get("id", ""))
+            return {"page": page.n, "findings": findings, "dt": time.time() - t,
+                    "prompt_tok": r.get("prompt_eval_count"), "err": None,
+                    "attempts": attempt + 1}
+        except Exception as e:
+            last_err = str(e)
+    return {"page": page.n, "findings": [], "dt": time.time() - t,
+            "prompt_tok": None, "err": last_err, "attempts": retries + 1}
 
 
-def run(query: str, target_tokens: int = 900_000, num_ctx: int = 1_100_000,
-        workers: int = 4):
+def run(query: str, target_tokens: int = 480_000, num_ctx: int = 650_000,
+        workers: int = 2):
+    # NOTE: gemini-cloud is unreliable for concurrent calls near its 1M cap, so we
+    # use smaller ~480K windows + modest concurrency. Smaller calls succeed far
+    # more often and retries are cheap. Honest coverage ledger flags any gap.
     store = Store()
     t0 = time.time()
     print(f"{GREY}paginating corpus…{RESET}", flush=True)
@@ -109,6 +121,8 @@ def run(query: str, target_tokens: int = 900_000, num_ctx: int = 1_100_000,
 
     all_findings = []
     page_tok = 0
+    ok_pages = 0
+    failed_pages = []
     print(f"{MAG}▸ mapping {len(pages)} pages concurrently (reading everything)…{RESET}")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(map_page, p, query, num_ctx): p for p in pages}
@@ -116,9 +130,12 @@ def run(query: str, target_tokens: int = 900_000, num_ctx: int = 1_100_000,
             r = fut.result()
             p = futs[fut]
             if r["err"]:
+                failed_pages.append(p.n)
                 print(f"{YEL}  ✗ page {r['page']} ({p.token_est//1000}k tok) "
-                      f"error: {r['err'][:80]}{RESET}")
+                      f"FAILED after {r.get('attempts','?')} tries: {r['err'][:70]} "
+                      f"— COVERAGE GAP{RESET}")
                 continue
+            ok_pages += 1
             n = len(r["findings"])
             page_tok += (r["prompt_tok"] or p.token_est)
             print(f"{GRN}  ✓ page {r['page']}{RESET} ({p.token_est//1000}k tok, "
@@ -137,22 +154,47 @@ def run(query: str, target_tokens: int = 900_000, num_ctx: int = 1_100_000,
             continue
         seen.add(key); deduped.append(f)
 
-    print(f"\n{MAG}▸ reducing {len(deduped)} passages → cited answer…{RESET}\n")
-    # synthesis (streaming)
+    # cluster by facet so the reduce is forced to cover EVERY facet (union-complete,
+    # not a curated essay that silently drops findings).
+    clusters = {}
+    for f in deduped:
+        key = (f.get("facet") or "misc").strip().lower()
+        clusters.setdefault(key, []).append(f)
+    n_facets = len(clusters)
+    print(f"\n{MAG}▸ reducing {len(deduped)} passages across {n_facets} facets "
+          f"→ union-complete cited answer…{RESET}\n")
     findings_block = "\n".join(
-        f'- {f.get("id","")} [{f.get("facet","")}/{f.get("stance","")}] '
-        f'"{f.get("quote","")}"' for f in deduped)
+        f"### facet: {facet}\n" + "\n".join(
+            f'- {f.get("id","")} [{f.get("stance","")}] "{f.get("quote","")}"'
+            for f in fs)
+        for facet, fs in clusters.items())
     msgs = [{"role": "system", "content": REDUCE_SYS},
-            {"role": "user", "content": f"QUESTION: {query}\n\nFINDINGS "
-                                        f"(from reading 100% of history):\n{findings_block}"}]
+            {"role": "user", "content":
+                f"QUESTION: {query}\n\nThese findings were gathered by reading 100% "
+                f"of the history, grouped into {n_facets} facets. Write the answer "
+                f"with one section PER facet, in this order. You MUST include EVERY "
+                f"facet and cite EVERY [id] at least once — do not omit or merge away "
+                f"any finding; completeness matters more than brevity.\n\n{findings_block}"}]
     answer = ""
     sys.stdout.write(BOLD + "● answer" + RESET + "\n")
     for ch in glm.chat(msgs, stream=True, think=False, num_ctx=200_000,
-                       temperature=0.2, options_extra={"num_predict": 6000}):
+                       temperature=0.2, options_extra={"num_predict": 14000}):
         m = ch.get("message") or {}
         if m.get("content"):
             answer += m["content"]
             sys.stdout.write(m["content"]); sys.stdout.flush()
+
+    # deterministic union backstop: any extracted passage the synthesis didn't
+    # cite is appended verbatim, so reading-everything => reporting-everything.
+    cited = set(re.findall(r"\[((?:claude|codex)/[^\]\s]+?/L\d+)\]", answer))
+    missing = [f for f in deduped if f.get("id", "").strip() not in cited]
+    if missing:
+        extra = f"\n\n{BOLD}— also found (read but not woven in above) —{RESET}\n"
+        sys.stdout.write(extra)
+        for f in missing:
+            line = f'- [{f.get("facet","")}] "{f.get("quote","")}" [{f.get("id","")}]\n'
+            sys.stdout.write(line)
+            answer += line
 
     # validate citations + coverage ledger
     def emit(ev: Event):
@@ -160,9 +202,16 @@ def run(query: str, target_tokens: int = 900_000, num_ctx: int = 1_100_000,
             mta = ev.meta or {}
             print(f"\n\n{GRN}✓ {mta['valid']}/{mta['total']} citations validated{RESET}")
     _emit_sources(store, answer, emit)
+    print(f"  findings reported: {len(deduped)}/{len(deduped)} "
+          f"({len(deduped)-len(missing)} woven + {len(missing)} appended)")
 
+    pct = round(100 * ok_pages / len(pages))
+    cov_color = GRN if ok_pages == len(pages) else YEL
     print(f"\n{BOLD}── coverage ledger ──{RESET}")
-    print(f"  pages read: {len(pages)}/{len(pages)} (100% of corpus)")
+    print(f"  {cov_color}pages read: {ok_pages}/{len(pages)} "
+          f"({pct}% of corpus){RESET}"
+          + (f"  ⚠ FAILED pages {failed_pages} NOT read — answer is INCOMPLETE"
+             if failed_pages else ""))
     print(f"  tokens read: ~{page_tok//1000}k")
     print(f"  passages found: {len(all_findings)} ({len(deduped)} after dedup)")
     print(f"  total latency: {time.time()-t0:.0f}s")
