@@ -44,6 +44,7 @@ mod ledger;
 mod openrouter;
 mod provider;
 mod query;
+mod recall;
 mod route_recall;
 mod statusline;
 mod tail;
@@ -78,6 +79,12 @@ enum Commands {
     /// Start (or ensure) the background daemon that watches and indexes markdown files.
     /// If a daemon is already running for this directory, this command exits silently.
     Init,
+
+    /// Query everything you ever typed to your coding agents (load-everything recall).
+    Recall {
+        #[command(subcommand)]
+        action: recall::RecallCmd,
+    },
 
     /// Semantic search over the indexed markdown files.
     Query {
@@ -707,6 +714,10 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => {
             daemonize(&root)?;
+        }
+
+        Commands::Recall { action } => {
+            recall::run(action)?;
         }
 
         Commands::Query { query, top_k, rerank, global } => {
