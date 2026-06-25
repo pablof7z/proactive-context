@@ -178,6 +178,7 @@ pub(crate) fn call_model_blocking_with_timeout(
             ollama_api_key.map(|k| format!("Bearer {}", k)),
             true,
         ),
+        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
     };
 
     let http = reqwest::blocking::Client::builder()
@@ -1131,6 +1132,7 @@ async fn run_stage(
             );
             Ok(resp)
         }
+        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
     }
 }
 

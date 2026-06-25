@@ -5,6 +5,7 @@ use rig_core::providers::ollama;
 pub enum Provider {
     OpenRouter,
     Ollama,
+    ClaudeCli,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,10 @@ impl ModelSpec {
                 provider: Provider::Ollama,
                 model: model.to_string(),
             },
+            Some(("claude-cli", model)) => Self {
+                provider: Provider::ClaudeCli,
+                model: model.to_string(),
+            },
             _ => Self {
                 provider: Provider::OpenRouter,
                 model: s.to_string(),
@@ -42,6 +47,7 @@ impl ModelSpec {
         match self.provider {
             Provider::OpenRouter => "OpenRouter",
             Provider::Ollama => "Ollama",
+            Provider::ClaudeCli => "Claude CLI",
         }
     }
 }

@@ -1536,6 +1536,7 @@ async fn wiki_navigate_and_compile(
             );
             resp
         }
+        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
     };
 
     let sel = selection.trim();
@@ -1754,6 +1755,7 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
             );
             resp
         }
+        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
     };
 
     // The synthesized briefing is the output as-is. Its leading `TITLE:` line is stripped by the
