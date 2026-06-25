@@ -122,6 +122,18 @@ pub fn canonical_key(noun: &str) -> String {
     }
 }
 
+/// The COMPACT key for a noun: lowercase, with every non-alphanumeric character removed (dots,
+/// dashes, spaces, slashes all stripped). This is alias hygiene, not semantics — it lets a domain
+/// or punctuation variant resolve to the same entity as its bare spelling: `compact_key("purplepag.es")`
+/// == `compact_key("purplepages")` == `"purplepages"`, and `compact_key("NIP-42")` == `"nip42"`.
+/// Used by the inject-time noun matcher as a recall layer beneath the exact-phrase path.
+pub fn compact_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 /// Token-set Jaccard similarity of two canonical keys (|A∩B| / |A∪B|). 0.0 when either is empty.
 pub fn token_jaccard(a: &str, b: &str) -> f64 {
     let sa: BTreeSet<&str> = a.split_whitespace().collect();
@@ -337,6 +349,20 @@ mod tests {
         for n in &a {
             assert_eq!(ma[n], mb[n], "cluster id must not depend on input order");
         }
+    }
+
+    #[test]
+    fn compact_key_strips_punctuation_for_domain_recall() {
+        // The headline case: a domain and its bare spelling collapse to one compact key.
+        assert_eq!(compact_key("purplepag.es"), "purplepages");
+        assert_eq!(compact_key("purplepages"), "purplepages");
+        assert_eq!(compact_key("PurplePages"), "purplepages");
+        // dashes / colons / spaces all strip
+        assert_eq!(compact_key("NIP-42"), "nip42");
+        assert_eq!(compact_key("kind:7375"), "kind7375");
+        assert_eq!(compact_key("relay.tenex.chat"), "relaytenexchat");
+        // but distinct entities stay distinct
+        assert_ne!(compact_key("purplepages"), compact_key("croissant"));
     }
 
     #[test]
