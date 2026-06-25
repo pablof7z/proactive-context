@@ -10,6 +10,7 @@ pub mod corpus;
 pub mod ask;
 pub mod usage;
 pub mod gate;
+pub mod chunked;
 mod picker;
 mod repl;
 
@@ -37,7 +38,14 @@ pub enum RecallCmd {
         /// Terse cited bullets (for an agent consuming mid-task) instead of a full answer.
         #[arg(long)]
         brief: bool,
-        /// Model spec, e.g. "ollama:gemini-3-flash-preview:cloud" or "openrouter:google/gemini-2.0-flash-001".
+        /// Map-reduce over the corpus in chunks (use when the model context < corpus,
+        /// e.g. free small-context models). Reads 100% of the corpus across chunks.
+        #[arg(long)]
+        chunk: bool,
+        /// Tokens per chunk for --chunk (default 100000; keep under the model's context).
+        #[arg(long)]
+        chunk_tokens: Option<usize>,
+        /// Model spec, e.g. "openrouter:openai/gpt-oss-120b:free" or "ollama:gemini-3-flash-preview:cloud".
         #[arg(long)]
         model: Option<String>,
     },
@@ -62,10 +70,14 @@ fn spec_of(model: &Option<String>) -> ModelSpec {
 pub fn run(cmd: RecallCmd) -> Result<()> {
     match cmd {
         RecallCmd::Index { incremental } => index(incremental),
-        RecallCmd::Ask { query, brief, model } => {
+        RecallCmd::Ask { query, brief, chunk, chunk_tokens, model } => {
             let q = query.join(" ");
             if q.trim().is_empty() { anyhow::bail!("usage: pc recall ask \"<question>\""); }
-            ask::run_once(&spec_of(&model), &q, brief)
+            if chunk {
+                chunked::run_chunked(&spec_of(&model), &q, chunk_tokens.unwrap_or(100_000))
+            } else {
+                ask::run_once(&spec_of(&model), &q, brief)
+            }
         }
         RecallCmd::Repl { model } => repl::run(&spec_of(&model)),
         RecallCmd::Gate { model } => gate::build_gate(

@@ -9,10 +9,12 @@ import os, re, subprocess, sys, time
 from bench import QUESTIONS, gold_coverage
 
 PC = "/Users/pablofernandez/src/proactive-context/target/debug/pc"
-# OpenRouter account is out of credits → default to FREE ollama-cloud (rate-limited).
-# Override with RECALL_BENCH_MODEL=openrouter:google/gemini-3-flash-preview once topped up.
-MODEL = os.environ.get("RECALL_BENCH_MODEL", "ollama:gemini-3-flash-preview:cloud")
+# Free path: chunked map-reduce on free gpt-oss-120b (131K) — reads 100% of the
+# corpus in chunks, so it works without 1M context or paid credits.
+MODEL = os.environ.get("RECALL_BENCH_MODEL", "openrouter:openai/gpt-oss-120b:free")
+CHUNK = os.environ.get("RECALL_BENCH_CHUNK", "1") == "1"
 ENV = {**os.environ, "RECALL_OLLAMA": "http://localhost:11434"}
+EXTRA = ["--chunk", "--chunk-tokens", "100000"] if CHUNK else []
 
 print(f"{'Q':<50} cites valid gold   s", flush=True)
 rows = []
@@ -23,8 +25,8 @@ def ask_with_retry(q, tries=3):
     and retry the whole call so the eval survives a contended OpenRouter account."""
     for attempt in range(tries):
         try:
-            r = subprocess.run([PC, "recall", "ask", "--model", MODEL, q],
-                               capture_output=True, text=True, timeout=600, env=ENV)
+            r = subprocess.run([PC, "recall", "ask", "--model", MODEL, *EXTRA, q],
+                               capture_output=True, text=True, timeout=900, env=ENV)
         except subprocess.TimeoutExpired:
             time.sleep(30); continue
         m = re.search(r"\[recall: (\d+)/(\d+) citations valid", r.stdout)
