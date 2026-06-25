@@ -327,13 +327,62 @@ fn emit(out: &OutMode, context_block: Option<&str>, verbose_msg: &str) {
     }
 }
 
+/// Commit a STANDALONE noun-primer injection (no guide briefing): wrap the resolver's block in the
+/// system-reminder envelope, persist the per-session ledgers (briefing dedup + primed nouns), log
+/// the primer event, and return the wrapped output + its char length. None when there is nothing to
+/// inject. This is what makes the noun layer a true peer: every terminal arm that would otherwise
+/// inject nothing calls this first.
+fn commit_noun_only(
+    root: &Path,
+    session_id: &str,
+    project_basename: &str,
+    noun: &crate::nouns::NounResolution,
+) -> Option<(String, usize)> {
+    let block = noun.block.as_ref()?;
+    let out = format!(
+        "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
+        project_basename, block
+    );
+    crate::ledger::append(root, session_id, None, block);
+    if !noun.primed_slugs.is_empty() {
+        crate::nouns::record_primed(&project_context_dir(root), session_id, &noun.primed_slugs);
+    }
+    log_noun_primer(noun, true);
+    let n = out.len();
+    Some((out, n))
+}
+
+/// Log the `inject.noun_primer` event (shared by the standalone path and the guide-briefing
+/// prepend path). `standalone` distinguishes "noun primer WAS the injection" from "noun primer
+/// rode along with a guide briefing".
+fn log_noun_primer(noun: &crate::nouns::NounResolution, standalone: bool) {
+    if noun.primed_slugs.is_empty() {
+        return;
+    }
+    log_event("inject.noun_primer", None, serde_json::json!({
+        "level": noun.level.as_str(),
+        "direct_query": noun.direct_query,
+        "standalone": standalone,
+        "primed": noun.primed_slugs,
+        "matched": noun.matched.iter().map(|m| serde_json::json!({
+            "slug": m.slug, "name": m.name, "status": m.status, "via": m.via
+        })).collect::<Vec<_>>(),
+    }));
+}
+
 // ─── Fallback renderer ────────────────────────────────────────────────────────
 
-fn render_raw_reminder(project_name: &str, hits: &[QueryResult]) -> String {
+fn render_raw_reminder(project_name: &str, hits: &[QueryResult], noun_block: Option<&str>) -> String {
     let mut out = format!(
         "<system-reminder>\nRelevant project context ({}):\n\n",
         project_name
     );
+    // The noun primer is LLM-free, so it rides along even in the raw-fallback paths (no key / compile
+    // error / timeout) — placed first as the highest-signal context.
+    if let Some(block) = noun_block {
+        out.push_str(block);
+        out.push_str("\n\n");
+    }
     for h in hits {
         out.push_str(&format!(
             "--- {} (chunk {}, score {:.2}) ---\n{}\n\n",
@@ -521,6 +570,35 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
     if input.prompt.trim().len() < 3 || should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words) {
+        // A terse prompt the word-count gate rejects (e.g. "what is purplepag.es?" — 3 words) is
+        // still worth the noun layer if it NAMES a known entity. The resolver is LLM-free and never
+        // touches the guide pipeline, so we run it with empty recent (cheap) and inject noun-only on
+        // a hit. Only bother for substantive-length prompts so "ok"/"yes" stay free.
+        if input.prompt.trim().len() >= 8 {
+            let noun = crate::nouns::resolve_noun_primer(
+                &wiki::wiki_dir(&root),
+                &project_context_dir(&root),
+                &input.session_id,
+                &input.prompt,
+                "",
+            );
+            let project_basename = project_basename(&project);
+            if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun)
+            {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "reason": "trivial_prompt_entity",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &crate::events::truncate(&input.prompt, 150)
+                }));
+                emit(&out_mode, Some(&out), &format!(
+                    "inject [{}ms] | trivial prompt named entity → noun primer {}c",
+                    start.elapsed().as_millis(), out_chars));
+                return Ok(());
+            }
+        }
         log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
             "outcome": "skipped",
             "reason": "trivial_prompt",
@@ -554,6 +632,18 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         cap_tail(&format!("{}\n\n{}", recent, input.prompt), cfg.inject_query_char_cap)
     };
 
+    // ── Noun resolver (peer to the guide pipeline) ─────────────────────────
+    // LLM-free, runs independently of guide selection so a pure-entity prompt ("what is X?")
+    // injects the captured definition even when no guide is relevant (the short-circuit case
+    // that previously injected nothing). Computed up front; consumed by every terminal arm.
+    let noun_resolution = crate::nouns::resolve_noun_primer(
+        &wiki::wiki_dir(&root),
+        &project_context_dir(&root),
+        &input.session_id,
+        &input.prompt,
+        &recent,
+    );
+
     // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
     let hits = match run_query(&root, &enriched_query, cfg.inject_top_k, cfg.inject_rerank, true) {
         Ok(h) => h,
@@ -562,6 +652,22 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 "stage": "query.start",
                 "message": truncate(&format!("retrieval failed: {}", e), 300)
             }));
+            // Retrieval is dead, but the noun layer is LLM-free and independent — still inject it.
+            let basename = project_basename(&project);
+            if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &basename, &noun_resolution)
+            {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "reason": "retrieval_failed",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, Some(&out), &format!(
+                    "inject [{}ms] | retrieval failed → noun primer {}c", start.elapsed().as_millis(), out_chars));
+                return Ok(());
+            }
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
                 "outcome": "empty",
                 "hits": 0,
@@ -574,7 +680,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     // Compute fallback block upfront (before any async work)
     let project_basename = project_basename(&project);
-    let fallback_block = render_raw_reminder(&project_basename, &hits);
+    let fallback_block = render_raw_reminder(&project_basename, &hits, noun_resolution.block.as_deref());
 
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
     let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
@@ -584,6 +690,20 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
     if needs_key && api_key.is_empty() {
         if hits.is_empty() {
+            // The noun primer is LLM-free, so it still fires without an API key.
+            if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+            {
+                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, Some(&out), &format!("inject [{}ms] | 0 hits | no API key → noun primer {}c",
+                    start.elapsed().as_millis(), out_chars));
+                return Ok(());
+            }
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
                 "outcome": "empty",
                 "hits": 0,
@@ -632,6 +752,10 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         Err(_) => {
             if !hits.is_empty() {
                 print!("{}", fallback_block);
+            } else if let Some((out, _)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+            {
+                emit(&out_mode, Some(&out), "inject | runtime unavailable → noun primer");
             }
             return Ok(());
         }
@@ -682,6 +806,21 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                     "briefing_chars": 0,
                     "summary": "NONE"
                 }));
+                // Guide briefing was empty — fall back to the noun primer if one resolved.
+                if let Some((out, out_chars)) =
+                    commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+                {
+                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                        "outcome": "noun_primer",
+                        "hits": hits.len(),
+                        "out_chars": out_chars,
+                        "prompt_preview": &prompt_preview
+                    }));
+                    emit(&out_mode, Some(&out), &format!(
+                        "inject [{}ms] | {} hits | guides: {} | briefing: NONE → noun primer {}c",
+                        elapsed_ms, hits.len(), format_guides(&guides_read), out_chars));
+                    return Ok(());
+                }
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "none",
                     "hits": hits.len(),
@@ -696,17 +835,10 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
             // ── Noun first-mention primer (entity-layer) ──
             // Additive: a SEPARATE block prepended to the briefing body, placement held
-            // constant, retrieval NOT blended (spec F16). Fact retrieval is LLM-free (the
-            // noun's source guides/claims, lexically filtered to the prompt) — no per-noun
-            // model call on the hot path.
-            let primer = crate::nouns::build_inject_primer(
-                &wiki_path,
-                &project_context_dir(&root),
-                &input.session_id,
-                &input.prompt,
-                &recent,
-            );
-            let body_with_primer = match &primer.block {
+            // constant, retrieval NOT blended (spec F16). The primer block was resolved up front
+            // (LLM-free, authority store) so the same resolution serves both this guide-briefing
+            // path and the standalone short-circuit paths.
+            let body_with_primer = match &noun_resolution.block {
                 Some(block) => format!("{}\n\n{}", block, body),
                 None => body.to_string(),
             };
@@ -719,12 +851,9 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             // Record what we just injected so later turns this session dedup against it.
             crate::ledger::append(&root, &input.session_id, title_opt.as_deref(), &body_with_primer);
             // Mark primed nouns once we've committed to injecting (so they prime once/session).
-            if !primer.primed_slugs.is_empty() {
-                crate::nouns::record_primed(&project_context_dir(&root), &input.session_id, &primer.primed_slugs);
-                log_event("inject.noun_primer", None, serde_json::json!({
-                    "level": primer.level.as_str(),
-                    "primed": primer.primed_slugs,
-                }));
+            if !noun_resolution.primed_slugs.is_empty() {
+                crate::nouns::record_primed(&project_context_dir(&root), &input.session_id, &noun_resolution.primed_slugs);
+                log_noun_primer(&noun_resolution, false);
             }
 
             log_event("generate.briefing", None, serde_json::json!({
@@ -756,15 +885,31 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             log_event("select.shortcircuit", None, serde_json::json!({
                 "reason": "no_relevant_guides"
             }));
-            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                "outcome": "none",
-                "hits": hits.len(),
-                "out_chars": 0,
-                "prompt_preview": &prompt_preview
-            }));
-            emit(&out_mode, None, &format!(
-                "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
-                elapsed_ms, hits.len(), format_guides(&guides_read)));
+            // No relevant guide — but the noun layer is a PEER, not a garnish. If the prompt named
+            // a known entity, inject its captured definition standalone (the bug this fixes).
+            if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+            {
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "hits": hits.len(),
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, Some(&out), &format!(
+                    "inject [{}ms] | {} hits | no relevant guide → noun primer {}c",
+                    elapsed_ms, hits.len(), out_chars));
+            } else {
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                    "outcome": "none",
+                    "hits": hits.len(),
+                    "out_chars": 0,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, None, &format!(
+                    "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
+                    elapsed_ms, hits.len(), format_guides(&guides_read)));
+            }
         }
 
         Ok(Err(e)) => {
@@ -786,6 +931,17 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                     "inject [{}ms] | {} hits | error: {} | fallback {}c",
                     elapsed_ms, hits.len(), truncate(&format!("{}", e), 120),
                     out_chars));
+            } else if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+            {
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, Some(&out), &format!(
+                    "inject [{}ms] | 0 hits | compile error → noun primer {}c", elapsed_ms, out_chars));
             } else {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",
@@ -813,6 +969,17 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 emit(&out_mode, Some(&fallback_block), &format!(
                     "inject [{}ms] | {} hits | timeout → fallback {}c",
                     elapsed_ms, hits.len(), out_chars));
+            } else if let Some((out, out_chars)) =
+                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
+            {
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
+                emit(&out_mode, Some(&out), &format!(
+                    "inject [{}ms] | 0 hits | timeout → noun primer {}c", elapsed_ms, out_chars));
             } else {
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "empty",

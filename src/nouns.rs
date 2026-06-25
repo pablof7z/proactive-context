@@ -1459,6 +1459,384 @@ pub fn build_inject_primer(
     PrimerResult { block, primed_slugs, level }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Authority noun resolver — the peer-to-guides entity layer (2026-06-25)
+// ════════════════════════════════════════════════════════════════════════════════
+//
+//  The original primer (`build_inject_primer`) was subordinate to the guide pipeline: it ran
+//  ONLY after SELECT had already chosen a guide and COMPILE produced a briefing, and its noun
+//  POPULATION came from C3 guide titles gated by the realness ledger — never from the
+//  `<wiki>/nouns/*.md` store that capture actually writes. A pure-entity prompt ("what is X?")
+//  with no relevant guide short-circuited before the primer ever ran, and even if it ran, the
+//  captured noun was not in its population. Four independent failures, all fatal.
+//
+//  This resolver fixes the structural model: it is a PEER to the guide pipeline (the inject path
+//  runs it independently of guide selection), it reads `<wiki>/nouns/*.md` as the priming
+//  AUTHORITY (C3 is demoted to enrichment only — facts/source-refs for an already-admitted noun),
+//  it matches the prompt with layered alias hygiene (exact phrase → compact/domain → distinctive
+//  token), and the realness ledger is reframed as a SURFACING GATE (suppress known confabulations)
+//  rather than the population itself. LLM-free on the hot path.
+
+/// A captured entity read from the canonical `<wiki>/nouns/*.md` store — the authority for what
+/// the user actually named (distinct from the C3 guide-derived registry, which is enrichment only).
+/// `definition` is the full entry body.
+#[derive(Debug, Clone)]
+pub struct AuthorityNoun {
+    pub slug: String,
+    pub name: String,
+    pub definition: String,
+    pub origin: String,
+}
+
+/// Read the canonical noun store as the priming authority: each `<wiki>/nouns/*.md` entry with its
+/// FULL body (heading/blank lines dropped) as the definition. This is what capture writes and what
+/// inject must read. Empty vec when the subdir is absent. Non-recursive, parse-tolerant.
+pub fn read_authority_nouns(wiki_dir: &Path) -> Vec<AuthorityNoun> {
+    let nouns_dir = wiki_dir.join("nouns");
+    let dir = match fs::read_dir(&nouns_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !content.contains("type: noun-entry") {
+            continue;
+        }
+        let fm = |key: &str| -> String {
+            let mut in_fm = false;
+            for line in content.lines() {
+                if line.trim() == "---" {
+                    if in_fm {
+                        break;
+                    }
+                    in_fm = true;
+                    continue;
+                }
+                if !in_fm {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
+                    return rest.trim().trim_matches('"').to_string();
+                }
+            }
+            String::new()
+        };
+        let mut slug = fm("slug");
+        let mut name = fm("name");
+        // Derive a missing slug/name from the other field (or the filename) so a half-written entry
+        // never yields an empty slug (which would re-prime forever) or an empty `- ****` display.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        if slug.is_empty() {
+            slug = if !name.is_empty() { slugify(&name) } else { slugify(&stem) };
+        }
+        if name.is_empty() {
+            name = deslug(&slug);
+        }
+        if slug.is_empty() || name.is_empty() {
+            continue;
+        }
+        // Definition = full body, headings/blank lines dropped, collapsed to one line. The thin-anchor
+        // placeholder that `render_noun_record` writes for a definition-less anchor is NOT a real
+        // definition — normalize it back to empty so the surfacing gate treats it as a thin anchor.
+        let definition = body_after_frontmatter(&content)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let definition = if definition.contains("thin anchor — no project-specific definition") {
+            String::new()
+        } else {
+            definition
+        };
+        out.push(AuthorityNoun {
+            slug,
+            name,
+            origin: fm("origin"),
+            definition,
+        });
+    }
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    out
+}
+
+/// True when the prompt is a DIRECT entity question ("what is X?", "you know what X is?", "explain
+/// X") rather than an incidental task mention. The asking is itself a strong relevance signal, so
+/// the surfacing gate relaxes for thin/unscored nouns on a direct query. Heuristic, LLM-free.
+fn is_direct_entity_query(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "what is", "what's", "whats ", "what are", "what does", "what do ", "what was",
+        "who is", "who's", "tell me about", "explain ", "describe ", "remind me",
+        "you know what", "do you know", "know what", "definition of", "meaning of",
+        "what's the deal with", "wtf is", "wtf are",
+    ];
+    PATTERNS.iter().any(|pat| p.contains(pat))
+}
+
+/// The strength of a noun↔prompt match — drives both telemetry and the surfacing gate. `Phrase` and
+/// `Compact` are HIGH confidence (the user named THIS entity); `Token(n)` is alias recall on `n`
+/// distinct distinctive component tokens — low confidence at n=1 (a single shared word like "limit"
+/// / "cache"), stronger at n≥2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchStrength {
+    Phrase,
+    Compact,
+    Token(usize),
+}
+
+impl MatchStrength {
+    /// True for a high-confidence match: an exact phrase, a compact/domain alias, or ≥2 distinct
+    /// distinctive tokens. A lone token match (`Token(1)`) is NOT high-confidence.
+    fn is_high_confidence(&self) -> bool {
+        matches!(self, MatchStrength::Phrase | MatchStrength::Compact | MatchStrength::Token(2..))
+    }
+    /// Telemetry label.
+    fn label(&self) -> String {
+        match self {
+            MatchStrength::Phrase => "phrase".into(),
+            MatchStrength::Compact => "compact".into(),
+            MatchStrength::Token(n) => format!("token×{}", n),
+        }
+    }
+    /// Ranking ordinal (higher = more relevant) so the per-turn cap keeps the strongest matches.
+    fn rank(&self) -> u8 {
+        match self {
+            MatchStrength::Phrase => 4,
+            MatchStrength::Compact => 3,
+            MatchStrength::Token(n) if *n >= 2 => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Layered alias match of a noun against the prompt. Returns the strongest match or None:
+///   1. `Phrase`  — the display name OR deslugged slug appears as a whole token-bounded phrase.
+///   2. `Compact` — a single prompt token, punctuation-stripped, equals the noun's compact key
+///      (`purplepag.es` → `purplepages`); the ≥5-char guard keeps short tokens from colliding.
+///   3. `Token(n)`— for a multi-token noun, `n` distinct distinctive component tokens appear.
+/// `prompt_l` is expected lowercase.
+fn match_noun_in_prompt(prompt_l: &str, name: &str, slug: &str) -> Option<MatchStrength> {
+    let needle_name = name.to_lowercase();
+    let needle_slug = deslug(slug).to_lowercase();
+    if contains_phrase(prompt_l, &needle_name) || contains_phrase(prompt_l, &needle_slug) {
+        return Some(MatchStrength::Phrase);
+    }
+    let targets = [
+        crate::alias::compact_key(name),
+        crate::alias::compact_key(&needle_slug),
+    ];
+    // Preserve intra-token punctuation that belongs to identifiers/domains (`.`, `-`, `_`, `:`) so
+    // `purplepag.es` and `kind:7375` survive as single atoms and compact correctly.
+    for tok in prompt_l.split(|c: char| !c.is_alphanumeric() && !matches!(c, '.' | '-' | '_' | ':')) {
+        if tok.is_empty() {
+            continue;
+        }
+        let ct = crate::alias::compact_key(tok);
+        if ct.len() >= 5 && targets.iter().any(|t| t.len() >= 5 && *t == ct) {
+            return Some(MatchStrength::Compact);
+        }
+    }
+    let n = distinctive_tokens(name, slug)
+        .iter()
+        .filter(|t| contains_phrase(prompt_l, t))
+        .count();
+    if n > 0 {
+        return Some(MatchStrength::Token(n));
+    }
+    None
+}
+
+/// One matched noun, with the surfacing decision recorded for telemetry.
+#[derive(Debug, Clone)]
+pub struct MatchedNoun {
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+    pub via: String,
+}
+
+/// The result of the authority noun resolver: the composed primer block (if any), the slugs to
+/// record in the per-session primed-ledger on commit, and the per-noun match telemetry.
+pub struct NounResolution {
+    pub block: Option<String>,
+    pub primed_slugs: Vec<String>,
+    pub matched: Vec<MatchedNoun>,
+    pub level: PrimerLevel,
+    pub direct_query: bool,
+}
+
+impl NounResolution {
+    fn empty(level: PrimerLevel, direct_query: bool) -> Self {
+        NounResolution { block: None, primed_slugs: Vec::new(), matched: Vec::new(), level, direct_query }
+    }
+}
+
+/// Resolve the noun primer for one inject turn — the PEER-to-guides entry point. Independent of
+/// guide selection: the inject path calls this whether or not SELECT found a relevant guide.
+///
+/// Population = `<wiki>/nouns/*.md` (authority). For each noun first-mentioned in `prompt` (matched
+/// by `match_noun_in_prompt`, not already in `recent`, not already primed this session) the
+/// SURFACING GATE applies, by match CONFIDENCE:
+///   - `suppressed` (rejected confabulation, across any spelling) NEVER primes;
+///   - HIGH-confidence match (exact phrase / compact alias / ≥2 distinctive tokens): primes when
+///     `real`, when it carries a definition, or on a direct entity query;
+///   - LOW-confidence match (a single shared token like "limit"/"cache"): primes ONLY when `real`.
+/// Surviving candidates are ranked (strength, then realness, then slug) before the per-turn cap.
+/// C3 enriches an admitted noun's facts/source-refs but never creates one. LLM-free.
+pub fn resolve_noun_primer(
+    wiki_dir: &Path,
+    project_dir: &Path,
+    session_id: &str,
+    prompt: &str,
+    recent: &str,
+) -> NounResolution {
+    let level = PrimerLevel::from_env();
+    let direct_query = is_direct_entity_query(prompt);
+    let authority = read_authority_nouns(wiki_dir);
+    if authority.is_empty() {
+        return NounResolution::empty(level, direct_query);
+    }
+
+    // Realness ledger → SURFACING GATE. A stance learned under ANY spelling of the noun must apply,
+    // so index suppressed/real status by BOTH the canonical key AND the compact key (so a stance on
+    // "purplepages" reaches the entry named "purplepag.es", whose canonical key differs).
+    let realness = read_realness_registry(wiki_dir);
+    let mut suppressed_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut real_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &realness {
+        let dst = if r.status == "suppressed" {
+            &mut suppressed_keys
+        } else if r.status == "real" {
+            &mut real_keys
+        } else {
+            continue;
+        };
+        dst.insert(r.canonical.clone());
+        dst.insert(crate::alias::compact_key(&r.name));
+    }
+    let status_for = |name: &str, slug: &str| -> &'static str {
+        let keys = [
+            crate::alias::canonical_key(name),
+            crate::alias::canonical_key(&deslug(slug)),
+            crate::alias::compact_key(name),
+            crate::alias::compact_key(&deslug(slug)),
+        ];
+        if keys.iter().any(|k| suppressed_keys.contains(k)) {
+            "suppressed" // suppression wins across all candidate spellings
+        } else if keys.iter().any(|k| real_keys.contains(k)) {
+            "real"
+        } else {
+            "provisional"
+        }
+    };
+
+    // C3 = ENRICHMENT only (facts + source refs for an already-admitted noun).
+    let c3 = build_registry_from_disk(wiki_dir, project_dir);
+    let c3_by_key = c3_by_canonical(&c3);
+
+    let primed = read_primed(project_dir, session_id);
+    let prompt_l = prompt.to_lowercase();
+    let recent_l = recent.to_lowercase();
+
+    // Collect candidates with their match strength so we can RANK before the per-turn cap (a strong
+    // exact match must not be dropped in favor of an earlier-slug lone-token match).
+    let mut cands: Vec<(NounEntry, MatchedNoun, MatchStrength)> = Vec::new();
+    for a in &authority {
+        if primed.contains(&a.slug) {
+            continue;
+        }
+        let strength = match match_noun_in_prompt(&prompt_l, &a.name, &a.slug) {
+            Some(s) => s,
+            None => continue,
+        };
+        // First-mention only: already in the live transcript → not "first", don't re-prime.
+        if match_noun_in_prompt(&recent_l, &a.name, &a.slug).is_some() {
+            continue;
+        }
+        let status = status_for(&a.name, &a.slug);
+        if status == "suppressed" {
+            continue; // the whole point of the gate — a rejected confabulation never primes
+        }
+        let has_def = !a.definition.trim().is_empty();
+        // Surfacing policy by match CONFIDENCE:
+        //   high-confidence (exact phrase / compact alias / ≥2 tokens): prime when REAL, when the
+        //     authority entry carries a definition, or on a direct entity query;
+        //   low-confidence (a single shared token like "limit"/"cache"): prime ONLY when REAL — a
+        //     lone token is too weak to surface a merely-provisional noun (precision guard).
+        let prime = if strength.is_high_confidence() {
+            status == "real" || has_def || direct_query
+        } else {
+            status == "real"
+        };
+        if !prime {
+            continue;
+        }
+        let canon = crate::alias::canonical_key(&a.name);
+        let enrich = c3_by_key
+            .get(&canon)
+            .or_else(|| c3_by_key.get(&crate::alias::canonical_key(&deslug(&a.slug))));
+        let definition = if has_def {
+            a.definition.clone()
+        } else {
+            enrich.map(|e| e.definition.clone()).unwrap_or_default()
+        };
+        let source_refs = enrich.map(|e| e.source_refs.clone()).unwrap_or_default();
+        cands.push((
+            NounEntry {
+                slug: a.slug.clone(),
+                name: a.name.clone(),
+                definition,
+                source_refs,
+                origin: if a.origin.is_empty() { "extracted".into() } else { a.origin.clone() },
+            },
+            MatchedNoun {
+                slug: a.slug.clone(),
+                name: a.name.clone(),
+                status: status.to_string(),
+                via: strength.label(),
+            },
+            strength,
+        ));
+    }
+    if cands.is_empty() {
+        return NounResolution::empty(level, direct_query);
+    }
+    // Rank: match strength desc, then real-before-provisional, then slug for stable determinism.
+    cands.sort_by(|a, b| {
+        b.2.rank()
+            .cmp(&a.2.rank())
+            .then_with(|| (b.1.status == "real").cmp(&(a.1.status == "real")))
+            .then_with(|| a.0.slug.cmp(&b.0.slug))
+    });
+    cands.truncate(MAX_PRIME_PER_TURN);
+    let mut entries: Vec<NounEntry> = Vec::with_capacity(cands.len());
+    let mut matched: Vec<MatchedNoun> = Vec::with_capacity(cands.len());
+    for (e, m, _) in cands {
+        entries.push(e);
+        matched.push(m);
+    }
+
+    let (index_rows, claim_subjects) = if matches!(level, PrimerLevel::Facts | PrimerLevel::Intent) {
+        (read_index_live(wiki_dir), read_claim_subjects(project_dir))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let refs: Vec<&NounEntry> = entries.iter().collect();
+    let inputs = compose_primer_inputs(&refs, prompt, level, wiki_dir, &index_rows, &claim_subjects);
+    let block = compose_primer(&inputs, level);
+    let primed_slugs: Vec<String> = entries.iter().map(|e| e.slug.clone()).collect();
+    NounResolution { block, primed_slugs, matched, level, direct_query }
+}
+
 // ─── pc debug nouns: inspect the derived registry + first-mention detection ────────
 
 /// Inspect the noun layer for a transcript-less, capture-less dry run: build the C3
@@ -1485,24 +1863,29 @@ pub fn run_debug_nouns(
         println!("       name: {} | refs: {}", e.name, e.source_refs.join(", "));
     }
 
+    // The AUTHORITY store — the production priming population (what capture writes).
+    let authority = read_authority_nouns(wiki_dir);
+    println!("\n=== Authority noun store (<wiki>/nouns/*.md — the priming population) ===");
+    println!("nouns:   {}\n", authority.len());
+    for a in &authority {
+        println!("  {:<32} [{}] {}", a.slug, a.origin, truncate_for_display(&a.definition, 90));
+        println!("       name: {}", a.name);
+    }
+
     if let Some(prompt) = sample_prompt {
-        println!("\n=== First-mention detection for sample prompt ===");
+        println!("\n=== Authority resolver for sample prompt (production path) ===");
         println!("prompt: {:?}", prompt);
-        let primed = std::collections::HashSet::new();
-        let hits = detect_first_mentions(&registry, prompt, "", &primed);
-        if hits.is_empty() {
-            println!("  (no registry noun referenced for the first time)");
+        // session_id "" → empty primed-ledger, so this is a clean dry run.
+        let res = resolve_noun_primer(wiki_dir, project_dir, "", prompt, "");
+        println!("direct_entity_query: {}", res.direct_query);
+        if res.matched.is_empty() {
+            println!("  (no authority noun surfaced — see the matcher/surfacing gate)");
         } else {
-            for h in &hits {
-                println!("  → {} ({})", h.slug, h.name);
+            for m in &res.matched {
+                println!("  → {} ({}) [status: {}, via: {}]", m.slug, m.name, m.status, m.via);
             }
-            let level = PrimerLevel::from_env();
-            // Real inject content: LLM-free prompt-relevant fact retrieval at Facts/Intent levels.
-            let index_rows = read_index_live(wiki_dir);
-            let claim_subjects = read_claim_subjects(project_dir);
-            let inputs = compose_primer_inputs(&hits, prompt, level, wiki_dir, &index_rows, &claim_subjects);
-            if let Some(block) = compose_primer(&inputs, level) {
-                println!("\n=== Primer block (PC_PRIMER_LEVEL={}) ===", level.as_str());
+            if let Some(block) = &res.block {
+                println!("\n=== Primer block (PC_PRIMER_LEVEL={}) ===", res.level.as_str());
                 println!("{}", block);
             }
         }
@@ -2179,5 +2562,183 @@ mod tests {
         record_primed(&dir, "", &["x".to_string()]);
         assert!(read_primed(&dir, "").is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ─── Authority noun resolver (peer layer) ───
+
+    #[test]
+    fn match_strength_layers_phrase_compact_token() {
+        // Exact domain phrase.
+        assert_eq!(
+            match_noun_in_prompt("you know what purplepag.es is?", "purplepag.es", "purplepag-es"),
+            Some(MatchStrength::Phrase)
+        );
+        // Compact/domain: bare spelling 'purplepages' resolves to the dotted noun.
+        assert_eq!(
+            match_noun_in_prompt("is purplepages up on the server", "purplepag.es", "purplepag-es"),
+            Some(MatchStrength::Compact)
+        );
+        // Lone distinctive token → Token(1) (low confidence).
+        assert_eq!(
+            match_noun_in_prompt("please clear the cache", "rate limit cache", "rate-limit-cache"),
+            Some(MatchStrength::Token(1))
+        );
+        // Two distinctive tokens → Token(2) (high confidence).
+        assert_eq!(
+            match_noun_in_prompt("the rate limit cache entry", "rate limit cache", "rate-limit-cache"),
+            Some(MatchStrength::Phrase) // whole phrase present → Phrase wins
+        );
+        assert_eq!(
+            match_noun_in_prompt("the limit on the cache", "rate limit cache", "rate-limit-cache"),
+            Some(MatchStrength::Token(2))
+        );
+        assert_eq!(match_noun_in_prompt("nothing relevant here at all", "purplepag.es", "purplepag-es"), None);
+    }
+
+    #[test]
+    fn match_strength_confidence_split() {
+        assert!(MatchStrength::Phrase.is_high_confidence());
+        assert!(MatchStrength::Compact.is_high_confidence());
+        assert!(MatchStrength::Token(2).is_high_confidence());
+        assert!(!MatchStrength::Token(1).is_high_confidence());
+    }
+
+    fn write_noun(wiki: &Path, slug: &str, name: &str, body: &str) {
+        let dir = wiki.join("nouns");
+        fs::create_dir_all(&dir).unwrap();
+        let content = format!(
+            "---\ntype: noun-entry\nslug: {slug}\nname: \"{name}\"\norigin: extracted\nsource_refs:\n  []\n---\n\n# {name}\n\n{body}\n"
+        );
+        fs::write(dir.join(format!("{}.md", slug)), content).unwrap();
+    }
+
+    #[test]
+    fn read_authority_normalizes_thin_anchor_and_derives_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay called PurplePages.");
+        // Thin-anchor placeholder must normalize back to an empty definition.
+        write_noun(wiki, "thin-thing", "Thin Thing", "*(thin anchor — no project-specific definition yet)*");
+        let nouns = read_authority_nouns(wiki);
+        let pp = nouns.iter().find(|n| n.slug == "purplepag-es").unwrap();
+        assert!(pp.definition.contains("Nostr relay"));
+        let thin = nouns.iter().find(|n| n.slug == "thin-thing").unwrap();
+        assert!(thin.definition.is_empty(), "placeholder must read as empty def");
+    }
+
+    #[test]
+    fn resolver_primes_phrase_match_provisional_with_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay (PurplePages).");
+        let res = resolve_noun_primer(wiki, &proj, "s1", "you know what purplepag.es is?", "");
+        assert_eq!(res.matched.len(), 1);
+        assert_eq!(res.matched[0].slug, "purplepag-es");
+        assert_eq!(res.matched[0].status, "provisional");
+        assert!(res.block.as_ref().unwrap().contains("Nostr relay"));
+    }
+
+    #[test]
+    fn resolver_compact_domain_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay.");
+        // Bare spelling, no dot → compact match.
+        let res = resolve_noun_primer(wiki, &proj, "s1", "is purplepages running and healthy", "");
+        assert_eq!(res.matched.len(), 1);
+        assert_eq!(res.matched[0].via, "compact");
+    }
+
+    #[test]
+    fn resolver_token_only_provisional_does_not_prime_but_real_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_noun(wiki, "rate-limit-cache", "rate limit cache", "An in-memory per-IP cache.");
+        // Lone token "cache", provisional (no realness) → must NOT prime.
+        let res = resolve_noun_primer(wiki, &proj, "s1", "please clear the cache now", "");
+        assert!(res.matched.is_empty(), "lone-token provisional must not prime");
+        // Mark it real → now the same lone-token match primes.
+        write_realness_registry(wiki, &[RealnessNoun::new("rate limit cache", 3)]).unwrap();
+        let res2 = resolve_noun_primer(wiki, &proj, "s2", "please clear the cache now", "");
+        assert_eq!(res2.matched.len(), 1, "real noun primes even on a lone token");
+    }
+
+    #[test]
+    fn resolver_suppressed_never_primes_across_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay.");
+        // Suppression learned under the bare spelling must still gate the dotted noun (compact key).
+        write_realness_registry(wiki, &[RealnessNoun::new("purplepages", -3)]).unwrap();
+        let res = resolve_noun_primer(wiki, &proj, "s1", "what is purplepag.es?", "");
+        assert!(res.matched.is_empty(), "suppressed across spellings must not prime");
+    }
+
+    #[test]
+    fn resolver_thin_anchor_primes_only_on_direct_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        // Thin anchor (no definition) — phrase match but no def.
+        write_noun(wiki, "khatru", "khatru", "*(thin anchor — no project-specific definition yet)*");
+        // Incidental mention (not a question) → no prime.
+        let res = resolve_noun_primer(wiki, &proj, "s1", "deploy khatru to the box tonight", "");
+        assert!(res.matched.is_empty());
+        // Direct entity query → primes (thin anchor surfaced on an explicit ask).
+        let res2 = resolve_noun_primer(wiki, &proj, "s2", "what is khatru exactly?", "");
+        assert_eq!(res2.matched.len(), 1);
+    }
+
+    #[test]
+    fn resolver_dedups_against_recent_and_primed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay.");
+        // Already in recent transcript → not a first mention.
+        let res = resolve_noun_primer(wiki, &proj, "s1", "what is purplepag.es?", "earlier: purplepag.es came up");
+        assert!(res.matched.is_empty());
+        // Already primed this session → suppressed.
+        record_primed(&proj, "s2", &["purplepag-es".to_string()]);
+        let res2 = resolve_noun_primer(wiki, &proj, "s2", "what is purplepag.es?", "");
+        assert!(res2.matched.is_empty());
+    }
+
+    #[test]
+    fn resolver_ranks_phrase_over_token_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        // 'aaa-relay' sorts first by slug but matches only via a lone token; 'zzz-target' is an exact
+        // phrase. With real status forcing both in, the phrase match must rank first.
+        write_noun(wiki, "aaa-relay", "aaa relay service", "Some relay.");
+        write_noun(wiki, "zzz-target", "zzz target", "The exact thing.");
+        write_realness_registry(
+            wiki,
+            &[RealnessNoun::new("aaa relay service", 3), RealnessNoun::new("zzz target", 3)],
+        )
+        .unwrap();
+        let res = resolve_noun_primer(wiki, &proj, "s1", "tell me about the zzz target and the relay", "");
+        assert!(!res.matched.is_empty());
+        assert_eq!(res.matched[0].slug, "zzz-target", "exact phrase ranks above lone-token match");
+    }
+
+    #[test]
+    fn is_direct_entity_query_detects_questions() {
+        assert!(is_direct_entity_query("what is purplepag.es?"));
+        assert!(is_direct_entity_query("you know what khatru is?"));
+        assert!(is_direct_entity_query("explain the relay setup"));
+        assert!(!is_direct_entity_query("deploy the relay to production"));
     }
 }
