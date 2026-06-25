@@ -455,6 +455,16 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     try_acquire_lock(root)?;
     println!("Acquired daemon lock. Starting proactive-context daemon...");
 
+    // Pre-warm the claude sidecar if any role is configured to use claude-cli:.
+    // Best-effort — don't fail daemon startup if the sidecar can't be reached.
+    if cfg.capture_model.starts_with("claude-cli:")
+        || cfg.inject_select_model.starts_with("claude-cli:")
+        || cfg.inject_compile_model.starts_with("claude-cli:")
+        || cfg.capture_triage_model.starts_with("claude-cli:")
+    {
+        let _ = crate::claude_sidecar::start_sidecar();
+    }
+
     // Set up cleanup on Ctrl-C / termination
     let root_clone = root.to_path_buf();
     ctrlc::set_handler(move || {
