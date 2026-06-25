@@ -91,12 +91,23 @@ dropping TENEX-automation codex sessions by `session_meta`), it paginates into
 over EVERY page concurrently → reduce → cited answer. **No input recall gap: 100%
 of the corpus is read every time.**
 
-| Metric | Result |
-|---|---|
-| Pages read | **4/4 (100% of corpus, 2.76M tokens)** |
-| Passages extracted | 46 |
-| Citations valid | **25/25 (100%)** |
-| Latency | **88s** (4 fixed gemini calls, concurrent) |
+| Metric | concurrent (4×870K) | sequential (7×480K) |
+|---|---|---|
+| Pages read | 4/4 when it works | **7/7 (100%, reliable)** |
+| Passages | 46 | **75** |
+| Citations valid | 25/25 | **66/66 (100%)** |
+| Findings reported | 31/31 | **75/75 (union-complete)** |
+| Latency | **88s** | 697s (~11.6 min) |
+| Reliability | flaky (near-cap calls fail) | reliable |
+
+**Operational reality (measured):** gemini-cloud is unreliable for *concurrent*
+calls near its 1M cap (pages fail intermittently) AND throttles *repeated* big
+calls (sequential page latency climbed 17s → 238s as the run progressed). So the
+exhaustive mode is either **fast-but-flaky** (concurrent) or **reliable-but-slow**
+(~12 min sequential). The honest coverage ledger now flags any page that fails
+("⚠ FAILED pages … — answer is INCOMPLETE") instead of silently claiming 100%.
+The union-complete reduce wove all 75 findings with a deterministic append-backstop
+for anything it drops.
 
 **Recall-gap test (the whole point):** reading everything surfaced major themes
 Variant A's FTS search *missed* — the Olas *"ANY refresh button is a total
@@ -137,8 +148,27 @@ Two-mode product, not one winner:
 Best of both: run E's exhaustive map to *seed* candidates, let A's cheap tools
 verify/expand — union of their findings is the real "perfect recall."
 
-Open follow-ups: (1) E reads everything but its reduce drops material — push the
-reduce toward union/completeness (or shard the reduce). (2) residual pastes
-(unfenced logs / pasted JSON / pasted docs) still inflate a few long messages —
-structural paste detection would finish the cleanup. (3) port to Rust in `pc`
-(rusqlite+FTS5, reqwest streaming, ratatui).
+### Roadmap (from validation + external review by deepseek-v4-pro)
+
+1. **Fix the spine representation (highest value).** Today's "longest human line"
+   is a random snippet, not a title — the event-driven query worked partly because
+   its keywords sat in long lines; it would fail on "how did we handle auth in the
+   early prototypes?". Cheapest pure-win: a structural label
+   `project/session8 (date, 12 turns, first: "<first substantive line>")`. Better:
+   a one-time 5–10-word session label (cheap flash call, ~1.7K calls, spine stays
+   byte-stable so caching survives) — metadata, not a belief graph.
+2. **Two-tier for interactive recall:** cheap ~2K-token project digests → agent
+   narrows to 1–3 projects → loads those full (<300K tok each). Keep exhaustive
+   map-reduce as audit-only.
+3. **Hybrid recall:** FTS misses synonyms ("event-driven" ≠ "message bus"); add a
+   vector index as a *lossless* retrieval signal (not distillation) with rank fusion.
+4. **Run the gate (`gate.py`) at index time**, store cleaned text beside original.
+5. **content_hash + `find_duplicates` tool** → cross-project reuse becomes a feature.
+6. **Killer feature:** expose recall as a TOOL the coding agent calls mid-session
+   (MCP/CLI) so Claude Code / Codex auto-retrieve your past nuance and cite it.
+7. **Then** port to Rust in `pc` — lock the schema + tool API first; gate the port
+   on "answers 50 different 'how did we solve X?' with zero hallucinated citations."
+
+Caveat on the precompilation line: embeddings (#3) and LLM session-labels (#1) are
+*lossless indexes / metadata*, not the lossy belief-graph that was rejected — fair
+to use, but flag for Pablo's call.
