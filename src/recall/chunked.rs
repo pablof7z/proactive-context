@@ -10,7 +10,11 @@ use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
 use crate::provider::ModelSpec;
 use super::{ask, corpus, llm, store::Store};
 
-const WORKERS: usize = 4;
+// Concurrency for the map stage. Free OpenRouter tiers rate-limit bursts (429),
+// so set RECALL_WORKERS=1 for a gentle sequential pass on free models.
+fn workers() -> usize {
+    std::env::var("RECALL_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+}
 const CHARS_PER_TOK: usize = 3; // conservative; keeps chunks safely under the cap
 
 const MAP_SYS: &str = "You are reading ONE slice of everything a developer typed to \
@@ -57,7 +61,7 @@ pub fn run_chunked(spec: &ModelSpec, query: &str, chunk_tokens: usize) -> Result
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     std::thread::scope(|s| {
-        for _ in 0..WORKERS {
+        for _ in 0..workers() {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 if i >= chunks.len() { break; }
