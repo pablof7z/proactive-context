@@ -178,6 +178,12 @@ pub(crate) fn call_model_blocking_with_timeout(
             ollama_api_key.map(|k| format!("Bearer {}", k)),
             true,
         ),
+        Provider::ClaudeCli => {
+            return crate::claude_sidecar::chat_blocking(
+                &spec.model, system, user_msg,
+                std::time::Duration::from_secs(timeout_secs),
+            ).map(|r| r.content);
+        }
     };
 
     let http = reqwest::blocking::Client::builder()
@@ -1130,6 +1136,17 @@ async fn run_stage(
                 t0.elapsed().as_millis() as u64,
             );
             Ok(resp)
+        }
+        Provider::ClaudeCli => {
+            let model = spec.model.clone();
+            let system = system.to_string();
+            let user = user.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::claude_sidecar::chat_blocking(
+                    &model, &system, &user,
+                    std::time::Duration::from_secs(120),
+                ).map(|r| r.content)
+            }).await?
         }
     }
 }

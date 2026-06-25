@@ -1,0 +1,27 @@
+corpus: 7436 msgs, 5414 dupes collapsed, ~744k tok
+
+Q                                                    cites valid% spec  ptok   s
+what was the way we solved event-driven design in m    15  100%  5/5  907k   54
+how do I feel about polling vs push-based updates?     15  100%  5/5  907k   23
+what are my strong opinions about type safety in Ru    11  100%  5/5  907k   30
+how did we handle authentication, signing, and key     21   90%  5/5  907k   31
+what's my philosophy on the kernel vs native-shell     24  100%  5/5  907k   23
+how did I want errors and panics handled across the    10  100%  5/5  907k   62
+what did I decide about testing strategy and what I    16  100%  5/5  907k   24
+what are my UI/UX pet peeves?                          23  100%  5/5  907k   31
+when is caching a hack vs legitimate, in my view?      11   91%  5/5  907k   25
+what did I say about the wire format between Rust a    13  100%  5/5  907k   25
+how should autonomous agents coordinate in TENEX?      27  100%  5/5  907k   29
+what's my stance on code duplication and copy-paste     0    0%  5/5  907k   30
+how did I want relay selection and the outbox handl    15  100%  5/5  907k   29
+what did I decide about offline-first behaviour?        7  100%  5/5  907k   18
+how do I think about migrations and schema changes?    14  100%  5/5  907k   71
+what makes me reject an architecture as wrong?         25  100%  5/5  907k   30
+
+— aggregate —
+  questions:           16
+  mean citations:      15.4
+  mean validity:       93%
+  mean specificity:    5.0/5
+  100%-valid-cite Qs:  13/16
+  mean latency:        33s (Q1=54s, rest=32s)
