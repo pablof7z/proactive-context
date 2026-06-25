@@ -109,16 +109,26 @@ Ollama at `http://localhost:11434` (env `OLLAMA_HOST=:8080` is a dead proxy).
 **Built (Python, `experiments/recall/`, on master):**
 `extract.py`, `store.py` (SQLite+FTS5), `build_index.py`, `gate.py`,
 `build_gate.py`, `corpus.py` (assemble+dedup), `agent.py` (`build_full_system` +
-streaming tool loop), `run_full.py` (validation runner), `tools.py`, `glm.py`,
-`eval_nuance.py`, `VALIDATION.md`.
+streaming tool loop), `run_full.py`, `tools.py`, `glm.py`, `eval_nuance.py`,
+`VALIDATION.md`, plus:
+- `recall_repl.py` — interactive load-everything REPL on gemini-1M (item 1). ✓
+- `ask.py` — callable cited-answer core; brief (mid-task) + full; **supersession-
+  aware** (current stance + dated reversals, both cited). ✓
+- `mcp_server.py` — MCP server exposing `recall` as a mid-session agent tool. ✓
+- `bench.py` + `run_bench.py` — 16-question benchmark harness (partial item 5). ✓
 
-**Left to do:**
-1. Wire the REPL to default to load-everything + a 1M model; test cache reuse (§6).
+**Resolved:** cache reuse does NOT hold on gemini-cloud (907K re-prefill every
+question, ~32s); the GLM-spine ~3s cache win does not transfer. So load-everything
+costs ~32s/question on this endpoint (item 1 caveat closed).
+
+**Left to do (spec checklist):**
 2. Settle the gate's skill-doc miss at the extraction layer.
 3. `content_hash` as a first-class column; surface "also said in N sessions" in answers.
 4. Incremental index updates (new transcripts only) keyed by file mtime/offset.
-5. A frozen eval: ≥20 diverse questions with gold nuance checklists + zero-false-
-   citation requirement. **Gate the Rust port on passing this.**
+5. **Finish the frozen eval to spec:** ≥20 diverse questions + gold nuance checklists
+   + **zero-false-citation** gate (current bench has 16 Qs, citation-validity +
+   LLM-judge specificity; needs the gold checklists + the hard zero-false-cite gate).
+   **Gate the Rust port on passing this.**
 6. Rust port: `pc recall-repl` — rusqlite+FTS5, reqwest streaming, ratatui TUI;
    lock the schema, citation verifier, and tool signatures first.
 
