@@ -238,6 +238,26 @@ def _codex_user_text(payload: dict) -> Optional[str]:
     return None
 
 
+# Codex launchers that mean a real human is typing interactively.
+INTERACTIVE_ORIGINATORS = {
+    "Codex Desktop", "codex-tui", "codex_cli_rs", "codex_vscode",
+}
+
+
+def codex_is_automation(meta_payload: dict) -> bool:
+    """True if this codex session was launched by automation (codex exec, the
+    AI SDK, or as a named TENEX agent) rather than typed by the human. Decided
+    purely from session_meta — no prompt-string heuristics."""
+    orig = meta_payload.get("originator")
+    if orig is not None and orig not in INTERACTIVE_ORIGINATORS:
+        return True  # codex_exec, ai-sdk-provider-*, tenex-agent-acp, …
+    # codex-tui can be driven as an agent; agent-identity keys give it away.
+    if any(meta_payload.get(k) for k in
+           ("agent_role", "agent_nickname", "multi_agent_version")):
+        return True
+    return False
+
+
 def extract_codex_file(path: Path) -> Iterator[Utterance]:
     session = path.stem
     # session id is the trailing uuid in rollout-...-<uuid>.jsonl
@@ -258,6 +278,8 @@ def extract_codex_file(path: Path) -> Iterator[Utterance]:
             payload = o.get("payload") or {}
             if typ == "session_meta":
                 cwd = payload.get("cwd", "") or cwd
+                if codex_is_automation(payload):
+                    return  # not human-typed — skip the whole session
                 continue
             text = None
             if typ == "response_item" and payload.get("type") == "message" \
