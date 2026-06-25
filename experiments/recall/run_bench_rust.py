@@ -5,10 +5,14 @@ own citations against its own index, and applies the gold checklists + the
 RUST-PORT GATE (>=20 Qs, zero false citations, gold >=80%).
 """
 from __future__ import annotations
-import re, subprocess, sys, time
+import os, re, subprocess, sys, time
 from bench import QUESTIONS, gold_coverage
 
 PC = "/Users/pablofernandez/src/proactive-context/target/debug/pc"
+# OpenRouter account is out of credits → default to FREE ollama-cloud (rate-limited).
+# Override with RECALL_BENCH_MODEL=openrouter:google/gemini-3-flash-preview once topped up.
+MODEL = os.environ.get("RECALL_BENCH_MODEL", "ollama:gemini-3-flash-preview:cloud")
+ENV = {**os.environ, "RECALL_OLLAMA": "http://localhost:11434"}
 
 print(f"{'Q':<50} cites valid gold   s", flush=True)
 rows = []
@@ -19,8 +23,8 @@ def ask_with_retry(q, tries=3):
     and retry the whole call so the eval survives a contended OpenRouter account."""
     for attempt in range(tries):
         try:
-            r = subprocess.run([PC, "recall", "ask", q], capture_output=True,
-                               text=True, timeout=500)
+            r = subprocess.run([PC, "recall", "ask", "--model", MODEL, q],
+                               capture_output=True, text=True, timeout=600, env=ENV)
         except subprocess.TimeoutExpired:
             time.sleep(30); continue
         m = re.search(r"\[recall: (\d+)/(\d+) citations valid", r.stdout)

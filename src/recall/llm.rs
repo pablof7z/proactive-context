@@ -8,7 +8,10 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 use crate::provider::{ModelSpec, Provider};
 
@@ -31,6 +34,7 @@ pub fn chat(spec: &ModelSpec, messages: &[Msg], num_ctx: u64, max_tokens: u32) -
     match spec.provider {
         Provider::OpenRouter => openrouter_chat(&spec.model, messages, max_tokens),
         Provider::Ollama => ollama_chat(&spec.model, messages, num_ctx, max_tokens),
+        Provider::ClaudeCli => claude_cli_chat(&spec.model, messages),
     }
 }
 
@@ -61,6 +65,97 @@ where
         return Ok(resp);
     }
     anyhow::bail!("exhausted retries (429/503)")
+}
+
+fn claude_cli_chat(model: &str, messages: &[Msg]) -> Result<Reply> {
+    let system_text = messages.iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_text = messages.iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if user_text.is_empty() {
+        anyhow::bail!("Claude CLI recall adapter requires a user message");
+    }
+
+    let mut system_file = NamedTempFile::new().context("create Claude CLI system prompt file")?;
+    system_file.write_all(system_text.as_bytes()).context("write Claude CLI system prompt file")?;
+    system_file.flush().ok();
+
+    let mut cmd = Command::new("claude");
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        cmd.arg("--bare");
+    } else {
+        cmd.arg("--safe-mode");
+    }
+    cmd.arg("-p")
+        .arg("--no-session-persistence")
+        .arg("--output-format").arg("json")
+        .arg("--disallowedTools").arg("*")
+        .arg("--model").arg(model)
+        .arg("--system-prompt-file").arg(system_file.path())
+        .arg(&user_text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = wait_with_timeout(
+        cmd.spawn().context("spawn claude CLI")?,
+        Duration::from_secs(1800),
+    )?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    let v: Value = serde_json::from_str(&stdout).with_context(|| {
+        format!(
+            "parse Claude CLI JSON output; stdout=`{}`, stderr=`{}`",
+            stdout.chars().take(400).collect::<String>(),
+            stderr.chars().take(400).collect::<String>(),
+        )
+    })?;
+
+    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !output.status.success() || is_error {
+        let result_msg = v.get("result").and_then(|x| x.as_str()).unwrap_or("");
+        let api_status = v.get("api_error_status").and_then(|x| x.as_i64());
+        let status_note = api_status.map(|s| format!(" (api status {s})")).unwrap_or_default();
+        let detail = if !result_msg.is_empty() { result_msg } else { stderr.as_str() };
+        anyhow::bail!("Claude CLI failed{}: {}", status_note, detail);
+    }
+
+    let usage = &v["usage"];
+    let cost = v.get("total_cost_usd").and_then(|x| x.as_f64());
+    Ok(Reply {
+        content: v.get("result").and_then(|x| x.as_str()).unwrap_or("").trim().to_string(),
+        usage: super::usage::Usage {
+            prompt_tokens: usage.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            completion_tokens: usage.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            cached_tokens: usage.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            cost: cost.unwrap_or(0.0),
+            cost_known: cost.is_some(),
+        },
+    })
+}
+
+fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Result<Output> {
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().context("read Claude CLI output");
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("Claude CLI timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 pub(super) fn ollama_base() -> String {

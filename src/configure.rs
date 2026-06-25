@@ -115,6 +115,7 @@ impl ModelEntry {
         match self.provider {
             Provider::OpenRouter => "OR",
             Provider::Ollama => "OL",
+            Provider::ClaudeCli => "CC",
         }
     }
 
@@ -122,6 +123,7 @@ impl ModelEntry {
         match self.provider {
             Provider::OpenRouter => Color::Cyan,
             Provider::Ollama => Color::Green,
+            Provider::ClaudeCli => Color::Magenta,
         }
     }
 }
@@ -504,6 +506,10 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
                 Provider::Ollama => Span::styled(
                     "[OL]",
                     Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+                ),
+                Provider::ClaudeCli => Span::styled(
+                    "[CC]",
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
                 ),
             };
 

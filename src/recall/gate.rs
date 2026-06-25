@@ -60,16 +60,22 @@ pub fn build_gate(spec: &ModelSpec) -> Result<()> {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if i >= todo.len() { break; }
                     let (ref id, ref text) = todo[i];
-                    let (action, human, kind) = match gate_one(spec, text) {
-                        Ok(Action::Keep) => ("KEEP".to_string(), text.clone(), 0),
-                        Ok(Action::Drop) => ("DROP".to_string(), String::new(), 1),
-                        Ok(Action::Clean(c)) => ("CLEAN".to_string(), c, 2),
-                        Err(_) => ("KEEP".to_string(), text.clone(), 3), // fail-open: keep raw
-                    };
-                    results.lock().unwrap().push(
-                        (id.clone(), action, human.chars().count() as i64, human));
-                    let mut c = counters.lock().unwrap();
-                    match kind { 0 => c.0 += 1, 1 => c.1 += 1, 2 => c.2 += 1, _ => c.3 += 1 }
+                    match gate_one(spec, text) {
+                        Ok(action) => {
+                            let (act, human, kind) = match action {
+                                Action::Keep => ("KEEP".to_string(), text.clone(), 0),
+                                Action::Drop => ("DROP".to_string(), String::new(), 1),
+                                Action::Clean(c) => ("CLEAN".to_string(), c, 2),
+                            };
+                            results.lock().unwrap().push(
+                                (id.clone(), act, human.chars().count() as i64, human));
+                            let mut c = counters.lock().unwrap();
+                            match kind { 0 => c.0 += 1, 1 => c.1 += 1, _ => c.2 += 1 }
+                        }
+                        // On error do NOT persist a gated row — leave it ungated so a
+                        // later `pc recall gate` retries it (don't poison the cache).
+                        Err(_) => { counters.lock().unwrap().3 += 1; }
+                    }
                 }
             });
         }

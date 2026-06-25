@@ -14,8 +14,7 @@ use super::{ask, corpus, picker, store::Store, usage::Ledger};
 const GATE_DEFAULT: &str = "openrouter:deepseek/deepseek-v4-flash";
 
 fn label(s: &ModelSpec) -> String {
-    let p = if s.provider == crate::provider::Provider::OpenRouter { "openrouter" } else { "ollama" };
-    format!("{}:{}", p, s.model)
+    format!("{}:{}", s.provider_name().to_lowercase().replace(' ', "-"), s.model)
 }
 
 fn help() {
