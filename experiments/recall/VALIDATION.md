@@ -81,11 +81,64 @@ More **exhaustive** (surfaces contradictions: delta-sync vs full-rebuild, generi
 vs typed dispatch) and ships a provable coverage ledger — but ~10× the GLM calls
 and no cache reuse across questions.
 
+## Variant E — exhaustive "read everything" (gemini-3-flash 1M)  ⭐ best recall
+
+Key enabler discovered mid-build: **GLM cloud caps at 202,752 tokens, NOT 1M.**
+The real 1M model on ollama-cloud is **`gemini-3-flash-preview:cloud`** (verified
+to 983K tokens). After cleaning the corpus to **2.16M tokens** (paste-stripping +
+dropping TENEX-automation codex sessions by `session_meta`), it paginates into
+**4 windows** (~850K tok each; corpus density is ~3.5 chars/tok). Every query maps
+over EVERY page concurrently → reduce → cited answer. **No input recall gap: 100%
+of the corpus is read every time.**
+
+| Metric | Result |
+|---|---|
+| Pages read | **4/4 (100% of corpus, 2.76M tokens)** |
+| Passages extracted | 46 |
+| Citations valid | **25/25 (100%)** |
+| Latency | **88s** (4 fixed gemini calls, concurrent) |
+
+**Recall-gap test (the whole point):** reading everything surfaced major themes
+Variant A's FTS search *missed* — the Olas *"ANY refresh button is a total
+anti-pattern… event-based doesn't require refreshing"*, the Tenex **CQRS** split
+(`state.db` unified read store + write-side Fabric Provider materializer),
+**ADR-0037** typed projection sidecar, the `claim()`/EventClaimSink frontend-driven
+model, and offline-first **arrival-order-agnostic** rendering. Pablo's instinct
+was right: exhaustive reading finds what search misses.
+
+**But "read everything" ≠ "report everything".** E's reduce step *dropped* Rung
+projection-emission and Bevy DefaultPlugins from its final answer even though it
+read those pages — while A surfaced them. The output is still bounded by mapper +
+reduce choices. So A and E are **complementary, not subset/superset**: the true
+"perfect recall" is their union.
+
+### Three-way comparison
+
+| | A: FTS spine + tools | D: FTS map-reduce | E: exhaustive read |
+|---|---|---|---|
+| model | glm-5.1 (203K) | glm-5.1 | gemini-3-flash (1M) |
+| input recall gap | search-bound | union-bound | **none (reads 100%)** |
+| latency | 105s | 121s | **88s** |
+| citations valid | 12/12 | ~80 | 25/25 |
+| cross-query cache | **★ 1 spine, ~3s/q** | none | weak (4 page prefixes) |
+| cost/query | low | high | medium (2.76M tok read) |
+| found uniquely | Rung, Bevy, D0 | contradictions | CQRS, refresh-btn, ADR-0037, offline-first |
+
 ## Verdict
 
-**Variant A is the one to build as `pc recall-repl`.** It nails the faithful
-vision, is fast and cheap via spine-caching, and the REPL + `/reset` exploit the
-cache exactly as Pablo described. Variant D is the "audit mode" to reach for when
-completeness must be *proven* on a hard question — keep it as a second command.
+Two-mode product, not one winner:
 
-Next: port Variant A to Rust in `pc` (ratatui TUI, rusqlite+FTS5, reqwest stream).
+- **`pc recall-repl` (fast/interactive) = Variant A.** Cached 97K spine + agentic
+  tools, ~3s follow-ups via prompt-cache, streams thinking + tool calls. The
+  daily driver.
+- **`pc recall --exhaustive` (deep/complete) = Variant E.** Reads 100% of history
+  on gemini-1M in ~88s for the hard "surface everything" questions.
+
+Best of both: run E's exhaustive map to *seed* candidates, let A's cheap tools
+verify/expand — union of their findings is the real "perfect recall."
+
+Open follow-ups: (1) E reads everything but its reduce drops material — push the
+reduce toward union/completeness (or shard the reduce). (2) residual pastes
+(unfenced logs / pasted JSON / pasted docs) still inflate a few long messages —
+structural paste detection would finish the cleanup. (3) port to Rust in `pc`
+(rusqlite+FTS5, reqwest streaming, ratatui).
