@@ -15,14 +15,14 @@
 /// - `--dry-run`: scans, counts, estimates cost — makes NO LLM calls.
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 
 use crate::capture::{
     archeologist_captured_sessions_dir, archeologist_is_already_captured, archeologist_project_dir,
-    run_capture_for_archeologist, run_episode_repair_for_session, run_structural_maintenance,
+    run_capture_for_archeologist, run_structural_maintenance,
 };
 use crate::config::{normalize_path, resolve_project_root};
 use crate::transcript::{transcript_cwd, transcript_first_ts, transcript_message_count};
@@ -66,98 +66,48 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
         anyhow::bail!("--project and --yes/--all are mutually exclusive (ambiguous scope)");
     }
 
-    // Collect all project metadata from ~/.claude/projects/
-    eprint!("archeologist: scanning Claude Code sessions...");
-    let mut projects = scan_claude_projects(&args.since)?;
-    eprintln!(" {} project(s)", projects.len());
-
-    // Auto-detect and merge all other known conversation sources.
-    // Each scanner checks whether its path exists before doing any work; silently returns
-    // empty when the tool isn't installed. TempDirs must be kept alive for the run.
-
-    // TENEX (~/.tenex/config.json must be present and valid)
-    let _tenex_tmp = match crate::tenex::load_config() {
-        Some(cfg) => {
-            let tmp = tempfile::Builder::new()
-                .prefix("pc-tenex-")
-                .tempdir()
-                .context("failed to create temp dir for TENEX synthesis")?;
-            eprint!("archeologist: scanning TENEX sessions...");
-            match crate::tenex::scan_tenex_projects(&cfg, &args.since, tmp.path(), args.output_dir.as_ref()) {
-                Ok(p) if !p.is_empty() => {
-                    eprintln!(" {} project(s)", p.len());
-                    projects.extend(p);
-                    Some(tmp)
-                }
-                Ok(_) => { eprintln!(" none"); None }
-                Err(e) => { eprintln!(" failed: {e}"); None }
-            }
-        }
-        None => None,
-    };
-
-    // Codex (~/.codex/sessions/ or ~/.codex/archived_sessions/ must exist)
-    eprint!("archeologist: scanning Codex sessions...");
-    match crate::codex::scan_codex_sessions(&args.since, args.output_dir.as_ref()) {
-        Ok(p) if !p.is_empty() => {
-            eprintln!(" {} project(s)", p.len());
-            projects.extend(p);
-        }
-        Ok(_) => eprintln!(" none"),
-        Err(e) => eprintln!(" failed: {e}"),
-    }
-
-    // opencode (~/.local/share/opencode/opencode.db must exist)
-    eprint!("archeologist: scanning opencode sessions...");
-    let _opencode_tmp = {
-        let tmp = tempfile::Builder::new()
-            .prefix("pc-opencode-")
-            .tempdir()
-            .context("failed to create temp dir for opencode synthesis")?;
-        match crate::opencode::scan_opencode_sessions(&args.since, tmp.path(), args.output_dir.as_ref()) {
-            Ok(p) if !p.is_empty() => {
-                eprintln!(" {} project(s)", p.len());
-                projects.extend(p);
-                Some(tmp)
-            }
-            Ok(_) => { eprintln!(" none"); None }
-            Err(e) => { eprintln!(" failed: {e}"); None }
-        }
-    };
-
-    if projects.is_empty() {
-        println!("archeologist: no projects found (checked Claude Code, Codex, opencode, TENEX)");
-        return Ok(());
-    }
-
     // Select projects to process.
     // routing_cwd: when Some, all selected sessions write to this project's wiki instead of
     // their original per-session cwd. Set only for interactive picker so that the user can
     // merge sessions from several source paths into the current project. --yes and --project
     // keep their original per-session routing.
     let mut routing_cwd: Option<String> = None;
-    let selected: Vec<ProjectInfo> = if args.yes {
-        projects
-    } else if let Some(ref path_filter) = args.project {
-        let key = normalize_path(&PathBuf::from(path_filter));
-        let filtered: Vec<ProjectInfo> = projects
-            .into_iter()
-            .filter(|p| p.normalized_cwd == key || p.display_name.contains(path_filter.as_str()))
-            .collect();
-        if filtered.is_empty() {
-            anyhow::bail!("--project: no project matches '{}'", path_filter);
-        }
-        filtered
+    let mut source_tempdirs: Vec<tempfile::TempDir> = Vec::new();
+    let selected: Vec<ProjectInfo> = if !args.yes
+        && args.project.is_none()
+        && io::stdout().is_terminal()
+    {
+        // Interactive picker (TTY only): render a cheap Claude project list first, then
+        // expand stats for selected rows on a background worker. This keeps large
+        // ~/.claude/projects trees from blocking the first frame.
+        let current_dir = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        routing_cwd = current_dir.clone();
+        run_lazy_picker(&args, current_dir.as_deref())?
     } else {
-        // Interactive picker (TTY only)
-        let is_tty = io::stdout().is_terminal();
-        if is_tty {
-            // Compute current dir before picker so it can pre-select and sort matching projects.
-            let current_dir = std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().to_string());
-            routing_cwd = current_dir.clone();
-            run_picker(projects, current_dir.as_deref())?
+        let projects = scan_all_projects(&args, &mut source_tempdirs)?;
+        if projects.is_empty() {
+            println!(
+                "archeologist: no projects found (checked Claude Code, Codex, opencode, TENEX)"
+            );
+            return Ok(());
+        }
+
+        if args.yes {
+            projects
+        } else if let Some(ref path_filter) = args.project {
+            let key = normalize_path(&PathBuf::from(path_filter));
+            let filtered: Vec<ProjectInfo> = projects
+                .into_iter()
+                .filter(|p| {
+                    p.normalized_cwd == key || p.display_name.contains(path_filter.as_str())
+                })
+                .collect();
+            if filtered.is_empty() {
+                anyhow::bail!("--project: no project matches '{}'", path_filter);
+            }
+            filtered
         } else {
             // Non-TTY without --yes: print summary and exit
             eprintln!("archeologist: not a TTY and --yes not set — use --yes to mine all projects or --project to target one");
@@ -188,7 +138,14 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
     }
 
     if use_linelog {
-        run_linelog(selected, &args, total_new, total_sessions, total_bytes, routing_cwd)
+        run_linelog(
+            selected,
+            &args,
+            total_new,
+            total_sessions,
+            total_bytes,
+            routing_cwd,
+        )
     } else {
         // TTY serial run — show TUI
         run_tui_mode(selected, &args, routing_cwd)
@@ -251,7 +208,9 @@ fn run_reset(args: &ArcheologistArgs) -> Result<()> {
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("removing marker {}", path.display())),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing marker {}", path.display()))
+                }
             }
         }
         println!(
@@ -296,8 +255,7 @@ fn run_reset(args: &ArcheologistArgs) -> Result<()> {
     }
 
     for path in &existing {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
         println!("archeologist: removed {}", path.display());
     }
     println!("archeologist: reset complete — all sessions will be re-captured on the next run");
@@ -318,10 +276,75 @@ fn confirm(assume_yes: bool, prompt: &str) -> Result<bool> {
     io::stdout().flush().ok();
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 // ─── Project scanning ─────────────────────────────────────────────────────────
+
+fn scan_all_projects(
+    args: &ArcheologistArgs,
+    tempdirs: &mut Vec<tempfile::TempDir>,
+) -> Result<Vec<ProjectInfo>> {
+    // Collect all project metadata from ~/.claude/projects/
+    let mut projects = scan_claude_projects_with_output(&args.since, args.output_dir.as_ref())?;
+
+    // Auto-detect and merge all other known conversation sources.
+    // Each scanner checks whether its path exists before doing any work; silently returns
+    // empty when the tool isn't installed. TempDirs must be kept alive for the run.
+
+    // TENEX (~/.tenex/config.json must be present and valid)
+    if let Some(cfg) = crate::tenex::load_config() {
+        let tmp = tempfile::Builder::new()
+            .prefix("pc-tenex-")
+            .tempdir()
+            .context("failed to create temp dir for TENEX synthesis")?;
+        match crate::tenex::scan_tenex_projects(
+            &cfg,
+            &args.since,
+            tmp.path(),
+            args.output_dir.as_ref(),
+        ) {
+            Ok(p) if !p.is_empty() => {
+                println!("archeologist: tenex: found {} project(s)", p.len());
+                projects.extend(p);
+                tempdirs.push(tmp);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("archeologist: tenex scan failed: {e}"),
+        }
+    }
+
+    // Codex (~/.codex/sessions/ or ~/.codex/archived_sessions/ must exist)
+    match crate::codex::scan_codex_sessions(&args.since, args.output_dir.as_ref()) {
+        Ok(p) if !p.is_empty() => {
+            println!("archeologist: codex: found {} project(s)", p.len());
+            projects.extend(p);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("archeologist: codex scan failed: {e}"),
+    }
+
+    // opencode (~/.local/share/opencode/opencode.db must exist)
+    let tmp = tempfile::Builder::new()
+        .prefix("pc-opencode-")
+        .tempdir()
+        .context("failed to create temp dir for opencode synthesis")?;
+    match crate::opencode::scan_opencode_sessions(&args.since, tmp.path(), args.output_dir.as_ref())
+    {
+        Ok(p) if !p.is_empty() => {
+            println!("archeologist: opencode: found {} project(s)", p.len());
+            projects.extend(p);
+            tempdirs.push(tmp);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("archeologist: opencode scan failed: {e}"),
+    }
+
+    Ok(projects)
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -359,6 +382,13 @@ pub struct ProjectInfo {
 }
 
 fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo>> {
+    scan_claude_projects_with_output(since_filter, None)
+}
+
+fn scan_claude_projects_with_output(
+    since_filter: &Option<String>,
+    output_dir: Option<&PathBuf>,
+) -> Result<Vec<ProjectInfo>> {
     let home = dirs::home_dir().expect("cannot determine home directory");
     let claude_projects = home.join(".claude").join("projects");
 
@@ -387,100 +417,125 @@ fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo
             continue;
         }
 
-        // Find all *.jsonl files in this directory
-        let jsonl_files = match std::fs::read_dir(&entry_path) {
-            Ok(d) => d
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
-                })
-                .map(|e| e.path())
-                .collect::<Vec<_>>(),
-            Err(_) => continue,
-        };
+        collect_claude_project_dir(&entry_path, since_filter, &mut project_map);
+    }
 
-        if jsonl_files.is_empty() {
+    Ok(build_project_infos_from_map(
+        project_map,
+        output_dir.map(|d| d.join("captured-sessions")).as_ref(),
+    ))
+}
+
+fn scan_single_claude_project_dir(
+    entry_path: &Path,
+    since_filter: &Option<String>,
+    output_dir: Option<&PathBuf>,
+) -> Vec<ProjectInfo> {
+    let mut project_map: HashMap<String, (String, Vec<SessionInfo>)> = HashMap::new();
+    collect_claude_project_dir(entry_path, since_filter, &mut project_map);
+    build_project_infos_from_map(
+        project_map,
+        output_dir.map(|d| d.join("captured-sessions")).as_ref(),
+    )
+}
+
+fn collect_claude_project_dir(
+    entry_path: &Path,
+    since_filter: &Option<String>,
+    project_map: &mut HashMap<String, (String, Vec<SessionInfo>)>,
+) {
+    // Find all *.jsonl files in this directory
+    let jsonl_files = match std::fs::read_dir(entry_path) {
+        Ok(d) => d
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .map(|e| e.path())
+            .collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+
+    if jsonl_files.is_empty() {
+        return;
+    }
+
+    for jsonl_path in jsonl_files {
+        let path_str = jsonl_path.to_string_lossy().to_string();
+        let session_id = jsonl_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        if session_id.is_empty() {
             continue;
         }
 
-        for jsonl_path in jsonl_files {
-            let path_str = jsonl_path.to_string_lossy().to_string();
-            let session_id = jsonl_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+        let size_bytes = jsonl_path.metadata().map(|m| m.len()).unwrap_or(0);
 
-            if session_id.is_empty() {
+        // Cheap: read only what we need from the first message line
+        let cwd = transcript_cwd(&path_str);
+        let first_ts = transcript_first_ts(&path_str);
+
+        // Apply --since filter early (cheap string compare on RFC3339)
+        if let (Some(ref since), Some(ref ts)) = (since_filter, &first_ts) {
+            // RFC3339 lexicographic compare works because timestamps are fixed-width UTC
+            // Normalize since to just the date prefix for comparison
+            let since_prefix = since.trim_end_matches('Z');
+            if ts.as_str() < since_prefix {
                 continue;
             }
-
-            let size_bytes = jsonl_path
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
-
-            // Cheap: read only what we need from the first message line
-            let cwd = transcript_cwd(&path_str);
-            let first_ts = transcript_first_ts(&path_str);
-
-            // Apply --since filter early (cheap string compare on RFC3339)
-            if let (Some(ref since), Some(ref ts)) = (since_filter, &first_ts) {
-                // RFC3339 lexicographic compare works because timestamps are fixed-width UTC
-                // Normalize since to just the date prefix for comparison
-                let since_prefix = since.trim_end_matches('Z');
-                if ts.as_str() < since_prefix {
-                    continue;
-                }
-            }
-
-            // Routing key: normalize_path(cwd) or fall back to encoded dir name
-            let (routing_key, display_name) = match &cwd {
-                Some(c) if !c.is_empty() => {
-                    let key = normalize_path(&resolve_project_root(&PathBuf::from(c)));
-                    let name = PathBuf::from(c)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(c.as_str())
-                        .to_string();
-                    (key, name)
-                }
-                _ => {
-                    // Fallback: use the encoded directory name as display + key
-                    let dir_name = entry_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    (dir_name.clone(), dir_name)
-                }
-            };
-
-            if routing_key.is_empty() {
-                continue;
-            }
-
-            // message_count is cheap but still a full pass — defer if not needed
-            // For the picker we want it, so compute here
-            let message_count = transcript_message_count(&path_str);
-
-            let session = SessionInfo {
-                path: jsonl_path,
-                session_id,
-                first_ts,
-                cwd,
-                size_bytes,
-                message_count,
-            };
-
-            let entry = project_map
-                .entry(routing_key.clone())
-                .or_insert_with(|| (display_name, Vec::new()));
-            entry.1.push(session);
         }
-    }
 
-    // Build ProjectInfo list
+        // Routing key: normalize_path(cwd) or fall back to encoded dir name
+        let (routing_key, display_name) = match &cwd {
+            Some(c) if !c.is_empty() => {
+                let key = normalize_path(&resolve_project_root(&PathBuf::from(c)));
+                let name = PathBuf::from(c)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(c.as_str())
+                    .to_string();
+                (key, name)
+            }
+            _ => {
+                // Fallback: use the encoded directory name as display + key
+                let dir_name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                (dir_name.clone(), dir_name)
+            }
+        };
+
+        if routing_key.is_empty() {
+            continue;
+        }
+
+        // message_count is cheap but still a full pass, so lazy picker computes it
+        // only for selected projects.
+        let message_count = transcript_message_count(&path_str);
+
+        let session = SessionInfo {
+            path: jsonl_path,
+            session_id,
+            first_ts,
+            cwd,
+            size_bytes,
+            message_count,
+        };
+
+        let entry = project_map
+            .entry(routing_key.clone())
+            .or_insert_with(|| (display_name, Vec::new()));
+        entry.1.push(session);
+    }
+}
+
+fn build_project_infos_from_map(
+    project_map: HashMap<String, (String, Vec<SessionInfo>)>,
+    marker_dir: Option<&PathBuf>,
+) -> Vec<ProjectInfo> {
     let mut projects: Vec<ProjectInfo> = project_map
         .into_iter()
         .map(|(normalized_cwd, (display_name, mut sessions))| {
@@ -493,7 +548,7 @@ fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo
 
             let new_sessions = sessions
                 .iter()
-                .filter(|s| !archeologist_is_already_captured(&s.session_id, None))
+                .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir))
                 .count();
 
             let total_bytes: u64 = sessions.iter().map(|s| s.size_bytes).sum();
@@ -532,7 +587,7 @@ fn scan_claude_projects(since_filter: &Option<String>) -> Result<Vec<ProjectInfo
             .then_with(|| a.display_name.cmp(&b.display_name))
     });
 
-    Ok(projects)
+    projects
 }
 
 // ─── Cost model ───────────────────────────────────────────────────────────────
@@ -743,39 +798,34 @@ struct WorkItem {
     checkpoint_after: bool,
     /// true → this is the last session of its project (final checkpoint runs after)
     project_last: bool,
-    /// true → this session was already captured; run ONLY the cheap episode-repair
-    /// pass (backfill missing transcripts, no TRIAGE/EXTRACT, no recognition LLM).
-    /// These items are silent in the line-log and never trigger checkpoints.
-    episode_repair_only: bool,
     /// Forwarded from ArcheologistArgs::output_dir
     output_dir: Option<std::path::PathBuf>,
 }
 
 /// Build the flattened, ordered work-list across all selected projects.
-///
-/// Includes ALL sessions in chronological order so the archeologist is a true replay:
-/// uncaptured sessions run the full pipeline; already-captured sessions are emitted as
-/// cheap `episode_repair_only` items that only backfill missing episode transcripts (no
-/// TRIAGE/EXTRACT, no recognition LLM). The progress counts and checkpoint cadence are
-/// driven by NEW sessions only — repair-only items are not counted as new work and never
-/// trigger a checkpoint (they don't mutate guides or the index).
-///
+/// Filters already-captured sessions; computes checkpoint flags from `synth_every`.
 /// `routing_cwd`: when `Some`, all sessions write to that project's wiki instead of their
 /// own per-session cwd. Used by the interactive picker to merge multiple source paths into
 /// the current project.
-fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Option<&std::path::PathBuf>, routing_cwd: Option<&str>) -> Vec<WorkItem> {
+fn build_work_plan(
+    projects: &[ProjectInfo],
+    synth_every: usize,
+    output_dir: Option<&std::path::PathBuf>,
+    routing_cwd: Option<&str>,
+) -> Vec<WorkItem> {
     let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
-    let is_captured =
-        |s: &SessionInfo| archeologist_is_already_captured(&s.session_id, marker_dir.as_ref());
     let mut plan = Vec::new();
     for (proj_idx, project) in projects.iter().enumerate() {
-        let n_new = project.sessions.iter().filter(|s| !is_captured(s)).count();
-        // Absolute index (within project.sessions) of the last NEW session — it owns the
-        // mandatory final checkpoint. None when the project has no new work.
-        let last_new_abs = project.sessions.iter().rposition(|s| !is_captured(s));
-
-        let mut new_seen = 0usize; // running count of NEW sessions emitted so far
-        for (abs_idx, session) in project.sessions.iter().enumerate() {
+        let work_list: Vec<&SessionInfo> = project
+            .sessions
+            .iter()
+            .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
+            .collect();
+        let n_new = work_list.len();
+        for (sess_idx, session) in work_list.iter().enumerate() {
+            let is_last = sess_idx == n_new - 1;
+            let checkpoint_after =
+                synth_every > 0 && ((sess_idx + 1) % synth_every == 0) && !is_last;
             let date = session
                 .first_ts
                 .as_ref()
@@ -784,32 +834,6 @@ fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Opt
             let cwd = routing_cwd
                 .unwrap_or_else(|| session.cwd.as_deref().unwrap_or(""))
                 .to_string();
-
-            if is_captured(session) {
-                // Repair-only: silent, never checkpoints. session_in_project carries the
-                // count of new work done so far purely for a stable (if unused) value.
-                plan.push(WorkItem {
-                    project_idx: proj_idx,
-                    session_in_project: new_seen,
-                    project_new_count: n_new,
-                    session_id: session.session_id.clone(),
-                    cwd,
-                    path: session.path.to_string_lossy().to_string(),
-                    date,
-                    message_count: session.message_count,
-                    checkpoint_after: false,
-                    project_last: false,
-                    episode_repair_only: true,
-                    output_dir: output_dir.cloned(),
-                });
-                continue;
-            }
-
-            let sess_idx = new_seen; // 0-based among NEW sessions
-            let is_last_new = last_new_abs == Some(abs_idx);
-            let checkpoint_after = synth_every > 0
-                && ((sess_idx + 1) % synth_every == 0)
-                && !is_last_new;
             plan.push(WorkItem {
                 project_idx: proj_idx,
                 session_in_project: sess_idx,
@@ -820,11 +844,9 @@ fn build_work_plan(projects: &[ProjectInfo], synth_every: usize, output_dir: Opt
                 date,
                 message_count: session.message_count,
                 checkpoint_after,
-                project_last: is_last_new,
-                episode_repair_only: false,
+                project_last: is_last,
                 output_dir: output_dir.cloned(),
             });
-            new_seen += 1;
         }
     }
     plan
@@ -859,26 +881,6 @@ fn replay_worker(
     for item in plan.iter() {
         if stop.load(Ordering::Relaxed) {
             break;
-        }
-
-        // Already-captured session: run ONLY the cheap episode-repair pass (backfill
-        // missing transcripts, no TRIAGE/EXTRACT, no recognition LLM). Stay silent —
-        // no SessionStart/Done so it is not counted as "seen" work in either driver.
-        // Best-effort: errors are logged, never fatal.
-        if item.episode_repair_only {
-            if let Err(e) = run_episode_repair_for_session(
-                &item.session_id,
-                &item.cwd,
-                &item.path,
-                item.output_dir.clone(),
-            ) {
-                eprintln!(
-                    "archeologist: episode-repair failed for {}: {}",
-                    &item.session_id[..item.session_id.len().min(8)],
-                    e
-                );
-            }
-            continue;
         }
 
         let _ = tx.send(WorkerMsg::SessionStart { item: item.clone() });
@@ -955,6 +957,7 @@ struct RunCounters {
     errors: usize,
     tokens_in: u64,
     tokens_out: u64,
+    cost_usd: f64,
 }
 
 impl RunCounters {
@@ -993,14 +996,30 @@ impl RunCounters {
             "error" => self.errors += 1,
             _ => {}
         }
-        // Token usage, when the provider returns it on any event payload
-        if let Some(u) = payload.get("usage") {
-            if let Some(t) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                self.tokens_in += t;
-            }
-            if let Some(t) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
-                self.tokens_out += t;
-            }
+        // Token usage and cost. The capture pipeline emits flat keys on llm.response
+        // (prompt_tokens, completion_tokens, cost_usd); some older/event-aggregated
+        // payloads nest them under `usage` with `cost`. Read both shapes.
+        let (pt, ct, cost) = if let Some(u) = payload.get("usage") {
+            (
+                u.get("prompt_tokens").and_then(|v| v.as_u64()),
+                u.get("completion_tokens").and_then(|v| v.as_u64()),
+                u.get("cost").and_then(|v| v.as_f64()),
+            )
+        } else {
+            (
+                payload.get("prompt_tokens").and_then(|v| v.as_u64()),
+                payload.get("completion_tokens").and_then(|v| v.as_u64()),
+                payload.get("cost_usd").and_then(|v| v.as_f64()),
+            )
+        };
+        if let Some(t) = pt {
+            self.tokens_in += t;
+        }
+        if let Some(t) = ct {
+            self.tokens_out += t;
+        }
+        if let Some(c) = cost {
+            self.cost_usd += c;
         }
     }
 }
@@ -1043,9 +1062,21 @@ fn run_linelog(
     // Build the flattened, ordered work-list and run the worker on this thread.
     // Counters are derived from the run's events (read after the loop) so we report
     // the true captured / triage-skip / too-short split, not "every Ok() is captured".
-    let worker_plan = build_work_plan(&projects, args.synth_every, args.output_dir.as_ref(), routing_cwd.as_deref());
+    let worker_plan = build_work_plan(
+        &projects,
+        args.synth_every,
+        args.output_dir.as_ref(),
+        routing_cwd.as_deref(),
+    );
     let run_start = Instant::now();
     let since_ms = unix_now_millis();
+
+    // Project keys for the event tailer so we only fold this run's events.
+    let project_keys: std::collections::HashSet<String> =
+        projects.iter().map(|p| p.normalized_cwd.clone()).collect();
+    let log_path = events_log_path();
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<crate::tail::Record>(1000);
+    spawn_archeologist_tailer(log_path, project_keys, since_ms, ev_tx);
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
@@ -1059,8 +1090,14 @@ fn run_linelog(
 
     let mut current_proj_printed: Option<usize> = None;
     let mut grand_seen = 0usize;
+    let mut counters = RunCounters::default();
 
     for msg in rx.iter() {
+        // Fold any new events into the live counters before handling the worker msg.
+        while let Ok(rec) = ev_rx.try_recv() {
+            counters.apply(&rec.ev.event, &rec.ev.payload);
+        }
+
         match msg {
             WorkerMsg::SessionStart { item } => {
                 if current_proj_printed != Some(item.project_idx) {
@@ -1075,6 +1112,7 @@ fn run_linelog(
                     current_proj_printed = Some(item.project_idx);
                 }
                 grand_seen += 1;
+                counters.seen = grand_seen;
                 print!(
                     "archeologist:   [{}/{}] session {} ({})  msgs={}  ...",
                     item.session_in_project + 1,
@@ -1085,10 +1123,18 @@ fn run_linelog(
                 );
                 let _ = io::Write::flush(&mut io::stdout());
             }
-            WorkerMsg::SessionDone { error } => match error {
-                None => println!(" ok"),
-                Some(e) => println!(" error: {}", e),
-            },
+            WorkerMsg::SessionDone { error } => {
+                let tally = format!(
+                    "tokens {} in / {} out  ${:.4}",
+                    fmt_tokens(counters.tokens_in),
+                    fmt_tokens(counters.tokens_out),
+                    counters.cost_usd,
+                );
+                match error {
+                    None => println!(" ok  {}", tally),
+                    Some(e) => println!(" error: {}  {}", e, tally),
+                }
+            }
             WorkerMsg::Checkpoint { final_for_project } => {
                 if final_for_project {
                     println!("archeologist:   [final checkpoint] rebuilt index");
@@ -1099,11 +1145,11 @@ fn run_linelog(
             WorkerMsg::Finished => break,
         }
     }
+    // Drain trailing events so the final summary is accurate.
+    while let Ok(rec) = ev_rx.try_recv() {
+        counters.apply(&rec.ev.event, &rec.ev.payload);
+    }
     let _ = worker.join();
-
-    // Derive the true outcome split from the run's events. `seen` comes from the driver
-    // (too-short sessions emit no event, so too_short() = seen - captured - triage_skip).
-    let mut counters = collect_run_counters(&projects, since_ms);
     counters.seen = grand_seen;
     let total_elapsed = fmt_duration(run_start.elapsed());
     let interrupted_note = if counters.interrupted() > 0 {
@@ -1112,7 +1158,7 @@ fn run_linelog(
         String::new()
     };
     println!(
-        "archeologist: complete — {} captured / {} seen ({} triage-skip, {} too-short{}), {} guides, {} statements, {} revisions, {}",
+        "archeologist: complete — {} captured / {} seen ({} triage-skip, {} too-short{}), {} guides, {} statements, {} revisions, {} removals, {} links, tokens {} in / {} out, ${:.4}, {}",
         counters.captured,
         grand_seen,
         counters.triage_skip,
@@ -1121,6 +1167,11 @@ fn run_linelog(
         counters.guides,
         counters.statements,
         counters.revisions,
+        counters.removals,
+        counters.links,
+        fmt_tokens(counters.tokens_in),
+        fmt_tokens(counters.tokens_out),
+        counters.cost_usd,
         total_elapsed,
     );
 
@@ -1247,8 +1298,11 @@ fn stage_label_for_event(event: &str) -> Option<&'static str> {
         "capture.authority_tagging" => "routing to guides",
         "capture.route_recall" => "routing to guides",
         "capture.route" => "reconciling guides",
-        "wiki.create" | "wiki.add_statement" | "wiki.revise_statement"
-        | "wiki.remove_statement" | "wiki.link" => "writing wiki",
+        "wiki.create"
+        | "wiki.add_statement"
+        | "wiki.revise_statement"
+        | "wiki.remove_statement"
+        | "wiki.link" => "writing wiki",
         "capture.agent_done" => "rebuilding index",
         _ => return None,
     })
@@ -1347,7 +1401,11 @@ impl Drop for StderrRedirect {
     }
 }
 
-fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd: Option<String>) -> Result<()> {
+fn run_tui_mode(
+    projects: Vec<ProjectInfo>,
+    args: &ArcheologistArgs,
+    routing_cwd: Option<String>,
+) -> Result<()> {
     use crossterm::{
         event::{self as ct_event, Event as CtEvent, KeyCode, KeyModifiers},
         execute,
@@ -1358,7 +1416,12 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd
     use std::sync::mpsc;
 
     // ── Pre-flight: build plan & totals (cheap, before touching the terminal) ──
-    let plan = build_work_plan(&projects, args.synth_every, args.output_dir.as_ref(), routing_cwd.as_deref());
+    let plan = build_work_plan(
+        &projects,
+        args.synth_every,
+        args.output_dir.as_ref(),
+        routing_cwd.as_deref(),
+    );
     let total_sessions = plan.len();
     if total_sessions == 0 {
         println!("archeologist: nothing new to capture — all selected sessions already done");
@@ -1591,7 +1654,8 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd
                         if view.detail_open.is_some() {
                             view.detail_scroll = view.detail_scroll.saturating_sub(1);
                         } else {
-                            view.feed_scroll = view.feed_scroll.saturating_add(1).min(view.feed.len());
+                            view.feed_scroll =
+                                view.feed_scroll.saturating_add(1).min(view.feed.len());
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -1652,7 +1716,7 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd
         String::new()
     };
     println!(
-        "archeologist: complete — {} captured / {} seen ({} triage-skip, {} too-short{}), {} guides, {} statements, {} revisions, {} removals, {} links, {}",
+        "archeologist: complete — {} captured / {} seen ({} triage-skip, {} too-short{}), {} guides, {} statements, {} revisions, {} removals, {} links, tokens {} in / {} out, ${:.4}, {}",
         c.captured,
         view.seen,
         c.triage_skip,
@@ -1663,6 +1727,9 @@ fn run_tui_mode(projects: Vec<ProjectInfo>, args: &ArcheologistArgs, routing_cwd
         c.revisions,
         c.removals,
         c.links,
+        fmt_tokens(c.tokens_in),
+        fmt_tokens(c.tokens_out),
+        c.cost_usd,
         fmt_duration(view.run_start.elapsed()),
     );
     Ok(())
@@ -1770,78 +1837,118 @@ fn feed_line_for_event(rec: &crate::tail::Record) -> Option<FeedLine> {
     let text_body = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let proj = crate::tail::proj_display_name(&ev.project);
 
-    let (glyph, text, highlight, detail): (&'static str, String, bool, String) = match ev.event.as_str() {
-        "wiki.create" => {
-            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
-            let detail = format!(
-                "New guide: {}\nSection: {}\n\n{}",
-                title,
-                if section.is_empty() { "(top level)" } else { section },
-                text_body
-            );
-            ("✚", format!("New guide: \"{}\"", trunc_feed(title, 50)), false, detail)
-        }
-        "wiki.add_statement" => {
-            let sec_short = section.trim_start_matches("## ").trim_start_matches("### ");
-            let preview = trunc_feed(text_body, 55);
-            let detail = format!("{} › {}\n\n{}", slug, section, text_body);
-            ("＋", format!("{} › {}  {}", slug, sec_short, preview), false, detail)
-        }
-        "wiki.revise_statement" => {
-            let sec_short = section.trim_start_matches("## ").trim_start_matches("### ");
-            let preview = trunc_feed(text_body, 50);
-            let detail = format!("{} › {}  (updated)\n\n{}", slug, section, text_body);
-            ("✎", format!("{} › {}  {}", slug, sec_short, preview), true, detail)
-        }
-        "wiki.remove_statement" => {
-            let detail = format!("Removed section from {}\nSection: {}", slug, section);
-            ("⊘", format!("Removed {} › {}", slug, section), false, detail)
-        }
-        "wiki.link" => {
-            let a = p.get("a").and_then(|v| v.as_str()).unwrap_or("");
-            let b = p.get("b").and_then(|v| v.as_str()).unwrap_or("");
-            ("↔", format!("Linked {} ↔ {}", a, b), false, String::new())
-        }
-        "capture.triage" => {
-            if p.get("result").and_then(|v| v.as_str()) == Some("skip") {
-                ("⊘", "Nothing to capture — skipped".to_string(), false, String::new())
-            } else {
-                return None;
+    let (glyph, text, highlight, detail): (&'static str, String, bool, String) =
+        match ev.event.as_str() {
+            "wiki.create" => {
+                let title = p.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
+                let detail = format!(
+                    "New guide: {}\nSection: {}\n\n{}",
+                    title,
+                    if section.is_empty() {
+                        "(top level)"
+                    } else {
+                        section
+                    },
+                    text_body
+                );
+                (
+                    "✚",
+                    format!("New guide: \"{}\"", trunc_feed(title, 50)),
+                    false,
+                    detail,
+                )
             }
-        }
-        "capture.start" => {
-            let n = p.get("exchanges").and_then(|v| v.as_u64()).unwrap_or(0);
-            let date = p.get("date").and_then(|v| v.as_str()).unwrap_or("—");
-            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("—");
-            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("—");
-            let detail = format!(
-                "Session: {}\nDate: {}\nExchanges: {}\nModel: {}",
-                sid, date, n, model
-            );
-            ("▶", format!("Reading conversation from {} ({} exchanges)", date, n), false, detail)
-        }
-        "capture.agent_done" => {
-            let s = p.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            // Extract counts from summary like "Staged capture complete: 24 claim(s) admitted across 3 guide(s), 18 op(s) applied."
-            let display = if s.contains("admitted") {
-                trunc_feed(s.trim_start_matches("Staged capture complete: "), 72)
-            } else {
-                trunc_feed(s, 72)
-            };
-            ("✓", format!("Saved: {}", display), false, s.to_string())
-        }
-        "capture.done" => {
-            let secs = ev.lat_ms.map(|ms| ms / 1000).unwrap_or(0);
-            ("●", format!("Done in {}s", secs), false, String::new())
-        }
-        "error" => {
-            let stage = p.get("stage").and_then(|v| v.as_str()).unwrap_or("");
-            let msg = p.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let detail = format!("Stage: {}\n\n{}", stage, msg);
-            ("✖", format!("Error: {}", trunc_feed(msg, 60)), false, detail)
-        }
-        _ => return None,
-    };
+            "wiki.add_statement" => {
+                let sec_short = section.trim_start_matches("## ").trim_start_matches("### ");
+                let preview = trunc_feed(text_body, 55);
+                let detail = format!("{} › {}\n\n{}", slug, section, text_body);
+                (
+                    "＋",
+                    format!("{} › {}  {}", slug, sec_short, preview),
+                    false,
+                    detail,
+                )
+            }
+            "wiki.revise_statement" => {
+                let sec_short = section.trim_start_matches("## ").trim_start_matches("### ");
+                let preview = trunc_feed(text_body, 50);
+                let detail = format!("{} › {}  (updated)\n\n{}", slug, section, text_body);
+                (
+                    "✎",
+                    format!("{} › {}  {}", slug, sec_short, preview),
+                    true,
+                    detail,
+                )
+            }
+            "wiki.remove_statement" => {
+                let detail = format!("Removed section from {}\nSection: {}", slug, section);
+                (
+                    "⊘",
+                    format!("Removed {} › {}", slug, section),
+                    false,
+                    detail,
+                )
+            }
+            "wiki.link" => {
+                let a = p.get("a").and_then(|v| v.as_str()).unwrap_or("");
+                let b = p.get("b").and_then(|v| v.as_str()).unwrap_or("");
+                ("↔", format!("Linked {} ↔ {}", a, b), false, String::new())
+            }
+            "capture.triage" => {
+                if p.get("result").and_then(|v| v.as_str()) == Some("skip") {
+                    (
+                        "⊘",
+                        "Nothing to capture — skipped".to_string(),
+                        false,
+                        String::new(),
+                    )
+                } else {
+                    return None;
+                }
+            }
+            "capture.start" => {
+                let n = p.get("exchanges").and_then(|v| v.as_u64()).unwrap_or(0);
+                let date = p.get("date").and_then(|v| v.as_str()).unwrap_or("—");
+                let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("—");
+                let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("—");
+                let detail = format!(
+                    "Session: {}\nDate: {}\nExchanges: {}\nModel: {}",
+                    sid, date, n, model
+                );
+                (
+                    "▶",
+                    format!("Reading conversation from {} ({} exchanges)", date, n),
+                    false,
+                    detail,
+                )
+            }
+            "capture.agent_done" => {
+                let s = p.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                // Extract counts from summary like "Staged capture complete: 24 claim(s) admitted across 3 guide(s), 18 op(s) applied."
+                let display = if s.contains("admitted") {
+                    trunc_feed(s.trim_start_matches("Staged capture complete: "), 72)
+                } else {
+                    trunc_feed(s, 72)
+                };
+                ("✓", format!("Saved: {}", display), false, s.to_string())
+            }
+            "capture.done" => {
+                let secs = ev.lat_ms.map(|ms| ms / 1000).unwrap_or(0);
+                ("●", format!("Done in {}s", secs), false, String::new())
+            }
+            "error" => {
+                let stage = p.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+                let msg = p.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let detail = format!("Stage: {}\n\n{}", stage, msg);
+                (
+                    "✖",
+                    format!("Error: {}", trunc_feed(msg, 60)),
+                    false,
+                    detail,
+                )
+            }
+            _ => return None,
+        };
     Some(FeedLine {
         ts: crate::tail::format_ts_short(&ev.ts),
         project: proj,
@@ -1866,7 +1973,12 @@ fn feed_cursor_idx(total: usize, feed_scroll: usize) -> usize {
 /// to the bottom (newest); it only scrolls up once the cursor climbs above its top, which keeps
 /// the rows below the cursor visible. Invariant: when `feed_scroll > 0` the cursor is always
 /// inside `[start, end)`, so the selected line is never scrolled out of view.
-fn feed_window(total: usize, viewport_h: usize, feed_scroll: usize, cursor_idx: usize) -> (usize, usize) {
+fn feed_window(
+    total: usize,
+    viewport_h: usize,
+    feed_scroll: usize,
+    cursor_idx: usize,
+) -> (usize, usize) {
     let mut start = total.saturating_sub(viewport_h);
     if feed_scroll > 0 && cursor_idx < start {
         start = cursor_idx;
@@ -1909,7 +2021,11 @@ fn load_transcript_sidecar(path: &str) -> Option<String> {
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
         let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        out.push_str(&format!("───── {} ─────\n{}\n\n", role.to_uppercase(), content));
+        out.push_str(&format!(
+            "───── {} ─────\n{}\n\n",
+            role.to_uppercase(),
+            content
+        ));
     }
     if out.trim().is_empty() {
         None
@@ -1983,7 +2099,11 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
         ));
     frame.render_widget(overall, header_rows[0]);
 
-    let proj_new = view.project_new.get(view.cur_project_idx).copied().unwrap_or(0);
+    let proj_new = view
+        .project_new
+        .get(view.cur_project_idx)
+        .copied()
+        .unwrap_or(0);
     let proj_ratio = if proj_new > 0 {
         view.cur_project_done as f64 / proj_new as f64
     } else {
@@ -2007,17 +2127,38 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
         ));
     frame.render_widget(project, header_rows[1]);
 
-    let cost_line = Paragraph::new(Line::from(vec![Span::styled(
-        format!(
-            "Cost  est ~${:.2}-${:.2}   tokens {} in / {} out   model {}   serial",
-            view.est_cost_low,
-            view.est_cost_high,
+    let actual_cost = view.counters.cost_usd;
+    let cost_color = if actual_cost == 0.0 {
+        Color::DarkGray
+    } else if actual_cost <= view.est_cost_low {
+        Color::Green
+    } else if actual_cost <= view.est_cost_high {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    let cost_line = Paragraph::new(Line::from(vec![
+        Span::raw("Cost  est ~"),
+        Span::styled(
+            format!("${:.2}-${:.2}", view.est_cost_low, view.est_cost_high),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("   actual ~"),
+        Span::styled(
+            format!("${:.2}", actual_cost),
+            Style::default().fg(cost_color),
+        ),
+        Span::raw(format!(
+            "   tokens {} in / {} out   model {}   serial",
             fmt_tokens(view.counters.tokens_in),
             fmt_tokens(view.counters.tokens_out),
-            if view.capture_model.is_empty() { "(unset)" } else { &view.capture_model },
-        ),
-        Style::default().fg(Color::Yellow),
-    )]));
+            if view.capture_model.is_empty() {
+                "(unset)"
+            } else {
+                &view.capture_model
+            },
+        )),
+    ]));
     frame.render_widget(cost_line, header_rows[2]);
 
     // ── Counters ──
@@ -2026,7 +2167,11 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
     let counters_text = vec![
         Line::from(format!(
             "seen {}   captured {}   triage-skip {}   too-short {}   guides {}",
-            view.seen, c.captured, c.triage_skip, c.too_short(), c.guides,
+            view.seen,
+            c.captured,
+            c.triage_skip,
+            c.too_short(),
+            c.guides,
         )),
         Line::from(format!(
             "statements {}   revisions {}   removals {}   links {}   errors {}",
@@ -2043,7 +2188,12 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
     let cursor_idx = feed_cursor_idx(total, view.feed_scroll);
     // Show the cursor's position in the feed while scrolled up so it's clear where you are.
     let feed_title = if view.feed_scroll > 0 {
-        format!(" feed · line {}/{}{} ", cursor_idx + 1, total, if view.feed_paused { " [PAUSED]" } else { "" })
+        format!(
+            " feed · line {}/{}{} ",
+            cursor_idx + 1,
+            total,
+            if view.feed_paused { " [PAUSED]" } else { "" }
+        )
     } else if view.feed_paused {
         " live feed [PAUSED] ".to_string()
     } else {
@@ -2066,7 +2216,9 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
         .map(|(i, fl)| {
             let is_cursor = view.feed_scroll > 0 && i == cursor_idx;
             let style = if fl.highlight {
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
             } else if is_cursor {
                 Style::default().bg(Color::DarkGray)
             } else {
@@ -2074,7 +2226,10 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{}  ", fl.ts), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<12} ", trunc_feed(&fl.project, 12)), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    format!("{:<12} ", trunc_feed(&fl.project, 12)),
+                    Style::default().fg(Color::Blue),
+                ),
                 Span::raw(format!("{} ", fl.glyph)),
                 Span::styled(fl.text.clone(), style),
             ]))
@@ -2090,7 +2245,8 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
             Style::default().fg(Color::Green),
         ))
     } else if view.current.active {
-        let elapsed = unix_now_millis() / 1000 - view.current.started_at_secs.min(unix_now_millis() / 1000);
+        let elapsed =
+            unix_now_millis() / 1000 - view.current.started_at_secs.min(unix_now_millis() / 1000);
         let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let sp = spinner[((view.run_start.elapsed().as_millis() / 100) % 10) as usize];
         let stage = if view.current.stage.is_empty() {
@@ -2181,7 +2337,642 @@ fn render_run_view(frame: &mut ratatui::Frame, view: &mut RunView) {
 
 // ─── Picker TUI (crossterm multiselect) ───────────────────────────────────────
 
-pub fn run_picker(mut projects: Vec<ProjectInfo>, current_cwd: Option<&str>) -> Result<Vec<ProjectInfo>> {
+#[derive(Clone)]
+struct ClaudeProjectCandidate {
+    dir_path: PathBuf,
+    dir_name: String,
+    display_name: String,
+    current_match: bool,
+}
+
+#[derive(Clone)]
+enum LazyStatsState {
+    Pending,
+    Loading,
+    Ready(Vec<ProjectInfo>),
+    Error(String),
+}
+
+#[derive(Default)]
+struct LazyStatsTotals {
+    sessions: usize,
+    new_sessions: usize,
+    total_messages: usize,
+    total_bytes: u64,
+    first_date: Option<String>,
+    last_date: Option<String>,
+}
+
+struct LazyStatsResult {
+    idx: usize,
+    result: std::result::Result<Vec<ProjectInfo>, String>,
+}
+
+fn run_lazy_picker(args: &ArcheologistArgs, current_cwd: Option<&str>) -> Result<Vec<ProjectInfo>> {
+    use crossterm::{
+        event::{self as ct_event, Event as CtEvent, KeyCode},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+        Terminal,
+    };
+
+    let candidates = list_claude_project_candidates(current_cwd)?;
+    if candidates.is_empty() {
+        println!("archeologist: no Claude Code projects found in ~/.claude/projects/");
+        return Ok(vec![]);
+    }
+
+    struct TGuard;
+    impl TGuard {
+        fn install_panic_hook() {
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                default(info);
+            }));
+        }
+    }
+    impl Drop for TGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<usize>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<LazyStatsResult>();
+    let worker_candidates = candidates.clone();
+    let since_filter = args.since.clone();
+    let output_dir = args.output_dir.clone();
+    std::thread::spawn(move || {
+        for idx in req_rx {
+            let Some(candidate) = worker_candidates.get(idx) else {
+                continue;
+            };
+            let infos = scan_single_claude_project_dir(
+                &candidate.dir_path,
+                &since_filter,
+                output_dir.as_ref(),
+            );
+            let result = Ok(infos);
+            let _ = res_tx.send(LazyStatsResult { idx, result });
+        }
+    });
+
+    TGuard::install_panic_hook();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let _guard = TGuard;
+
+    let n = candidates.len();
+    let mut states = vec![LazyStatsState::Pending; n];
+    let mut selected: Vec<bool> = candidates.iter().map(|c| c.current_match).collect();
+    if !selected.iter().any(|s| *s) && n == 1 {
+        selected[0] = true;
+    }
+    for idx in selected_indices(&selected) {
+        enqueue_lazy_stats(idx, &mut states, &req_tx);
+    }
+
+    let cfg = crate::config::load_config().unwrap_or_default();
+    let capture_model = if cfg.capture_model.is_empty() {
+        "(unset)".to_string()
+    } else {
+        cfg.capture_model.clone()
+    };
+    let triage_model = if cfg.capture_triage_model.is_empty() {
+        "off".to_string()
+    } else {
+        cfg.capture_triage_model.clone()
+    };
+
+    let mut cursor = 0usize;
+    let mut list_state = ListState::default();
+    list_state.select(Some(cursor));
+    let mut query = String::new();
+    let mut search_mode = false;
+    let mut run_requested = false;
+    let mut dry_run_requested = false;
+
+    loop {
+        while let Ok(msg) = res_rx.try_recv() {
+            if let Some(state) = states.get_mut(msg.idx) {
+                *state = match msg.result {
+                    Ok(infos) => LazyStatsState::Ready(infos),
+                    Err(e) => LazyStatsState::Error(e),
+                };
+            }
+        }
+
+        if run_requested && selected_ready(&selected, &states) {
+            drop(_guard);
+            return Ok(chosen_lazy_projects(candidates, selected, states));
+        }
+        if dry_run_requested && selected_ready(&selected, &states) {
+            drop(_guard);
+            let chosen = chosen_lazy_projects(candidates, selected, states);
+            if chosen.is_empty() {
+                println!("archeologist: no projects selected for dry-run");
+            } else {
+                print_dry_run_report(&chosen, args.synth_every);
+            }
+            return Ok(vec![]);
+        }
+
+        let visible: Vec<usize> = (0..n)
+            .filter(|&i| {
+                query.is_empty()
+                    || fuzzy_match(&candidates[i].display_name, &query)
+                    || fuzzy_match(&candidates[i].dir_name, &query)
+            })
+            .collect();
+        if cursor >= visible.len() {
+            cursor = visible.len().saturating_sub(1);
+        }
+        list_state.select(if visible.is_empty() {
+            None
+        } else {
+            Some(cursor)
+        });
+
+        let selected_summary = lazy_selected_summary(&selected, &states);
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(area);
+
+            let items: Vec<ListItem> = visible
+                .iter()
+                .enumerate()
+                .map(|(row, &i)| {
+                    let candidate = &candidates[i];
+                    let check = if selected[i] { "[x]" } else { "[ ]" };
+                    let highlight = row == cursor;
+                    let (label, sessions, new, dates, bytes, suffix) =
+                        lazy_row_fields(candidate, &states[i]);
+                    let line_text = format!(
+                        " {} {:<35} sessions:{:>4}{}{} {:>8}{}",
+                        check,
+                        truncate_str(&label, 35),
+                        sessions,
+                        new,
+                        dates,
+                        bytes,
+                        suffix,
+                    );
+                    let style = if highlight {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else if selected[i] {
+                        Style::default().fg(Color::Green)
+                    } else if matches!(states[i], LazyStatsState::Error(_)) {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(Span::styled(line_text, style)))
+                })
+                .collect();
+
+            let title = format!(
+                " archeologist — {} Claude project dirs{}  ·  capture: {}  triage: {} ",
+                visible.len(),
+                if query.is_empty() {
+                    String::new()
+                } else {
+                    format!(" matching '{}'", query)
+                },
+                capture_model,
+                triage_model,
+            );
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title));
+            frame.render_stateful_widget(list, chunks[0], &mut list_state);
+
+            let status_text = if search_mode {
+                format!("  /{}▏   (type to filter · Enter apply · Esc cancel)", query)
+            } else if run_requested || dry_run_requested {
+                format!(
+                    "  calculating selected projects: {} ready, {} loading, {} pending  |  sessions {}  new {}",
+                    selected_summary.ready_selected,
+                    selected_summary.loading_selected,
+                    selected_summary.pending_selected,
+                    selected_summary.totals.sessions,
+                    selected_summary.totals.new_sessions,
+                )
+            } else {
+                format!(
+                    "  {} selected  |  stats {} ready, {} loading  |  sessions {}  new {}  msgs {}  size {}  |  ↑/↓ move  space toggle  a all  n none  / search  d dry-run  enter run  q quit",
+                    selected_summary.selected,
+                    selected_summary.ready_selected,
+                    selected_summary.loading_selected,
+                    selected_summary.totals.sessions,
+                    selected_summary.totals.new_sessions,
+                    selected_summary.totals.total_messages,
+                    fmt_bytes(selected_summary.totals.total_bytes),
+                )
+            };
+            let status = Paragraph::new(Line::from(Span::styled(
+                status_text,
+                Style::default().fg(if search_mode {
+                    Color::Yellow
+                } else if run_requested || dry_run_requested {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            )));
+            frame.render_widget(status, chunks[1]);
+        })?;
+
+        if ct_event::poll(std::time::Duration::from_millis(100))? {
+            if let CtEvent::Key(key) = ct_event::read()? {
+                if search_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            query.clear();
+                            search_mode = false;
+                            cursor = 0;
+                        }
+                        KeyCode::Enter => {
+                            search_mode = false;
+                            cursor = 0;
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            cursor = 0;
+                        }
+                        KeyCode::Char(c) => {
+                            query.push(c);
+                            cursor = 0;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char('/') => {
+                        search_mode = true;
+                    }
+                    KeyCode::Char('q') => {
+                        drop(_guard);
+                        return Ok(vec![]);
+                    }
+                    KeyCode::Esc => {
+                        if query.is_empty() {
+                            drop(_guard);
+                            return Ok(vec![]);
+                        }
+                        query.clear();
+                        cursor = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cursor = cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if cursor + 1 < visible.len() {
+                            cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(&i) = visible.get(cursor) {
+                            selected[i] = !selected[i];
+                            if selected[i] {
+                                enqueue_lazy_stats(i, &mut states, &req_tx);
+                            }
+                            run_requested = false;
+                            dry_run_requested = false;
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        for &i in &visible {
+                            selected[i] = true;
+                            enqueue_lazy_stats(i, &mut states, &req_tx);
+                        }
+                        run_requested = false;
+                        dry_run_requested = false;
+                    }
+                    KeyCode::Char('n') => {
+                        for &i in &visible {
+                            selected[i] = false;
+                        }
+                        run_requested = false;
+                        dry_run_requested = false;
+                    }
+                    KeyCode::Char('d') => {
+                        for idx in selected_indices(&selected) {
+                            enqueue_lazy_stats(idx, &mut states, &req_tx);
+                        }
+                        dry_run_requested = true;
+                        run_requested = false;
+                    }
+                    KeyCode::Enter => {
+                        for idx in selected_indices(&selected) {
+                            enqueue_lazy_stats(idx, &mut states, &req_tx);
+                        }
+                        run_requested = true;
+                        dry_run_requested = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn list_claude_project_candidates(
+    current_cwd: Option<&str>,
+) -> Result<Vec<ClaudeProjectCandidate>> {
+    let home = dirs::home_dir().expect("cannot determine home directory");
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        return Ok(vec![]);
+    }
+
+    let current_encoded = current_cwd.map(encode_claude_project_path);
+    let dir_iter = match std::fs::read_dir(&claude_projects) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("archeologist: cannot read ~/.claude/projects/: {}", e);
+            return Ok(vec![]);
+        }
+    };
+
+    let mut candidates = Vec::new();
+    for entry in dir_iter {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let dir_path = entry.path();
+        if !dir_path.is_dir() || !dir_has_jsonl(&dir_path) {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let current_match = current_encoded.as_ref() == Some(&dir_name);
+        let display_name = if current_match {
+            current_cwd
+                .and_then(|c| Path::new(c).file_name().and_then(|n| n.to_str()))
+                .unwrap_or(&dir_name)
+                .to_string()
+        } else {
+            display_from_claude_project_dir_name(&dir_name)
+        };
+        candidates.push(ClaudeProjectCandidate {
+            dir_path,
+            dir_name,
+            display_name,
+            current_match,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.current_match
+            .cmp(&a.current_match)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    Ok(candidates)
+}
+
+fn dir_has_jsonl(dir: &Path) -> bool {
+    let iter = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    for entry in iter.filter_map(|e| e.ok()) {
+        if entry.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            return true;
+        }
+    }
+    false
+}
+
+fn encode_claude_project_path(path: &str) -> String {
+    path.trim_end_matches('/').replace('/', "-")
+}
+
+fn display_from_claude_project_dir_name(name: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_encoded = encode_claude_project_path(&home.to_string_lossy());
+        let home_prefix = format!("{}-", home_encoded);
+        if let Some(rest) = name.strip_prefix(&home_prefix) {
+            return format!("~/{}", rest);
+        }
+    }
+    name.trim_start_matches('-').to_string()
+}
+
+fn enqueue_lazy_stats(
+    idx: usize,
+    states: &mut [LazyStatsState],
+    req_tx: &std::sync::mpsc::Sender<usize>,
+) {
+    if matches!(states.get(idx), Some(LazyStatsState::Pending)) {
+        states[idx] = LazyStatsState::Loading;
+        let _ = req_tx.send(idx);
+    }
+}
+
+fn selected_indices(selected: &[bool]) -> Vec<usize> {
+    selected
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| if *s { Some(i) } else { None })
+        .collect()
+}
+
+fn selected_ready(selected: &[bool], states: &[LazyStatsState]) -> bool {
+    selected.iter().enumerate().all(|(i, is_selected)| {
+        !*is_selected
+            || matches!(
+                states.get(i),
+                Some(LazyStatsState::Ready(_)) | Some(LazyStatsState::Error(_))
+            )
+    })
+}
+
+fn chosen_lazy_projects(
+    _candidates: Vec<ClaudeProjectCandidate>,
+    selected: Vec<bool>,
+    states: Vec<LazyStatsState>,
+) -> Vec<ProjectInfo> {
+    selected
+        .into_iter()
+        .zip(states)
+        .filter_map(|(is_selected, state)| {
+            if !is_selected {
+                return None;
+            }
+            match state {
+                LazyStatsState::Ready(infos) => Some(infos),
+                _ => None,
+            }
+        })
+        .flatten()
+        .collect()
+}
+
+struct LazySelectedSummary {
+    selected: usize,
+    ready_selected: usize,
+    loading_selected: usize,
+    pending_selected: usize,
+    totals: LazyStatsTotals,
+}
+
+fn lazy_selected_summary(selected: &[bool], states: &[LazyStatsState]) -> LazySelectedSummary {
+    let mut summary = LazySelectedSummary {
+        selected: 0,
+        ready_selected: 0,
+        loading_selected: 0,
+        pending_selected: 0,
+        totals: LazyStatsTotals::default(),
+    };
+    for (i, is_selected) in selected.iter().enumerate() {
+        if !*is_selected {
+            continue;
+        }
+        summary.selected += 1;
+        match states.get(i) {
+            Some(LazyStatsState::Ready(infos)) => {
+                summary.ready_selected += 1;
+                summary.totals.add_infos(infos);
+            }
+            Some(LazyStatsState::Loading) => summary.loading_selected += 1,
+            Some(LazyStatsState::Pending) | Some(LazyStatsState::Error(_)) | None => {
+                summary.pending_selected += 1;
+            }
+        }
+    }
+    summary
+}
+
+fn lazy_row_fields(
+    candidate: &ClaudeProjectCandidate,
+    state: &LazyStatsState,
+) -> (String, String, String, String, String, String) {
+    match state {
+        LazyStatsState::Pending => (
+            candidate.display_name.clone(),
+            "--".to_string(),
+            String::new(),
+            String::new(),
+            "--".to_string(),
+            "  idle".to_string(),
+        ),
+        LazyStatsState::Loading => (
+            candidate.display_name.clone(),
+            "…".to_string(),
+            String::new(),
+            String::new(),
+            "…".to_string(),
+            "  scanning".to_string(),
+        ),
+        LazyStatsState::Error(e) => (
+            candidate.display_name.clone(),
+            "0".to_string(),
+            String::new(),
+            String::new(),
+            "0B".to_string(),
+            format!("  {}", truncate_str(e, 18)),
+        ),
+        LazyStatsState::Ready(infos) => {
+            let totals = totals_for_project_infos(infos);
+            let label = infos
+                .first()
+                .map(|p| p.display_name.clone())
+                .unwrap_or_else(|| candidate.display_name.clone());
+            let new = if totals.new_sessions > 0 {
+                format!("  NEW:{}", totals.new_sessions)
+            } else {
+                String::new()
+            };
+            let dates = match (&totals.first_date, &totals.last_date) {
+                (Some(f), Some(_l)) => format!("  {}..", f),
+                (Some(f), None) => format!("  {}", f),
+                _ => String::new(),
+            };
+            (
+                label,
+                totals.sessions.to_string(),
+                new,
+                dates,
+                fmt_bytes(totals.total_bytes),
+                String::new(),
+            )
+        }
+    }
+}
+
+impl LazyStatsTotals {
+    fn add_infos(&mut self, infos: &[ProjectInfo]) {
+        let other = totals_for_project_infos(infos);
+        self.sessions += other.sessions;
+        self.new_sessions += other.new_sessions;
+        self.total_messages += other.total_messages;
+        self.total_bytes += other.total_bytes;
+        if let Some(first) = other.first_date {
+            if self
+                .first_date
+                .as_ref()
+                .map_or(true, |cur| first.as_str() < cur.as_str())
+            {
+                self.first_date = Some(first);
+            }
+        }
+        if let Some(last) = other.last_date {
+            if self
+                .last_date
+                .as_ref()
+                .map_or(true, |cur| last.as_str() > cur.as_str())
+            {
+                self.last_date = Some(last);
+            }
+        }
+    }
+}
+
+fn totals_for_project_infos(infos: &[ProjectInfo]) -> LazyStatsTotals {
+    let mut totals = LazyStatsTotals::default();
+    for info in infos {
+        totals.sessions += info.sessions.len();
+        totals.new_sessions += info.new_sessions;
+        totals.total_messages += info.total_messages;
+        totals.total_bytes += info.total_bytes;
+        if let Some(first) = &info.first_date {
+            if totals.first_date.as_ref().map_or(true, |cur| first < cur) {
+                totals.first_date = Some(first.clone());
+            }
+        }
+        if let Some(last) = &info.last_date {
+            if totals.last_date.as_ref().map_or(true, |cur| last > cur) {
+                totals.last_date = Some(last.clone());
+            }
+        }
+    }
+    totals
+}
+
+#[allow(dead_code)]
+pub fn run_picker(
+    mut projects: Vec<ProjectInfo>,
+    current_cwd: Option<&str>,
+) -> Result<Vec<ProjectInfo>> {
     use crossterm::{
         event::{self as ct_event, Event as CtEvent, KeyCode},
         execute,
@@ -2224,13 +3015,18 @@ pub fn run_picker(mut projects: Vec<ProjectInfo>, current_cwd: Option<&str>) -> 
     let _guard = TGuard;
 
     // Normalize the current cwd for matching against project keys.
-    let current_normalized = current_cwd
-        .map(|c| normalize_path(&PathBuf::from(c)));
+    let current_normalized = current_cwd.map(|c| normalize_path(&PathBuf::from(c)));
 
     // Float matching projects to the top (stable within each group).
     if let Some(ref norm) = current_normalized {
         let mut order: Vec<usize> = (0..projects.len()).collect();
-        order.sort_by_key(|&i| if projects[i].normalized_cwd == *norm { 0usize } else { 1usize });
+        order.sort_by_key(|&i| {
+            if projects[i].normalized_cwd == *norm {
+                0usize
+            } else {
+                1usize
+            }
+        });
         projects = order.iter().map(|&i| projects[i].clone()).collect();
     }
 
@@ -2251,7 +3047,11 @@ pub fn run_picker(mut projects: Vec<ProjectInfo>, current_cwd: Option<&str>) -> 
 
     let mut selected: Vec<bool> = projects
         .iter()
-        .map(|p| current_normalized.as_ref().map_or(false, |norm| &p.normalized_cwd == norm))
+        .map(|p| {
+            current_normalized
+                .as_ref()
+                .map_or(false, |norm| &p.normalized_cwd == norm)
+        })
         .collect();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
@@ -2271,7 +3071,11 @@ pub fn run_picker(mut projects: Vec<ProjectInfo>, current_cwd: Option<&str>) -> 
         if cursor >= visible.len() {
             cursor = visible.len().saturating_sub(1);
         }
-        list_state.select(if visible.is_empty() { None } else { Some(cursor) });
+        list_state.select(if visible.is_empty() {
+            None
+        } else {
+            Some(cursor)
+        });
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -2536,12 +3340,48 @@ mod tests {
             lat_ms: None,
             payload,
         };
-        Record { raw: String::new(), ev }
+        Record {
+            raw: String::new(),
+            ev,
+        }
+    }
+
+    #[test]
+    fn claude_project_path_encoder_matches_directory_shape() {
+        assert_eq!(
+            encode_claude_project_path("/Users/pablofernandez/src/proactive-context"),
+            "-Users-pablofernandez-src-proactive-context"
+        );
+        assert_eq!(
+            encode_claude_project_path("/Users/pablofernandez/src/proactive-context/"),
+            "-Users-pablofernandez-src-proactive-context"
+        );
+    }
+
+    #[test]
+    fn lazy_selected_ready_allows_completed_or_error_rows_only() {
+        let selected = vec![true, true, false];
+        let states = vec![
+            LazyStatsState::Ready(Vec::new()),
+            LazyStatsState::Error("failed".to_string()),
+            LazyStatsState::Pending,
+        ];
+        assert!(selected_ready(&selected, &states));
+
+        let states = vec![
+            LazyStatsState::Ready(Vec::new()),
+            LazyStatsState::Loading,
+            LazyStatsState::Pending,
+        ];
+        assert!(!selected_ready(&selected, &states));
     }
 
     #[test]
     fn counters_fold_v04_events() {
-        let mut c = RunCounters { seen: 5, ..Default::default() };
+        let mut c = RunCounters {
+            seen: 5,
+            ..Default::default()
+        };
         // Two sessions capture cleanly (start → done each).
         c.apply("capture.start", &serde_json::json!({"exchanges": 10}));
         c.apply("capture.done", &serde_json::json!({"exchanges": 10}));
@@ -2549,12 +3389,27 @@ mod tests {
         c.apply("capture.done", &serde_json::json!({"exchanges": 8}));
         c.apply("capture.triage", &serde_json::json!({"result": "skip"}));
         c.apply("capture.triage", &serde_json::json!({"result": "proceed"})); // not a skip
-        c.apply("wiki.create", &serde_json::json!({"slug": "pkg-manager", "title": "Package Manager"}));
-        c.apply("wiki.add_statement", &serde_json::json!({"slug": "a", "section": "Overview"}));
-        c.apply("wiki.revise_statement", &serde_json::json!({"slug": "a", "section": "Overview"}));
-        c.apply("wiki.remove_statement", &serde_json::json!({"slug": "a", "section": "Old"}));
+        c.apply(
+            "wiki.create",
+            &serde_json::json!({"slug": "pkg-manager", "title": "Package Manager"}),
+        );
+        c.apply(
+            "wiki.add_statement",
+            &serde_json::json!({"slug": "a", "section": "Overview"}),
+        );
+        c.apply(
+            "wiki.revise_statement",
+            &serde_json::json!({"slug": "a", "section": "Overview"}),
+        );
+        c.apply(
+            "wiki.remove_statement",
+            &serde_json::json!({"slug": "a", "section": "Old"}),
+        );
         c.apply("wiki.link", &serde_json::json!({"a": "x", "b": "y"}));
-        c.apply("error", &serde_json::json!({"stage": "wiki.agent", "message": "boom"}));
+        c.apply(
+            "error",
+            &serde_json::json!({"stage": "wiki.agent", "message": "boom"}),
+        );
 
         assert_eq!(c.started, 2);
         assert_eq!(c.captured, 2);
@@ -2575,19 +3430,29 @@ mod tests {
     fn interrupted_session_is_not_counted_as_too_short() {
         // One session: picked up (seen), began capturing (start), but the worker was
         // stopped before capture.done — the exact case `q`-mid-EXTRACT produces.
-        let mut c = RunCounters { seen: 1, ..Default::default() };
+        let mut c = RunCounters {
+            seen: 1,
+            ..Default::default()
+        };
         c.apply("capture.start", &serde_json::json!({"exchanges": 3}));
         // no capture.done
         assert_eq!(c.started, 1);
         assert_eq!(c.captured, 0);
         assert_eq!(c.interrupted(), 1);
-        assert_eq!(c.too_short(), 0, "an interrupted capture must not read as too-short");
+        assert_eq!(
+            c.too_short(),
+            0,
+            "an interrupted capture must not read as too-short"
+        );
     }
 
     #[test]
     fn dead_v03_events_are_ignored() {
         // The dormant v0.3 names must NOT move any counter.
-        let mut c = RunCounters { seen: 3, ..Default::default() };
+        let mut c = RunCounters {
+            seen: 3,
+            ..Default::default()
+        };
         c.apply("capture.lesson", &serde_json::json!({"slug": "x"}));
         c.apply("synth.write", &serde_json::json!({}));
         assert_eq!(c.captured, 0);
@@ -2597,56 +3462,107 @@ mod tests {
     #[test]
     fn token_usage_accumulates_when_present() {
         let mut c = RunCounters::default();
-        c.apply("capture.done", &serde_json::json!({
-            "usage": {"prompt_tokens": 1000, "completion_tokens": 200}
-        }));
+        // Legacy nested usage shape
+        c.apply(
+            "capture.done",
+            &serde_json::json!({
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "cost": 0.0015}
+            }),
+        );
         assert_eq!(c.tokens_in, 1000);
         assert_eq!(c.tokens_out, 200);
+        assert!((c.cost_usd - 0.0015).abs() < f64::EPSILON);
+
+        // Real llm.response flat shape
+        c.apply(
+            "llm.response",
+            &serde_json::json!({
+                "model": "x",
+                "turn": 1,
+                "prompt_tokens": 500,
+                "completion_tokens": 100,
+                "cost_usd": 0.0008,
+            }),
+        );
+        assert_eq!(c.tokens_in, 1500);
+        assert_eq!(c.tokens_out, 300);
+        assert!((c.cost_usd - 0.0023).abs() < f64::EPSILON);
     }
 
     #[test]
     fn feed_line_renders_mutations_and_highlights_supersession() {
         // wiki.create → a "New guide" line carrying the human title; not a supersession.
-        let create = feed_line_for_event(&rec("wiki.create", serde_json::json!({
-            "slug": "feed-avatar", "title": "Avatar hovercard"
-        }))).unwrap();
+        let create = feed_line_for_event(&rec(
+            "wiki.create",
+            serde_json::json!({
+                "slug": "feed-avatar", "title": "Avatar hovercard"
+            }),
+        ))
+        .unwrap();
         assert!(create.text.contains("New guide"));
         assert!(create.text.contains("Avatar hovercard"));
         assert!(!create.highlight);
         assert!(!create.is_conversation);
 
         // wiki.add_statement → a claim line naming its target guide/section.
-        let claim = feed_line_for_event(&rec("wiki.add_statement", serde_json::json!({
-            "slug": "package-manager", "section": "## Tooling", "text": "uses pnpm workspaces"
-        }))).unwrap();
+        let claim = feed_line_for_event(&rec(
+            "wiki.add_statement",
+            serde_json::json!({
+                "slug": "package-manager", "section": "## Tooling", "text": "uses pnpm workspaces"
+            }),
+        ))
+        .unwrap();
         assert!(claim.text.contains("package-manager"));
         assert!(claim.text.contains("uses pnpm workspaces"));
 
         // wiki.revise_statement → highlighted as a supersession.
-        let revise = feed_line_for_event(&rec("wiki.revise_statement", serde_json::json!({
-            "slug": "package-manager", "section": "Tooling"
-        }))).unwrap();
+        let revise = feed_line_for_event(&rec(
+            "wiki.revise_statement",
+            serde_json::json!({
+                "slug": "package-manager", "section": "Tooling"
+            }),
+        ))
+        .unwrap();
         assert!(revise.highlight, "revise must highlight as supersession");
         assert!(revise.text.contains("package-manager"));
 
         // proceed-triage is not feed-worthy; skip-triage is
-        assert!(feed_line_for_event(&rec("capture.triage", serde_json::json!({"result": "proceed"}))).is_none());
-        assert!(feed_line_for_event(&rec("capture.triage", serde_json::json!({"result": "skip"}))).is_some());
+        assert!(feed_line_for_event(&rec(
+            "capture.triage",
+            serde_json::json!({"result": "proceed"})
+        ))
+        .is_none());
+        assert!(feed_line_for_event(&rec(
+            "capture.triage",
+            serde_json::json!({"result": "skip"})
+        ))
+        .is_some());
 
         // capture.start → the "Reading conversation" line; flagged is_conversation so Enter
         // resolves the transcript, and it carries the session id for that lookup.
-        let start = feed_line_for_event(&rec("capture.start", serde_json::json!({"exchanges": 7}))).unwrap();
+        let start = feed_line_for_event(&rec("capture.start", serde_json::json!({"exchanges": 7})))
+            .unwrap();
         assert!(start.text.contains("Reading conversation"));
         assert!(start.text.contains('7'));
         assert!(start.is_conversation);
         assert_eq!(start.session_id, "abcdef");
-        assert!(feed_line_for_event(&rec("capture.done", serde_json::json!({"exchanges": 3}))).is_some());
+        assert!(
+            feed_line_for_event(&rec("capture.done", serde_json::json!({"exchanges": 3})))
+                .is_some()
+        );
 
         // Pipeline-internal phase events drive only the stage label, not the feed.
-        assert!(feed_line_for_event(&rec("capture.extract", serde_json::json!({"claims": 12}))).is_none());
-        assert!(feed_line_for_event(&rec("capture.route", serde_json::json!({"guides": 3}))).is_none());
+        assert!(
+            feed_line_for_event(&rec("capture.extract", serde_json::json!({"claims": 12})))
+                .is_none()
+        );
+        assert!(
+            feed_line_for_event(&rec("capture.route", serde_json::json!({"guides": 3}))).is_none()
+        );
         assert!(feed_line_for_event(&rec("wiki.index_read", serde_json::json!({}))).is_none());
-        assert!(feed_line_for_event(&rec("llm.request", serde_json::json!({"model": "x"}))).is_none());
+        assert!(
+            feed_line_for_event(&rec("llm.request", serde_json::json!({"model": "x"}))).is_none()
+        );
     }
 
     #[test]
@@ -2674,26 +3590,62 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("s1".to_string(), "FULL TRANSCRIPT".to_string());
         let conv = FeedLine {
-            ts: "t".into(), project: "p".into(), glyph: "▶", text: "Reading…".into(),
-            highlight: false, detail: "metadata".into(),
-            session_id: "s1".into(), is_conversation: true,
+            ts: "t".into(),
+            project: "p".into(),
+            glyph: "▶",
+            text: "Reading…".into(),
+            highlight: false,
+            detail: "metadata".into(),
+            session_id: "s1".into(),
+            is_conversation: true,
         };
         assert_eq!(detail_content_for(&conv, &map), "FULL TRANSCRIPT");
-        let unknown = FeedLine { session_id: "s2".into(), ..conv.clone() };
-        assert_eq!(detail_content_for(&unknown, &map), "metadata", "no transcript → metadata fallback");
-        let claim = FeedLine { is_conversation: false, session_id: "s1".into(), ..conv.clone() };
-        assert_eq!(detail_content_for(&claim, &map), "metadata", "non-conversation line never shows the transcript");
+        let unknown = FeedLine {
+            session_id: "s2".into(),
+            ..conv.clone()
+        };
+        assert_eq!(
+            detail_content_for(&unknown, &map),
+            "metadata",
+            "no transcript → metadata fallback"
+        );
+        let claim = FeedLine {
+            is_conversation: false,
+            session_id: "s1".into(),
+            ..conv.clone()
+        };
+        assert_eq!(
+            detail_content_for(&claim, &map),
+            "metadata",
+            "non-conversation line never shows the transcript"
+        );
     }
 
     #[test]
     fn feed_cursor_idx_selects_from_the_bottom() {
         // feed_scroll counts up from the newest line; 1 = newest, N = oldest.
-        assert_eq!(feed_cursor_idx(10, 0), 9, "live mode still resolves to the newest line");
+        assert_eq!(
+            feed_cursor_idx(10, 0),
+            9,
+            "live mode still resolves to the newest line"
+        );
         assert_eq!(feed_cursor_idx(10, 1), 9, "one step up selects the newest");
         assert_eq!(feed_cursor_idx(10, 3), 7);
-        assert_eq!(feed_cursor_idx(10, 10), 0, "scrolling to the top selects the oldest");
-        assert_eq!(feed_cursor_idx(10, 999), 0, "over-scroll clamps to the oldest");
-        assert_eq!(feed_cursor_idx(0, 5), 0, "empty feed never indexes out of range");
+        assert_eq!(
+            feed_cursor_idx(10, 10),
+            0,
+            "scrolling to the top selects the oldest"
+        );
+        assert_eq!(
+            feed_cursor_idx(10, 999),
+            0,
+            "over-scroll clamps to the oldest"
+        );
+        assert_eq!(
+            feed_cursor_idx(0, 5),
+            0,
+            "empty feed never indexes out of range"
+        );
     }
 
     #[test]
@@ -2705,16 +3657,29 @@ mod tests {
         for feed_scroll in 1..=total {
             let cursor = feed_cursor_idx(total, feed_scroll);
             let (start, end) = feed_window(total, h, feed_scroll, cursor);
-            assert!(start <= cursor && cursor < end,
-                "cursor {} must be within window [{},{}) at feed_scroll {}", cursor, start, end, feed_scroll);
+            assert!(
+                start <= cursor && cursor < end,
+                "cursor {} must be within window [{},{}) at feed_scroll {}",
+                cursor,
+                start,
+                end,
+                feed_scroll
+            );
             assert!(end - start <= h, "window never exceeds the viewport height");
         }
         // Bottom-anchored until the cursor reaches the top edge, then the window scrolls up.
         let (s_bottom, e_bottom) = feed_window(total, h, 1, feed_cursor_idx(total, 1));
-        assert_eq!((s_bottom, e_bottom), (80, 100), "feed_scroll=1 shows the newest page");
+        assert_eq!(
+            (s_bottom, e_bottom),
+            (80, 100),
+            "feed_scroll=1 shows the newest page"
+        );
         let top_edge = feed_window(total, h, h, feed_cursor_idx(total, h)).0;
         let past_edge = feed_window(total, h, h + 5, feed_cursor_idx(total, h + 5)).0;
-        assert!(past_edge < top_edge, "the window scrolls up once the cursor passes the top edge");
+        assert!(
+            past_edge < top_edge,
+            "the window scrolls up once the cursor passes the top edge"
+        );
         // A feed shorter than the viewport shows everything from index 0.
         assert_eq!(feed_window(5, 20, 3, feed_cursor_idx(5, 3)), (0, 5));
     }
