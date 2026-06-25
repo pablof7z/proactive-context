@@ -81,6 +81,41 @@ More **exhaustive** (surfaces contradictions: delta-sync vs full-rebuild, generi
 vs typed dispatch) and ships a provable coverage ledger — but ~10× the GLM calls
 and no cache reuse across questions.
 
+## ⭐ WINNER — load-everything, no spine (gemini-3-flash 1M, single window)
+
+The corpus only ever overflowed because of junk + a wrong model. After cleaning
+(harness strip → paste-strip → drop codex automation → cheap-LLM gate) **plus
+exact-dedup** (codex logs each utterance many times — 5,414 dupes collapsed), the
+ENTIRE human corpus is **~745K–851K tokens** — it fits one real-1M window
+(`gemini-3-flash-preview:cloud`). No spine, no search-first: load it ALL, ask,
+get a cited answer in one shot. `expand`/`search` survive only to recover the
+head/tail-trimmed middle of a long message.
+
+### Frozen 16-question benchmark (the pre-Rust gate)
+
+Diverse questions incl. *oblique* ones whose answer lines don't contain the
+question's keywords (auth, UI pet peeves, wire format, "what makes me reject an
+architecture") — the case the spine would fail. Single-window gemini, one shot each:
+
+| metric | result |
+|---|---|
+| specificity (LLM-judge 1–5) | **5.0 / 5 on all 16** |
+| citation validity | **93%** (13/16 at 100%) |
+| mean citations / answer | 15.4 |
+| latency | ~32s/question (Q1 54s cold) |
+
+Oblique questions scored as well as keyword-rich ones — **seeing everything removes
+keyword dependency**, the core of Pablo's thesis. On a genuinely sparse topic
+("code duplication") the model returned a thin answer **without fabricating
+citations** (good — no hallucination; the benchmark's specificity judge is the weak
+link there and should weight citation count).
+
+**Cache-reuse does NOT hold on gemini-cloud** (resolves the open question): the
+907K prefix re-prefills every question (`prompt_eval_count`≈907K each), latency only
+drops 54s→32s from a warm model. So load-everything costs ~32s/q here — vs the GLM
+spine's proven ~3s cached. The cache win was real but GLM-specific; a less-throttled
+1M endpoint (or provider prompt-caching) would make load-everything fast too.
+
 ## Variant E — exhaustive "read everything" (gemini-3-flash 1M)  ⭐ best recall
 
 Key enabler discovered mid-build: **GLM cloud caps at 202,752 tokens, NOT 1M.**
