@@ -1536,7 +1536,15 @@ async fn wiki_navigate_and_compile(
             );
             resp
         }
-        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
+        Provider::ClaudeCli => {
+            let model = select_spec.model.clone();
+            let preamble2 = preamble.clone();
+            let prompt2 = current_prompt.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
+                    std::time::Duration::from_secs(25)).map(|r| r.content)
+            }).await??
+        }
     };
 
     let sel = selection.trim();
@@ -1755,7 +1763,15 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
             );
             resp
         }
-        Provider::ClaudeCli => anyhow::bail!("claude-cli provider is only supported for `pc recall`"),
+        Provider::ClaudeCli => {
+            let model = spec.model.clone();
+            let preamble2 = preamble.clone();
+            let prompt2 = current_prompt.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
+                    std::time::Duration::from_secs(25)).map(|r| r.content)
+            }).await??
+        }
     };
 
     // The synthesized briefing is the output as-is. Its leading `TITLE:` line is stripped by the
