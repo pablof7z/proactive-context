@@ -59,6 +59,8 @@ enum RunKind {
 enum InjectOutcome {
     InFlight,
     Compiled,
+    /// A standalone noun-primer injection (no guide briefing) — the entity layer fired on its own.
+    NounPrimer,
     Fallback(String),
     SkippedTrivial,
     SkippedNoGuides,
@@ -166,7 +168,9 @@ impl HookRun {
         }
         match self.kind {
             RunKind::Inject => match self.inject.as_ref().map(|a| &a.outcome) {
-                Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => RunState::Done,
+                Some(InjectOutcome::Compiled)
+                | Some(InjectOutcome::NounPrimer)
+                | Some(InjectOutcome::Fallback(_)) => RunState::Done,
                 Some(InjectOutcome::SkippedTrivial)
                 | Some(InjectOutcome::SkippedNoGuides)
                 | Some(InjectOutcome::SkippedNothingRelevant)
@@ -504,6 +508,7 @@ impl AppState {
                         arc.out_chars = out_chars;
                         arc.outcome = match outcome_str.as_str() {
                             "compiled" => InjectOutcome::Compiled,
+                            "noun_primer" => InjectOutcome::NounPrimer,
                             "fallback" => InjectOutcome::Fallback(reason.clone()),
                             "skipped" | "none" | "empty" => match &arc.outcome {
                                 InjectOutcome::InFlight => InjectOutcome::Skipped(reason.clone()),
@@ -519,7 +524,7 @@ impl AppState {
                         };
                         matches!(
                             arc.outcome,
-                            InjectOutcome::Compiled | InjectOutcome::Fallback(_)
+                            InjectOutcome::Compiled | InjectOutcome::NounPrimer | InjectOutcome::Fallback(_)
                         )
                     } else {
                         false
@@ -1116,6 +1121,10 @@ fn run_to_list_item(
                     lat_suffix(run.total_lat_ms)
                 )
             }
+            Some(InjectOutcome::NounPrimer) => {
+                let chars = run.inject.as_ref().and_then(|a| a.out_chars).unwrap_or(0);
+                format!("{} ch · noun{}", chars, lat_suffix(run.total_lat_ms))
+            }
             Some(InjectOutcome::Fallback(reason)) => format!(
                 "fallback·{}{}",
                 if reason.is_empty() { "timeout" } else { reason },
@@ -1139,9 +1148,9 @@ fn run_to_list_item(
     // Capture verdict
     let capture_col = match &run.capture {
         None => match run.inject.as_ref().map(|a| &a.outcome) {
-            Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => {
-                "(pending)".to_string()
-            }
+            Some(InjectOutcome::Compiled)
+            | Some(InjectOutcome::NounPrimer)
+            | Some(InjectOutcome::Fallback(_)) => "(pending)".to_string(),
             _ => "—".to_string(),
         },
         Some(arc) => match &arc.outcome {
@@ -1183,6 +1192,7 @@ fn run_to_list_item(
     } else {
         match run.inject.as_ref().map(|a| &a.outcome) {
             Some(InjectOutcome::Compiled) => Style::default().fg(Color::Green),
+            Some(InjectOutcome::NounPrimer) => Style::default().fg(Color::Green),
             Some(InjectOutcome::Fallback(_)) => Style::default().fg(Color::Yellow),
             Some(InjectOutcome::SkippedNoGuides) | Some(InjectOutcome::SkippedNothingRelevant) => {
                 Style::default().fg(Color::Yellow)
@@ -1398,6 +1408,11 @@ fn render_run_detail(frame: &mut Frame, state: &AppState) {
                 arc.out_chars.unwrap_or(0),
                 run.total_lat_ms.unwrap_or(0) as f64 / 1000.0
             ),
+            InjectOutcome::NounPrimer => format!(
+                "noun primer ✓  {}c  {:.1}s",
+                arc.out_chars.unwrap_or(0),
+                run.total_lat_ms.unwrap_or(0) as f64 / 1000.0
+            ),
             InjectOutcome::Fallback(r) => format!(
                 "fallback ({})  {:.1}s",
                 r,
@@ -1415,6 +1430,7 @@ fn render_run_detail(frame: &mut Frame, state: &AppState) {
         };
         let verdict_color = match &arc.outcome {
             InjectOutcome::Compiled => Color::Green,
+            InjectOutcome::NounPrimer => Color::Green,
             InjectOutcome::Fallback(_) => Color::Yellow,
             InjectOutcome::Error(_) => Color::Red,
             InjectOutcome::InFlight => Color::Cyan,
@@ -1474,7 +1490,9 @@ fn render_run_detail(frame: &mut Frame, state: &AppState) {
     {
         let (verdict_text, verdict_color) = match capture_data.map(|a| &a.outcome) {
             None => match run.inject.as_ref().map(|a| &a.outcome) {
-                Some(InjectOutcome::Compiled) | Some(InjectOutcome::Fallback(_)) => (
+                Some(InjectOutcome::Compiled)
+                | Some(InjectOutcome::NounPrimer)
+                | Some(InjectOutcome::Fallback(_)) => (
                     "(pending — waiting for session end)".to_string(),
                     Color::DarkGray,
                 ),
