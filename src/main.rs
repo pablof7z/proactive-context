@@ -36,6 +36,8 @@ mod db;
 mod cross_supersede;
 mod doctor;
 mod embed;
+mod claude_cli;
+mod claude_sidecar;
 mod embed_sidecar;
 mod events;
 mod harness;
@@ -132,6 +134,12 @@ enum Commands {
     Embed {
         #[command(subcommand)]
         action: EmbedAction,
+    },
+
+    /// Warm-pool sidecar for the claude-cli: provider.
+    Claude {
+        #[command(subcommand)]
+        action: ClaudeAction,
     },
 
     /// Show or edit configuration (~/.proactive-context/config.json)
@@ -466,6 +474,12 @@ enum EmbedAction {
 }
 
 #[derive(Subcommand)]
+enum ClaudeAction {
+    /// Run the warm-pool claude sidecar in the foreground.
+    Serve,
+}
+
+#[derive(Subcommand)]
 enum DebugAction {
     /// Print the line-numbered transcript EXACTLY as the EXTRACT stage sees it (after the
     /// same preprocessing + 250KB tail-truncation the live capture path applies).
@@ -787,6 +801,12 @@ fn main() -> Result<()> {
         Commands::Embed { action } => match action {
             EmbedAction::Serve => {
                 crate::embed_sidecar::run_sidecar()?;
+            }
+        },
+
+        Commands::Claude { action } => match action {
+            ClaudeAction::Serve => {
+                crate::claude_sidecar::run_sidecar()?;
             }
         },
 
