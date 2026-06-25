@@ -30,12 +30,19 @@ fn trim(body: &str) -> String {
 
 pub fn build(store: &Store) -> anyhow::Result<(String, CorpusStats)> {
     let rows = store.all_ordered()?;
+    let gated = store.gated_map(); // id -> (action, human_text); empty if no gate run
     let mut seen: HashMap<String, usize> = HashMap::new();   // hash -> index in kept
     let mut dup_count: HashMap<usize, usize> = HashMap::new();
     let mut kept: Vec<(super::store::Turn, String)> = vec![];
     let mut dupes = 0;
     for t in rows {
-        let body = trim(&t.text);
+        // prefer gated human-only text; DROP removes the message entirely
+        let raw = match gated.get(&t.id) {
+            Some((action, _)) if action == "DROP" => continue,
+            Some((_, human)) if !human.is_empty() => human.clone(),
+            _ => t.text.clone(),
+        };
+        let body = trim(&raw);
         let h = format!("{:x}", Sha256::digest(norm(&body).as_bytes()));
         if let Some(&idx) = seen.get(&h) {
             *dup_count.entry(idx).or_insert(1) += 1;

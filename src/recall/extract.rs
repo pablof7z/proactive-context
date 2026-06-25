@@ -266,6 +266,22 @@ pub fn extract_all() -> Result<Vec<Turn>> {
     Ok(out)
 }
 
+/// All transcript files (Claude + Codex), for incremental indexing.
+pub fn all_transcript_files() -> Vec<PathBuf> {
+    let mut v = claude_files();
+    v.extend(codex_files());
+    v
+}
+
+/// Extract one transcript file (source inferred from its path).
+pub fn extract_one(path: &Path) -> Vec<Turn> {
+    let mut out = vec![];
+    let s = path.to_string_lossy();
+    if s.contains("/.claude/") { extract_claude(path, &mut out); }
+    else if s.contains("/.codex/") { extract_codex(path, &mut out); }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

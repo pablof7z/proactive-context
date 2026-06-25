@@ -124,4 +124,89 @@ impl Store {
         }));
         match rows { Ok(it) => it.filter_map(|r| r.ok()).collect(), Err(_) => vec![] }
     }
+
+    // ── gate (cheap-LLM cleaning of long messages) ──────────────────────────
+    pub fn ensure_gated_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gated (id TEXT PRIMARY KEY, action TEXT, \
+             human_chars INTEGER, human_text TEXT);")?;
+        Ok(())
+    }
+
+    pub fn has_gated(&self) -> bool {
+        self.conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gated'",
+            [], |_| Ok(())).is_ok()
+    }
+
+    /// Long messages not yet gated: (id, text).
+    pub fn ungated_long(&self, threshold: i64) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, t.text FROM turns t LEFT JOIN gated g ON g.id=t.id \
+             WHERE g.id IS NULL AND t.chars > ?")?;
+        let rows = st.query_map([threshold], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn write_gated(&mut self, rows: &[(String, String, i64, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut s = tx.prepare("INSERT OR REPLACE INTO gated VALUES (?,?,?,?)")?;
+            for (id, act, hc, ht) in rows {
+                s.execute(rusqlite::params![id, act, hc, ht])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Map id -> (action, human_text) for corpus assembly.
+    pub fn gated_map(&self) -> std::collections::HashMap<String, (String, String)> {
+        let mut m = std::collections::HashMap::new();
+        if !self.has_gated() { return m; }
+        if let Ok(mut st) = self.conn.prepare("SELECT id, action, human_text FROM gated") {
+            if let Ok(rows) = st.query_map([], |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))) {
+                for row in rows.flatten() { m.insert(row.0, (row.1, row.2)); }
+            }
+        }
+        m
+    }
+
+    // ── incremental indexing (skip unchanged transcript files) ───────────────
+    pub fn ensure_files_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime INTEGER);")?;
+        Ok(())
+    }
+
+    pub fn known_files(&self) -> std::collections::HashMap<String, i64> {
+        let mut m = std::collections::HashMap::new();
+        if let Ok(mut st) = self.conn.prepare("SELECT path, mtime FROM files") {
+            if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                for row in rows.flatten() { m.insert(row.0, row.1); }
+            }
+        }
+        m
+    }
+
+    pub fn upsert_file(&self, path: &str, mtime: i64) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO files VALUES (?,?)",
+            rusqlite::params![path, mtime])?;
+        Ok(())
+    }
+
+    /// Remove all turns (and their FTS rows) from one transcript file.
+    pub fn delete_turns_for_path(&self, raw_path: &str) -> Result<()> {
+        let ids: Vec<String> = {
+            let mut st = self.conn.prepare("SELECT id FROM turns WHERE raw_path=?")?;
+            let rows = st.query_map([raw_path], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for id in &ids {
+            self.conn.execute("DELETE FROM turns_fts WHERE id=?", [id])?;
+        }
+        self.conn.execute("DELETE FROM turns WHERE raw_path=?", [raw_path])?;
+        Ok(())
+    }
 }
