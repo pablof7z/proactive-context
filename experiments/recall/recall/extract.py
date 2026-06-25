@@ -41,6 +41,7 @@ WRAPPER_PREFIXES = (
     "User:", "Assistant:", "<turn_context>", "<context_summary",
     "<environment_details>", "<persisted_state",
     "Respond only to the final user message", "# Your Identity",
+    "Another Claude session sent a message", "<teammate-message",
 )
 
 # Inline blocks to surgically remove (open ... close), keep surrounding human text.
