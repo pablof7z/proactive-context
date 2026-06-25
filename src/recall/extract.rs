@@ -179,6 +179,14 @@ fn extract_codex(path: &Path, out: &mut Vec<Turn>) {
         .captures(stem).map(|c| c[1].to_string())
         .unwrap_or_else(|| stem.chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect());
     let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return };
+    out.extend(extract_codex_content(&content, &session, &path.to_string_lossy()));
+}
+
+/// Pure, testable codex extraction. A human prompt is logged as EITHER a
+/// `response_item` user message OR an `event_msg`/`user_message` (sometimes both;
+/// dedup at corpus time collapses the overlap). Automation sessions are dropped
+/// wholesale via session_meta.
+fn extract_codex_content(content: &str, session: &str, raw_path: &str) -> Vec<Turn> {
     let mut cwd = String::new();
     let mut human = true;
     let mut staged: Vec<Turn> = vec![];
@@ -189,22 +197,26 @@ fn extract_codex(path: &Path, out: &mut Vec<Turn>) {
         if typ == Some("session_meta") {
             cwd = payload.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
             human = codex_is_human(&o);
-            if !human { return; } // drop automation session entirely
+            if !human { return vec![]; } // drop automation session entirely
             continue;
         }
         let text_opt = if typ == Some("response_item")
             && payload.get("type").and_then(|t| t.as_str()) == Some("message")
             && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
             codex_user_text(&payload)
+        } else if typ == Some("event_msg")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("user_message") {
+            payload.get("message").and_then(|m| m.as_str()).map(String::from)
+                .or_else(|| codex_user_text(&payload))
         } else { None };
         let text = match text_opt { Some(t) => t, None => continue };
         let text = clean_text(&text);
         if text.is_empty() || is_wrapper(&text) || is_trivial(&text) { continue; }
         let project = project_of(&cwd, "codex");
         let ts = o.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-        staged.push(mk("codex", &project, &session, (i + 1) as i64, ts, text, &path.to_string_lossy()));
+        staged.push(mk("codex", &project, session, (i + 1) as i64, ts, text, raw_path));
     }
-    if human { out.extend(staged); }
+    if human { staged } else { vec![] }
 }
 
 fn codex_user_text(payload: &Value) -> Option<String> {
@@ -252,4 +264,76 @@ pub fn extract_all() -> Result<Vec<Turn>> {
     for f in codex_files() { extract_codex(&f, &mut out); }
     eprintln!("  claude: {} turns · codex: {} turns", claude_n, out.len() - claude_n);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jl(lines: &[&str]) -> String { lines.join("\n") }
+    const SID: &str = "abc12345-1111-2222";
+
+    #[test]
+    fn event_msg_user_message_is_extracted() {
+        // The case the original port missed: a human prompt logged ONLY as event_msg.
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","cwd":"/x/proj"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"refactor the event bus to be push-based, not polling"}}"#,
+        ]);
+        let t = extract_codex_content(&c, SID, "/p");
+        assert_eq!(t.len(), 1, "event_msg/user_message must yield a turn");
+        assert!(t[0].text.contains("push-based"));
+        assert_eq!(t[0].project, "proj");
+        assert!(t[0].id.starts_with("codex/proj/abc12345/L"));
+    }
+
+    #[test]
+    fn response_item_user_is_extracted() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"Codex Desktop","cwd":"/a/myapp"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"use FlatBuffers not JSON across the FFI boundary"}]}}"#,
+        ]);
+        let t = extract_codex_content(&c, SID, "/p");
+        assert_eq!(t.len(), 1);
+        assert!(t[0].text.contains("FlatBuffers"));
+    }
+
+    #[test]
+    fn automation_session_is_dropped_even_with_user_messages() {
+        // agent_role present => script-spawned agent, not the human typing.
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","agent_role":"Reviewer","cwd":"/a/x"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"You are reviewing the architecture decision D0"}}"#,
+        ]);
+        assert_eq!(extract_codex_content(&c, SID, "/p").len(), 0);
+        // also: non-interactive originator
+        let c2 = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex_exec","cwd":"/a/x"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Repo: do the thing"}}"#,
+        ]);
+        assert_eq!(extract_codex_content(&c2, SID, "/p").len(), 0);
+    }
+
+    #[test]
+    fn acks_and_harness_wrappers_are_filtered() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","cwd":"/a/x"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"ok"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context><cwd>/a/x</cwd></environment_context>"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"the kernel must own all projections; the shell is a thin renderer"}}"#,
+        ]);
+        let t = extract_codex_content(&c, SID, "/p");
+        assert_eq!(t.len(), 1, "ack + harness wrapper dropped, real prompt kept");
+        assert!(t[0].text.contains("thin renderer"));
+    }
+
+    #[test]
+    fn short_technical_lines_survive_trivial_filter() {
+        // per MEMORY: "use 8px not 10px" is gold — digits = signal.
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","cwd":"/a/x"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"use 8px not 10px"}}"#,
+        ]);
+        assert_eq!(extract_codex_content(&c, SID, "/p").len(), 1);
+    }
 }
