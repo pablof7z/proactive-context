@@ -111,53 +111,68 @@ fn help() {
     );
     println!(
         "  {} {}",
-        command_col("/model [spec]", 17),
-        dim("pick or set the processing model")
+        command_col("/model", 23),
+        dim("choose fast or thinking model")
     );
     println!(
         "  {} {}",
-        command_col("/gate [spec]", 17),
-        dim("pick or set the gate model used by `pc recall gate`")
+        command_col("/model fast", 23),
+        dim("pick the fast gate model")
     );
     println!(
         "  {} {}",
-        command_col("/brief", 17),
+        command_col("/model thinking", 23),
+        dim("pick the thinking answer model")
+    );
+    println!(
+        "  {} {}",
+        command_col("/model fast <spec>", 23),
+        dim("set the fast model directly")
+    );
+    println!(
+        "  {} {}",
+        command_col("/model thinking <spec>", 23),
+        dim("set the thinking model directly")
+    );
+    println!(
+        "  {} {}",
+        command_col("/brief", 23),
         dim("toggle terse agent-facing answers")
     );
     println!(
         "  {} {}",
-        command_col("/full", 17),
+        command_col("/full", 23),
         dim("switch back to full answers")
     );
     println!(
         "  {} {}",
-        command_col("/last", 17),
+        command_col("/last", 23),
         dim("ask the previous question again")
     );
     println!(
         "  {} {}",
-        command_col("/status", 17),
+        command_col("/status", 23),
         dim("show corpus, models, and answer mode")
     );
     println!(
         "  {} {}",
-        command_col("/usage", 17),
+        command_col("/usage", 23),
         dim("token / cost / cache breakdown for this session")
     );
     println!(
         "  {} {}",
-        command_col("/examples", 17),
+        command_col("/examples", 23),
         dim("show useful recall questions")
     );
     println!(
         "  {} {}",
-        command_col("/clear", 17),
+        command_col("/clear", 23),
         dim("clear the screen")
     );
-    println!("  {} {}", command_col("/help", 17), dim("this help"));
+    println!("  {} {}", command_col("/help", 23), dim("this help"));
     println!(
         "  {} {}",
-        command_col("/quit", 17),
+        command_col("/quit", 23),
         dim("exit (Ctrl-D also exits)")
     );
     println!();
@@ -183,6 +198,36 @@ fn select(title: &str, current: &ModelSpec) -> Option<ModelSpec> {
     match picker::pick(title, &label(current), &entries) {
         Ok(Some(spec)) => Some(ModelSpec::parse(&spec)),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ModelRole {
+    Fast,
+    Thinking,
+}
+
+impl ModelRole {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "fast" | "gate" | "quick" => Some(Self::Fast),
+            "thinking" | "think" | "answer" | "processing" => Some(Self::Thinking),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast model (gate)",
+            Self::Thinking => "Thinking model",
+        }
+    }
+
+    fn command_name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Thinking => "thinking",
+        }
     }
 }
 
@@ -223,6 +268,20 @@ impl ReplState {
             history: Vec::new(),
         }
     }
+
+    fn model_for_role(&self, role: ModelRole) -> &ModelSpec {
+        match role {
+            ModelRole::Fast => &self.gate_spec,
+            ModelRole::Thinking => &self.proc_spec,
+        }
+    }
+
+    fn set_model_for_role(&mut self, role: ModelRole, spec: ModelSpec) {
+        match role {
+            ModelRole::Fast => self.gate_spec = spec,
+            ModelRole::Thinking => self.proc_spec = spec,
+        }
+    }
 }
 
 struct CorpusView {
@@ -241,7 +300,8 @@ fn print_banner(state: &ReplState, corpus: &CorpusView) {
         corpus.dupes,
         corpus.token_est
     );
-    println!("  {} {}", dim("processing:"), model_label(&state.proc_spec));
+    println!("  {} {}", dim("thinking:"), model_label(&state.proc_spec));
+    println!("  {} {}", dim("fast gate:"), model_label(&state.gate_spec));
     println!("  {} {}", dim("answer mode:"), accent(state.mode.label()));
     println!(
         "  {} {}",
@@ -270,12 +330,12 @@ fn print_status(state: &ReplState, corpus: &CorpusView) {
     );
     println!(
         "  {} {}",
-        dim("processing model:"),
+        dim("thinking model:"),
         model_label(&state.proc_spec)
     );
     println!(
         "  {}       {}",
-        dim("gate model:"),
+        dim("fast model:"),
         model_label(&state.gate_spec)
     );
     println!(
@@ -297,6 +357,103 @@ enum Command {
     Ask(String),
     Continue,
     Quit,
+}
+
+fn select_model_role(state: &ReplState) -> Option<ModelRole> {
+    if !io::stdin().is_terminal() {
+        println!("{} {}", command("/model fast"), dim("or"),);
+        println!("{}", command("/model thinking"));
+        return None;
+    }
+
+    terminal::enable_raw_mode().ok()?;
+    let result = select_model_role_inner(state);
+    terminal::disable_raw_mode().ok();
+    let mut out = io::stdout();
+    let _ = execute!(out, cursor::MoveToColumn(0));
+    println!();
+    result.ok().flatten()
+}
+
+fn select_model_role_inner(state: &ReplState) -> Result<Option<ModelRole>> {
+    let roles = [ModelRole::Fast, ModelRole::Thinking];
+    let mut sel = 0usize;
+    let mut last_lines = 0u16;
+    let mut out = io::stdout();
+    loop {
+        if last_lines > 0 {
+            execute!(
+                out,
+                cursor::MoveUp(last_lines),
+                cursor::MoveToColumn(0),
+                terminal::Clear(ClearType::FromCursorDown)
+            )?;
+        }
+
+        let mut lines = 0u16;
+        write!(out, "{}\r\n", accent("Select model role"))?;
+        lines += 1;
+        for (i, role) in roles.iter().enumerate() {
+            let marker = if i == sel { ">" } else { " " };
+            let role_text = if i == sel {
+                accent(role.label())
+            } else {
+                role.label().to_string()
+            };
+            write!(
+                out,
+                "{} {:<20} {}\r\n",
+                marker,
+                role_text,
+                model_label(state.model_for_role(*role))
+            )?;
+            lines += 1;
+        }
+        write!(out, "{}\r\n", dim("↑↓ select · enter · esc"))?;
+        lines += 1;
+        out.flush()?;
+        last_lines = lines;
+
+        if let Event::Key(k) = event::read()? {
+            match k.code {
+                KeyCode::Up => {
+                    sel = sel.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if sel + 1 < roles.len() {
+                        sel += 1;
+                    }
+                }
+                KeyCode::Enter => return Ok(Some(roles[sel])),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn choose_model_for_role(state: &mut ReplState, role: ModelRole) {
+    let title = format!("select {} model", role.command_name().to_uppercase());
+    if let Some(spec) = select(&title, state.model_for_role(role)) {
+        state.set_model_for_role(role, spec);
+        println!(
+            "{} {}",
+            dim(format!("{} →", role.label())),
+            model_label(state.model_for_role(role))
+        );
+    }
+}
+
+fn set_model_for_role(state: &mut ReplState, role: ModelRole, spec: &str) {
+    state.set_model_for_role(role, ModelSpec::parse(spec));
+    println!(
+        "{} {}",
+        dim(format!("{} →", role.label())),
+        model_label(state.model_for_role(role))
+    );
 }
 
 fn handle_command(
@@ -362,43 +519,33 @@ fn handle_command(
         }
         "/model" => {
             if arg.is_empty() {
-                if let Some(s) = select("select PROCESSING model", &state.proc_spec) {
-                    state.proc_spec = s;
-                    println!(
-                        "{} {}",
-                        dim("processing model →"),
-                        model_label(&state.proc_spec)
-                    );
+                if let Some(role) = select_model_role(state) {
+                    choose_model_for_role(state, role);
                 }
             } else {
-                state.proc_spec = ModelSpec::parse(arg);
-                println!(
-                    "{} {}",
-                    dim("processing model →"),
-                    model_label(&state.proc_spec)
-                );
+                let (first, rest) = arg
+                    .split_once(char::is_whitespace)
+                    .map(|(a, b)| (a, b.trim()))
+                    .unwrap_or((arg, ""));
+                if let Some(role) = ModelRole::parse(first) {
+                    if rest.is_empty() {
+                        choose_model_for_role(state, role);
+                    } else {
+                        set_model_for_role(state, role, rest);
+                    }
+                } else {
+                    // Backward-compatible shorthand: `/model <spec>` sets the thinking model.
+                    set_model_for_role(state, ModelRole::Thinking, arg);
+                }
             }
             Command::Continue
         }
         "/gate" => {
+            // Compatibility alias; `/model fast` is the primary UI.
             if arg.is_empty() {
-                if let Some(s) = select("select GATE model", &state.gate_spec) {
-                    state.gate_spec = s;
-                    println!(
-                        "{} {} {}",
-                        dim("gate model →"),
-                        model_label(&state.gate_spec),
-                        dim("(used by `pc recall gate`)")
-                    );
-                }
+                choose_model_for_role(state, ModelRole::Fast);
             } else {
-                state.gate_spec = ModelSpec::parse(arg);
-                println!(
-                    "{} {} {}",
-                    dim("gate model →"),
-                    model_label(&state.gate_spec),
-                    dim("(used by `pc recall gate`)")
-                );
+                set_model_for_role(state, ModelRole::Fast, arg);
             }
             Command::Continue
         }
@@ -712,6 +859,26 @@ mod tests {
         let (mut state, ledger, corpus) = fixture_state();
         let _ = handle_command("/model ollama:gemma3:27b", &mut state, &ledger, &corpus);
         assert_eq!(label(&state.proc_spec), "ollama:gemma3:27b");
+    }
+
+    #[test]
+    fn model_fast_command_sets_gate_model() {
+        let (mut state, ledger, corpus) = fixture_state();
+        let _ = handle_command("/model fast claude-cli:haiku", &mut state, &ledger, &corpus);
+        assert_eq!(label(&state.gate_spec), "claude-cli:haiku");
+        assert_eq!(label(&state.proc_spec), "openrouter:test/model");
+    }
+
+    #[test]
+    fn model_thinking_command_sets_processing_model() {
+        let (mut state, ledger, corpus) = fixture_state();
+        let _ = handle_command(
+            "/model thinking claude-cli:sonnet",
+            &mut state,
+            &ledger,
+            &corpus,
+        );
+        assert_eq!(label(&state.proc_spec), "claude-cli:sonnet");
     }
 
     #[test]
