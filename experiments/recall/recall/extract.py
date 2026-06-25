@@ -40,6 +40,7 @@ WRAPPER_PREFIXES = (
     "<subagent_notification>", "<user_prompt>", "<task_notification",
     "User:", "Assistant:", "<turn_context>", "<context_summary",
     "<environment_details>", "<persisted_state",
+    "Respond only to the final user message", "# Your Identity",
 )
 
 # Inline blocks to surgically remove (open ... close), keep surrounding human text.
@@ -63,6 +64,45 @@ ACK_RE = re.compile(
 
 SIGNAL_CHARS = set("/.()[]{}?=:_-0123456789`\n")
 
+# --- pasted / injected NON-human content (the long-tail token hogs) ---
+# Embedded git diffs are pasted payloads; cut from the first one to the end.
+DIFF_RE = re.compile(r"\n*diff --git [\s\S]*$")
+# Unified-diff / hunk dumps without the `diff --git` header.
+HUNK_RE = re.compile(r"\n@@[ \-+\d,]+@@[\s\S]*$")
+# Fenced code/log blocks: elide if large (keep small inline snippets).
+CODEFENCE_RE = re.compile(r"```[\s\S]*?```")
+# Harness agent-identity boot blocks (and a leaked nsec) — never human-typed.
+IDENTITY_RE = re.compile(r"Your nsec:\s*nsec1|# Your Identity\b", re.IGNORECASE)
+
+PASTE_HEAD = 9000   # chars of human framing to keep at the top of a big paste
+PASTE_TAIL = 2000   # chars to keep at the end (closing human note, if any)
+PASTE_MAX = 16000   # only trim messages larger than this AFTER structural strips
+
+
+def is_harness_payload(t: str) -> bool:
+    """Whole message is a harness-injected agent boot block (identity/nsec)."""
+    return bool(IDENTITY_RE.search(t[:4000]))
+
+
+def strip_pasted(t: str) -> str:
+    """Remove pasted, non-human-typed bulk (diffs, big code/log fences), then
+    head+tail-trim any remaining giant blob. Human prose framing is preserved;
+    genuine human messages (< ~4k tokens) pass through untouched."""
+    t = DIFF_RE.sub("\n[diff elided]", t, count=1)
+    t = HUNK_RE.sub("\n[diff hunks elided]", t, count=1)
+
+    def _fence(m):
+        b = m.group(0)
+        return b if len(b) < 800 else f"[code block elided, ~{len(b)} chars]"
+    t = CODEFENCE_RE.sub(_fence, t)
+    t = t.strip()
+    if len(t) > PASTE_MAX:
+        elided = len(t) - PASTE_HEAD - PASTE_TAIL
+        t = (t[:PASTE_HEAD].rstrip()
+             + f"\n…[{elided} chars of pasted content elided]…\n"
+             + t[-PASTE_TAIL:].lstrip())
+    return t
+
 
 def clean_text(raw: str) -> str:
     if not raw:
@@ -71,6 +111,9 @@ def clean_text(raw: str) -> str:
     t = IMG_RE.sub(" ", t)
     t = LOOSE_TAG_RE.sub(" ", t)
     t = t.strip()
+    if is_harness_payload(t):
+        return ""
+    t = strip_pasted(t)
     return t
 
 
