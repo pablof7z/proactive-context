@@ -40,7 +40,39 @@ QUESTIONS = [
     "what did I decide about offline-first behaviour?",
     "how do I think about migrations and schema changes?",
     "what makes me reject an architecture as wrong?",       # oblique / meta
+    "what's my position on JSON vs FlatBuffers for the FFI, and how did it change?",
+    "how do I want subscriptions and feeds declared by apps?",
+    "what do I believe about where business logic should live (Rust core vs shell)?",
+    "what are my views on agents not stepping on each other in shared repos?",
+    "how should the daemon / IPC architecture work in TENEX?",
+    "what's my stance on spinners, loading states, and perceived latency?",
 ]
+
+# Gold checklists: distinctive things Pablo actually said (corpus-verified), keyed
+# by question index. Each item is a set of near-synonym keywords; an item is
+# "covered" if any keyword appears. Not every question has gold (oblique ones rely
+# on the citation gate + judge).
+GOLD = {
+    0: {"event-driven": [["rung", "projection", "emission"], ["no polling", "hate polling", "never poll"],
+                         ["flatbuffer"], ["kernel", "thin shell"]]},
+    1: {"polling": [["hate polling", "fucking hate", "no polling"], ["push", "reactive"],
+                    ["refresh button", "anti-pattern", "anti pattern"]]},
+    4: {"kernel/shell": [["kernel owns", "rust", "core owns"], ["thin shell", "no business logic", "renderer"],
+                         ["d0", "d7", "doctrine"]]},
+    5: {"ffi-errors": [["panic"], ["actor-death", "actor death", "supervisor"], ["fail-closed", "fail closed", "fatal"]]},
+    9: {"wire-format": [["flatbuffer"], ["json"], ["no fallback", "no production json", "clean cut"]]},
+    16: {"json-evolution": [["flatbuffer"], ["json"], ["performance", "decode", "killer"], ["fallback", "symmetry"]]},
+}
+
+
+def gold_coverage(idx: int, answer: str):
+    spec = GOLD.get(idx)
+    if not spec:
+        return None
+    a = answer.lower()
+    items = list(spec.values())[0]
+    covered = sum(1 for kws in items if any(k in a for k in kws))
+    return covered, len(items)
 
 JUDGE_SYS = """You grade an answer about what a developer (Pablo) historically said.
 Score SPECIFICITY 1-5: 5 = surfaces concrete, distinctive decisions with his exact

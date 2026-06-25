@@ -7,8 +7,24 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.request
+import urllib.error
 from typing import Iterator, Optional
+
+
+def _open(req, timeout, retries=5):
+    """urlopen with exponential backoff on 429/503 (shared cloud endpoints throttle)."""
+    delay = 4.0
+    for attempt in range(retries + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and attempt < retries:
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
 
 OLLAMA_HOST = os.environ.get("RECALL_OLLAMA", "http://localhost:11434")
 MODEL = os.environ.get("RECALL_MODEL", "glm-5.1:cloud")
@@ -35,13 +51,13 @@ def chat(messages, tools=None, model=MODEL, num_ctx=131072, temperature=0.2,
         f"{OLLAMA_HOST}/api/chat", data=data,
         headers={"Content-Type": "application/json"})
     if not stream:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _open(req, timeout) as r:
             return json.loads(r.read())
     return _stream(req, timeout)
 
 
 def _stream(req, timeout) -> Iterator[dict]:
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _open(req, timeout) as r:
         for line in r:
             line = line.strip()
             if not line:
