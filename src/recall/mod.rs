@@ -8,6 +8,8 @@ pub mod store;
 pub mod extract;
 pub mod corpus;
 pub mod ask;
+pub mod usage;
+mod picker;
 mod repl;
 
 use anyhow::Result;

@@ -56,7 +56,7 @@ pub struct Answer {
     pub text: String,
     pub cites_total: usize,
     pub cites_valid: usize,
-    pub prompt_tokens: u64,
+    pub usage: super::usage::Usage,
 }
 
 pub fn validate_citations(store: &Store, text: &str) -> (usize, usize) {
@@ -74,7 +74,7 @@ pub fn ask(spec: &ModelSpec, store: &Store, corpus_txt: &str, query: &str, brief
     let (valid, total) = validate_citations(store, &reply.content);
     Ok(Answer {
         text: reply.content, cites_total: total, cites_valid: valid,
-        prompt_tokens: reply.prompt_tokens,
+        usage: reply.usage,
     })
 }
 
@@ -90,7 +90,8 @@ pub fn run_once(spec: &ModelSpec, query: &str, brief: bool) -> Result<()> {
         stats.messages, stats.dupes, stats.chars / 4 / 1000, spec.provider_name(), spec.model);
     let a = ask(spec, &store, &corpus_txt, query, brief)?;
     println!("{}", a.text);
-    println!("\n[recall: {}/{} citations valid · {} prompt-tokens]",
-        a.cites_valid, a.cites_total, a.prompt_tokens);
+    let cost = if a.usage.cost_known { format!(" · ${:.4}", a.usage.cost) } else { String::new() };
+    println!("\n[recall: {}/{} citations valid · {} prompt-tok · {} gen-tok{}]",
+        a.cites_valid, a.cites_total, a.usage.prompt_tokens, a.usage.completion_tokens, cost);
     Ok(())
 }
