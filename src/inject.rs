@@ -795,6 +795,12 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         ).await
     });
 
+    // A `spawn_blocking` LLM call (ClaudeCli select/compile) that outlived the inner
+    // timeout cannot be cancelled; letting `rt` drop normally would block this process
+    // until that task returns — indefinitely if the sidecar read is wedged. Detach the
+    // runtime instead so we exit now; the client-side socket timeout bounds the task.
+    rt.shutdown_background();
+
     match browse_result {
         Ok(Ok(NavigateResult::Briefing { text: briefing, guides_read })) => {
             let trimmed = briefing.trim();

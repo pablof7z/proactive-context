@@ -8,7 +8,6 @@ pub mod store;
 pub mod extract;
 pub mod corpus;
 pub mod ask;
-pub mod usage;
 pub mod gate;
 pub mod chunked;
 mod picker;

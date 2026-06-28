@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "this is from the debug tail command: [Image #1] does that mean we spent 16 seconds reading the guides? why did it take so long? it ended up timing out?"
+  ],
+  [
+    "assistant",
+    "The 16 seconds was a SELECT LLM call to choose which guides to read from a 150-item catalog, consuming 16 of the 25-second timeout budget before COMPILE could finish. To fix it: either raise the timeout to 35-40 seconds or lower the catalog size from 150 to 80-100 items, or both."
+  ],
+  [
+    "user",
+    "what is it doing? \"haiku via sidewcar\"? what sidecar? what the fuck are you talking about?"
+  ],
+  [
+    "assistant",
+    "The claude-cli provider spawns local Claude CLI child processes (claude -p) for inference, so the 16-second SELECT step was that local CLI call processing the 150 catalog entries."
+  ]
+]

@@ -14,7 +14,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-use crate::recall::usage::Usage;
+use crate::usage::Usage;
 
 pub struct CliReply {
     pub content: String,
@@ -82,8 +82,8 @@ fn parse_output(output: Output) -> Result<CliReply> {
             prompt_tokens:     u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
             completion_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
             cached_tokens:     u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-            cost: cost.unwrap_or(0.0),
-            cost_known: cost.is_some(),
+            total_tokens:      0,
+            cost,
         },
     })
 }

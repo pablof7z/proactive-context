@@ -1,5 +1,5 @@
 use crate::config::{config_dir, normalize_path, project_context_dir, project_db_path, project_pid_path, Config};
-use crate::db::{content_hash, delete_chunks_for_path, index_stats, indexed_paths, insert_chunks, open_db, open_db_at};
+use crate::db::{chunk_hashes_for_path, content_hash, delete_chunks_for_path, index_stats, indexed_paths, insert_chunks, open_db, open_db_at};
 use crate::embed::{build_embedder, build_sidecar_embedder, Embedder};
 use crate::chunker::chunk_markdown;
 use crate::events::{log_event, new_pass};
@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel as std_channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
@@ -419,31 +419,57 @@ pub fn index_single_file(
         Err(_) => return Ok(()), // unreadable file, skip
     };
 
-    let _file_hash = content_hash(&content);
-
-    // Quick skip: if the whole file hash matches what we have for any chunk of this path,
-    // we can assume it's unchanged (we store per-chunk hashes, but file-level is a good heuristic).
-    // For simplicity in v1 we just always delete+reinsert. The heavy cost is embedding, not SQL.
-    // A future improvement: store a files table with content_hash.
-
-    delete_chunks_for_path(conn, rel_path)?;
-
     let chunks = chunk_markdown(&content, cfg);
     if chunks.is_empty() {
+        // No content to index; drop any stale rows for this path and return.
+        delete_chunks_for_path(conn, rel_path)?;
         return Ok(());
     }
+
+    // Content-unchanged skip: compare the freshly-chunked hashes against what's already
+    // indexed for this path. If they match (same count, same order), the file's content
+    // is unchanged — skip the expensive re-embed entirely. This is the dominant CPU saver:
+    // file watchers fire on touches/regens that often rewrite identical content, and
+    // embedding (not SQL) is the heavy cost. Chunking + hashing is cheap by comparison.
+    let new_hashes: Vec<String> = chunks.iter().map(|c| content_hash(&c.content)).collect();
+    if let Ok(existing) = chunk_hashes_for_path(conn, rel_path) {
+        if existing == new_hashes {
+            return Ok(());
+        }
+    }
+
+    delete_chunks_for_path(conn, rel_path)?;
 
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let embeddings = embedder.embed(&texts)?;
 
     let mut rows = Vec::new();
-    for (_i, chunk) in chunks.iter().enumerate() {
-        let h = content_hash(&chunk.content);
+    for (chunk, h) in chunks.iter().zip(new_hashes.into_iter()) {
         rows.push((chunk.index, chunk.content.clone(), h));
     }
 
     insert_chunks(conn, rel_path, &rows, &embeddings)?;
     Ok(())
+}
+
+/// Directory names the watcher should never descend into. The initial `full_index`
+/// already skips these via gitignore-aware walking, but the live `notify` watcher
+/// covers the root verbatim — without this filter it re-embeds e.g. every
+/// `node_modules/**/README.md` and fires on the `target/` build firehose.
+const WATCH_IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules", ".proactive-context"];
+
+/// Exit a daemon that has seen no indexable change for this long, so per-project
+/// watchers don't accumulate and idle forever. A new request re-spawns one on demand.
+const IDLE_EXIT_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// True if a changed path lives under an ignored build/VCS dir or any hidden dir
+/// component (mirroring `full_index`'s `.hidden(true)`), so the watcher skips it.
+fn is_ignored_watch_path(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        WATCH_IGNORE_DIRS.contains(&s.as_ref()) || (s.starts_with('.') && s.len() > 1)
+    })
 }
 
 /// Start the daemon: acquire lock, do initial index, then watch for changes.
@@ -496,11 +522,15 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     // Simple debounce: collect events for a short period then process
     let mut pending: Vec<PathBuf> = Vec::new();
     let debounce = Duration::from_millis(300);
+    let mut last_activity = Instant::now();
 
     loop {
         match rx.recv_timeout(debounce) {
             Ok(Ok(event)) => {
                 for path in event.paths {
+                    if is_ignored_watch_path(&path, root) {
+                        continue;
+                    }
                     if let Some(ext) = path.extension() {
                         if ext == "md" || ext == "markdown" {
                             pending.push(path);
@@ -512,7 +542,15 @@ pub fn run_daemon(root: &Path) -> Result<()> {
                 eprintln!("Watcher error: {}", e);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !pending.is_empty() {
+                if pending.is_empty() {
+                    // No indexable activity for a while → retire this idle daemon so
+                    // per-project watchers don't pile up. Re-spawned on the next request.
+                    if last_activity.elapsed() >= IDLE_EXIT_AFTER {
+                        println!("Idle for {}h — shutting down daemon.", IDLE_EXIT_AFTER.as_secs() / 3600);
+                        break;
+                    }
+                } else {
+                    last_activity = Instant::now();
                     // Dedup and process
                     let mut unique = std::collections::HashSet::new();
                     pending.retain(|p| unique.insert(p.clone()));
@@ -621,4 +659,24 @@ fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod watch_filter_tests {
+    use super::is_ignored_watch_path;
+    use std::path::Path;
+
+    #[test]
+    fn ignores_build_vcs_and_hidden_dirs_but_keeps_real_docs() {
+        let root = Path::new("/proj");
+        // Ignored: build/VCS/hidden + the central data dir.
+        assert!(is_ignored_watch_path(Path::new("/proj/target/doc/x.md"), root));
+        assert!(is_ignored_watch_path(Path::new("/proj/node_modules/foo/README.md"), root));
+        assert!(is_ignored_watch_path(Path::new("/proj/.git/COMMIT_EDITMSG"), root));
+        assert!(is_ignored_watch_path(Path::new("/proj/.proactive-context/index.db"), root));
+        assert!(is_ignored_watch_path(Path::new("/proj/.obsidian/cache.md"), root));
+        // Kept: ordinary documentation paths.
+        assert!(!is_ignored_watch_path(Path::new("/proj/docs/wiki/guide.md"), root));
+        assert!(!is_ignored_watch_path(Path::new("/proj/README.md"), root));
+    }
 }

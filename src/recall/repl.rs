@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use super::{
     ask, corpus, picker,
     store::{self, Store},
-    usage::Ledger,
 };
+use crate::usage::Ledger;
 use crate::provider::ModelSpec;
 
 const GATE_DEFAULT: &str = "openrouter:deepseek/deepseek-v4-flash";
@@ -800,20 +800,16 @@ pub fn run(spec: &ModelSpec) -> Result<()> {
             Ok(a) => {
                 let secs = t.elapsed().as_secs_f64();
                 println!("\n{}", a.text);
-                let cost = if a.usage.cost_known {
-                    format!(" · ${:.4}", a.usage.cost)
-                } else {
-                    String::new()
-                };
+                let cost = a.usage.cost.map(|c| format!(" · ${:.4}", c)).unwrap_or_default();
                 println!(
                     "\n{}",
                     dim(format!(
                         "[{}/{} citations valid · {}↑ {}↓ tok · {} cached{} · {:.0}s]",
                         a.cites_valid,
                         a.cites_total,
-                        super::usage::fmt_tok(a.usage.prompt_tokens),
-                        super::usage::fmt_tok(a.usage.completion_tokens),
-                        super::usage::fmt_tok(a.usage.cached_tokens),
+                        crate::usage::fmt_tok(a.usage.prompt_tokens),
+                        crate::usage::fmt_tok(a.usage.completion_tokens),
+                        crate::usage::fmt_tok(a.usage.cached_tokens),
                         cost,
                         secs
                     ))

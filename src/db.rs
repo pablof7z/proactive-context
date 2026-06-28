@@ -135,6 +135,17 @@ pub fn delete_chunks_for_path(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Return the stored chunk content-hashes for a path, ordered by chunk_index.
+/// Used to skip re-embedding a file whose content is unchanged since last index.
+pub fn chunk_hashes_for_path(conn: &Connection, path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT content_hash FROM vec_chunks WHERE path = ? ORDER BY chunk_index")?;
+    let hashes = stmt
+        .query_map(params![path], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(hashes)
+}
+
 /// Return all distinct file paths currently in the index.
 pub fn indexed_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT DISTINCT path FROM vec_chunks")?;

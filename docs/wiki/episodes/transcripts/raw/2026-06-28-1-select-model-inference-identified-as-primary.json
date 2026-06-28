@@ -1,0 +1,22 @@
+[
+  [
+    "user",
+    "this is from the debug tail command: [Image #1] does that mean we spent 16 seconds reading the guides? why did it take so long? it ended up timing out?"
+  ],
+  [
+    "user",
+    "[Image: source: /var/folders/bl/w2vvyf7n0sq2vrh10pg8bd4h0000gn/T/TemporaryItems/NSIRD_screencaptureui_FFYlKn/Screenshot 2026-06-28 at 1.57.05 PM.png]"
+  ],
+  [
+    "assistant",
+    "The 16 seconds wasn't reading guides — it was the SELECT LLM call (claude-cli:haiku deciding *which* guides to read) running against a 150-item catalog. Here's the exact breakdown:\n\n| Time | Event |\n|------|-------|\n| 10:56:15 | inject.start |\n| 10:56:16 | wiki.index_read — catalog built (150 items) |\n| **10:56:16 → 10:56:32** | **SELECT call (haiku via sidecar) — 16 seconds** |\n| 10:56:32 | inject.resolve — SELECT returned, QUERY parsed |\n| 10:56:41 | inject.done — **overall 25s timeout fired** before COMPILE could finish |\n\nSELECT ate 16 of the 25s budget, leaving ~9s for COMPILE which wasn't enough. The inject.done says `fallback [timeout]` — it fell back to raw chunks.\n\n**Why is SELECT that slow?** 150-item catalog is a large context for haiku-via-sidecar. The sidecar also has socket overhead on top of inference time.\n\nTwo levers to fix this:\n\n1. **Raise `inject_browse_timeout_ms`** — e.g. 40s gives COMPILE ~24s after a 16s SELECT. Downside: slower worst-case hook latency for relevant prompts.\n2. **Lower `CATALOG_MAX`** from 150 — e.g. 80 items cuts SELECT context roughly in half, probably 2-4x faster. Downside: some lower-ranked sources get dropped before SELECT sees them.\n\nThe cleanest fix is probably both: cut `CATALOG_MAX` to 80-100 and bump the timeout to 35s. Want me to make those changes?"
+  ],
+  [
+    "user",
+    "what is it doing? \"haiku via sidewcar\"? what sidecar? what the fuck are you talking about?"
+  ],
+  [
+    "assistant",
+    "The `claude-cli` provider in your codebase (`claude_sidecar.rs`) literally spawns `claude -p` — the Claude Code CLI binary on your machine — to run inference. It keeps a pool of pre-warmed `claude` child processes.\n\nSo the SELECT step is: feed a 150-item catalog to the `claude` CLI and wait for it to pick which guides are relevant. That call took 16 seconds. That's what ate the timeout budget before COMPILE could run.\n\nThe 16 seconds is just how long a local `claude` CLI call took to process that much context. Nothing exotic — it's slow because 150 catalog entries is a big prompt."
+  ]
+]

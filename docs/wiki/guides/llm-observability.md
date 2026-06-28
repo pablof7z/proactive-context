@@ -8,21 +8,22 @@ tags:
 volatility: warm
 confidence: medium
 created: 2026-05-29
-updated: 2026-06-16
+updated: 2026-06-28
 verified: 2026-05-29
 compiled-from: conversation
 sources:
   - session:9af6a8f7-5ec5-420f-9110-fdf509d30c2b
   - session:54cada63-dcb1-4088-9838-22639779ca06
+  - session:5e3eb16d-da30-4e4d-938f-4d3e508fd24d
 ---
 
 # LLM Observability
 
 ## Event Logging
 
-The event JSONL log records all steps throughout LLM generation, including cost metadata from OpenRouter (usage.cost is always present in the response body with no opt-in needed). Both OpenRouter and Ollama LLM call paths in inject.rs are instrumented to log llm.request/llm.response events and write sidecar files. The separate /generation endpoint does not work reliably; cost metadata comes only from the main response body. RunCounters accumulates usage from llm.response events using flat prompt_tokens, completion_tokens, and cost_usd fields, rather than only the nested usage.* shape.
+The event JSONL log records all steps throughout LLM generation, including cost metadata from OpenRouter (usage.cost is always present in the response body with no opt-in needed). Both OpenRouter and Ollama LLM call paths in inject.rs are instrumented to log llm.request/llm.response events and write sidecar files. The separate /generation endpoint does not work reliably; cost metadata comes only from the main response body. Usage accounting for prompt tokens, completion tokens, cached tokens, and cost is decoupled from the recall module and globally available across any LLM call path, including claude-cli, accumulating from llm.response events using flat fields rather than only the nested usage.* shape.
 
-<!-- citations: [^9af6a-5] [^54cad-2] -->
+<!-- citations: [^9af6a-5] [^54cad-2] [^5e3eb-77d27] -->
 ## Sidecar Files
 
 A sidecar JSON file is written at ~/.proactive-context/logs/llm_turns/<req>-t<turn>.json containing the full prompt messages array, response text, and usage/cost data for each LLM turn. Turn numbering uses t1 for the select call and t2 for the compile call to avoid overwriting the same t0 file. <!-- [^9af6a-6] -->

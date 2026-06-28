@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "do we have any kind of accounting to know how many tokens were using for the different things (input, output, cache, etc)"
+  ],
+  [
+    "assistant",
+    "Here's the full picture:\n\n**`recall/usage.rs` — most complete** (used only in `pc recall-repl`):\n- `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cost`, `latency`\n- Per-model breakdown + totals, cache hit %, `/usage` detailed view\n\n**`archeologist.rs` `RunCounters`** (archeologist TUI/line-log):\n- `tokens_in`, `tokens_out`, `cost_usd`\n- **No cache tokens** — `cached_tokens` was never added to this struct\n\n**`openrouter.rs` `llm.response` events** (capture pipeline):\n- Emits `prompt_tokens`, `completion_tokens`, `cost_usd`\n- **No cache tokens** — `parse_usage` at line 307 never reads cache fields from the OpenRouter response\n\n**`claude_sidecar.rs`**:\n- Does read `cache_read_input_tokens` at line 394 and populates `cached_tokens`\n- But this flows into `recall::usage::Usage`, not into the `llm.response` events or `RunCounters`\n\nSo in practice: cache tokens are tracked only in the recall-repl path. The main capture pipeline and archeologist are blind to cache reads. Two gaps:\n1. `openrouter.rs` `parse_usage` → doesn't read OpenRouter's `prompt_tokens_details.cached_tokens` field\n2. `RunCounters.apply()` → doesn't accumulate `cached_tokens` even if they were emitted"
+  ],
+  [
+    "user",
+    "usage shouldn't have been coupled to recall -- it should be global to ANY and ALL llm calls! including claude-cli"
+  ],
+  [
+    "assistant",
+    "Clean build. The refactor is done. Here's what changed:\n\n- **`src/usage.rs`** (new) — canonical `Usage` struct with `prompt_tokens`, `completion_tokens`, `cached_tokens`, `total_tokens`, `cost: Option<f64>` + `Ledger` for per-model tracking\n- **`openrouter.rs`** — dropped local `Usage`/`CostDetails`, now uses `crate::usage::Usage`; `parse_usage` now reads `prompt_tokens_details.cached_tokens` (was silently dropped before)\n- **`claude_cli.rs`** / **`claude_sidecar.rs`** — `use crate::usage::Usage` (was `recall::usage`)\n- **`recall/llm.rs`** / **`recall/ask.rs`** / **`recall/repl.rs`** — updated to `crate::usage::{Usage, Ledger, fmt_tok}`; `cost_known` replaced with `cost.is_some()`\n- **`recall/mod.rs`** — `pub mod usage` removed\n- **`recall/usage.rs`** — tombstoned"
+  ]
+]

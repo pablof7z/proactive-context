@@ -16,6 +16,11 @@ use uuid::Uuid;
 const IDLE_DROP_AFTER: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 const RETRIES: usize = 3;
+/// Upper bound on a single blocking client read/write. The embed wire protocol has no
+/// per-request timeout, so without this a wedged sidecar leaves the client blocked on
+/// `read_line` forever — which pins the caller's tokio runtime on drop. Generous enough
+/// to cover a large full-index batch, while still bounding the hang to seconds-not-days.
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EmbedRequest {
@@ -139,6 +144,8 @@ fn request_embeddings(socket_path: &Path, texts: &[String]) -> Result<Vec<Vec<f3
 
     let mut stream = StdUnixStream::connect(socket_path)
         .with_context(|| format!("connect to embed sidecar at {}", socket_path.display()))?;
+    let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
     serde_json::to_writer(&mut stream, &request).context("write embed sidecar request")?;
     stream
         .write_all(b"\n")

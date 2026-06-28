@@ -2597,6 +2597,12 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         .await
     });
 
+    // Detach the runtime rather than letting it drop: a ClaudeCli `spawn_blocking` call
+    // that outlived the 5-min timeout can't be cancelled, and a normal drop would block
+    // capture until it returns (forever, if the sidecar read is wedged). The client-side
+    // socket timeout bounds the task; we exit now.
+    rt.shutdown_background();
+
     match agent_result {
         Ok(Ok(summary)) => {
             eprintln!(
@@ -3444,12 +3450,16 @@ pub(crate) fn run_debug_extract(
     o.flush()?;
     let rt = Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
-    let raw = rt.block_on(async {
+    let raw_result = rt.block_on(async {
         run_stage(
             &capture_spec, &openrouter_api_key, &ollama_base_url, ollama_api_key.as_deref(),
             &system, &user, 6000,
         ).await
-    })?;
+    });
+    // Detach before propagating: an uncancellable ClaudeCli `spawn_blocking` task must not
+    // pin this process on runtime drop. The client-side socket timeout bounds the task.
+    rt.shutdown_background();
+    let raw = raw_result?;
     writeln!(o, "{}\n", raw)?;
 
     writeln!(o, "{}\n", paint(use_color, TC_HEADER, "──── (4) PARSED CLAIMS ────────────────────────────────────────"))?;

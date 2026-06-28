@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "do we have any kind of accounting to know how many tokens were using for the different things (input, output, cache, etc)"
+  ],
+  [
+    "assistant",
+    "Token tracking is fragmented across multiple paths—cache tokens are tracked only in recall-repl, while the capture pipeline and archeologist lack cache token accounting."
+  ],
+  [
+    "user",
+    "usage shouldn't have been coupled to recall -- it should be global to ANY and ALL llm calls! including claude-cli"
+  ],
+  [
+    "assistant",
+    "Refactored usage tracking into a canonical Usage struct in src/usage.rs and updated all LLM modules (openrouter, claude_cli, claude_sidecar, recall) to use it."
+  ]
+]

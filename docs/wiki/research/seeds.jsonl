@@ -1,0 +1,1 @@
+{"date":"2026-06-28","evidence":[{"end":1,"start":1}],"evidence_text":"User: do we have any kind of accounting to know how many tokens were using for the different things (input, output, cache, etc)","session":"5e3eb16d-da30-4e4d-938f-4d3e508fd24d","topic":"The user is probing token accounting coverage across the codebase."}

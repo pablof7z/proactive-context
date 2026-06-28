@@ -9,24 +9,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::events::log_event;
+use crate::usage::Usage;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub cost: Option<f64>,
-    pub cost_details: Option<CostDetails>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CostDetails {
-    pub upstream_inference_prompt_cost: Option<f64>,
-    pub upstream_inference_completions_cost: Option<f64>,
-    pub upstream_inference_cost: Option<f64>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -305,24 +290,12 @@ pub fn record_external_turn(
 }
 
 fn parse_usage(u: &Value) -> Usage {
-    let cost_details = {
-        let cd = &u["cost_details"];
-        if cd.is_object() {
-            Some(CostDetails {
-                upstream_inference_prompt_cost: cd["upstream_inference_prompt_cost"].as_f64(),
-                upstream_inference_completions_cost: cd["upstream_inference_completions_cost"].as_f64(),
-                upstream_inference_cost: cd["upstream_inference_cost"].as_f64(),
-            })
-        } else {
-            None
-        }
-    };
-
     Usage {
-        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+        prompt_tokens:     u["prompt_tokens"].as_u64().unwrap_or(0),
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-        total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
-        cost: u["cost"].as_f64(),
-        cost_details,
+        cached_tokens:     u.pointer("/prompt_tokens_details/cached_tokens")
+                            .and_then(|v| v.as_u64()).unwrap_or(0),
+        total_tokens:      u["total_tokens"].as_u64().unwrap_or(0),
+        cost:              u["cost"].as_f64(),
     }
 }

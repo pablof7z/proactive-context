@@ -22,7 +22,7 @@ pub fn user(c: impl Into<String>) -> Msg { Msg { role: "user".into(), content: c
 
 pub struct Reply {
     pub content: String,
-    pub usage: super::usage::Usage,
+    pub usage: crate::usage::Usage,
 }
 
 /// One chat completion against the configured provider. `num_ctx` is applied to
@@ -110,12 +110,12 @@ fn ollama_chat(model: &str, messages: &[Msg], num_ctx: u64, max_tokens: u32) -> 
     }
     Ok(Reply {
         content: v.pointer("/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        usage: super::usage::Usage {
+        usage: crate::usage::Usage {
             prompt_tokens: v.get("prompt_eval_count").and_then(|n| n.as_u64()).unwrap_or(0),
             completion_tokens: v.get("eval_count").and_then(|n| n.as_u64()).unwrap_or(0),
             cached_tokens: 0,
-            cost: 0.0,
-            cost_known: false, // Ollama doesn't report cost
+            total_tokens: 0,
+            cost: None, // Ollama doesn't report cost
         },
     })
 }
@@ -149,12 +149,12 @@ fn openrouter_chat(model: &str, messages: &[Msg], max_tokens: u32) -> Result<Rep
     let cost = u.get("cost").and_then(|n| n.as_f64());
     Ok(Reply {
         content: v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        usage: super::usage::Usage {
-            prompt_tokens: u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+        usage: crate::usage::Usage {
+            prompt_tokens:     u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
             completion_tokens: u.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
-            cached_tokens: u.pointer("/prompt_tokens_details/cached_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
-            cost: cost.unwrap_or(0.0),
-            cost_known: cost.is_some(),
+            cached_tokens:     u.pointer("/prompt_tokens_details/cached_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+            total_tokens:      u.get("total_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+            cost,
         },
     })
 }

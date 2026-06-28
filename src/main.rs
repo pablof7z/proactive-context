@@ -4,6 +4,7 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod alias;
+mod usage;
 mod archeologist;
 mod tenex;
 mod codex;
