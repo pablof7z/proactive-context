@@ -31,7 +31,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::recall::usage::Usage;
+use crate::usage::Usage;
 
 // ─── Tuning constants ──────────────────────────────────────────────────────────
 
@@ -286,8 +286,8 @@ async fn handle_client(stream: UnixStream, pool: Arc<Mutex<Pool>>) -> Result<()>
                             prompt_tokens: usage.prompt_tokens,
                             completion_tokens: usage.completion_tokens,
                             cached_tokens: usage.cached_tokens,
-                            cost: usage.cost,
-                            cost_known: usage.cost_known,
+                            cost: usage.cost.unwrap_or(0.0),
+                            cost_known: usage.cost.is_some(),
                         }),
                         error: None,
                     },
@@ -392,8 +392,8 @@ async fn read_until_result(warm: &mut WarmChild) -> Result<(String, Usage)> {
                 prompt_tokens:     u["input_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                 cached_tokens:     u["cache_read_input_tokens"].as_u64().unwrap_or(0),
-                cost: cost.unwrap_or(0.0),
-                cost_known: cost.is_some(),
+                total_tokens:      0,
+                cost,
             },
         ));
     }
@@ -403,6 +403,13 @@ async fn read_until_result(warm: &mut WarmChild) -> Result<(String, Usage)> {
 
 /// Blocking client: try warm sidecar first, fall back to cold `claude -p` spawn.
 pub fn chat_blocking(model: &str, system: &str, user: &str, timeout: Duration) -> Result<crate::recall::llm::Reply> {
+    crate::events::log_event("claude_cli.call", None, serde_json::json!({
+        "cmd": format!("claude --safe-mode -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --disallowedTools '*' --model {}", model),
+        "model": model,
+        "system": system,
+        "user": user,
+        "timeout_secs": timeout.as_secs(),
+    }));
     let socket = match claude_socket_path() {
         Ok(p) => p,
         Err(_) => return cold_fallback(model, system, user, timeout),
@@ -446,6 +453,13 @@ fn request_chat(socket: &Path, model: &str, system: &str, user: &str, timeout: D
 
     let mut stream = StdUnixStream::connect(socket)
         .with_context(|| format!("connect to claude sidecar at {}", socket.display()))?;
+    // Bound the blocking read/write: without a deadline a wedged sidecar (or a stuck
+    // warm `claude` child) leaves this client blocked on `read_line` forever, which in
+    // turn pins the caller's tokio runtime on drop. Give a few seconds of slack over the
+    // server-side timeout so the server's own deadline reports a clean error first.
+    let sock_deadline = timeout.saturating_add(Duration::from_secs(5));
+    let _ = stream.set_read_timeout(Some(sock_deadline));
+    let _ = stream.set_write_timeout(Some(sock_deadline));
     serde_json::to_writer(&mut stream, &req).context("write claude sidecar request")?;
     stream.write_all(b"\n").context("finish claude sidecar request")?;
     stream.flush().context("flush claude sidecar request")?;
@@ -472,8 +486,8 @@ fn request_chat(socket: &Path, model: &str, system: &str, user: &str, timeout: D
             prompt_tokens:     wu.prompt_tokens,
             completion_tokens: wu.completion_tokens,
             cached_tokens:     wu.cached_tokens,
-            cost:              wu.cost,
-            cost_known:        wu.cost_known,
+            total_tokens:      0,
+            cost:              if wu.cost_known { Some(wu.cost) } else { None },
         },
     })
 }
