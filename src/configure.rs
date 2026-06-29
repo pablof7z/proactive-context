@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -315,6 +315,51 @@ enum Pane {
     Models,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProviderTab {
+    All,
+    ClaudeCli,
+    OpenRouter,
+    Ollama,
+}
+
+impl ProviderTab {
+    const ALL: &'static [ProviderTab] = &[
+        ProviderTab::All,
+        ProviderTab::ClaudeCli,
+        ProviderTab::OpenRouter,
+        ProviderTab::Ollama,
+    ];
+
+    fn next(self) -> Self {
+        let pos = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(pos + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Self {
+        let pos = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[if pos == 0 { Self::ALL.len() - 1 } else { pos - 1 }]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ProviderTab::All => "All",
+            ProviderTab::ClaudeCli => "Claude CLI",
+            ProviderTab::OpenRouter => "OpenRouter",
+            ProviderTab::Ollama => "Ollama",
+        }
+    }
+
+    fn matches(self, p: &Provider) -> bool {
+        match self {
+            ProviderTab::All => true,
+            ProviderTab::ClaudeCli => *p == Provider::ClaudeCli,
+            ProviderTab::OpenRouter => *p == Provider::OpenRouter,
+            ProviderTab::Ollama => *p == Provider::Ollama,
+        }
+    }
+}
+
 #[allow(dead_code)]
 enum LoadState {
     Loading,
@@ -335,6 +380,8 @@ struct AppState {
     // filter text
     filter: String,
     filter_mode: bool,
+    // active provider tab
+    provider_tab: ProviderTab,
     // pending errors (from background thread)
     fetch_errors: Vec<String>,
     dirty: bool,
@@ -354,6 +401,7 @@ impl AppState {
             model_sel: 0,
             filter: String::new(),
             filter_mode: false,
+            provider_tab: ProviderTab::All,
             fetch_errors: Vec::new(),
             dirty: false,
             tick: 0,
@@ -368,10 +416,12 @@ impl AppState {
 
     fn apply_filter(&mut self) {
         let q = self.filter.to_lowercase();
+        let tab = self.provider_tab;
         self.filtered = self
             .models
             .iter()
             .enumerate()
+            .filter(|(_, m)| tab.matches(&m.provider))
             .filter(|(_, m)| {
                 if q.is_empty() {
                     return true;
@@ -439,6 +489,22 @@ impl AppState {
             self.role_sel += 1;
         }
     }
+
+    fn tab_next(&mut self) {
+        self.provider_tab = self.provider_tab.next();
+        self.model_sel = 0;
+        self.apply_filter();
+    }
+
+    fn tab_prev(&mut self) {
+        self.provider_tab = self.provider_tab.prev();
+        self.model_sel = 0;
+        self.apply_filter();
+    }
+
+    fn tab_count(&self, tab: ProviderTab) -> usize {
+        self.models.iter().filter(|m| tab.matches(&m.provider)).count()
+    }
 }
 
 // ─── Terminal guard ────────────────────────────────────────────────────────────
@@ -500,8 +566,8 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Leave bottom 3 lines for description + suggestion
-    let info_lines = 3u16;
+    // Leave bottom 6 lines for description (wraps) + suggestion (wraps)
+    let info_lines = 6u16;
     let list_area = Rect {
         height: inner.height.saturating_sub(info_lines),
         ..inner
@@ -567,7 +633,7 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, list_area, list_state);
 
-    // Info block: divider + description + suggestion for selected role
+    // Info block: divider + description (wraps) + suggestion (wraps)
     let info_y = inner.y + inner.height.saturating_sub(info_lines);
     let w = inner.width as usize;
     let role = &ROLES[state.role_sel];
@@ -581,29 +647,44 @@ fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mu
         Rect { x: inner.x, y: info_y, width: inner.width, height: 1 },
     );
 
-    // Description line
-    let desc = truncate_to(role.description, w);
+    // Description (up to 3 lines, word-wrapped)
     frame.render_widget(
-        Paragraph::new(Span::styled(desc, Style::default().fg(Color::White))),
-        Rect { x: inner.x, y: info_y + 1, width: inner.width, height: 1 },
+        Paragraph::new(Span::styled(role.description, Style::default().fg(Color::White)))
+            .wrap(Wrap { trim: true }),
+        Rect { x: inner.x, y: info_y + 1, width: inner.width, height: 3 },
     );
 
-    // Suggestion line (colored hint)
-    let sug = truncate_to(role.suggestion, w);
+    // Suggestion (up to 2 lines, word-wrapped)
     frame.render_widget(
-        Paragraph::new(Span::styled(sug, Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM))),
-        Rect { x: inner.x, y: info_y + 2, width: inner.width, height: 1 },
+        Paragraph::new(Span::styled(role.suggestion, Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)))
+            .wrap(Wrap { trim: true }),
+        Rect { x: inner.x, y: info_y + 4, width: inner.width, height: 2 },
     );
 }
 
-fn truncate_to(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max > 1 {
-        format!("{}…", &s[..max - 1])
-    } else {
-        s[..max].to_string()
+fn render_provider_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, &tab) in ProviderTab::ALL.iter().enumerate() {
+        let count = state.tab_count(tab);
+        let is_active = state.provider_tab == tab;
+        let label = format!(" {} ({}) ", tab.label(), count);
+        let style = if is_active {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if count == 0 {
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(label, style));
+        if i < ProviderTab::ALL.len() - 1 {
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        }
     }
+    spans.push(Span::styled(
+        "  [/] switch",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
@@ -611,19 +692,9 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
 
     let current_model = get_role_value(&state.cfg, state.current_role().key);
 
-    // Count OR / OL models to show in title
-    let or_count = state.models.iter().filter(|m| m.provider == Provider::OpenRouter).count();
-    let ol_count = state.models.iter().filter(|m| m.provider == Provider::Ollama).count();
-    let counts = if or_count > 0 || ol_count > 0 {
-        format!(" {or_count}×OR {ol_count}×OL")
-    } else {
-        String::new()
-    };
-
     let title = format!(
-        " Models for '{}'{}{} ",
+        " Models for '{}'{} ",
         state.current_role().label,
-        counts,
         if state.dirty { " *" } else { "" }
     );
 
@@ -640,16 +711,19 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Filter bar (1 line) + list + optional error lines
+    // Tab bar (1 line) + filter bar (1 line) + list + optional error lines
     let error_lines = state.fetch_errors.len() as u16;
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),              // provider tab bar
             Constraint::Length(1),              // filter bar
-            Constraint::Min(1),                  // model list
-            Constraint::Length(error_lines),     // fetch errors (0 if none)
+            Constraint::Min(1),                 // model list
+            Constraint::Length(error_lines),    // fetch errors (0 if none)
         ])
         .split(inner);
+
+    render_provider_tabs(frame, v_chunks[0], state);
 
     // Filter bar
     let filter_bar = if state.filter_mode {
@@ -672,7 +746,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
             ),
         ])
     };
-    frame.render_widget(Paragraph::new(filter_bar), v_chunks[0]);
+    frame.render_widget(Paragraph::new(filter_bar), v_chunks[1]);
 
     // Model list
     match &state.load_state {
@@ -687,7 +761,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])),
-                v_chunks[1],
+                v_chunks[2],
             );
         }
         LoadState::Error(e) => {
@@ -696,7 +770,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                     format!(" ✗ {}", e),
                     Style::default().fg(Color::Red),
                 ))),
-                v_chunks[1],
+                v_chunks[2],
             );
         }
         LoadState::Done => {
@@ -708,7 +782,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                 };
                 frame.render_widget(
                     Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
-                    v_chunks[1],
+                    v_chunks[2],
                 );
                 return;
             }
@@ -734,7 +808,6 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                         Span::raw("   ")
                     };
 
-                    // Model id (strip provider prefix for display)
                     let id_style = if is_current {
                         Style::default().fg(Color::Green)
                     } else if is_sel {
@@ -744,7 +817,6 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                     };
                     let id_span = Span::styled(format!(" {}", m.display), id_style);
 
-                    // Right-aligned metadata (ctx length, price)
                     let meta = build_meta_span(m, area.width);
 
                     let base = if is_sel {
@@ -765,9 +837,9 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
 
             // Count display
             let count_area = Rect {
-                x: v_chunks[1].x,
-                y: v_chunks[1].y,
-                width: v_chunks[1].width,
+                x: v_chunks[2].x,
+                y: v_chunks[2].y,
+                width: v_chunks[2].width,
                 height: 1,
             };
             let count_str = if state.filter.is_empty() {
@@ -775,19 +847,18 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
             } else {
                 format!(" {}/{} models", total, state.models.len())
             };
-            // Only render count if we have height
-            let list_area = if v_chunks[1].height > 2 {
+            let list_area = if v_chunks[2].height > 2 {
                 frame.render_widget(
                     Paragraph::new(Span::styled(&count_str, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))),
                     count_area,
                 );
                 Rect {
-                    y: v_chunks[1].y + 1,
-                    height: v_chunks[1].height - 1,
-                    ..v_chunks[1]
+                    y: v_chunks[2].y + 1,
+                    height: v_chunks[2].height - 1,
+                    ..v_chunks[2]
                 }
             } else {
-                v_chunks[1]
+                v_chunks[2]
             };
 
             list_state.select(Some(state.model_sel));
@@ -798,7 +869,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
     }
 
     // Fetch errors (bottom of model pane, always visible)
-    if !state.fetch_errors.is_empty() && v_chunks[2].height > 0 {
+    if !state.fetch_errors.is_empty() && v_chunks[3].height > 0 {
         let err_lines: Vec<Line> = state
             .fetch_errors
             .iter()
@@ -809,7 +880,7 @@ fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &m
                 ])
             })
             .collect();
-        frame.render_widget(Paragraph::new(err_lines), v_chunks[2]);
+        frame.render_widget(Paragraph::new(err_lines), v_chunks[3]);
     }
 }
 
@@ -860,7 +931,9 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             dirty_indicator,
             Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::styled(":switch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(":pane  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[/]", Style::default().fg(Color::Cyan)),
+            Span::styled(":provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("↑↓/jk", Style::default().fg(Color::Cyan)),
             Span::styled(":navigate  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
@@ -1058,6 +1131,16 @@ pub fn run_configure() -> Result<()> {
                     for _ in 0..10 {
                         app.model_down();
                     }
+                }
+
+                // Provider tabs
+                KeyCode::Char('[') => {
+                    app.pane = Pane::Models;
+                    app.tab_prev();
+                }
+                KeyCode::Char(']') => {
+                    app.pane = Pane::Models;
+                    app.tab_next();
                 }
 
                 // Filter
