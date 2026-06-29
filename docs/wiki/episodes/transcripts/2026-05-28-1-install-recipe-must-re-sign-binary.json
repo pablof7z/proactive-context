@@ -1,6 +1,0 @@
-[
-  [
-    "assistant",
-    "`~/.bin/proactive-context` is working again; added `codesign --force --sign -` to the `just install` recipe to prevent future issues."
-  ]
-]

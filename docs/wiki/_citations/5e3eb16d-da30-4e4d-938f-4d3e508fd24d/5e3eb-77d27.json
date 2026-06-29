@@ -1,6 +1,0 @@
-{
-  "id": "5e3eb-77d27",
-  "ts": "2026-06-28T11:10:18Z",
-  "session": "5e3eb16d-da30-4e4d-938f-4d3e508fd24d",
-  "text": "User: do we have any kind of accounting to know how many tokens were using for the different things (input, output, cache, etc) [...] User: usage shouldn't have been coupled to recall -- it should be global to ANY and ALL llm calls! including claude-cli"
-}
