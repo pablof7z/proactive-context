@@ -76,6 +76,28 @@ pub fn validate_citations(store: &Store, text: &str) -> (usize, usize) {
     (valid, ids.len())
 }
 
+fn wiki_system(corpus_txt: &str) -> String {
+    format!(
+"You are `oracle`: the user's compiled knowledge base. Below is the ENTIRE wiki — synthesized \
+guides, episode cards, research records, and noun definitions, each tagged [subdir/slug].
+
+Answer by citing guide names in brackets, e.g. [guides/capture-routing-bottleneck] or \
+[research/some-record]. State the CURRENT position; surface reversals and open questions. \
+If a guide is marked SUPERSEDED, note what supersedes it.
+
+=== WIKI ===
+{corpus_txt}
+=== END WIKI ===")
+}
+
+pub fn ask_wiki(spec: &ModelSpec, corpus_txt: &str, query: &str, brief: bool) -> Result<Answer> {
+    let system = wiki_system(corpus_txt);
+    let msgs = vec![llm::system(system), llm::user(query.to_string())];
+    let max_tokens = if brief { 2500 } else { 6000 };
+    let reply = llm::chat(spec, &msgs, 1_050_000, max_tokens)?;
+    Ok(Answer { text: reply.content, cites_total: 0, cites_valid: 0, usage: reply.usage })
+}
+
 pub fn ask(spec: &ModelSpec, store: &Store, corpus_txt: &str, query: &str, brief: bool) -> Result<Answer> {
     let system = if brief { brief_system(corpus_txt) } else { full_system(corpus_txt) };
     let msgs = vec![llm::system(system), llm::user(query.to_string())];

@@ -284,7 +284,13 @@ impl ReplState {
     }
 }
 
+enum CorpusSource {
+    Transcripts,
+    Wiki,
+}
+
 struct CorpusView {
+    source: CorpusSource,
     messages: usize,
     dupes: usize,
     token_est: usize,
@@ -292,22 +298,24 @@ struct CorpusView {
 }
 
 fn print_banner(state: &ReplState, corpus: &CorpusView) {
-    println!("{}", accent("recall"));
-    println!(
-        "  {} {} messages · {} dupes collapsed · ~{}k tokens",
-        dim("corpus:"),
-        corpus.messages,
-        corpus.dupes,
-        corpus.token_est
-    );
+    match corpus.source {
+        CorpusSource::Wiki => println!("{}", accent("oracle  (wiki mode)")),
+        CorpusSource::Transcripts => println!("{}", accent("recall")),
+    }
+    let corpus_label = match corpus.source {
+        CorpusSource::Wiki => format!("{} guides · ~{}k tokens", corpus.messages, corpus.token_est),
+        CorpusSource::Transcripts => format!(
+            "{} messages · {} dupes collapsed · ~{}k tokens",
+            corpus.messages, corpus.dupes, corpus.token_est
+        ),
+    };
+    println!("  {} {}", dim("corpus:"), corpus_label);
     println!("  {} {}", dim("thinking:"), model_label(&state.proc_spec));
-    println!("  {} {}", dim("fast gate:"), model_label(&state.gate_spec));
     println!("  {} {}", dim("answer mode:"), accent(state.mode.label()));
-    println!(
-        "  {} {}",
-        dim("database:"),
-        dim(corpus.db_path.display().to_string())
-    );
+    if matches!(corpus.source, CorpusSource::Transcripts) {
+        println!("  {} {}", dim("fast gate:"), model_label(&state.gate_spec));
+        println!("  {} {}", dim("database:"), dim(corpus.db_path.display().to_string()));
+    }
     println!();
     println!(
         "Ask a question, or type {}. Use {} for history, {} for terse answers, {} to exit.",
@@ -321,33 +329,20 @@ fn print_banner(state: &ReplState, corpus: &CorpusView) {
 
 fn print_status(state: &ReplState, corpus: &CorpusView) {
     println!("{}", accent("status"));
-    println!(
-        "  {} {} messages · {} dupes collapsed · ~{}k tokens",
-        dim("corpus:"),
-        corpus.messages,
-        corpus.dupes,
-        corpus.token_est
-    );
-    println!(
-        "  {} {}",
-        dim("thinking model:"),
-        model_label(&state.proc_spec)
-    );
-    println!(
-        "  {}       {}",
-        dim("fast model:"),
-        model_label(&state.gate_spec)
-    );
-    println!(
-        "  {}      {}",
-        dim("answer mode:"),
-        accent(state.mode.label())
-    );
-    println!(
-        "  {}         {}",
-        dim("database:"),
-        dim(corpus.db_path.display().to_string())
-    );
+    let corpus_label = match corpus.source {
+        CorpusSource::Wiki => format!("{} guides · ~{}k tokens", corpus.messages, corpus.token_est),
+        CorpusSource::Transcripts => format!(
+            "{} messages · {} dupes collapsed · ~{}k tokens",
+            corpus.messages, corpus.dupes, corpus.token_est
+        ),
+    };
+    println!("  {} {}", dim("corpus:"), corpus_label);
+    println!("  {} {}", dim("thinking model:"), model_label(&state.proc_spec));
+    if matches!(corpus.source, CorpusSource::Transcripts) {
+        println!("  {}       {}", dim("fast model:"), model_label(&state.gate_spec));
+        println!("  {}         {}", dim("database:"), dim(corpus.db_path.display().to_string()));
+    }
+    println!("  {}      {}", dim("answer mode:"), accent(state.mode.label()));
     if let Some(q) = &state.last_question {
         println!("  {}    {}", dim("last question:"), q);
     }
@@ -741,23 +736,39 @@ fn friendly_error(e: &anyhow::Error) {
     }
 }
 
-pub fn run(spec: &ModelSpec) -> Result<()> {
+pub fn run(spec: &ModelSpec, wiki: bool) -> Result<()> {
     configure_color();
-    let store = Store::open()?;
-    if store.count()? == 0 {
-        anyhow::bail!("recall index is empty — run `pc recall index` first");
-    }
-    eprintln!("recall: building corpus…");
-    let (corpus_txt, stats) = corpus::build(&store)?;
+
+    let (corpus_txt, corpus_view, store) = if wiki {
+        eprintln!("oracle: loading wiki…");
+        let (txt, stats) = corpus::build_wiki()?;
+        let view = CorpusView {
+            source: CorpusSource::Wiki,
+            messages: stats.guides,
+            dupes: 0,
+            token_est: stats.chars / 4 / 1000,
+            db_path: PathBuf::new(),
+        };
+        (txt, view, None)
+    } else {
+        let store = Store::open()?;
+        if store.count()? == 0 {
+            anyhow::bail!("recall index is empty — run `pc recall index` first");
+        }
+        eprintln!("recall: building corpus…");
+        let (txt, stats) = corpus::build(&store)?;
+        let view = CorpusView {
+            source: CorpusSource::Transcripts,
+            messages: stats.messages,
+            dupes: stats.dupes,
+            token_est: stats.chars / 4 / 1000,
+            db_path: store::db_path(),
+        };
+        (txt, view, Some(store))
+    };
 
     let mut state = ReplState::new(spec);
     let mut ledger = Ledger::default();
-    let corpus_view = CorpusView {
-        messages: stats.messages,
-        dupes: stats.dupes,
-        token_est: stats.chars / 4 / 1000,
-        db_path: store::db_path(),
-    };
 
     print_banner(&state, &corpus_view);
 
@@ -790,23 +801,25 @@ pub fn run(spec: &ModelSpec) -> Result<()> {
             model_label(&state.proc_spec),
             dim(format!("({})…", state.mode.label()))
         );
-        match ask::ask(
-            &state.proc_spec,
-            &store,
-            &corpus_txt,
-            &q,
-            state.mode.is_brief(),
-        ) {
+        let result = match &store {
+            Some(s) => ask::ask(&state.proc_spec, s, &corpus_txt, &q, state.mode.is_brief()),
+            None    => ask::ask_wiki(&state.proc_spec, &corpus_txt, &q, state.mode.is_brief()),
+        };
+        match result {
             Ok(a) => {
                 let secs = t.elapsed().as_secs_f64();
                 println!("\n{}", a.text);
                 let cost = a.usage.cost.map(|c| format!(" · ${:.4}", c)).unwrap_or_default();
+                let cite_part = if a.cites_total > 0 {
+                    format!("{}/{} citations valid · ", a.cites_valid, a.cites_total)
+                } else {
+                    String::new()
+                };
                 println!(
                     "\n{}",
                     dim(format!(
-                        "[{}/{} citations valid · {}↑ {}↓ tok · {} cached{} · {:.0}s]",
-                        a.cites_valid,
-                        a.cites_total,
+                        "[{}{}↑ {}↓ tok · {} cached{} · {:.0}s]",
+                        cite_part,
                         crate::usage::fmt_tok(a.usage.prompt_tokens),
                         crate::usage::fmt_tok(a.usage.completion_tokens),
                         crate::usage::fmt_tok(a.usage.cached_tokens),
@@ -833,6 +846,7 @@ mod tests {
             ReplState::new(&ModelSpec::parse("openrouter:test/model")),
             Ledger::default(),
             CorpusView {
+                source: CorpusSource::Transcripts,
                 messages: 3,
                 dupes: 1,
                 token_est: 2,

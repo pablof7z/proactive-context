@@ -52,6 +52,9 @@ pub enum RecallCmd {
     Repl {
         #[arg(long)]
         model: Option<String>,
+        /// Query the compiled wiki (guides, episodes, research, nouns) instead of raw transcripts.
+        #[arg(long)]
+        wiki: bool,
     },
     /// Gate long messages with a cheap model (KEEP/DROP/clean pasted content),
     /// cached in a `gated` table; corpus assembly then prefers the human-only text.
@@ -78,7 +81,7 @@ pub fn run(cmd: RecallCmd) -> Result<()> {
                 ask::run_once(&spec_of(&model), &q, brief)
             }
         }
-        RecallCmd::Repl { model } => repl::run(&spec_of(&model)),
+        RecallCmd::Repl { model, wiki } => repl::run(&spec_of(&model), wiki),
         RecallCmd::Gate { model } => gate::build_gate(
             &ModelSpec::parse(model.as_deref().unwrap_or(gate::GATE_DEFAULT))),
     }

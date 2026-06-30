@@ -991,7 +991,8 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
             log_event("generate.briefing", None, serde_json::json!({
                 "briefing_chars": body.len(),
-                "summary": truncate(body, 200)
+                "summary": truncate(body, 200),
+                "briefing_text": body
             }));
 
             let out_chars = out.len();
@@ -1723,10 +1724,16 @@ async fn wiki_navigate_and_compile(
             let model = select_spec.model.clone();
             let preamble2 = preamble.clone();
             let prompt2 = current_prompt.to_string();
-            tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            let reply = tokio::task::spawn_blocking(move || {
                 crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
-                    std::time::Duration::from_secs(25)).map(|r| r.content)
-            }).await??
+                    std::time::Duration::from_secs(25))
+            }).await??;
+            crate::openrouter::record_external_turn(
+                &select_spec.model, 1, &preamble, current_prompt, &reply.content,
+                t0.elapsed().as_millis() as u64,
+            );
+            reply.content
         }
     };
 
@@ -1943,10 +1950,16 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
             let model = spec.model.clone();
             let preamble2 = preamble.clone();
             let prompt2 = current_prompt.to_string();
-            tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            let reply = tokio::task::spawn_blocking(move || {
                 crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
-                    std::time::Duration::from_secs(25)).map(|r| r.content)
-            }).await??
+                    std::time::Duration::from_secs(25))
+            }).await??;
+            crate::openrouter::record_external_turn(
+                &spec.model, 2, &preamble, current_prompt, &reply.content,
+                t0.elapsed().as_millis() as u64,
+            );
+            reply.content
         }
     };
 

@@ -64,6 +64,7 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
     if ascii {
         match event {
             "inject.start" => ">",
+            "claude_cli.call" => "$",
             "query.start" => "?",
             "retrieve.subquery" => "-",
             "retrieve.hit" => "*",
@@ -90,6 +91,7 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
     } else {
         match event {
             "inject.start" => "▶",
+            "claude_cli.call" => "⌘",
             "query.start" => "⟜",
             "retrieve.subquery" => "↳",
             "retrieve.hit" => "•",
@@ -119,6 +121,7 @@ pub(crate) fn glyph_for(event: &str, ascii: bool) -> &'static str {
 pub(crate) fn event_color_ansi(event: &str) -> &'static str {
     match event {
         "inject.start" => ANSI_CYAN,
+        "claude_cli.call" => ANSI_YELLOW,
         "query.start" => ANSI_BLUE,
         "retrieve.subquery" => ANSI_DIM,
         "retrieve.hit" => ANSI_GREEN,
@@ -157,6 +160,7 @@ pub enum Verbosity {
 pub(crate) fn event_verbosity_tier(event: &str) -> Verbosity {
     match event {
         "inject.start" | "inject.done" | "capture.start" | "capture.done" => Verbosity::Quiet,
+        "claude_cli.call" => Verbosity::Default,
         "error" | "llm.error" => Verbosity::Quiet,
         "retrieve.subquery" | "retrieve.hit" => Verbosity::Verbose,
         "guide.read" | "link.follow" => Verbosity::Verbose,
@@ -387,6 +391,12 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
             trunc(&format!("{} failed · {}", stage, msg), budget)
+        }
+        "claude_cli.call" => {
+            let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let sys_chars = p.get("system").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            let user = p.get("user").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(&format!("{} · {}c system · \"{}\"", model, sys_chars, user), budget)
         }
         "wiki.index_read" => {
             let count = p.get("guide_count").and_then(|v| v.as_u64()).unwrap_or(0);

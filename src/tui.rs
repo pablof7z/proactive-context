@@ -1677,10 +1677,27 @@ fn render_modal_event_detail(
             lines.extend(llm_sidecar_lines(ev));
         }
         "generate.briefing" => {
-            lines.push(Line::from(Span::styled(
-                "  note: (full briefing text was sent to the session and is not persisted in the log)",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
-            )));
+            if let Some(text) = ev.payload.get("briefing_text").and_then(|v| v.as_str()) {
+                lines.push(Line::from(Span::styled(
+                    "briefing:",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for chunk in text
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .chunks(area.width as usize - 4)
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", chunk.iter().collect::<String>()),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  note: (briefing text not available — re-run to capture)",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
         "inject.done" => {
             if let Some(stages) = ev.payload.get("stages") {
@@ -2690,7 +2707,7 @@ pub mod tests {
             "brief-req-111",
             "generate.briefing",
             None,
-            json!({"briefing_chars": 1500, "summary": "Hot path context: inject budget..."}),
+            json!({"briefing_chars": 1500, "summary": "Hot path context: inject budget...", "briefing_text": "Hot path context: inject budget exceeded threshold"}),
         );
         state.push_record(rec);
         state.selected = Some(0);
@@ -2705,8 +2722,8 @@ pub mod tests {
         let content = buffer_text(&terminal);
         assert!(content.contains("INJECT"), "modal should show INJECT section");
         assert!(
-            content.contains("briefing") || content.contains("Hot path"),
-            "modal should surface the briefing summary"
+            content.contains("briefing:") || content.contains("Hot path"),
+            "modal should render the full briefing text"
         );
     }
 

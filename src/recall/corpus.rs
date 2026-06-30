@@ -13,6 +13,48 @@ pub struct CorpusStats {
     pub chars: usize,
 }
 
+pub struct WikiStats {
+    pub guides: usize,
+    pub chars: usize,
+}
+
+/// Walk the wiki (guides/, episodes/, research/, nouns/) and concatenate all .md files
+/// into a single tagged corpus. Each section is labelled with its guide slug so the
+/// model can cite by name, e.g. [capture-routing-bottleneck].
+pub fn build_wiki() -> anyhow::Result<(String, WikiStats)> {
+    let cwd = std::env::current_dir()?;
+    let root = crate::config::resolve_project_root(&cwd);
+    let wiki = crate::wiki::wiki_dir(&root);
+    if !wiki.exists() {
+        anyhow::bail!(
+            "wiki not found at {} — run `pc recall repl --wiki` from a project root",
+            wiki.display()
+        );
+    }
+    let subdirs = ["guides", "episodes", "research", "nouns"];
+    let mut out = String::new();
+    let mut count = 0usize;
+    for subdir in &subdirs {
+        let dir = wiki.join(subdir);
+        if !dir.exists() { continue; }
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('_'))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let slug = path.file_stem().unwrap_or_default().to_string_lossy();
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            out.push_str(&format!("\n\n=== [{subdir}/{slug}] ===\n{content}"));
+            count += 1;
+        }
+    }
+    let chars = out.len();
+    Ok((out, WikiStats { guides: count, chars }))
+}
+
 fn norm(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
