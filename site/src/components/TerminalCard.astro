@@ -1,0 +1,24 @@
+---
+interface Props {
+  title?: string;
+  label?: string;
+  compact?: boolean;
+}
+
+const { title = "terminal", label, compact = false } = Astro.props;
+---
+
+<section class:list={["terminal-card", { compact }]} aria-label={title}>
+  <div class="terminal-toolbar" aria-hidden="true">
+    <span class="terminal-dots">
+      <span></span>
+      <span></span>
+      <span></span>
+    </span>
+    <span class="terminal-title">{title}</span>
+    {label && <span class="terminal-label">{label}</span>}
+  </div>
+  <div class="terminal-body">
+    <slot />
+  </div>
+</section>

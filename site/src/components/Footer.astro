@@ -1,0 +1,21 @@
+---
+const footerLinks = [
+  ["GitHub", "https://github.com/pablof7z/proactive-context"],
+  ["Docs", "https://github.com/pablof7z/proactive-context/tree/master/docs/product-spec"],
+  ["Architecture", "https://github.com/pablof7z/proactive-context/blob/master/docs/product-spec/how-it-works.md"],
+  ["Evals", "https://github.com/pablof7z/proactive-context/tree/master/docs/product-spec"]
+];
+---
+
+<footer class="site-footer">
+  <div>
+    <a class="brand footer-brand" href="#top">
+      <span class="brand-mark">pc</span>
+      <span class="brand-sub">Provenance over fluency.</span>
+    </a>
+    <p>Local-first. Markdown-native. Built for people who inspect their tools.</p>
+  </div>
+  <nav aria-label="Footer">
+    {footerLinks.map(([label, href]) => <a href={href}>{label}</a>)}
+  </nav>
+</footer>

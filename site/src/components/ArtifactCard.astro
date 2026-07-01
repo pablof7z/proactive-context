@@ -1,0 +1,18 @@
+---
+import type { ArtifactItem } from "@data/home";
+
+interface Props {
+  item: ArtifactItem;
+}
+
+const { item } = Astro.props;
+---
+
+<article class={`artifact-card surface is-${item.tone}`} data-reveal>
+  <div class="card-meta">
+    <span class="badge">{item.label}</span>
+    <code>{item.path}</code>
+  </div>
+  <h3>{item.title}</h3>
+  <p>{item.body}</p>
+</article>

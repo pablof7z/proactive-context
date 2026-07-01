@@ -1,0 +1,11 @@
+---
+import type { Tone } from "@data/home";
+
+interface Props {
+  tone?: Tone;
+}
+
+const { tone = "amber" } = Astro.props;
+---
+
+<span class={`citation-chip is-${tone}`}><slot /></span>

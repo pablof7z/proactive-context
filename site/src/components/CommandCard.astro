@@ -1,0 +1,17 @@
+---
+import type { CommandItem } from "@data/home";
+
+interface Props {
+  item: CommandItem;
+}
+
+const { item } = Astro.props;
+---
+
+<article class={`command-card surface is-${item.tone}`} data-reveal>
+  <div class="command-head">
+    <code>{item.command}</code>
+    <span>{item.state}</span>
+  </div>
+  <p>{item.description}</p>
+</article>

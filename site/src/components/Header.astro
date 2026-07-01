@@ -1,0 +1,23 @@
+---
+const navLinks = [
+  ["How it works", "#how-it-works"],
+  ["Artifacts", "#artifacts"],
+  ["Evals", "#evals"],
+  ["Install", "#install"],
+  ["GitHub", "https://github.com/pablof7z/proactive-context"]
+];
+---
+
+<a class="skip-link" href="#content">Skip to content</a>
+<header class="site-header">
+  <nav class="site-nav" aria-label="Primary">
+    <a class="brand" href="#top" aria-label="pc home">
+      <span class="brand-mark">pc</span>
+      <span class="brand-sub">proactive-context</span>
+    </a>
+    <div class="nav-links">
+      {navLinks.map(([label, href]) => <a href={href}>{label}</a>)}
+    </div>
+    <a class="nav-cta" href="#install">Install</a>
+  </nav>
+</header>

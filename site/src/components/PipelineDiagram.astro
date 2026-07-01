@@ -1,0 +1,76 @@
+---
+---
+
+<section id="how-it-works" class="section pipeline-section" aria-labelledby="pipeline-heading">
+  <div class="section-intro" data-reveal>
+    <p class="eyebrow">Capture - Wiki - Inject</p>
+    <h2 id="pipeline-heading">Capture → Wiki → Inject</h2>
+    <p>
+      Capture is slow and off the hot path. Inject is fast and happens before the agent acts.
+      The separation is the architecture.
+    </p>
+  </div>
+
+  <div class="pipeline-wrap">
+    <aside class="pipeline-rail" aria-label="Pipeline rail">
+      <a href="#capture-panel">Capture</a>
+      <a href="#wiki-panel">Wiki</a>
+      <a href="#inject-panel">Inject</a>
+      <a href="#evals">Evaluate</a>
+    </aside>
+
+    <div class="pipeline-grid">
+      <article id="capture-panel" class="pipeline-panel surface is-blue" data-reveal>
+        <div class="panel-index">01</div>
+        <p class="eyebrow">Capture</p>
+        <h3>Turn completed sessions into cited claims.</h3>
+        <p>
+          At session end, pc reads the transcript and extracts atomic claims: decisions,
+          constraints, corrections, open questions, and changes of direction. The model points
+          at transcript line ranges. Rust slices the evidence.
+        </p>
+        <p class="microcopy">The model proposes evidence. Rust verifies it.</p>
+        <div class="line-snippet" aria-label="Line-numbered transcript excerpt">
+          <span><b>128</b> user: No, do not make this a generic memory system.</span>
+          <span><b>129</b> user: The point is provenance over fluency.</span>
+          <span><b>130</b> assistant: Understood, position around cited human discernment.</span>
+        </div>
+      </article>
+
+      <article id="wiki-panel" class="pipeline-panel surface is-amber" data-reveal>
+        <div class="panel-index">02</div>
+        <p class="eyebrow">Wiki</p>
+        <h3>Distill messy conversation into durable project knowledge.</h3>
+        <p>
+          Claims become a project wiki: guides for current truth, episode cards for direction
+          changes, research records for investigations, and an append-only claim log underneath it all.
+        </p>
+        <p class="microcopy">A wiki, not a landfill.</p>
+        <div class="artifact-stack" aria-label="Wiki artifact folders">
+          <code>docs/wiki/guides/</code>
+          <code>docs/wiki/episodes/</code>
+          <code>docs/wiki/research/</code>
+          <code>claims.jsonl</code>
+        </div>
+      </article>
+
+      <article id="inject-panel" class="pipeline-panel surface is-magenta" data-reveal>
+        <div class="panel-index">03</div>
+        <p class="eyebrow">Inject</p>
+        <h3>Push the right context before the agent acts.</h3>
+        <p>
+          On each prompt, pc retrieves candidate sources, selects the relevant guides and episode
+          cards, compiles a dense cited briefing, deduplicates against what the session has already
+          seen, and injects the result as a system reminder.
+        </p>
+        <p class="microcopy">Context window is attention.</p>
+        <div class="trace-block" aria-label="Inject trace">
+          <span>▶ inject.start "why did we reject context dumps?"</span>
+          <span>⟜ select sources</span>
+          <span>✎ compile briefing</span>
+          <span>✓ inject.done 312c</span>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>

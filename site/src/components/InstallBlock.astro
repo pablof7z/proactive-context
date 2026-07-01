@@ -1,0 +1,47 @@
+---
+import TerminalCard from "@components/TerminalCard.astro";
+
+const hookExample = `{
+  "UserPromptSubmit": "pc inject",
+  "Stop": "pc capture --in"
+}`;
+---
+
+<section id="install" class="section install-section" aria-labelledby="install-heading">
+  <div class="section-intro" data-reveal>
+    <p class="eyebrow">Install</p>
+    <h2 id="install-heading">Install the binary. Wire the hooks. Let the wiki grow.</h2>
+    <p>
+      pc is a local CLI, not a hosted memory service. Build it, configure models,
+      and connect capture and inject to your agent workflow.
+    </p>
+  </div>
+
+  <div class="install-grid">
+    <TerminalCard title="quick start" label="local checkout">
+      <div class="terminal-row command">git clone https://github.com/pablof7z/proactive-context</div>
+      <div class="terminal-row command">cd proactive-context</div>
+      <div class="terminal-row command">cargo install --path .</div>
+      <div class="terminal-row command">pc configure</div>
+      <div class="terminal-row command">pc install</div>
+      <div class="terminal-row command">pc archeologist</div>
+    </TerminalCard>
+
+    <article class="hook-block surface" data-reveal>
+      <div class="card-meta">
+        <span class="badge is-magenta">hook shape</span>
+        <code>agent lifecycle</code>
+      </div>
+      <pre aria-label="Hook example"><code>{hookExample}</code></pre>
+      <p>
+        Claude Code is the current primary host integration. The architecture is not limited to Claude Code.
+      </p>
+      <div class="statusline-row" aria-label="Statusline examples">
+        <span>⬡ ▶ ⠋ · 14g</span>
+        <span>⬡ ✎ 312c · 14g</span>
+        <span>⬡ ◆ distilling · 14g</span>
+        <span>⬡ ⊘ · 14g</span>
+      </div>
+    </article>
+  </div>
+</section>

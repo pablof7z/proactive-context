@@ -1,0 +1,15 @@
+---
+import type { MetricItem } from "@data/home";
+
+interface Props {
+  item: MetricItem;
+}
+
+const { item } = Astro.props;
+---
+
+<article class={`metric-card surface is-${item.tone}`} data-reveal>
+  <span class="metric-sigil">⬡</span>
+  <h3>{item.metric}</h3>
+  <p>{item.question}</p>
+</article>
