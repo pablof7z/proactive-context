@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -1206,6 +1207,23 @@ fn extract_json_blob(raw: &str) -> Option<String> {
     None
 }
 
+fn parse_stage_json<T: DeserializeOwned>(stage: &str, raw: &str) -> Result<Vec<T>> {
+    let blob = extract_json_blob(raw)
+        .ok_or_else(|| anyhow::anyhow!("{} produced no JSON array/object", stage))?;
+    serde_json::from_str(&blob).map_err(|e| {
+        anyhow::anyhow!(
+            "{} produced invalid JSON: {} (blob preview: {})",
+            stage,
+            e,
+            truncate(&blob, 300)
+        )
+    })
+}
+
+fn should_mark_capture_success<T, E>(agent_result: &std::result::Result<Result<T>, E>) -> bool {
+    matches!(agent_result, Ok(Ok(_)))
+}
+
 // ─── Stage data shapes ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1216,8 +1234,8 @@ struct ExtractedClaim {
     // investigation; "research_seed" = a "the user is probing <topic>" attention signal. Optional
     // so pre-Stage-2 EXTRACT output (no `kind`) still parses → None → treated as spec_claim.
     // Tolerant deserializer: a malformed non-string `kind` (e.g. `false`, an object) coerces to
-    // None rather than failing the whole-array parse — otherwise one bad value would make the live
-    // path's `unwrap_or_default()` silently drop EVERY claim in the session.
+    // None rather than failing the whole-array parse. Stage parse errors now abort for retry, but
+    // one bad optional field should not poison an otherwise usable capture.
     #[serde(default, deserialize_with = "deserialize_claim_kind")]
     kind: Option<String>,
     #[serde(default)]
@@ -1256,8 +1274,7 @@ struct AdmittedClaim {
 
 /// Tolerant deserializer for the EXTRACT `kind` field: any non-string JSON value (bool, number,
 /// object, array) coerces to `None` instead of erroring. Without this, a single malformed `kind`
-/// would fail `from_str::<Vec<ExtractedClaim>>` and the live path's `unwrap_or_default()` would
-/// silently drop the entire session's claims.
+/// would fail the whole stage parse and defer the capture to retry.
 fn deserialize_claim_kind<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1437,10 +1454,7 @@ async fn run_staged_capture(
             spec, openrouter_api_key, ollama_base_url, ollama_api_key,
             EXTRACT_PREAMBLE, &extract_user, 6000,
         ).await?;
-        let parsed: Vec<ExtractedClaim> = match extract_json_blob(&extract_raw) {
-            Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let parsed: Vec<ExtractedClaim> = parse_stage_json("EXTRACT", &extract_raw)?;
         eprintln!("capture: EXTRACT → {} raw claim(s)", parsed.len());
         log_event("capture.extract", None, serde_json::json!({ "claims": parsed.len() }));
         parsed
@@ -1606,11 +1620,8 @@ async fn run_staged_capture(
                                     &delta_spec, &delta_api_key, &delta_ollama_url, delta_ollama_key.as_deref(),
                                     DELTA_EXTRACT_PREAMBLE, &delta_user, 240,
                                 )
-                            }).unwrap_or_default();
-                            let ops: Vec<DeltaOp> = match extract_json_blob(&delta_raw) {
-                                Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-                                None => Vec::new(),
-                            };
+                            })?;
+                            let ops: Vec<DeltaOp> = parse_stage_json("DELTA_EXTRACT", &delta_raw)?;
                             eprintln!("delta: EXTRACT → {} typed op(s)", ops.len());
 
                             // 3+4. Verify (evidence + target-in-digest) and append typed.
@@ -1906,10 +1917,7 @@ async fn run_staged_capture(
         4000,
     )
     .await?;
-    let routes: Vec<RouteDecision> = match extract_json_blob(&route_raw) {
-        Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let routes: Vec<RouteDecision> = parse_stage_json("ROUTE", &route_raw)?;
 
     // Group admitted claim indices by canonical slug. Unrouted claims fall back to a
     // slug derived from their own assertion (recall bias: never silently drop a fact).
@@ -2012,10 +2020,8 @@ async fn run_staged_capture(
             6000,
         )
         .await?;
-        let ops: Vec<ReconcileOp> = match extract_json_blob(&reconcile_raw) {
-            Some(blob) => serde_json::from_str(&blob).unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let reconcile_stage = format!("RECONCILE {slug}");
+        let ops: Vec<ReconcileOp> = parse_stage_json(&reconcile_stage, &reconcile_raw)?;
         eprintln!("capture: RECONCILE {} → {} op(s)", slug, ops.len());
 
         for op in &ops {
@@ -2564,9 +2570,8 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // Char-safe tail-keep (never slices mid-codepoint).
     let truncated_numbered = tail_capped(&numbered_transcript, 250_000);
 
-    // Run the async staged capture pipeline.
-    // NOTE: mark_captured_in is called AFTER the run so that a pre-run failure
-    // (API error, early timeout) doesn't permanently suppress a retry.
+    // Run the async staged capture pipeline. The captured marker is written only after
+    // successful completion so API errors, parse failures, and timeouts remain retryable.
     // Concurrency is already serialized by the per-session flock above.
     let rt =
         Runtime::new().map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
@@ -2603,6 +2608,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // socket timeout bounds the task; we exit now.
     rt.shutdown_background();
 
+    let capture_completed = should_mark_capture_success(&agent_result);
     match agent_result {
         Ok(Ok(summary)) => {
             eprintln!(
@@ -2641,9 +2647,11 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
-    // Mark session as captured now that the staged run has completed (success or partial).
-    // Doing this after the run means a pre-run failure doesn't permanently suppress retry.
-    let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
+    // Mark only after durable staged-capture success. Failed or timed-out runs must remain
+    // retryable because SessionEnd captures usually will not gain new exchanges.
+    if capture_completed {
+        let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
+    }
 
     // Research-capture stage (feature-flagged, default OFF). Runs AFTER the normal
     // pass and is fully independent of it: recognizes investigation artifacts and
@@ -3468,17 +3476,16 @@ pub(crate) fn run_debug_extract(
         Some(b) => match serde_json::from_str::<Vec<ExtractedClaim>>(b) {
             Ok(v) => v,
             Err(e) => {
-                // Surface parse failure explicitly — do NOT silently coerce to [] like
-                // the live path's unwrap_or_default(), so "0 claims" is never ambiguous
-                // between "model said []" and "model emitted unparseable garbage".
+                // Surface parse failure explicitly, matching the live path's fail-fast behavior:
+                // "0 claims" is never ambiguous between "model said []" and unparseable garbage.
                 writeln!(o, "{}", paint(use_color, TC_RED, &format!("⚠ JSON parse FAILED on the extracted blob: {}", e)))?;
-                writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+                writeln!(o, "  (live capture would fail this stage and leave the session retryable)")?;
                 Vec::new()
             }
         },
         None => {
             writeln!(o, "{}", paint(use_color, TC_RED, "⚠ No JSON array/object found in the response at all."))?;
-            writeln!(o, "  (live capture would silently treat this as 0 claims)")?;
+            writeln!(o, "  (live capture would fail this stage and leave the session retryable)")?;
             Vec::new()
         }
     };
@@ -3771,6 +3778,40 @@ mod tests {
         assert!(wiki.join("_citations/AGENTS.md").exists());
     }
 
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct TinyStageRow {
+        x: String,
+    }
+
+    #[test]
+    fn parse_stage_json_keeps_empty_array_distinct_from_stage_failure() {
+        let empty: Vec<TinyStageRow> = parse_stage_json("EXTRACT", "model says:\n[]").unwrap();
+        assert!(empty.is_empty(), "a real [] response remains a successful no-op");
+
+        let missing = parse_stage_json::<TinyStageRow>("EXTRACT", "no structured output")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("EXTRACT produced no JSON"), "got: {missing}");
+
+        let malformed = parse_stage_json::<TinyStageRow>("ROUTE", r#"[{"x":1}]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("ROUTE produced invalid JSON"), "got: {malformed}");
+    }
+
+    #[test]
+    fn capture_marker_is_written_only_after_successful_staged_capture() {
+        let success: std::result::Result<Result<&str>, &str> = Ok(Ok("done"));
+        assert!(should_mark_capture_success(&success));
+
+        let stage_error: std::result::Result<Result<&str>, &str> =
+            Ok(Err(anyhow::anyhow!("stage failed")));
+        assert!(!should_mark_capture_success(&stage_error));
+
+        let timeout: std::result::Result<Result<&str>, &str> = Err("timeout");
+        assert!(!should_mark_capture_success(&timeout));
+    }
+
     /// The C1 variant rewrites EXTRACT_PREAMBLE by anchored string surgery (extract_preamble_variant).
     /// Those anchors MUST each occur exactly once inside the base preamble, or replacen would target
     /// the wrong site. Stage 1's surface-detail section sits before `## Rules`, so guard uniqueness.
@@ -3790,7 +3831,7 @@ mod tests {
 
     /// Stage 2: `kind` normalizes across absent/unknown/case/whitespace, and the tolerant
     /// deserializer coerces malformed NON-string `kind` to None (→ spec_claim) instead of failing
-    /// the whole-array parse (which the live path would silently turn into 0 claims).
+    /// the whole-array parse and forcing a retry.
     #[test]
     fn claim_kind_is_tolerant_and_normalized() {
         // Normalization of the canonical/edge string cases.
