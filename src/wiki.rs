@@ -13,6 +13,79 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn yaml_double_quoted(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+pub(crate) fn yaml_scalar(value: &str) -> String {
+    if yaml_scalar_needs_quotes(value) {
+        yaml_double_quoted(value)
+    } else {
+        value.to_string()
+    }
+}
+
+pub(crate) fn parse_yaml_scalar(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        return out;
+    }
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return value[1..value.len() - 1].replace("''", "'");
+    }
+    value.to_string()
+}
+
+fn yaml_scalar_needs_quotes(value: &str) -> bool {
+    if value.is_empty() || value.trim() != value {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "true" | "false" | "null" | "~") {
+        return true;
+    }
+    if value.contains([':', '#', '"', '\\', '\n', '\r', '\t']) {
+        return true;
+    }
+    matches!(
+        value.chars().next(),
+        Some('-' | '?' | '!' | '&' | '*' | '[' | ']' | '{' | '}' | '|' | '>' | '@' | '`' | '\'' | '"')
+    )
+}
+
 // ─── Frontmatter struct ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -873,7 +946,7 @@ pub fn scan_research_records(wiki_dir: &Path) -> Vec<ResearchRow> {
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
-                    return rest.trim().trim_matches('"').to_string();
+                    return parse_yaml_scalar(rest);
                 }
             }
             String::new()
