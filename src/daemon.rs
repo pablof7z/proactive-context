@@ -7,18 +7,18 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
-use std::fs::{self, File};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::channel as std_channel;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
-use nix::unistd::{fork, ForkResult, setsid, Pid};
-#[cfg(unix)]
-use std::os::fd::IntoRawFd;
+use nix::unistd::Pid;
 
 /// Info about a running daemon (returned by `list_daemons`).
 #[derive(Debug)]
@@ -147,52 +147,53 @@ pub fn release_lock(root: &Path) {
     let _ = fs::remove_file(pid_path);
 }
 
-/// Fork into the background, detach from the terminal, and run the daemon.
-/// The parent process returns Ok and exits 0.
-/// The child process checks the lock, and if already running, exits 0 silently.
-#[cfg(unix)]
+/// Start a background daemon by spawning a fresh `pc daemon` process.
+/// The caller returns immediately; the spawned process owns the long-lived watcher.
+///
+/// This intentionally execs through the CLI instead of forking the current hook
+/// process, so process listings show a daemon command rather than stale
+/// `pc hook inject` argv inherited from the caller.
 pub fn daemonize(root: &Path) -> Result<()> {
+    if daemon_pid(root).is_some() {
+        return Ok(());
+    }
+
     let ctx_dir = project_context_dir(root);
     fs::create_dir_all(&ctx_dir)?;
     let log_path = ctx_dir.join("daemon.log");
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { .. }) => {
-            // Parent exits immediately — the child continues in the background
-            return Ok(());
-        }
-        Ok(ForkResult::Child) => {
-            // Create a new session so we don't hold the terminal
-            setsid()?;
+    let log_out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log_out.try_clone()?;
+    let exe = std::env::current_exe()?;
 
-            // Redirect stdio to /dev/null (stdin) and a log file (stdout/stderr)
-            let devnull = File::open("/dev/null")?;
-            let log_out = File::create(&log_path)?;
-            let log_err = File::create(&log_path)?;
-            unsafe {
-                libc::dup2(devnull.into_raw_fd(), libc::STDIN_FILENO);
-                libc::dup2(log_out.into_raw_fd(), libc::STDOUT_FILENO);
-                libc::dup2(log_err.into_raw_fd(), libc::STDERR_FILENO);
-            }
+    Command::new(exe)
+        .args(daemon_spawn_args(root))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err))
+        .spawn()?;
 
-            // Acquire the daemon lock; if another instance is running, silently exit 0
-            if let Err(e) = try_acquire_lock(root) {
-                if e.downcast_ref::<AlreadyRunning>().is_some() {
-                    std::process::exit(0);
-                }
-                std::process::exit(1);
-            }
+    Ok(())
+}
 
-            if let Err(_e) = run_daemon(root) {
-                release_lock(root);
-                std::process::exit(1);
-            }
-            release_lock(root);
-            std::process::exit(0);
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("fork failed: {}", e));
-        }
+pub(crate) fn daemon_spawn_args(root: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--dir"),
+        root.as_os_str().to_os_string(),
+        OsString::from("daemon"),
+    ]
+}
+
+/// Run the daemon in the current process. Intended for the hidden internal CLI
+/// command used by `daemonize`.
+pub fn run_daemon_foreground(root: &Path) -> Result<()> {
+    match run_daemon(root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.downcast_ref::<AlreadyRunning>().is_some() => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -317,23 +318,6 @@ pub fn list_daemons() -> Result<Vec<DaemonInfo>> {
     // Sort by root directory for stable output
     daemons.sort_by(|a, b| a.root.cmp(&b.root));
     Ok(daemons)
-}
-
-/// Unix-only fallback: run the daemon inline without forking.
-#[cfg(not(unix))]
-pub fn daemonize(root: &Path) -> Result<()> {
-    if let Err(e) = try_acquire_lock(root) {
-        if e.downcast_ref::<AlreadyRunning>().is_some() {
-            return Ok(());
-        }
-        return Err(e);
-    }
-    if let Err(e) = run_daemon(root) {
-        release_lock(root);
-        return Err(e);
-    }
-    release_lock(root);
-    Ok(())
 }
 
 /// Perform a full (re)index of all .md files under root, respecting .gitignore.
@@ -661,8 +645,25 @@ fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod watch_filter_tests {
-    use super::is_ignored_watch_path;
+    use super::{daemon_spawn_args, is_ignored_watch_path};
+    use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn daemon_spawn_args_use_internal_daemon_command() {
+        let args = daemon_spawn_args(Path::new("/proj"));
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--dir"),
+                OsString::from("/proj"),
+                OsString::from("daemon"),
+            ]
+        );
+        assert!(!args.contains(&OsString::from("hook")));
+        assert!(!args.contains(&OsString::from("inject")));
+    }
 
     #[test]
     fn ignores_build_vcs_and_hidden_dirs_but_keeps_real_docs() {
