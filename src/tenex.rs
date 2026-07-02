@@ -137,21 +137,31 @@ pub fn scan_tenex_projects(
         let mut total_messages: usize = 0;
 
         for conv in conversations {
-            let jsonl_path = tmp_dir.join(format!("{}.jsonl", conv.id));
+            let already_captured =
+                archeologist_is_already_captured(&conv.id, marker_dir.as_ref());
 
-            // Synthesize the JSONL file now (cheap — just text)
-            if let Err(e) = synthesize_conversation_jsonl(
-                &db_path,
-                &conv.id,
-                &title,
-                &slug,
-                &jsonl_path,
-            ) {
-                eprintln!("tenex: skipping conv {} in {}: {}", &conv.id[..8], slug, e);
-                continue;
-            }
+            let (jsonl_path, size_bytes) = if already_captured {
+                (PathBuf::new(), 0u64)
+            } else {
+                let path = tmp_dir.join(format!("{}.jsonl", conv.id));
 
-            let size_bytes = jsonl_path.metadata().map(|m| m.len()).unwrap_or(0);
+                // Synthesize only conversations that the capture pipeline will process.
+                if let Err(e) =
+                    synthesize_conversation_jsonl(&db_path, &conv.id, &title, &slug, &path)
+                {
+                    eprintln!(
+                        "tenex: skipping conv {} in {}: {}",
+                        display_conv_id(&conv.id),
+                        slug,
+                        e
+                    );
+                    continue;
+                }
+
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                (path, size)
+            };
+
             total_bytes += size_bytes;
             total_messages += conv.message_count;
 
@@ -250,39 +260,31 @@ fn query_user_conversations(
     let conn = Connection::open(db_path)?;
     configure_sqlite_connection(&conn)?;
 
-    // Find conversations where the user sent at least one message
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT m.conversation_id
+        "SELECT m.conversation_id, COUNT(*), MIN(m.timestamp)
          FROM messages m
-         WHERE m.author_pubkey = ?1
-           AND m.message_type = 'text'",
+         WHERE m.message_type = 'text'
+           AND EXISTS (
+               SELECT 1
+               FROM messages user_m
+               WHERE user_m.conversation_id = m.conversation_id
+                 AND user_m.author_pubkey = ?1
+                 AND user_m.message_type = 'text'
+           )
+         GROUP BY m.conversation_id
+         ORDER BY MIN(m.timestamp) ASC, m.conversation_id ASC",
     )?;
-
-    let conv_ids: Vec<String> = stmt
-        .query_map([user_pubkey], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
 
     let mut results = Vec::new();
 
-    for conv_id in conv_ids {
-        // Get message count and earliest timestamp for this conversation
-        let row: Option<(usize, Option<i64>)> = conn
-            .query_row(
-                "SELECT COUNT(*), MIN(timestamp)
-                 FROM messages
-                 WHERE conversation_id = ?1
-                   AND message_type = 'text'",
-                [&conv_id],
-                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, Option<i64>>(1)?)),
-            )
-            .ok();
-
-        let (message_count, min_ts) = match row {
-            Some(r) => r,
-            None => continue,
-        };
-
+    for row in stmt.query_map([user_pubkey], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, usize>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })? {
+        let (conv_id, message_count, min_ts) = row?;
         let first_ts_rfc3339 = min_ts.map(unix_ts_to_rfc3339);
 
         // Apply --since filter
@@ -301,6 +303,10 @@ fn query_user_conversations(
     }
 
     Ok(results)
+}
+
+fn display_conv_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn unix_ts_to_rfc3339(ts: i64) -> String {
@@ -399,4 +405,189 @@ fn synthesize_conversation_jsonl(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn create_messages_table(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                conversation_id TEXT NOT NULL,
+                author_pubkey TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                timestamp INTEGER,
+                role TEXT,
+                content TEXT,
+                sequence INTEGER
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn insert_message(
+        conn: &Connection,
+        conversation_id: &str,
+        author_pubkey: &str,
+        timestamp: i64,
+        role: &str,
+        content: &str,
+        sequence: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO messages
+             (conversation_id, author_pubkey, message_type, timestamp, role, content, sequence)
+             VALUES (?1, ?2, 'text', ?3, ?4, ?5, ?6)",
+            params![
+                conversation_id,
+                author_pubkey,
+                timestamp,
+                role,
+                content,
+                sequence
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn scan_skips_synthesis_for_already_captured_conversations() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let tenex_projects_dir = tmp.path().join("tenex-projects");
+        let project_dir = tenex_projects_dir.join("demo");
+        std::fs::create_dir_all(&project_dir)?;
+
+        let projects_base = tmp.path().join("work");
+        let local_cwd = projects_base.join("demo");
+        std::fs::create_dir_all(&local_cwd)?;
+
+        std::fs::write(
+            project_dir.join("event.json"),
+            serde_json::json!({"tags": [["title", "Demo Project"]]}).to_string(),
+        )?;
+
+        let db_path = project_dir.join("conversation.db");
+        let conn = Connection::open(&db_path)?;
+        configure_sqlite_connection(&conn)?;
+        create_messages_table(&conn)?;
+
+        insert_message(&conn, "captured", "user-pubkey", 1_700_000_000, "user", "old", 1)?;
+        insert_message(
+            &conn,
+            "captured",
+            "assistant-pubkey",
+            1_700_000_001,
+            "assistant",
+            "old answer",
+            2,
+        )?;
+        insert_message(&conn, "new", "user-pubkey", 1_700_000_010, "user", "new", 1)?;
+        insert_message(
+            &conn,
+            "new",
+            "assistant-pubkey",
+            1_700_000_011,
+            "assistant",
+            "new answer",
+            2,
+        )?;
+
+        let output_dir = tmp.path().join("output");
+        let marker_dir = output_dir.join("captured-sessions");
+        std::fs::create_dir_all(&marker_dir)?;
+        std::fs::write(
+            marker_dir.join("captured.json"),
+            serde_json::json!({"captured_at_exchanges": 0}).to_string(),
+        )?;
+
+        let synth_dir = tmp.path().join("synth");
+        std::fs::create_dir_all(&synth_dir)?;
+        let config = TenexConfig {
+            tenex_projects_dir,
+            projects_base,
+            user_pubkey: "user-pubkey".to_string(),
+        };
+
+        let projects = scan_tenex_projects(&config, &None, &synth_dir, Some(&output_dir))?;
+
+        assert_eq!(projects.len(), 1);
+        let project = &projects[0];
+        assert_eq!(project.display_name, "Demo Project [tenex]");
+        assert_eq!(project.sessions.len(), 2);
+        assert_eq!(project.new_sessions, 1);
+        assert_eq!(project.total_messages, 4);
+        assert_eq!(project.total_bytes, synth_dir.join("new.jsonl").metadata()?.len());
+        assert!(!synth_dir.join("captured.jsonl").exists());
+        assert!(synth_dir.join("new.jsonl").exists());
+
+        let captured = project
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "captured")
+            .expect("captured session present");
+        assert!(captured.path.as_os_str().is_empty());
+        assert_eq!(captured.size_bytes, 0);
+
+        let new = project
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "new")
+            .expect("new session present");
+        assert_eq!(new.path, synth_dir.join("new.jsonl"));
+        assert!(new.size_bytes > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn query_user_conversations_groups_stats_and_applies_since_filter() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("conversation.db");
+        let conn = Connection::open(&db_path)?;
+        configure_sqlite_connection(&conn)?;
+        create_messages_table(&conn)?;
+
+        insert_message(&conn, "old", "user-pubkey", 1_600_000_000, "user", "old", 1)?;
+        insert_message(&conn, "new", "user-pubkey", 1_700_000_000, "user", "new", 1)?;
+        insert_message(
+            &conn,
+            "new",
+            "assistant-pubkey",
+            1_700_000_001,
+            "assistant",
+            "answer",
+            2,
+        )?;
+        insert_message(
+            &conn,
+            "other",
+            "someone-else",
+            1_800_000_000,
+            "user",
+            "not mine",
+            1,
+        )?;
+
+        let since = Some("2023-01-01T00:00:00Z".to_string());
+        let conversations = query_user_conversations(&db_path, "user-pubkey", &since)?;
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, "new");
+        assert_eq!(conversations[0].message_count, 2);
+        assert_eq!(
+            conversations[0].first_ts_rfc3339.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn display_conv_id_truncates_on_char_boundaries() {
+        assert_eq!(display_conv_id("abcdef123456"), "abcdef12");
+        assert_eq!(display_conv_id("åß∂ƒ©˙∆"), "åß∂ƒ©˙∆");
+        assert_eq!(display_conv_id("åß∂ƒ©˙∆emoji"), "åß∂ƒ©˙∆e");
+    }
 }
