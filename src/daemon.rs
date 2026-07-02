@@ -1,5 +1,5 @@
 use crate::config::{config_dir, normalize_path, project_context_dir, project_db_path, project_pid_path, Config};
-use crate::db::{chunk_hashes_for_path, content_hash, delete_chunks_for_path, index_stats, indexed_paths, insert_chunks, open_db, open_db_at};
+use crate::db::{chunk_hashes_for_path, content_hash, delete_chunks_for_path, index_stats, indexed_paths, open_db, open_db_at, replace_chunks_for_path};
 use crate::embed::{build_embedder, build_sidecar_embedder, Embedder};
 use crate::chunker::chunk_markdown;
 use crate::events::{log_event, new_pass};
@@ -438,8 +438,6 @@ pub fn index_single_file(
         }
     }
 
-    delete_chunks_for_path(conn, rel_path)?;
-
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let embeddings = embedder.embed(&texts)?;
 
@@ -448,7 +446,7 @@ pub fn index_single_file(
         rows.push((chunk.index, chunk.content.clone(), h));
     }
 
-    insert_chunks(conn, rel_path, &rows, &embeddings)?;
+    replace_chunks_for_path(conn, rel_path, &rows, &embeddings)?;
     Ok(())
 }
 
