@@ -84,12 +84,18 @@ pub fn run(cmd: RecallCmd) -> Result<()> {
     }
 }
 
-fn mtime_secs(p: &std::path::Path) -> i64 {
-    std::fs::metadata(p).ok()
-        .and_then(|m| m.modified().ok())
+fn file_state(p: &std::path::Path) -> store::FileState {
+    let metadata = match std::fs::metadata(p) {
+        Ok(metadata) => metadata,
+        Err(_) => return store::FileState { mtime: 0, size: -1 },
+    };
+    let mtime = metadata
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    store::FileState { mtime, size: metadata.len() as i64 }
 }
 
 fn index(incremental: bool) -> Result<()> {
@@ -100,10 +106,11 @@ fn index(incremental: bool) -> Result<()> {
     if !incremental {
         eprintln!("recall: extracting human-only utterances (full rebuild)…");
         store.reset()?;
+        store.clear_files()?;
         let turns = extract::extract_all()?;
         store.insert_batch(&turns)?;
         for f in extract::all_transcript_files() {
-            store.upsert_file(&f.to_string_lossy(), mtime_secs(&f))?;
+            store.upsert_file(&f.to_string_lossy(), file_state(&f))?;
         }
         let n = store.count()?;
         let chars: usize = turns.iter().map(|t| t.text.chars().count()).sum();
@@ -115,20 +122,50 @@ fn index(incremental: bool) -> Result<()> {
     eprintln!("recall: incremental index — checking transcript files…");
     let known = store.known_files();
     let files = extract::all_transcript_files();
-    let (mut changed, mut skipped, mut new_turns) = (0usize, 0usize, 0usize);
+    let current_paths: std::collections::HashSet<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().to_string())
+        .collect();
+    let (mut changed, mut skipped, mut removed, mut new_turns) = (0usize, 0usize, 0usize, 0usize);
+
+    for path in known.keys().filter(|path| !current_paths.contains(*path)) {
+        store.delete_turns_for_path(path)?;
+        store.delete_file(path)?;
+        removed += 1;
+    }
+
     for f in &files {
         let path = f.to_string_lossy().to_string();
-        let mt = mtime_secs(f);
-        if known.get(&path) == Some(&mt) { skipped += 1; continue; }
+        let state = file_state(f);
+        if known.get(&path) == Some(&state) { skipped += 1; continue; }
         store.delete_turns_for_path(&path)?;
         let turns = extract::extract_one(f);
         new_turns += turns.len();
         store.insert_batch(&turns)?;
-        store.upsert_file(&path, mt)?;
+        store.upsert_file(&path, state)?;
         changed += 1;
     }
-    println!("recall incremental index: {} files changed ({} turns), {} unchanged · \
+    println!("recall incremental index: {} files changed ({} turns), {} unchanged, {} removed · \
               {} total turns · {:.0}s",
-        changed, new_turns, skipped, store.count()?, t0.elapsed().as_secs_f64());
+        changed, new_turns, skipped, removed, store.count()?, t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_state_tracks_size_as_well_as_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, "one").unwrap();
+        let first = file_state(&path);
+
+        std::fs::write(&path, "one plus more").unwrap();
+        let second = file_state(&path);
+
+        assert_ne!(first.size, second.size);
+        assert_ne!(first, second);
+    }
 }
