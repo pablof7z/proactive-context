@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{normalize_path, resolve_project_root};
 
@@ -110,9 +110,17 @@ pub(super) fn acquire_project_wiki_lock(project_key: &str) -> Result<fs::File> {
     Ok(file)
 }
 
-pub(super) fn project_dir_from_cwd(cwd: &str) -> PathBuf {
+pub(super) fn project_wiki_lock_key_for_root(root: &Path) -> String {
+    normalize_path(root)
+}
+
+pub(super) fn project_wiki_lock_key_for_cwd(cwd: &str) -> String {
     let root = resolve_project_root(&PathBuf::from(cwd));
-    let normalized = normalize_path(&root);
+    project_wiki_lock_key_for_root(&root)
+}
+
+pub(super) fn project_dir_from_cwd(cwd: &str) -> PathBuf {
+    let normalized = project_wiki_lock_key_for_cwd(cwd);
     home_dir()
         .join(".proactive-context")
         .join("projects")
