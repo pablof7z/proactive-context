@@ -1225,6 +1225,99 @@ fn parse_stage_json<T: DeserializeOwned>(stage: &str, raw: &str) -> Result<Vec<T
     })
 }
 
+fn validate_route_decisions(
+    routes: &[RouteDecision],
+    recalls: &[crate::route_recall::ClaimRecall],
+    existing_rows: &[wiki::IndexRow],
+    claim_count: usize,
+) -> Result<Vec<ValidatedRoute>> {
+    if routes.len() != claim_count {
+        anyhow::bail!(
+            "ROUTE produced {} route(s) for {} claim(s); refusing to synthesize fallback guide slugs",
+            routes.len(),
+            claim_count
+        );
+    }
+    if recalls.len() != claim_count {
+        anyhow::bail!(
+            "ROUTE recall produced {} candidate set(s) for {} claim(s)",
+            recalls.len(),
+            claim_count
+        );
+    }
+
+    let existing_slugs: std::collections::HashSet<String> = existing_rows
+        .iter()
+        .map(|row| slugify(&row.slug))
+        .filter(|slug| !slug.is_empty())
+        .collect();
+    let mut seen = vec![false; claim_count];
+    let mut out = Vec::with_capacity(routes.len());
+
+    for route in routes {
+        if route.claim_index >= claim_count {
+            anyhow::bail!(
+                "ROUTE emitted out-of-range claim_index {} for {} claim(s)",
+                route.claim_index,
+                claim_count
+            );
+        }
+        if seen[route.claim_index] {
+            anyhow::bail!("ROUTE emitted duplicate row for claim_index {}", route.claim_index);
+        }
+        seen[route.claim_index] = true;
+
+        let slug = slugify(&route.slug);
+        if slug.is_empty() {
+            anyhow::bail!("ROUTE emitted an empty slug for claim_index {}", route.claim_index);
+        }
+
+        let candidate_slugs: std::collections::HashSet<String> = recalls[route.claim_index]
+            .candidates
+            .iter()
+            .map(|candidate| slugify(&candidate.slug))
+            .filter(|candidate| !candidate.is_empty())
+            .collect();
+        let is_existing = existing_slugs.contains(&slug);
+        let is_candidate = candidate_slugs.contains(&slug);
+
+        if is_existing && !is_candidate {
+            anyhow::bail!(
+                "ROUTE routed claim_index {} to existing guide '{}' outside its candidate set",
+                route.claim_index,
+                slug
+            );
+        }
+        if route.is_new && is_existing {
+            anyhow::bail!(
+                "ROUTE marked claim_index {} as new guide '{}' but that slug already exists",
+                route.claim_index,
+                slug
+            );
+        }
+        if !route.is_new && !is_existing {
+            anyhow::bail!(
+                "ROUTE marked claim_index {} as existing guide '{}' but it is not in the live catalog",
+                route.claim_index,
+                slug
+            );
+        }
+
+        out.push(ValidatedRoute {
+            claim_index: route.claim_index,
+            slug,
+            title: route.title.trim().to_string(),
+            topic: route.topic.trim().to_string(),
+        });
+    }
+
+    if let Some(missing) = seen.iter().position(|routed| !*routed) {
+        anyhow::bail!("ROUTE emitted no row for claim_index {}", missing);
+    }
+
+    Ok(out)
+}
+
 fn should_mark_capture_success<T, E>(agent_result: &std::result::Result<Result<T>, E>) -> bool {
     matches!(agent_result, Ok(Ok(_)))
 }
@@ -1397,6 +1490,14 @@ struct RouteDecision {
     #[serde(default)]
     #[allow(dead_code)]
     is_new: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedRoute {
+    claim_index: usize,
+    slug: String,
+    title: String,
+    topic: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1924,9 +2025,10 @@ async fn run_staged_capture(
     )
     .await?;
     let routes: Vec<RouteDecision> = parse_stage_json("ROUTE", &route_raw)?;
+    let routes = validate_route_decisions(&routes, &recalls, &index_rows, admitted.len())?;
 
-    // Group admitted claim indices by canonical slug. Unrouted claims fall back to a
-    // slug derived from their own assertion (recall bias: never silently drop a fact).
+    // Group admitted claim indices by canonical slug. ROUTE must produce one validated row
+    // per claim; malformed, partial, or hallucinated route sets abort so capture can retry.
     use std::collections::BTreeMap;
     let mut by_slug: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     // Human title proposed by ROUTE per slug — populates frontmatter title/summary on
@@ -1935,46 +2037,18 @@ async fn run_staged_capture(
     let mut slug_titles: BTreeMap<String, String> = BTreeMap::new();
     // Topic assigned by ROUTE per slug — written to guide frontmatter.
     let mut slug_topics: BTreeMap<String, String> = BTreeMap::new();
-    let mut routed_claims: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for r in &routes {
-        if r.claim_index >= admitted.len() {
-            continue;
-        }
-        let slug = slugify(&r.slug);
-        if slug.is_empty() {
-            continue;
-        }
-        let title = r.title.trim();
-        if !title.is_empty() {
+        if !r.title.is_empty() {
             slug_titles
-                .entry(slug.clone())
-                .or_insert_with(|| title.to_string());
+                .entry(r.slug.clone())
+                .or_insert_with(|| r.title.clone());
         }
-        let topic = r.topic.trim();
-        if !topic.is_empty() {
+        if !r.topic.is_empty() {
             slug_topics
-                .entry(slug.clone())
-                .or_insert_with(|| topic.to_string());
+                .entry(r.slug.clone())
+                .or_insert_with(|| r.topic.clone());
         }
-        by_slug.entry(slug).or_default().push(r.claim_index);
-        routed_claims.insert(r.claim_index);
-    }
-    for (i, c) in admitted.iter().enumerate() {
-        if !routed_claims.contains(&i) {
-            let slug = slugify(
-                &c.assertion
-                    .split_whitespace()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-            let slug = if slug.is_empty() {
-                format!("claim-{}", i)
-            } else {
-                slug
-            };
-            by_slug.entry(slug).or_default().push(i);
-        }
+        by_slug.entry(r.slug.clone()).or_default().push(r.claim_index);
     }
     eprintln!("capture: ROUTE → {} target guide(s)", by_slug.len());
     log_event(
@@ -3942,6 +4016,50 @@ mod tests {
         x: String,
     }
 
+    fn route_decision(
+        claim_index: usize,
+        slug: &str,
+        title: &str,
+        topic: &str,
+        is_new: bool,
+    ) -> RouteDecision {
+        RouteDecision {
+            claim_index,
+            slug: slug.to_string(),
+            title: title.to_string(),
+            topic: topic.to_string(),
+            is_new,
+        }
+    }
+
+    fn route_candidate(slug: &str) -> crate::route_recall::Candidate {
+        crate::route_recall::Candidate {
+            slug: slug.to_string(),
+            title: slug.replace('-', " "),
+            summary: String::new(),
+            score: 0.9,
+        }
+    }
+
+    fn route_recall(slugs: &[&str]) -> crate::route_recall::ClaimRecall {
+        crate::route_recall::ClaimRecall {
+            candidates: slugs.iter().map(|slug| route_candidate(slug)).collect(),
+        }
+    }
+
+    fn route_index_row(slug: &str) -> wiki::IndexRow {
+        wiki::IndexRow {
+            slug: slug.to_string(),
+            topic: "general".to_string(),
+            title: slug.replace('-', " "),
+            summary: String::new(),
+            tags: vec![],
+            volatility: String::new(),
+            verified: String::new(),
+            updated: String::new(),
+        }
+    }
+
     #[test]
     fn parse_stage_json_keeps_empty_array_distinct_from_stage_failure() {
         let empty: Vec<TinyStageRow> = parse_stage_json("EXTRACT", "model says:\n[]").unwrap();
@@ -3956,6 +4074,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(malformed.contains("ROUTE produced invalid JSON"), "got: {malformed}");
+    }
+
+    #[test]
+    fn validate_route_decisions_accepts_candidate_reuse_and_new_slug() {
+        let existing = vec![route_index_row("auth-guide")];
+        let recalls = vec![route_recall(&["auth-guide"]), route_recall(&[])];
+        let routes = vec![
+            route_decision(0, "auth-guide", " Auth Guide ", " auth ", false),
+            route_decision(1, "new-mechanism", "New Mechanism", "general", true),
+        ];
+
+        let validated = validate_route_decisions(&routes, &recalls, &existing, 2).unwrap();
+
+        assert_eq!(
+            validated,
+            vec![
+                ValidatedRoute {
+                    claim_index: 0,
+                    slug: "auth-guide".to_string(),
+                    title: "Auth Guide".to_string(),
+                    topic: "auth".to_string(),
+                },
+                ValidatedRoute {
+                    claim_index: 1,
+                    slug: "new-mechanism".to_string(),
+                    title: "New Mechanism".to_string(),
+                    topic: "general".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_route_decisions_rejects_partial_route_sets() {
+        let err = validate_route_decisions(&[], &[route_recall(&[])], &[], 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("refusing to synthesize fallback guide slugs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_route_decisions_rejects_existing_slug_outside_claim_candidates() {
+        let existing = vec![route_index_row("auth-guide"), route_index_row("cache-guide")];
+        let recalls = vec![route_recall(&["cache-guide"])];
+        let routes = vec![route_decision(0, "auth-guide", "Auth Guide", "auth", false)];
+
+        let err = validate_route_decisions(&routes, &recalls, &existing, 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("outside its candidate set"), "got: {err}");
     }
 
     #[test]
