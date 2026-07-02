@@ -1,8 +1,8 @@
 //! Claims store — Phase 0 of the claims-first validation experiment.
 //!
 //! ## What this is
-//! An append-only JSONL claim log + sqlite-vec embedding table.  Activated only when
-//! `PC_CLAIMS_LOG=1` is set (feature-flagged).  The rest of the pipeline (ROUTE /
+//! An append-only JSONL claim log + sqlite-vec embedding table.  ON by default;
+//! set `PC_CLAIMS_LOG=0` to disable.  The rest of the pipeline (ROUTE /
 //! RECONCILE / wiki writes) is unaffected: this is a **tap**, not a fork.
 //!
 //! ## Layout

@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// ── Claims-log tap (Phase 0 experiment; feature-flagged via PC_CLAIMS_LOG=1) ─
+// ── Claims-log tap (default-on; PC_CLAIMS_LOG=0 disables) ─
 use crate::claims;
 
 use rig_core::client::CompletionClient;
@@ -781,7 +781,9 @@ being actively worked on.\n\
 product, UX, output-format, default, copy, or implementation constraint. SMALL IS NOT \
 TRANSIENT: a one-line label, color, ordering, radius, default, or output-format change is \
 durable product spec when the transcript states it as desired behavior — capture it.\n\
-- Project-scoped facts only; no global/user-preference entries.\n\
+- Project-scoped facts only. Do not emit free-floating global preferences; if a stated \
+preference constrains this project's behavior, UX, tooling, or output, capture it as a \
+project-scoped requirement.\n\
 - Emit [] if there is genuinely nothing worth capturing.\n";
 
 /// Run 9 — delta-EXTRACT preamble. Same atomic-cited-spec contract as EXTRACT_PREAMBLE, but the
@@ -943,7 +945,7 @@ fn extract_preamble_variant() -> std::borrow::Cow<'static, str> {
 }
 
 /// Assemble the EXTRACT system prompt: the base preamble plus an optional wiki-index block.
-/// Used by BOTH the live capture path (`run_wiki_agent`) and `pc debug extract`, so the
+/// Used by BOTH the live staged capture path and `pc debug extract`, so the
 /// production prompt and the debug command stay in lockstep.
 fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
     let mut s = String::from(extract_preamble_variant().as_ref());
@@ -1517,9 +1519,9 @@ struct ReconcileOp {
 ///
 /// `claims_dir`: when `Some`, the claim-log tap writes every ROUTED claim (spec_claim +
 /// entity_definition; research_seeds are partitioned out beforehand into their own sink) to
-/// `<claims_dir>/claims.jsonl` and `<claims_dir>/claims.db`.  When `None` (default),
-/// the tap is a no-op and behavior is byte-identical to the pre-experiment code.
-/// Controlled by the `PC_CLAIMS_LOG=1` feature flag.
+/// `<claims_dir>/claims.jsonl` and `<claims_dir>/claims.db`.  When `None`, the tap is a no-op.
+/// Live capture passes `Some` while `claims::claims_log_enabled()` is true (default ON;
+/// `PC_CLAIMS_LOG=0` disables it).
 async fn run_staged_capture(
     spec: &ModelSpec,
     openrouter_api_key: &str,
@@ -1670,9 +1672,9 @@ async fn run_staged_capture(
         .and_then(|cfg| crate::embed::build_sidecar_embedder(cfg).ok());
 
     // ── CLAIM-LOG TAP (after authority tagging, before ROUTE) ─────────────────────
-    // Feature flag: PC_CLAIMS_LOG=1.  When set, persist every admitted claim to
-    // claims.jsonl + claims.db under `claims_dir`.  The wiki pipeline (ROUTE/RECONCILE)
-    // continues unchanged — this is a tap, not a fork.  Both stores build in one pass.
+    // Default-on unless PC_CLAIMS_LOG=0. Persist every admitted claim to claims.jsonl +
+    // claims.db under `claims_dir`. The wiki pipeline (ROUTE/RECONCILE) continues
+    // unchanged — this is a tap, not a fork. Both stores build in one pass.
     if let Some(ref cd) = claims_dir {
         if claims::claims_log_enabled() {
             if let Some(cfg) = shared_cfg.as_ref() {
@@ -2252,7 +2254,7 @@ fn apply_reconcile_op(
                     }),
                 );
             }
-            true
+            !result.starts_with("Error:")
         }
         "revise" => {
             let (marker, sliced) = ctx.cite(&op.evidence);
@@ -2344,7 +2346,7 @@ fn apply_reconcile_op(
                     }),
                 );
             }
-            true
+            !result.starts_with("Error:")
         }
         "remove" => {
             let (marker, sliced) = ctx.cite(&op.evidence);
@@ -2393,7 +2395,8 @@ fn apply_reconcile_op(
                 }
             });
             eprintln!("capture: op remove → {}", result);
-            if retired_flag.get() && !result.starts_with("Error:") {
+            let applied = retired_flag.get() && !result.starts_with("Error:");
+            if applied {
                 if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
                     eprintln!("capture: citation log write failed: {}", e);
                 }
@@ -2408,7 +2411,7 @@ fn apply_reconcile_op(
                     }),
                 );
             }
-            retired_flag.get()
+            applied
         }
         other => {
             eprintln!("capture: unknown reconcile op '{}' — skipped", other);
@@ -2700,7 +2703,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     let rt =
         Runtime::new().map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
 
-    // Compute the claims-dir for the tap.  PC_CLAIMS_LOG=1 activates it; the dir is
+    // Compute the claims-dir for the default-on tap; PC_CLAIMS_LOG=0 disables it. The dir is
     // proj_dir (already resolved above) so experiment-scoped runs use the experiment home.
     let claims_tap_dir: Option<PathBuf> = if claims::claims_log_enabled() {
         Some(proj_dir.clone())
@@ -4203,6 +4206,33 @@ synchronization remains active.\n",
         assert!(
             !wiki.join("_citations.log").exists(),
             "invalid remove must not mint a citation receipt"
+        );
+    }
+
+    #[test]
+    fn reconcile_save_error_is_not_counted_as_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki_file = tmp.path().join("wiki-file");
+        fs::write(&wiki_file, "not a directory").unwrap();
+        let ctx = Arc::new(WikiAgentCtx::new(
+            wiki_file.clone(),
+            "proj-save-fail".into(),
+            "sess-save-fail".into(),
+            vec!["User: remember the durable sync policy.".into()],
+            vec!["user".into()],
+            "2026-07-02".into(),
+        ));
+        let op = ReconcileOp {
+            op: "add".into(),
+            section: "## Sync".into(),
+            text: "Sync policy is durable.".into(),
+            evidence: vec![EvidenceRange { start: 1, end: 1 }],
+        };
+
+        assert!(!apply_reconcile_op(&ctx, "sync-policy", Some("Sync Policy"), Some("sync"), &op));
+        assert!(
+            !wiki_file.join("_citations.log").exists(),
+            "failed guide mutation must not mint a citation receipt"
         );
     }
 
