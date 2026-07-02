@@ -1118,7 +1118,6 @@ async fn run_stage(
                 openrouter_api_key,
                 &spec.model,
                 &msgs,
-                None,
                 max_tokens,
                 1,
             )
