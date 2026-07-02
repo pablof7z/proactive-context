@@ -187,9 +187,8 @@ pub fn indexed_paths(conn: &Connection) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// Insert a batch of chunks + their embeddings for one file.
-/// This should be called inside a transaction for atomicity.
-pub fn insert_chunks(
+/// Replace all chunks for one source file in a single write transaction.
+pub fn replace_chunks_for_path(
     conn: &Connection,
     path: &str,
     chunks: &[(usize, String, String)], // (index, content, content_hash)
@@ -197,6 +196,34 @@ pub fn insert_chunks(
 ) -> Result<()> {
     assert_eq!(chunks.len(), embeddings.len());
 
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        delete_chunks_for_path(conn, path)?;
+        insert_chunks(conn, path, chunks, embeddings)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            if let Err(err) = conn.execute_batch("COMMIT;") {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(err.into());
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
+}
+
+fn insert_chunks(
+    conn: &Connection,
+    path: &str,
+    chunks: &[(usize, String, String)], // (index, content, content_hash)
+    embeddings: &[Vec<f32>],
+) -> Result<()> {
     let mut stmt = conn.prepare(
         "INSERT INTO vec_chunks (embedding, path, chunk_index, content, content_hash)
          VALUES (?, ?, ?, ?, ?)",
@@ -327,6 +354,19 @@ mod tests {
             .unwrap()
     }
 
+    fn indexed_content(conn: &Connection, path: &str) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT content, content_hash FROM vec_chunks
+                 WHERE path = ? ORDER BY chunk_index",
+            )
+            .unwrap();
+        stmt.query_map(params![path], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[test]
     fn configure_sqlite_connection_sets_busy_timeout() {
         let conn = Connection::open_in_memory().unwrap();
@@ -388,5 +428,71 @@ mod tests {
         );
         assert_eq!(busy_timeout_ms(&conn), SQLITE_BUSY_TIMEOUT_MS as i64);
         assert_eq!(query_only, 1);
+    }
+
+    #[test]
+    fn replace_chunks_for_path_swaps_rows_in_one_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let embedder = DimOnlyEmbedder(4);
+        let conn = open_db_at(&db_path, &embedder).unwrap();
+
+        replace_chunks_for_path(
+            &conn,
+            "guide.md",
+            &[(0, "old".to_string(), "old-hash".to_string())],
+            &[vec![0.0, 0.0, 0.0, 1.0]],
+        )
+        .unwrap();
+        replace_chunks_for_path(
+            &conn,
+            "guide.md",
+            &[
+                (0, "new-a".to_string(), "new-a-hash".to_string()),
+                (1, "new-b".to_string(), "new-b-hash".to_string()),
+            ],
+            &[vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        )
+        .unwrap();
+
+        assert_eq!(
+            indexed_content(&conn, "guide.md"),
+            vec![
+                ("new-a".to_string(), "new-a-hash".to_string()),
+                ("new-b".to_string(), "new-b-hash".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_chunks_for_path_rolls_back_delete_when_insert_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let embedder = DimOnlyEmbedder(4);
+        let conn = open_db_at(&db_path, &embedder).unwrap();
+
+        replace_chunks_for_path(
+            &conn,
+            "guide.md",
+            &[(0, "old".to_string(), "old-hash".to_string())],
+            &[vec![0.0, 0.0, 0.0, 1.0]],
+        )
+        .unwrap();
+        let err = replace_chunks_for_path(
+            &conn,
+            "guide.md",
+            &[(0, "new".to_string(), "new-hash".to_string())],
+            &[vec![1.0, 0.0, 0.0]],
+        )
+        .expect_err("wrong-dimension embedding should fail inside the transaction");
+
+        assert!(
+            err.to_string().contains("dimension"),
+            "unexpected sqlite-vec error: {err}"
+        );
+        assert_eq!(
+            indexed_content(&conn, "guide.md"),
+            vec![("old".to_string(), "old-hash".to_string())]
+        );
     }
 }
