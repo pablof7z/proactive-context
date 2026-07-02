@@ -575,6 +575,7 @@ pub fn enforce_bidirectional_links(wiki_dir: &Path, today: &str) -> Result<usize
         .collect();
 
     let mut added = 0usize;
+    let mut modified_indices = std::collections::BTreeSet::new();
     // For each A→B, ensure B→A exists
     for (from_idx, to_idx) in &edges {
         let from_slug = guides[*from_idx].0.clone();
@@ -591,13 +592,14 @@ pub fn enforce_bidirectional_links(wiki_dir: &Path, today: &str) -> Result<usize
         add_see_also_link(&mut to_guide.body, &from_slug, &from_title);
         to_guide.frontmatter.updated = today.to_string();
         added += 1;
+        modified_indices.insert(*to_idx);
     }
 
-    // Write back guides that were modified
-    for (_, guide, path) in &guides {
-        // Only write if we potentially modified it (small set; just write all touched guides)
-        // We check if the path's modification flag is needed by re-checking the body
-        let _ = save_guide(path, guide);
+    // Write back only guides that were actually modified. Rewriting every scanned guide
+    // can clobber concurrent capture writes from a stale maintenance snapshot.
+    for idx in modified_indices {
+        let (_, guide, path) = &guides[idx];
+        save_guide(path, guide)?;
     }
 
     Ok(added)
@@ -1466,6 +1468,26 @@ pub fn render_index_for_inject(rows: &[IndexRow]) -> String {
 mod tests {
     use super::*;
 
+    fn guide_fixture(slug: &str, title: &str, body: &str) -> String {
+        format!(
+            "---\n\
+title: {title}\n\
+slug: {slug}\n\
+summary: summary\n\
+tags: []\n\
+volatility: warm\n\
+confidence: medium\n\
+created: 2026-01-01\n\
+updated: 2026-01-01\n\
+verified: 2026-01-01\n\
+compiled-from: conversation\n\
+sources: []\n\
+custom-local-key: keep me\n\
+---\n\n\
+{body}\n"
+        )
+    }
+
     #[test]
     fn test_hide_bare_citation_markers() {
         let body = "# G\n\n## Behavior\n\nAvatars fade in over 0.2s. [^19e07-2]\n\n## See Also\n";
@@ -1579,6 +1601,81 @@ mod tests {
         let body = "# Guide\n\nContent.\n\n## See Also\n- [[other-guide|Other Guide]] — related\n- [[third-guide|Third]]\n\n## Notes\nMore.\n";
         let slugs = extract_see_also_slugs(body);
         assert_eq!(slugs, vec!["other-guide", "third-guide"]);
+    }
+
+    #[test]
+    fn bidirectional_links_write_only_mutated_guides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let a_path = guide_path(wiki, "alpha");
+        let b_path = guide_path(wiki, "beta");
+        fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+
+        fs::write(
+            &a_path,
+            guide_fixture(
+                "alpha",
+                "Alpha",
+                "# Alpha\n\nAlpha links to beta.\n\n## See Also\n\n- [[beta|Beta]] - related guide\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &b_path,
+            guide_fixture("beta", "Beta", "# Beta\n\nBeta has no backlink yet.\n"),
+        )
+        .unwrap();
+
+        let added = enforce_bidirectional_links(wiki, "2026-02-03").unwrap();
+        assert_eq!(added, 1);
+
+        let alpha_after = fs::read_to_string(&a_path).unwrap();
+        let beta_after = fs::read_to_string(&b_path).unwrap();
+
+        assert!(
+            alpha_after.contains("custom-local-key: keep me"),
+            "unmodified guide must not be reserialized"
+        );
+        assert!(
+            beta_after.contains("[[alpha|Alpha]]"),
+            "mutated guide must receive backlink"
+        );
+    }
+
+    #[test]
+    fn bidirectional_links_do_not_reserialize_when_nothing_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let a_path = guide_path(wiki, "alpha");
+        let b_path = guide_path(wiki, "beta");
+        fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+
+        fs::write(
+            &a_path,
+            guide_fixture(
+                "alpha",
+                "Alpha",
+                "# Alpha\n\n## See Also\n\n- [[beta|Beta]] - related guide\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &b_path,
+            guide_fixture(
+                "beta",
+                "Beta",
+                "# Beta\n\n## See Also\n\n- [[alpha|Alpha]] - related guide\n",
+            ),
+        )
+        .unwrap();
+
+        let before_a = fs::read_to_string(&a_path).unwrap();
+        let before_b = fs::read_to_string(&b_path).unwrap();
+        let added = enforce_bidirectional_links(wiki, "2026-02-03").unwrap();
+
+        assert_eq!(added, 0);
+        assert_eq!(fs::read_to_string(&a_path).unwrap(), before_a);
+        assert_eq!(fs::read_to_string(&b_path).unwrap(), before_b);
     }
 
     #[test]

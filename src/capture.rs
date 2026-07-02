@@ -31,7 +31,7 @@ use crate::wiki::{
 };
 use state::{
     acquire_project_wiki_lock, acquire_session_lock, captured_sessions_dir, is_already_captured_in,
-    mark_captured_in, pending_captures_dir, project_dir_from_cwd,
+    mark_captured_in, pending_captures_dir, project_dir_from_cwd, project_wiki_lock_key_for_root,
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -2555,7 +2555,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         model, max_turns
     );
 
-    let project_key = normalize_path(&PathBuf::from(&input.cwd));
+    let project_key = project_wiki_lock_key_for_root(&project_root);
     let ctx = Arc::new(WikiAgentCtx::new(
         wiki_path.clone(),
         project_key,
@@ -2753,7 +2753,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // archeologist calls `run_structural_maintenance` directly at checkpoints.
     // Default (false) → live hook behavior unchanged byte-for-byte.
     if !input.skip_structural_maintenance {
-        run_structural_maintenance(&wiki_path, &proj_dir, &today_str);
+        run_structural_maintenance(&wiki_path, &proj_dir, &ctx.project_key, &today_str);
     }
 
     log_event(
@@ -2874,10 +2874,23 @@ fn refresh_summary(guide: &mut Guide) {
     }
 }
 
-pub(crate) fn run_structural_maintenance(wiki_path: &Path, proj_dir: &Path, today: &str) {
+pub(crate) fn run_structural_maintenance(
+    wiki_path: &Path,
+    proj_dir: &Path,
+    project_key: &str,
+    today: &str,
+) {
     if !wiki_path.exists() {
         return;
     }
+    let _lock = match acquire_project_wiki_lock(project_key) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("capture: structural maintenance lock failed: {}", e);
+            return;
+        }
+    };
+
     let link_count = wiki::enforce_bidirectional_links(wiki_path, today).unwrap_or_else(|e| {
         eprintln!("capture: bidir links failed: {}", e);
         0
@@ -3708,6 +3721,7 @@ pub(crate) fn run_structural_maintenance_for_eval(
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
     let cwd_path = resolve_project_root(&PathBuf::from(cwd));
+    let project_key = project_wiki_lock_key_for_root(&cwd_path);
     let (wiki_path, proj_dir) = if let Some(ref out) = output_dir {
         let normalized = normalize_path(&cwd_path);
         let pd = out.join("projects").join(&normalized);
@@ -3717,7 +3731,7 @@ pub(crate) fn run_structural_maintenance_for_eval(
         (wiki_dir(&cwd_path), project_dir_from_cwd(cwd))
     };
     let today = today();
-    run_structural_maintenance(&wiki_path, &proj_dir, &today);
+    run_structural_maintenance(&wiki_path, &proj_dir, &project_key, &today);
     Ok(())
 }
 
@@ -3731,6 +3745,34 @@ mod tests {
 
     // Serialize PC_CLAIM_STATUS env mutations (process-global) for Phase 4 tests.
     static CLAIM_STATUS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn project_wiki_lock_key_uses_resolved_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .output()
+            .expect("git init should run");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let subdir = tmp.path().join("nested").join("leaf");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let key = state::project_wiki_lock_key_for_cwd(subdir.to_str().unwrap());
+        let root_key = normalize_path(tmp.path());
+        let raw_subdir_key = normalize_path(&subdir);
+
+        assert_eq!(key, root_key);
+        assert_ne!(
+            key, raw_subdir_key,
+            "subdirectory sessions must not get their own wiki lock"
+        );
+    }
 
     #[test]
     fn citation_ids_use_session_prefix_and_five_hash_chars() {
