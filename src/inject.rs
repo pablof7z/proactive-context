@@ -821,11 +821,15 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
     };
 
-    // Prior briefings injected this session — fed to the compiler so it surfaces
-    // only NEW facts (the assistant already has these in its transcript).
-    let already_injected = crate::ledger::read_recent(
+    // Prior briefings injected this session are only suppressive when the
+    // current transcript window still proves the reminder body is visible.
+    // After harness compaction, resurfacing context is safer than under-injecting.
+    let ledger_visibility_turns = cfg.inject_context_turns.saturating_mul(2).saturating_add(8);
+    let already_injected = crate::ledger::read_visible_recent(
         &root,
         &input.session_id,
+        input.transcript_path.as_deref(),
+        ledger_visibility_turns,
         cfg.inject_ledger_entries,
         cfg.inject_ledger_char_cap,
     );
