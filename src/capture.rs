@@ -959,6 +959,10 @@ fn build_extract_system(index_rows: &[wiki::IndexRow]) -> String {
     s
 }
 
+fn build_live_extract_system() -> String {
+    build_extract_system(&[])
+}
+
 const ROUTE_PREAMBLE: &str = "\
 You are the RERANK half of the ROUTE stage. Each claim must be assigned to the ONE wiki guide \
 whose topic it belongs to, OR to a NEW guide. You are given TWO inputs: (1) a FULL CATALOG of \
@@ -1449,11 +1453,12 @@ async fn run_staged_capture(
             "## LINE-NUMBERED TRANSCRIPT\n\n{}\n\nEmit the JSON array of atomic cited claims now.",
             numbered_transcript
         );
+        let extract_system = build_live_extract_system();
         // Run 12 cost bar: log input tokens (chars/4) for the plain EXTRACT call (the plain-B arm).
-        eprintln!("delta: extract_tokens_in={}", (EXTRACT_PREAMBLE.len() + extract_user.len()) / 4);
+        eprintln!("delta: extract_tokens_in={}", (extract_system.len() + extract_user.len()) / 4);
         let extract_raw = run_stage(
             spec, openrouter_api_key, ollama_base_url, ollama_api_key,
-            EXTRACT_PREAMBLE, &extract_user, 6000,
+            &extract_system, &extract_user, 6000,
         ).await?;
         let parsed: Vec<ExtractedClaim> = parse_stage_json("EXTRACT", &extract_raw)?;
         eprintln!("capture: EXTRACT → {} raw claim(s)", parsed.len());
@@ -4204,6 +4209,26 @@ synchronization remains active.\n",
         // Default: base preamble + granularity block (no wiki index for an empty catalog).
         let expected = format!("{}{}", EXTRACT_PREAMBLE, EXTRACT_GRANULARITY_BLOCK);
         assert_eq!(build_extract_system(&[]), expected);
+    }
+
+    #[test]
+    fn live_extract_system_uses_shared_builder_without_wiki_index() {
+        let _g = EXTRACT_VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+        std::env::remove_var("PC_EXTRACT_NO_GRANULARITY");
+
+        let system = build_live_extract_system();
+        assert_eq!(system, format!("{}{}", EXTRACT_PREAMBLE, EXTRACT_GRANULARITY_BLOCK));
+        assert!(!system.contains("## EXISTING WIKI"));
+
+        std::env::set_var("PC_EXTRACT_VARIANT", "typed");
+        let typed = build_live_extract_system();
+        assert!(typed.contains("\"status\": \"settled\"|\"proposed\""));
+        assert!(typed.contains("Sweep the WHOLE transcript"));
+        assert!(!typed.contains("## EXISTING WIKI"));
+
+        std::env::remove_var("PC_EXTRACT_VARIANT");
+        std::env::remove_var("PC_EXTRACT_NO_GRANULARITY");
     }
 
     #[test]
