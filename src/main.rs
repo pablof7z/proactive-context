@@ -58,7 +58,9 @@ mod tui;
 mod wiki;
 
 use crate::config::{load_config, normalize_path, project_context_dir, resolve_project_root, save_config};
-use crate::daemon::{daemonize, index_files_into_db, list_daemons, stop_daemon};
+use crate::daemon::{
+    daemonize, index_files_into_db, list_daemons, run_daemon_foreground, stop_daemon,
+};
 use crate::events::init_context;
 use crate::query::{print_results, run_query};
 
@@ -82,6 +84,10 @@ enum Commands {
     /// Start (or ensure) the background daemon that watches and indexes markdown files.
     /// If a daemon is already running for this directory, this command exits silently.
     Init,
+
+    /// Internal foreground daemon entry point.
+    #[command(hide = true)]
+    Daemon,
 
     /// Query everything you ever typed to your coding agents (load-everything recall).
     Recall {
@@ -726,6 +732,10 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => {
             daemonize(&root)?;
+        }
+
+        Commands::Daemon => {
+            run_daemon_foreground(&root)?;
         }
 
         Commands::Recall { action } => {
