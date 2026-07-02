@@ -1075,7 +1075,7 @@ pub fn render_episode_card_dated(
     } else {
         arc.subjects
             .iter()
-            .map(|s| format!("  - {}", s))
+            .map(|s| format!("  - {}", crate::wiki::yaml_scalar(s)))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -1117,7 +1117,7 @@ captured_at: {ts}\n\
         date = date,
         session = session_id,
         transcript = transcript_path,
-        salience = arc.salience,
+        salience = crate::wiki::yaml_scalar(&arc.salience),
         subjects = subjects_yaml,
         source_lines = source_lines_yaml,
         ts = captured_at,
@@ -1272,7 +1272,7 @@ pub fn scan_episode_cards(wiki_dir: &Path) -> Vec<EpisodeRow> {
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
-                    return rest.trim().trim_matches('"').to_string();
+                    return crate::wiki::parse_yaml_scalar(rest);
                 }
             }
             String::new()
@@ -1328,7 +1328,7 @@ pub fn parse_episode_card_frontmatter(content: &str) -> Option<EpisodeCardFrontm
     let fm = |key: &str| -> String {
         for line in fm_text.lines() {
             if let Some(rest) = line.strip_prefix(&format!("{}: ", key)) {
-                return rest.trim().trim_matches('"').to_string();
+                return crate::wiki::parse_yaml_scalar(rest);
             }
         }
         String::new()
@@ -1346,7 +1346,7 @@ pub fn parse_episode_card_frontmatter(content: &str) -> Option<EpisodeCardFrontm
             if in_subjects {
                 let trimmed = line.trim();
                 if trimmed.starts_with("- ") {
-                    subjects.push(trimmed[2..].trim().to_string());
+                    subjects.push(crate::wiki::parse_yaml_scalar(trimmed[2..].trim()));
                 } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
                     // Another key — end subjects list
                     if trimmed.contains(':') && !trimmed.starts_with('-') {
@@ -1970,6 +1970,41 @@ body
         assert!(rendered.contains("## Evidence"), "missing Evidence section");
         assert!(rendered.contains("transcript lines 120-145"), "missing evidence line range");
         assert!(rendered.contains("OpenRouter/OpenAI embeddings were the expected"), "missing prior_state text");
+    }
+
+    #[test]
+    fn render_episode_card_escapes_frontmatter_scalars() {
+        let arc = RecognizedArc {
+            title: "YAML-sensitive card".to_string(),
+            salience: "risk: data loss".to_string(),
+            subjects: vec![
+                "- leading dash".to_string(),
+                "quoted \"subject\"".to_string(),
+            ],
+            prior_state: "before".to_string(),
+            trigger: "trigger".to_string(),
+            decision: "decision".to_string(),
+            consequences: Vec::new(),
+            open_tail: Vec::new(),
+            evidence: vec![EvidenceRange { start: 10, end: 12 }],
+        };
+        let rendered = render_episode_card(
+            "sess-abc",
+            "/path/t.jsonl",
+            &arc,
+            &[EvidenceRange { start: 10, end: 12 }],
+            None,
+            None,
+            "2026-06-11T10:00:00Z",
+        );
+
+        assert!(rendered.contains("salience: \"risk: data loss\""), "{rendered}");
+        assert!(rendered.contains("  - \"- leading dash\""), "{rendered}");
+        assert!(rendered.contains("  - \"quoted \\\"subject\\\"\""), "{rendered}");
+
+        let parsed = parse_episode_card_frontmatter(&rendered).expect("frontmatter");
+        assert_eq!(parsed.salience, arc.salience);
+        assert_eq!(parsed.subjects, arc.subjects);
     }
 
     #[test]

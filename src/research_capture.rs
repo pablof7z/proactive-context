@@ -629,7 +629,7 @@ agent_attribution: {agent}\n\
 has_preregistered_criteria: {criteria}\n\
 has_method: {method}\n\
 has_structured_report: {report}\n\
-characterization: \"{char}\"\n\
+characterization: {char_yaml}\n\
 captured_at: {ts}\n\
 ---\n\n\
 {char}\n\n\
@@ -645,6 +645,7 @@ captured_at: {ts}\n\
         method = artifact.has_method,
         report = artifact.has_structured_report,
         char = artifact.characterization,
+        char_yaml = crate::wiki::yaml_double_quoted(&artifact.characterization),
         ts = captured_at,
         text = sliced_text
     )
@@ -1005,6 +1006,36 @@ mod tests {
         assert!(rendered.contains("source_lines: 100-150"));
         assert!(rendered.contains("agent_attribution: validation-agent"));
         assert!(rendered.contains("## Run 4 Report\nverbatim body"));
+    }
+
+    #[test]
+    fn record_frontmatter_escapes_quoted_characterization() {
+        let artifact = RecognizedArtifact {
+            start_line: 100,
+            end_line: 150,
+            characterization: "Run 4 — \"claims-first\" FAIL".to_string(),
+            agent_attribution: "validation-agent".to_string(),
+            has_preregistered_criteria: true,
+            has_method: true,
+            has_structured_report: true,
+        };
+        let rendered = render_research_record(
+            "sess-123",
+            "/path/to/transcript.jsonl",
+            &artifact,
+            100,
+            150,
+            "## Run 4 Report\nverbatim body",
+            "2026-06-11T10:00:00Z",
+        );
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("characterization: "))
+            .expect("characterization frontmatter");
+        let raw = line.strip_prefix("characterization: ").unwrap();
+
+        assert_eq!(raw, "\"Run 4 — \\\"claims-first\\\" FAIL\"");
+        assert_eq!(crate::wiki::parse_yaml_scalar(raw), artifact.characterization);
     }
 
     #[test]
