@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 // ─── Frontmatter struct ───────────────────────────────────────────────────────
@@ -409,11 +410,52 @@ This directory is the citation source of truth.
   be committed.
 "#;
 
+static ATOMIC_WRITE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("cannot atomically write path without file name: {}", path.display())
+    })?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = ATOMIC_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".{}.{}.{}.tmp", std::process::id(), timestamp, sequence));
+    let tmp = parent.join(tmp_name);
+
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 fn write_if_changed(path: &Path, content: &str) -> Result<()> {
     if fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(());
     }
-    fs::write(path, content)?;
+    write_atomic(path, content)?;
     Ok(())
 }
 
@@ -520,7 +562,7 @@ pub fn save_guide(path: &Path, guide: &Guide) -> Result<()> {
         g.body = normalized;
         serialize_guide(&g)
     };
-    fs::write(path, content)?;
+    write_atomic(path, &content)?;
     Ok(())
 }
 
@@ -869,7 +911,7 @@ fn write_index_file_with_research(
 
     if rows.is_empty() && research.is_empty() && episodes.is_empty() {
         out.push_str("*(no guides yet)*\n");
-        fs::write(&path, out)?;
+        write_atomic(&path, &out)?;
         return Ok(());
     }
 
@@ -962,7 +1004,7 @@ fn write_index_file_with_research(
         out.push('\n');
     }
 
-    fs::write(&path, out)?;
+    write_atomic(&path, &out)?;
     Ok(())
 }
 
@@ -1722,6 +1764,24 @@ custom-local-key: keep me\n\
         assert!(saved.contains("local-owner: pablo"));
         assert!(saved.contains("local-flags:\n  - do-not-drop\n"));
         assert!(saved.contains("Some content here. <!-- [^abc-1] -->"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_and_cleans_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("guide.md");
+        fs::write(&path, "old\n").unwrap();
+
+        write_atomic(&path, "new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".guide.md.") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {:?}", leftovers);
     }
 
     #[test]
