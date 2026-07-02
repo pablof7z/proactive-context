@@ -43,13 +43,15 @@ pub struct Config {
     /// Enable the research-capture stage: after the normal capture pass, a recognition
     /// pass detects investigation artifacts (structured reports with method + pre-registered
     /// criteria) and persists them as immutable research records under <wiki>/research/.
-    /// Default OFF — when off, capture behavior is unchanged.
+    /// Default ON after validation. When off, the normal capture pass still runs but
+    /// research-record recognition/persistence is skipped.
     #[serde(default = "default_capture_research")]
     pub capture_research: bool,
 
     /// Enable the episode-card capture stage: after the normal capture pass, a recognition
     /// pass generates session-level product movement arc cards under <wiki>/episodes/.
-    /// Default OFF — when off, capture behavior is unchanged.
+    /// Default ON after validation. When off, the normal capture pass still runs but
+    /// episode-card recognition/persistence is skipped.
     /// See docs/product-spec/session-episode-cards.md for spec details.
     #[serde(default = "default_capture_episode_cards")]
     pub capture_episode_cards: bool,
