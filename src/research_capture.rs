@@ -461,13 +461,15 @@ pub struct RecognizedArtifact {
 pub(crate) fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArtifact>> {
     // Extract JSON array from response (model may wrap in markdown or prose)
     let json_str = extract_json_array(response);
-    let Ok(arr) = serde_json::from_str::<Value>(&json_str) else {
-        eprintln!("[research-capture] WARNING: failed to parse recognition JSON: {}", &response[..response.len().min(300)]);
-        return Ok(Vec::new());
-    };
-    let items = match arr.as_array() {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
+    let arr = serde_json::from_str::<Value>(&json_str).map_err(|e| {
+        anyhow::anyhow!(
+            "research recognition produced invalid JSON: {}; excerpt: {}",
+            e,
+            response.chars().take(300).collect::<String>()
+        )
+    })?;
+    let Some(items) = arr.as_array() else {
+        anyhow::bail!("research recognition JSON was not an array");
     };
 
     let mut artifacts = Vec::new();
@@ -1076,6 +1078,13 @@ mod tests {
         );
         assert!(rendered.contains("date: 2025-05-04"));
         assert!(rendered.contains("captured_at: 2026-07-02T12:00:00Z"));
+    }
+
+    #[test]
+    fn parse_recognition_distinguishes_empty_from_malformed() {
+        assert!(parse_recognition_response("[]").unwrap().is_empty());
+        assert!(parse_recognition_response("not json").is_err());
+        assert!(parse_recognition_response(r#"{"start_line":1,"end_line":2}"#).is_err());
     }
 
     #[test]

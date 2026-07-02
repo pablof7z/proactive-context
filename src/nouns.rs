@@ -1307,11 +1307,18 @@ TRANSCRIPT:\n{}",
 /// wrapping (reuses the same extraction shape as research/episode parsing). Invalid or
 /// empty-evidence items are dropped here; evidence is VERIFIED against the transcript by
 /// the caller before persisting (integrity-by-construction).
-pub fn parse_definitional_response(response: &str) -> Vec<DefinitionalClaim> {
+pub fn parse_definitional_response(response: &str) -> anyhow::Result<Vec<DefinitionalClaim>> {
     let json = extract_json_array(response);
-    let arr = match serde_json::from_str::<serde_json::Value>(&json) {
-        Ok(serde_json::Value::Array(a)) => a,
-        _ => return Vec::new(),
+    let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|e| {
+        anyhow::anyhow!(
+            "definitional recognition produced invalid JSON: {}; excerpt: {}",
+            e,
+            response.chars().take(300).collect::<String>()
+        )
+    })?;
+    let arr = match value {
+        serde_json::Value::Array(a) => a,
+        _ => anyhow::bail!("definitional recognition JSON was not an array"),
     };
     let mut out = Vec::new();
     for item in &arr {
@@ -1337,7 +1344,7 @@ pub fn parse_definitional_response(response: &str) -> Vec<DefinitionalClaim> {
         }
         out.push(DefinitionalClaim { subject, definition, authority, evidence });
     }
-    out
+    Ok(out)
 }
 
 /// Extract a JSON array from model text (```json fence, bare ``` fence, or first [..]).
@@ -1413,7 +1420,7 @@ pub fn recognize_definitions(transcript_path: &str) -> anyhow::Result<Vec<NounEn
     let resp = crate::capture::call_model_blocking(
         &spec, openrouter_key, ollama_base, ollama_key, DEFINITIONAL_SYSTEM, &user,
     )?;
-    let claims = parse_definitional_response(&resp);
+    let claims = parse_definitional_response(&resp)?;
     let mut entries = Vec::new();
     for c in &claims {
         let verified = verify_definitional_evidence(&raw_lines, &spans, c);
@@ -2553,7 +2560,7 @@ mod tests {
           {"subject":"Token Event","definition":"kind:7375, self-encrypted holding Cashu proofs","authority":"explicit","evidence":[{"start":10,"end":12}]},
           {"subject":"PubkeyDecoderService","definition":"decodes npubs to hex","authority":"implicit","evidence":[{"start":40,"end":40}]}
         ]"#;
-        let claims = parse_definitional_response(resp);
+        let claims = parse_definitional_response(resp).unwrap();
         assert_eq!(claims.len(), 2);
         assert_eq!(claims[0].subject, "Token Event");
         assert_eq!(claims[0].authority, "explicit");
@@ -2565,9 +2572,16 @@ mod tests {
     #[test]
     fn parse_definitional_drops_empty_and_tolerates_prose() {
         let resp = "Sure! Here you go:\n```json\n[{\"subject\":\"\",\"definition\":\"x\"},{\"subject\":\"Mint\",\"definition\":\"shared with recipient\",\"authority\":\"explicit\",\"evidence\":[{\"start\":1,\"end\":2}]}]\n```\nDone.";
-        let claims = parse_definitional_response(resp);
+        let claims = parse_definitional_response(resp).unwrap();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].subject, "Mint");
+    }
+
+    #[test]
+    fn parse_definitional_distinguishes_empty_from_malformed() {
+        assert!(parse_definitional_response("[]").unwrap().is_empty());
+        assert!(parse_definitional_response("not json").is_err());
+        assert!(parse_definitional_response(r#"{"subject":"Mint"}"#).is_err());
     }
 
     #[test]
