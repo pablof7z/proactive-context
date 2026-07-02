@@ -470,17 +470,16 @@ pub struct EvidenceRange {
 
 pub(crate) fn parse_recognition_response(response: &str) -> Result<Vec<RecognizedArc>> {
     let json_str = extract_json_value(response);
-    let Ok(val) = serde_json::from_str::<Value>(&json_str) else {
-        eprintln!(
-            "[episode-capture] WARNING: failed to parse recognition JSON: {}",
-            &response[..response.len().min(300)]
-        );
-        return Ok(Vec::new());
-    };
+    let val = serde_json::from_str::<Value>(&json_str).map_err(|e| {
+        anyhow::anyhow!(
+            "episode recognition produced invalid JSON: {}; excerpt: {}",
+            e,
+            response.chars().take(300).collect::<String>()
+        )
+    })?;
 
-    let items = match val.as_array() {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
+    let Some(items) = val.as_array() else {
+        anyhow::bail!("episode recognition JSON was not an array");
     };
 
     let mut arcs = Vec::new();
@@ -2223,6 +2222,13 @@ body
     fn is_routine_command_only_false_for_empty_array() {
         let response = r#"[]"#;
         assert!(!is_routine_command_only(response));
+    }
+
+    #[test]
+    fn parse_recognition_distinguishes_empty_from_malformed() {
+        assert!(parse_recognition_response("[]").unwrap().is_empty());
+        assert!(parse_recognition_response("not json").is_err());
+        assert!(parse_recognition_response(r#"{"exclude_reason":"routine-command-only"}"#).is_err());
     }
 
     // ─── Index scanning ───────────────────────────────────────────────────────
