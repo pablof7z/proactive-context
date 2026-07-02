@@ -6,6 +6,7 @@
 /// Entry point: `pc research --transcript <path> [--out-dir <dir>] [--session-id <id>]`
 use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -75,13 +76,14 @@ pub fn run_research_capture(
             continue;
         }
         let slug = slugify_artifact(&artifact.characterization, idx + 1);
-        let filename = format!(
-            "{}-{}-{}.md",
-            &rfc3339_now()[..10], // YYYY-MM-DD
-            &session_id[..session_id.len().min(8)],
-            slug
-        );
-        let record_path = out_dir.join(&filename);
+        let captured_at = rfc3339_now();
+        let date = &captured_at[..captured_at.len().min(10)];
+        let record_path = research_record_path_for_session(out_dir, date, &session_id, &slug);
+        if record_path.exists() {
+            eprintln!("[research-capture] exists, leaving immutable record untouched: {}", record_path.display());
+            persisted.push(record_path);
+            continue;
+        }
         write_research_record(
             &record_path,
             &session_id,
@@ -90,6 +92,8 @@ pub fn run_research_capture(
             snap_start,
             snap_end,
             &sliced,
+            date,
+            &captured_at,
         )?;
         eprintln!("[research-capture] persisted: {}", record_path.display());
         persisted.push(record_path);
@@ -116,6 +120,7 @@ pub fn run_research_stage(
     wiki_dir: &Path,
     transcript_path: &str,
     session_id: &str,
+    date_override: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let research_dir = wiki_dir.join("research");
     let cfg = load_config()?;
@@ -137,7 +142,9 @@ pub fn run_research_stage(
 
     fs::create_dir_all(&research_dir)?;
     let captured_at = rfc3339_now();
-    let date = &captured_at[..captured_at.len().min(10)];
+    let date = date_override
+        .map(str::to_string)
+        .unwrap_or_else(|| captured_at[..captured_at.len().min(10)].to_string());
 
     let mut persisted = Vec::new();
     for (idx, artifact) in artifacts.iter().enumerate() {
@@ -148,21 +155,20 @@ pub fn run_research_stage(
             continue;
         }
         let slug = slugify_artifact(&artifact.characterization, idx + 1);
-        // Filename: <date>-<slug>.md (spec §6 D2: docs/wiki/research/<date>-<slug>.md).
-        let filename = format!("{}-{}.md", date, slug);
-        let record_path = research_dir.join(&filename);
+        let record_path = research_record_path_for_session(&research_dir, &date, session_id, &slug);
         // Immutability (R1): never overwrite an existing record.
         if record_path.exists() {
             persisted.push(record_path);
             continue;
         }
-        let content = render_research_record(
+        let content = render_research_record_dated(
             session_id,
             transcript_path,
             artifact,
             snap_start,
             snap_end,
             &sliced,
+            &date,
             &captured_at,
         );
         fs::write(&record_path, content)?;
@@ -556,15 +562,18 @@ fn write_research_record(
     start_line: usize,
     end_line: usize,
     sliced_text: &str,
+    date: &str,
+    captured_at: &str,
 ) -> Result<()> {
-    let content = render_research_record(
+    let content = render_research_record_dated(
         session_id,
         transcript_path,
         artifact,
         start_line,
         end_line,
         sliced_text,
-        &rfc3339_now(),
+        date,
+        captured_at,
     );
     let mut f = fs::File::create(path)?;
     f.write_all(content.as_bytes())?;
@@ -583,6 +592,30 @@ pub fn render_research_record(
     captured_at: &str,
 ) -> String {
     let date = &captured_at[..captured_at.len().min(10)];
+    render_research_record_dated(
+        session_id,
+        transcript_path,
+        artifact,
+        start_line,
+        end_line,
+        sliced_text,
+        date,
+        captured_at,
+    )
+}
+
+/// Like [`render_research_record`] but with an explicit logical research date.
+/// `captured_at` remains the real processing timestamp.
+pub fn render_research_record_dated(
+    session_id: &str,
+    transcript_path: &str,
+    artifact: &RecognizedArtifact,
+    start_line: usize,
+    end_line: usize,
+    sliced_text: &str,
+    date: &str,
+    captured_at: &str,
+) -> String {
     format!(
         "---\n\
 type: research-record\n\
@@ -671,6 +704,83 @@ fn derive_session_id(transcript_path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// Stable, filename-safe session component for immutable artifacts. Includes a readable
+/// session prefix plus a hash suffix so same-date artifacts from different sessions do not
+/// collide even when the model gives them the same title/characterization.
+pub(crate) fn session_filename_component(session_id: &str) -> String {
+    let mut prefix = String::new();
+    for c in session_id.chars() {
+        if c.is_ascii_alphanumeric() {
+            prefix.push(c.to_ascii_lowercase());
+            if prefix.len() >= 12 {
+                break;
+            }
+        }
+    }
+    if prefix.is_empty() {
+        prefix.push_str("session");
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    format!("{}-{}", prefix, &hash[..8])
+}
+
+pub(crate) fn artifact_filename_stem(date: &str, session_id: &str, slug: &str) -> String {
+    format!("{}-{}-{}", date, session_filename_component(session_id), slug)
+}
+
+fn research_record_path_for_session(
+    research_dir: &Path,
+    date: &str,
+    session_id: &str,
+    slug: &str,
+) -> PathBuf {
+    let stem = artifact_filename_stem(date, session_id, slug);
+    session_owned_markdown_path(research_dir, &stem, session_id, research_record_session)
+}
+
+pub(crate) fn session_owned_markdown_path(
+    dir: &Path,
+    stem: &str,
+    session_id: &str,
+    read_session: fn(&Path) -> Option<String>,
+) -> PathBuf {
+    let first = dir.join(format!("{}.md", stem));
+    if path_missing_or_owned_by_session(&first, session_id, read_session) {
+        return first;
+    }
+    for n in 2.. {
+        let candidate = dir.join(format!("{}-collision-{}.md", stem, n));
+        if path_missing_or_owned_by_session(&candidate, session_id, read_session) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded collision suffix search must return")
+}
+
+fn path_missing_or_owned_by_session(
+    path: &Path,
+    session_id: &str,
+    read_session: fn(&Path) -> Option<String>,
+) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    read_session(path).as_deref() == Some(session_id)
+}
+
+fn research_record_session(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("session: ") {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    None
 }
 
 fn slugify_artifact(characterization: &str, idx: usize) -> String {
@@ -893,6 +1003,79 @@ mod tests {
         assert!(rendered.contains("source_lines: 100-150"));
         assert!(rendered.contains("agent_attribution: validation-agent"));
         assert!(rendered.contains("## Run 4 Report\nverbatim body"));
+    }
+
+    #[test]
+    fn session_filename_component_is_safe_stable_and_hashed() {
+        let a = session_filename_component("Session-ABC_123/with spaces");
+        let b = session_filename_component("Session-ABC_123/with spaces");
+        let c = session_filename_component("Session-ABC_123/other");
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("sessionabc12-"), "got: {a}");
+        assert!(a.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
+        assert!(session_filename_component("✓✓").starts_with("session-"));
+    }
+
+    #[test]
+    fn artifact_filename_stem_includes_session_component() {
+        let stem = artifact_filename_stem("2025-05-04", "sess-A", "1-same-title");
+        assert!(stem.starts_with("2025-05-04-sessa-"), "got: {stem}");
+        assert!(stem.ends_with("-1-same-title"), "got: {stem}");
+    }
+
+    #[test]
+    fn research_record_path_does_not_reuse_other_sessions_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let slug = "1-same-result";
+        let base = research_record_path_for_session(dir, "2025-05-04", "sess-A", slug);
+        fs::write(
+            &base,
+            "---\ntype: research-record\ndate: 2025-05-04\nsession: sess-B\n---\nbody\n",
+        )
+        .unwrap();
+
+        let next = research_record_path_for_session(dir, "2025-05-04", "sess-A", slug);
+        assert_ne!(next, base);
+        assert!(
+            next.file_name().unwrap().to_string_lossy().contains("-collision-2.md"),
+            "got: {}",
+            next.display()
+        );
+
+        fs::write(
+            &next,
+            "---\ntype: research-record\ndate: 2025-05-04\nsession: sess-A\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(research_record_path_for_session(dir, "2025-05-04", "sess-A", slug), next);
+    }
+
+    #[test]
+    fn render_research_record_dated_uses_logical_date_not_processing_date() {
+        let artifact = RecognizedArtifact {
+            start_line: 1,
+            end_line: 2,
+            characterization: "Historical replay report".to_string(),
+            agent_attribution: "main".to_string(),
+            has_preregistered_criteria: true,
+            has_method: true,
+            has_structured_report: true,
+        };
+        let rendered = render_research_record_dated(
+            "sess-history",
+            "/path/to/transcript.jsonl",
+            &artifact,
+            1,
+            2,
+            "body",
+            "2025-05-04",
+            "2026-07-02T12:00:00Z",
+        );
+        assert!(rendered.contains("date: 2025-05-04"));
+        assert!(rendered.contains("captured_at: 2026-07-02T12:00:00Z"));
     }
 
     #[test]
