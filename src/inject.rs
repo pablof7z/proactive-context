@@ -339,10 +339,7 @@ fn commit_noun_only(
     noun: &crate::nouns::NounResolution,
 ) -> Option<(String, usize)> {
     let block = noun.block.as_ref()?;
-    let out = format!(
-        "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
-        project_basename, block
-    );
+    let out = wrap_context_reminder(project_basename, block);
     crate::ledger::append(root, session_id, None, block);
     if !noun.primed_slugs.is_empty() {
         crate::nouns::record_primed(&project_context_dir(root), session_id, &noun.primed_slugs);
@@ -372,16 +369,23 @@ fn log_noun_primer(noun: &crate::nouns::NounResolution, standalone: bool) {
 
 // ─── Fallback renderer ────────────────────────────────────────────────────────
 
-fn render_raw_reminder(project_name: &str, hits: &[QueryResult], noun_block: Option<&str>) -> String {
-    let mut out = format!(
-        "<system-reminder>\nRelevant project context ({}):\n\n",
-        project_name
-    );
+fn wrap_context_reminder(project_name: &str, body: &str) -> String {
+    format!(
+        "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
+        project_name, body
+    )
+}
+
+fn render_raw_body(hits: &[QueryResult], noun_block: Option<&str>) -> String {
+    let mut out = String::new();
     // The noun primer is LLM-free, so it rides along even in the raw-fallback paths (no key / compile
     // error / timeout) — placed first as the highest-signal context.
     if let Some(block) = noun_block {
-        out.push_str(block);
-        out.push_str("\n\n");
+        let block = block.trim();
+        if !block.is_empty() {
+            out.push_str(block);
+            out.push_str("\n\n");
+        }
     }
     for h in hits {
         out.push_str(&format!(
@@ -389,8 +393,28 @@ fn render_raw_reminder(project_name: &str, hits: &[QueryResult], noun_block: Opt
             h.path, h.chunk_index, h.score, h.content
         ));
     }
-    out.push_str("</system-reminder>");
-    out
+    out.trim_end().to_string()
+}
+
+fn commit_raw_fallback(
+    root: &Path,
+    session_id: &str,
+    project_basename: &str,
+    hits: &[QueryResult],
+    noun: &crate::nouns::NounResolution,
+) -> Option<(String, usize)> {
+    let body = render_raw_body(hits, noun.block.as_deref());
+    if body.trim().is_empty() {
+        return None;
+    }
+    crate::ledger::append(root, session_id, Some("Fallback context"), &body);
+    if !noun.primed_slugs.is_empty() {
+        crate::nouns::record_primed(&project_context_dir(root), session_id, &noun.primed_slugs);
+        log_noun_primer(noun, false);
+    }
+    let out = wrap_context_reminder(project_basename, &body);
+    let n = out.len();
+    Some((out, n))
 }
 
 // ─── Activation gate ─────────────────────────────────────────────────────────
@@ -738,9 +762,8 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
     };
 
-    // Compute fallback block upfront (before any async work)
+    // Prepare project label used by fallback/noun reminder rendering.
     let project_basename = project_basename(&project);
-    let fallback_block = render_raw_reminder(&project_basename, &hits, noun_resolution.block.as_deref());
 
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
     let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
@@ -775,7 +798,11 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             return Ok(());
         }
         let elapsed_ms = start.elapsed().as_millis();
-        let out_chars = fallback_block.len();
+        let Some((fallback_block, out_chars)) =
+            commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
+        else {
+            return Ok(());
+        };
         log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
             "outcome": "fallback",
             "reason": "no_api_key",
@@ -810,11 +837,32 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     let rt = match Runtime::new() {
         Ok(r) => r,
         Err(_) => {
+            let elapsed_ms = start.elapsed().as_millis();
             if !hits.is_empty() {
-                print!("{}", fallback_block);
-            } else if let Some((out, _)) =
+                if let Some((fallback_block, out_chars)) =
+                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
+                {
+                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                        "outcome": "fallback",
+                        "reason": "runtime_unavailable",
+                        "hits": hits.len(),
+                        "out_chars": out_chars,
+                        "prompt_preview": &prompt_preview
+                    }));
+                    emit(&out_mode, Some(&fallback_block), &format!(
+                        "inject [{}ms] | {} hits | runtime unavailable → fallback {}c",
+                        elapsed_ms, hits.len(), out_chars));
+                }
+            } else if let Some((out, out_chars)) =
                 commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
             {
+                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                    "outcome": "noun_primer",
+                    "reason": "runtime_unavailable",
+                    "hits": 0,
+                    "out_chars": out_chars,
+                    "prompt_preview": &prompt_preview
+                }));
                 emit(&out_mode, Some(&out), "inject | runtime unavailable → noun primer");
             }
             return Ok(());
@@ -989,7 +1037,11 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 "message": truncate(&format!("{}", e), 300)
             }));
             if !hits.is_empty() {
-                let out_chars = fallback_block.len();
+                let Some((fallback_block, out_chars)) =
+                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
+                else {
+                    return Ok(());
+                };
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "fallback",
                     "reason": "compile_error",
@@ -1028,7 +1080,11 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         Err(_timeout) => {
             let elapsed_ms = start.elapsed().as_millis();
             if !hits.is_empty() {
-                let out_chars = fallback_block.len();
+                let Some((fallback_block, out_chars)) =
+                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
+                else {
+                    return Ok(());
+                };
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "fallback",
                     "reason": "timeout",
@@ -2028,9 +2084,10 @@ fn format_guides(guides: &[String]) -> String {
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
     use super::{
-        build_catalog, config_error_payload, no_index_payload, read_catalog_content,
+        build_catalog, commit_raw_fallback, config_error_payload, no_index_payload, read_catalog_content,
         source_label_for_key, EPISODE_KEY_PREFIX,
     };
+    use crate::config::project_context_dir;
     use std::collections::HashSet;
     use std::fs;
 
@@ -2284,6 +2341,57 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         assert_eq!(payload.get("outcome").and_then(|v| v.as_str()), Some("empty"));
         assert_eq!(payload.get("reason").and_then(|v| v.as_str()), Some("config_error"));
         assert!(error.len() <= 203, "error should be truncated, got {}", error.len());
+    }
+
+    #[test]
+    fn raw_fallback_commit_records_briefing_and_primed_ledgers() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        struct RestorePcHome(Option<std::ffi::OsString>);
+        impl Drop for RestorePcHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PC_HOME", v),
+                    None => std::env::remove_var("PC_HOME"),
+                }
+            }
+        }
+        let _restore_pc_home = RestorePcHome(std::env::var_os("PC_HOME"));
+        let pc_home = tempfile::tempdir().unwrap();
+        std::env::set_var("PC_HOME", pc_home.path());
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        let session = format!("fallback-ledger-{}", std::process::id());
+        let hits = vec![crate::query::QueryResult {
+            path: "docs/spec.md".to_string(),
+            chunk_index: 2,
+            content: "Raw chunk body from fallback retrieval.".to_string(),
+            content_hash: "hash".to_string(),
+            score: 0.82,
+        }];
+        let noun = crate::nouns::NounResolution {
+            block: Some("Purple Pages is the local publish surface.".to_string()),
+            primed_slugs: vec!["purple-pages".to_string()],
+            matched: Vec::new(),
+            level: crate::nouns::PrimerLevel::Facts,
+            direct_query: true,
+        };
+
+        let (out, out_chars) =
+            commit_raw_fallback(root, &session, "demo", &hits, &noun).expect("fallback body");
+
+        assert_eq!(out_chars, out.len());
+        assert!(out.contains("<system-reminder>"));
+        assert!(out.contains("Purple Pages is the local publish surface."));
+        assert!(out.contains("Raw chunk body from fallback retrieval."));
+
+        let ledger = crate::ledger::read_recent(root, &session, 8, 3000);
+        assert!(ledger.contains("[Fallback context]"), "got: {ledger}");
+        assert!(ledger.contains("Purple Pages is the local publish surface."), "got: {ledger}");
+        assert!(ledger.contains("Raw chunk body from fallback retrieval."), "got: {ledger}");
+
+        let primed = crate::nouns::read_primed(&project_context_dir(root), &session);
+        assert!(primed.contains("purple-pages"), "got: {primed:?}");
     }
 
     // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────
