@@ -437,7 +437,7 @@ pub fn stance_llm_call(
 /// Returns judgments aligned to `refs` (input order); `None` for any item the model dropped.
 ///
 /// The production shape is one batched call per session. Sessions are chunked into sub-batches of at
-/// most `PC_T0_BATCH_CHUNK` (default 8) refs: a single huge session (e.g. 14 refs) makes the
+/// most `PC_T0_BATCH_CHUNK` (default 6) refs: a single huge session (e.g. 14 refs) makes the
 /// reasoning model's `thinking` + JSON array overrun any sane token budget and truncate (→ all items
 /// dropped, an unfair instrumentation miss). Chunking bounds each call; typical sessions (≤8 refs)
 /// remain a single call.

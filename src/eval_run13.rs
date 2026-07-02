@@ -270,67 +270,7 @@ pub(crate) struct NounMoment {
 /// `NIP-NN` tokens, and Capitalized multi-word phrases. Lowercased, de-duplicated, trimmed.
 /// Pure — unit-tested offline.
 pub(crate) fn extract_noun_candidates(turn: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
-        let c = c.trim().trim_matches(|ch: char| ch == '.' || ch == ',' || ch == '?' || ch == '!' || ch == ':' || ch == ';').to_string();
-        let cl = c.to_lowercase();
-        if c.len() >= 3 && c.len() <= 60 && seen.insert(cl.clone()) {
-            out.push(c);
-        }
-    };
-
-    // 1. Backticked identifiers: `foo_bar`, `kind:7375`.
-    let bytes = turn.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            if let Some(rel) = turn[i + 1..].find('`') {
-                let inner = &turn[i + 1..i + 1 + rel];
-                if !inner.trim().is_empty() {
-                    push(inner.to_string(), &mut out, &mut seen);
-                }
-                i = i + 1 + rel + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    // 2/3. Token scan for kind:NNNN and NIP-NN; and accumulate Capitalized runs.
-    let words: Vec<&str> = turn.split_whitespace().collect();
-    let mut cap_run: Vec<String> = Vec::new();
-    let flush_run = |run: &mut Vec<String>, out: &mut Vec<String>, seen: &mut HashSet<String>, push: &dyn Fn(String, &mut Vec<String>, &mut HashSet<String>)| {
-        if run.len() >= 2 {
-            push(run.join(" "), out, seen);
-        }
-        run.clear();
-    };
-    for w in &words {
-        let clean = w.trim_matches(|c: char| !c.is_alphanumeric() && c != ':' && c != '-' && c != '_');
-        let cl = clean.to_lowercase();
-        // kind:NNNN
-        if cl.starts_with("kind:") && cl[5..].chars().all(|c| c.is_ascii_digit()) && cl.len() > 5 {
-            push(clean.to_string(), &mut out, &mut seen);
-        }
-        // NIP-NN
-        if (cl.starts_with("nip-") || cl.starts_with("nip ")) && cl.len() >= 5 && cl[4..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            push(clean.to_string(), &mut out, &mut seen);
-        }
-        // Capitalized multi-word phrase accumulation (TitleCase words → noun phrase).
-        let first = clean.chars().next();
-        let is_cap = first.map(|c| c.is_uppercase()).unwrap_or(false)
-            && clean.chars().count() >= 2
-            && !clean.chars().all(|c| c.is_uppercase()); // skip ALLCAPS acronyms run-ons; single allowed below
-        if is_cap || (clean.chars().all(|c| c.is_uppercase()) && clean.len() >= 3 && clean.len() <= 6) {
-            cap_run.push(clean.to_string());
-        } else {
-            flush_run(&mut cap_run, &mut out, &mut seen, &push);
-        }
-    }
-    flush_run(&mut cap_run, &mut out, &mut seen, &push);
-
-    out
+    crate::noun_mining::extract_noun_candidates(turn)
 }
 
 /// Build the ground-truth fact set the store carries about a noun: store-repr lines (wiki body
