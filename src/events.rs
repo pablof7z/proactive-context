@@ -288,9 +288,8 @@ fn maybe_rotate(path: &PathBuf, max_bytes: u64, retention: usize) {
 
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+        if !try_lock_file_exclusive(&lock_file) {
+            return;
         }
     }
 
@@ -300,8 +299,7 @@ fn maybe_rotate(path: &PathBuf, max_bytes: u64, retention: usize) {
         Err(_) => {
             #[cfg(unix)]
             {
-                use std::os::unix::io::AsRawFd;
-                unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN); }
+                unlock_file(&lock_file);
             }
             return;
         }
@@ -326,10 +324,23 @@ fn maybe_rotate(path: &PathBuf, max_bytes: u64, retention: usize) {
 
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN); }
+        unlock_file(&lock_file);
     }
     drop(lock_file);
+}
+
+#[cfg(unix)]
+fn try_lock_file_exclusive(file: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
 }
 
 /// Return (current_req_id, events_log_path) — used by openrouter.rs for sidecar naming.
@@ -406,5 +417,24 @@ mod tests {
         assert_eq!(payload.get("small").and_then(|v| v.as_str()), Some("kept"));
         assert!(payload.get("system").and_then(|v| v.as_str()).unwrap().len() < 6000);
         assert!(payload.get("user").and_then(|v| v.as_str()).unwrap().len() < 6000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_lock_helper_reports_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".rotate.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let contending_file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        assert!(try_lock_file_exclusive(&file));
+        assert!(!try_lock_file_exclusive(&contending_file));
+        unlock_file(&file);
+        assert!(try_lock_file_exclusive(&contending_file));
+        unlock_file(&contending_file);
     }
 }
