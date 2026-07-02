@@ -1734,9 +1734,10 @@ impl NounResolution {
 /// Resolve the noun primer for one inject turn — the PEER-to-guides entry point. Independent of
 /// guide selection: the inject path calls this whether or not SELECT found a relevant guide.
 ///
-/// Population = `<wiki>/nouns/*.md` (authority). For each noun first-mentioned in `prompt` (matched
-/// by `match_noun_in_prompt`, not already in `recent`, not already primed this session) the
-/// SURFACING GATE applies, by match CONFIDENCE:
+/// Population = `<wiki>/nouns/*.md` (authority). For each noun matched in `prompt`, not already
+/// primed this session, and not merely repeated from recent context, the SURFACING GATE applies by
+/// match CONFIDENCE. A direct high-confidence entity question ("what is X?") is allowed through even
+/// when X appeared recently; the question itself is the relevance signal.
 ///   - `suppressed` (rejected confabulation, across any spelling) NEVER primes;
 ///   - HIGH-confidence match (exact phrase / compact alias / ≥2 distinctive tokens): primes when
 ///     `real`, when it carries a definition, or on a direct entity query;
@@ -1809,8 +1810,11 @@ pub fn resolve_noun_primer(
             Some(s) => s,
             None => continue,
         };
-        // First-mention only: already in the live transcript → not "first", don't re-prime.
-        if match_noun_in_prompt(&recent_l, &a.name, &a.slug).is_some() {
+        // First-mention only for ordinary prompts: already in recent live transcript → not "first",
+        // don't re-prime. Direct high-confidence entity questions are the exception: users often ask
+        // "what is X?" precisely because X just appeared.
+        let recent_match = match_noun_in_prompt(&recent_l, &a.name, &a.slug);
+        if recent_match.is_some() && !(direct_query && strength.is_high_confidence()) {
             continue;
         }
         let status = status_for(&a.name, &a.slug);
@@ -2789,9 +2793,13 @@ mod tests {
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
         write_noun(wiki, "purplepag-es", "purplepag.es", "A Nostr relay.");
-        // Already in recent transcript → not a first mention.
-        let res = resolve_noun_primer(wiki, &proj, "s1", "what is purplepag.es?", "earlier: purplepag.es came up");
+        // Ordinary prompt: already in recent transcript → not a first mention.
+        let res = resolve_noun_primer(wiki, &proj, "s1", "ship purplepag.es", "earlier: purplepag.es came up");
         assert!(res.matched.is_empty());
+        // Direct entity query: the user is asking *because* it came up, so recent mention must not
+        // suppress a high-confidence noun primer.
+        let res = resolve_noun_primer(wiki, &proj, "s1b", "what is purplepag.es?", "earlier: purplepag.es came up");
+        assert_eq!(res.matched.len(), 1);
         // Already primed this session → suppressed.
         record_primed(&proj, "s2", &["purplepag-es".to_string()]);
         let res2 = resolve_noun_primer(wiki, &proj, "s2", "what is purplepag.es?", "");
