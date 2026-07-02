@@ -23,6 +23,7 @@
 //! is a no-op (or returns an empty result for reads).
 
 use crate::config::project_context_dir;
+use crate::db::configure_sqlite_connection;
 use crate::embed::Embedder;
 use crate::route_recall::cosine;
 use anyhow::{Context, Result};
@@ -156,6 +157,7 @@ pub fn open_claims_db(db_path: &Path, dim: usize) -> Result<Connection> {
     fs::create_dir_all(db_path.parent().unwrap())?;
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open claims db at {}", db_path.display()))?;
+    configure_sqlite_connection(&conn)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     init_claims_schema(&conn, dim)?;
     Ok(conn)
@@ -1117,5 +1119,16 @@ mod status_tests {
         assert_eq!(serde_json::to_string(&ClaimStatus::Settled).unwrap(), "\"settled\"");
         assert_eq!(serde_json::to_string(&ClaimStatus::Unknown).unwrap(), "\"unknown\"");
         assert_eq!(ClaimStatus::default(), ClaimStatus::Unknown);
+    }
+
+    #[test]
+    fn open_claims_db_configures_busy_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_claims_db(&tmp.path().join("claims.db"), 4).unwrap();
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(timeout_ms, crate::db::SQLITE_BUSY_TIMEOUT_MS as i64);
     }
 }

@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::archeologist::{ProjectInfo, SessionInfo};
 use crate::capture::archeologist_is_already_captured;
 use crate::config::{normalize_path, resolve_project_root};
+use crate::db::configure_sqlite_connection;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -41,6 +42,7 @@ pub fn scan_opencode_sessions(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("opening opencode db at {}", db_path.display()))?;
+    configure_sqlite_connection(&conn)?;
 
     let sessions = query_sessions(&conn, since_filter)?;
     if sessions.is_empty() {
