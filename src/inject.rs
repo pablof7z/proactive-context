@@ -1180,6 +1180,48 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, project_dir: &Path, key: &
     std::fs::read_to_string(path).ok()
 }
 
+fn label_for_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|rel| format!("./{}", rel.display()))
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn source_label_for_key(
+    root: &Path,
+    wiki_dir: &Path,
+    project_dir: Option<&Path>,
+    key: &str,
+) -> String {
+    if let Some(stem) = key.strip_prefix(EPISODE_KEY_PREFIX) {
+        return label_for_path(root, &wiki_dir.join("episodes").join(format!("{}.md", stem)));
+    }
+
+    match ContentKind::parse_key(key) {
+        (ContentKind::ResearchRecord, stem) => {
+            label_for_path(root, &wiki_dir.join("research").join(format!("{}.md", stem)))
+        }
+        (ContentKind::NounEntry, slug) => {
+            label_for_path(root, &wiki_dir.join("nouns").join(format!("{}.md", slug)))
+        }
+        (ContentKind::Claim, cluster_id) => {
+            if let Some(project_dir) = project_dir {
+                let claim_store = crate::claims::claims_jsonl_path(project_dir);
+                format!("{}#claim-{}", label_for_path(root, &claim_store), cluster_id)
+            } else {
+                format!("claim-store#claim-{}", cluster_id)
+            }
+        }
+        _ => {
+            let path = if key.ends_with(".md") || key.contains('/') {
+                root.join(key)
+            } else {
+                guide_path(wiki_dir, key)
+            };
+            label_for_path(root, &path)
+        }
+    }
+}
+
 /// Catalog key prefix marking an episode card (historical provenance source).
 /// SELECT picks these for trajectory/rationale/history prompts; COMPILE treats them
 /// as historical per the currentness contract in COMPILE_PREAMBLE.
@@ -1601,6 +1643,7 @@ async fn wiki_navigate_and_compile(
         &guides,
         wiki_dir,
         root,
+        Some(project_dir),
         max_tokens,
     )
     .await
@@ -1697,23 +1740,14 @@ async fn compile_briefing(
     guides: &[(String, String)],
     wiki_dir: &Path,
     root: &Path,
+    project_dir: Option<&Path>,
     max_tokens: usize,
 ) -> Result<String> {
     // Label each source by a cwd-relative path the model must cite.
     let sources: Vec<(String, String)> = guides
         .iter()
         .map(|(slug, content)| {
-            let abs = if let Some(stem) = slug.strip_prefix(EPISODE_KEY_PREFIX) {
-                wiki_dir.join("episodes").join(format!("{}.md", stem))
-            } else if slug.ends_with(".md") || slug.contains('/') {
-                root.join(slug)
-            } else {
-                guide_path(wiki_dir, slug)
-            };
-            let label = abs
-                .strip_prefix(root)
-                .map(|rel| format!("./{}", rel.display()))
-                .unwrap_or_else(|_| abs.display().to_string());
+            let label = source_label_for_key(root, wiki_dir, project_dir, slug);
             (label, content.clone())
         })
         .collect();
@@ -1855,6 +1889,7 @@ pub(crate) async fn compile_briefing_pub(
         guides,
         wiki_dir,
         root,
+        None,
         max_tokens,
     )
     .await
@@ -1928,7 +1963,7 @@ fn format_guides(guides: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
-    use super::{build_catalog, read_catalog_content, EPISODE_KEY_PREFIX};
+    use super::{build_catalog, read_catalog_content, source_label_for_key, EPISODE_KEY_PREFIX};
     use std::collections::HashSet;
     use std::fs;
 
@@ -2083,6 +2118,50 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
 
         // A missing episode key resolves to None, not a panic or wrong file.
         assert!(read_catalog_content(root, &wiki, &dummy_project_dir, "episode:does-not-exist").is_none());
+    }
+
+    #[test]
+    fn source_label_for_key_resolves_typed_catalog_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        let project_dir = root.join("pc-project");
+
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "episode:2026-05-29-test"),
+            "./docs/wiki/episodes/2026-05-29-test.md"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "research:2026-06-12-run"),
+            "./docs/wiki/research/2026-06-12-run.md"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "noun:mint"),
+            "./docs/wiki/nouns/mint.md"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "claim:cl-abc123"),
+            "./pc-project/claims.jsonl#claim-cl-abc123"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, None, "claim:cl-abc123"),
+            "claim-store#claim-cl-abc123"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "routing-guide"),
+            "./docs/wiki/guides/routing-guide.md"
+        );
+        assert_eq!(
+            source_label_for_key(root, &wiki, Some(&project_dir), "docs/spec.md"),
+            "./docs/spec.md"
+        );
+
+        let research_label =
+            source_label_for_key(root, &wiki, Some(&project_dir), "research:2026-06-12-run");
+        assert!(
+            !research_label.contains("guides/research:"),
+            "research labels must not be fabricated guide paths: {research_label}"
+        );
     }
 
     #[test]
