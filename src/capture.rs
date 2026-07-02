@@ -1055,9 +1055,10 @@ are carried forward by the system. To EDIT one statement within a multi-statemen
 (replace or drop one statement while keeping its siblings), use \
 `revise` and re-emit the section's FULL text minus/plus the changed statement — preserving every \
 sibling statement you are not changing.\n\
-- remove: delete an entire section that is fully retracted (use only when the section's whole \
-content is being dropped; there is NO statement-level delete op — to drop one statement among \
-several, `revise` the section without it).\n\n\
+- remove: retire an entire section that is fully retracted. The system preserves the old section \
+as non-current history with a cited retirement breadcrumb; do NOT present it as current spec. Use \
+only when the section's whole content is being dropped; there is NO statement-level delete op — to \
+drop one statement among several, `revise` the section without it.\n\n\
 ## NO markers, NO promotion/deletion lifecycle\n\
 Write every admitted claim as clean desired-state prose. Do NOT add a 'provisional' prefix, do NOT \
 label statements by origin, and do NOT delete or 'promote' a statement because of its [explicit]/\
@@ -2025,13 +2026,6 @@ async fn run_staged_capture(
         eprintln!("capture: RECONCILE {} → {} op(s)", slug, ops.len());
 
         for op in &ops {
-            // Evidence must verify in Rust; otherwise the op is rejected (§2.4).
-            if !ctx.evidence_is_valid(&op.evidence) {
-                // For create/add/revise, evidence is required. Skip un-cited ops.
-                if op.op != "remove" {
-                    continue;
-                }
-            }
             let applied_op = apply_reconcile_op(
                 &ctx,
                 slug,
@@ -2064,6 +2058,15 @@ fn apply_reconcile_op(
     route_topic: Option<&str>,
     op: &ReconcileOp,
 ) -> bool {
+    // Evidence must verify in Rust for every mutating op, including `remove`.
+    if !ctx.evidence_is_valid(&op.evidence) {
+        eprintln!(
+            "capture: op {} on '{}' skipped: invalid or missing evidence",
+            op.op, slug
+        );
+        return false;
+    }
+
     let safe_slug = slugify(slug);
     // Title/summary for any NEW guide created here. Prefer ROUTE's human title; fall back to
     // the de-slugified form. Summary = the first statement's text (truncated) so the next
@@ -2265,7 +2268,16 @@ fn apply_reconcile_op(
             true
         }
         "remove" => {
+            let (marker, sliced) = ctx.cite(&op.evidence);
+            let id = marker
+                .trim_start_matches("[^")
+                .trim_end_matches(']')
+                .to_string();
+            let marker_clone = marker.clone();
+            let reason = op.text.clone();
             let section_c = section.clone();
+            let retired_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+            let retired_flag_c = retired_flag.clone();
             let result = ctx.with_guide_locked(&lock_slug, move |existing| {
                 let mut guide = match existing {
                     Some(g) => g,
@@ -2273,18 +2285,51 @@ fn apply_reconcile_op(
                 };
                 match wiki::find_full_section_range(&guide.body, &section_c) {
                     Some((start, end)) => {
-                        guide.body.replace_range(start..end, "");
+                        let removed = guide.body[start..end].to_string();
+                        let retired_section = render_retired_section(
+                            &section_c,
+                            &removed,
+                            &reason,
+                            &marker_clone,
+                            &today,
+                        );
+                        guide.body = replace_section_with_retirement(
+                            &guide.body,
+                            start,
+                            end,
+                            &retired_section,
+                        );
                         stamp_updated(&mut guide.frontmatter, &today);
-                        // Removing a section can drop the lead fact the summary described,
+                        // Retiring a section can drop the lead fact the summary described,
                         // so re-derive from whatever prose now leads the body.
                         refresh_summary(&mut guide);
-                        Ok((guide, format!("Removed '{}' / '{}'.", safe_slug, section_c)))
+                        let source_key = format!("session:{}", session_id);
+                        if !guide.frontmatter.sources.contains(&source_key) {
+                            guide.frontmatter.sources.push(source_key);
+                        }
+                        retired_flag_c.set(true);
+                        Ok((guide, format!("Retired '{}' / '{}'.", safe_slug, section_c)))
                     }
                     None => Ok((guide, format!("Remove: section '{}' not found.", section_c))),
                 }
             });
             eprintln!("capture: op remove → {}", result);
-            true
+            if retired_flag.get() && !result.starts_with("Error:") {
+                if let Err(e) = append_citation_log(&wiki_path, &id, &ctx.session_id, &sliced) {
+                    eprintln!("capture: citation log write failed: {}", e);
+                }
+                crate::events::log_event(
+                    "wiki.remove_statement",
+                    None,
+                    serde_json::json!({
+                        "slug": &lock_slug,
+                        "section": &section,
+                        "text": crate::events::truncate(&op.text, 300),
+                        "retained": true
+                    }),
+                );
+            }
+            retired_flag.get()
         }
         other => {
             eprintln!("capture: unknown reconcile op '{}' — skipped", other);
@@ -2872,6 +2917,65 @@ fn refresh_summary(guide: &mut Guide) {
     if let Some(s) = derive_summary_from_body(&guide.body) {
         guide.frontmatter.summary = s;
     }
+}
+
+fn render_retired_section(
+    section: &str,
+    retired_body: &str,
+    reason: &str,
+    marker: &str,
+    today: &str,
+) -> String {
+    let title = section.trim().trim_start_matches('#').trim();
+    let title = if title.is_empty() { "Section" } else { title };
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = if reason.is_empty() {
+        "This section is no longer part of the current specification".to_string()
+    } else {
+        reason
+    };
+    let punctuation = if matches!(reason.chars().last(), Some('.' | '!' | '?')) {
+        ""
+    } else {
+        "."
+    };
+
+    let mut out = format!(
+        "## Retired: {title}\n\nRetired on {today}: {reason}{punctuation} {marker}\n\nPreviously captured section:\n\n"
+    );
+    for line in retired_body.trim().lines() {
+        if line.trim().is_empty() {
+            out.push_str(">\n");
+        } else {
+            out.push_str("> ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn replace_section_with_retirement(
+    body: &str,
+    start: usize,
+    end: usize,
+    retired_section: &str,
+) -> String {
+    let mut current = String::with_capacity(body.len() + retired_section.len() + 4);
+    current.push_str(body[..start].trim_end());
+    let tail = body[end..].trim_start();
+    if !tail.is_empty() {
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(tail);
+    }
+    if !current.is_empty() {
+        current.push_str("\n\n");
+    }
+    current.push_str(retired_section.trim_end());
+    current.push('\n');
+    current
 }
 
 pub(crate) fn run_structural_maintenance(
@@ -3852,6 +3956,121 @@ mod tests {
 
         let timeout: std::result::Result<Result<&str>, &str> = Err("timeout");
         assert!(!should_mark_capture_success(&timeout));
+    }
+
+    fn remove_test_guide() -> Guide {
+        parse_guide(
+            "---\n\
+title: Sync Policy\n\
+slug: sync-policy\n\
+topic: sync\n\
+summary: optimistic locking is required\n\
+tags: []\n\
+volatility: warm\n\
+confidence: medium\n\
+created: 2026-06-01\n\
+updated: 2026-06-01\n\
+verified: 2026-06-01\n\
+compiled-from: conversation\n\
+sources:\n\
+  - session:seed\n\
+---\n\n\
+# Sync Policy\n\n\
+## Locking\n\n\
+optimistic locking is required. [^old-1]\n\n\
+<!-- citations: [^old-1] -->\n\n\
+## Sync\n\n\
+synchronization remains active.\n",
+        )
+        .unwrap()
+    }
+
+    fn remove_test_ctx(wiki: &Path) -> Arc<WikiAgentCtx> {
+        Arc::new(WikiAgentCtx::new(
+            wiki.to_path_buf(),
+            "proj".into(),
+            "sess-remove".into(),
+            vec!["User: drop the optimistic locking requirement.".into()],
+            vec!["user".into()],
+            "2026-07-02".into(),
+        ))
+    }
+
+    #[test]
+    fn reconcile_remove_with_invalid_evidence_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let path = guide_path(wiki, "sync-policy");
+        save_guide(&path, &remove_test_guide()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let ctx = remove_test_ctx(wiki);
+        let op = ReconcileOp {
+            op: "remove".into(),
+            section: "## Locking".into(),
+            text: "The locking requirement is no longer current.".into(),
+            evidence: vec![],
+        };
+
+        assert!(!apply_reconcile_op(&ctx, "sync-policy", Some("Sync Policy"), Some("sync"), &op));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(
+            !wiki.join("_citations.log").exists(),
+            "invalid remove must not mint a citation receipt"
+        );
+    }
+
+    #[test]
+    fn reconcile_remove_retires_section_with_citation_without_erasing_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        let path = guide_path(wiki, "sync-policy");
+        save_guide(&path, &remove_test_guide()).unwrap();
+        let ctx = remove_test_ctx(wiki);
+        let op = ReconcileOp {
+            op: "remove".into(),
+            section: "## Locking".into(),
+            text: "The locking requirement is no longer current.".into(),
+            evidence: vec![EvidenceRange { start: 1, end: 1 }],
+        };
+
+        assert!(apply_reconcile_op(&ctx, "sync-policy", Some("Sync Policy"), Some("sync"), &op));
+
+        let guide = load_guide(&path).unwrap();
+        assert!(
+            !guide.body.contains("\n## Locking\n\noptimistic locking is required"),
+            "retired section must no longer render as current spec:\n{}",
+            guide.body
+        );
+        assert!(guide.body.contains("## Sync"));
+        assert!(guide.body.contains("synchronization remains active."));
+        assert!(guide.body.contains("## Retired: Locking"), "missing retirement heading:\n{}", guide.body);
+        assert!(
+            guide.body.contains("Retired on 2026-07-02: The locking requirement is no longer current."),
+            "missing retirement reason:\n{}",
+            guide.body
+        );
+        assert!(guide.body.contains("> ## Locking"), "old heading must survive as quoted history");
+        assert!(
+            guide.body.contains("> optimistic locking is required."),
+            "old prose must survive as quoted history:\n{}",
+            guide.body
+        );
+        assert!(
+            guide.frontmatter
+                .sources
+                .contains(&"session:sess-remove".to_string()),
+            "retirement source session must be recorded"
+        );
+        assert!(
+            guide.frontmatter.summary.starts_with("synchronization remains active"),
+            "summary should describe the remaining live prose, got: {}",
+            guide.frontmatter.summary
+        );
+
+        let citation_log = fs::read_to_string(wiki.join("_citations.log")).unwrap();
+        assert!(citation_log.contains("session:sess-remove"));
+        assert!(citation_log.contains("drop the optimistic locking requirement"));
     }
 
     /// The C1 variant rewrites EXTRACT_PREAMBLE by anchored string surgery (extract_preamble_variant).
