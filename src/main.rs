@@ -25,6 +25,7 @@ mod eval_run15;
 mod eval_prompt_variant;
 mod eval_t0;
 mod merged_recognition;
+mod noun_mining;
 mod nouns;
 mod realness;
 mod session_start;

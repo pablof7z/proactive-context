@@ -711,36 +711,13 @@ fn mine_labels(
 /// it is assistant-side machine output, not human direction. We remove those spans here so the
 /// judge only ever sees what the human actually typed.
 pub(crate) fn strip_injected_context(text: &str) -> String {
-    let mut s = text.to_string();
-    // Remove <system-reminder>…</system-reminder> blocks (both raw and HTML-escaped forms).
-    for (open, close) in [
-        ("<system-reminder>", "</system-reminder>"),
-        ("&lt;system-reminder&gt;", "&lt;/system-reminder&gt;"),
-    ] {
-        loop {
-            let Some(start) = s.find(open) else { break };
-            let after = start + open.len();
-            if let Some(rel_end) = s[after..].find(close) {
-                let end = after + rel_end + close.len();
-                s.replace_range(start..end, " ");
-            } else {
-                // Unterminated reminder → drop to end of string.
-                s.truncate(start);
-                break;
-            }
-        }
-    }
-    s
+    crate::noun_mining::strip_injected_context(text)
 }
 
 /// True if a turn is dominated by pc's own injected/derived artifacts (briefing header, wiki
 /// index cache, citation log) rather than human text — these must never become labels.
 pub(crate) fn is_pc_self_referential(t: &str) -> bool {
-    let lower = t.to_lowercase();
-    lower.contains("relevant project context (")
-        || lower.contains("derived cache — do not hand-edit")
-        || lower.contains("rebuilt by proactive-context after each capture")
-        || (lower.contains("# wiki index") && lower.contains("| slug |"))
+    crate::noun_mining::is_pc_self_referential(t)
 }
 
 /// Extract human (user) conversational turns from a parsed transcript.

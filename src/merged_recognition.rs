@@ -132,7 +132,7 @@ pub fn call_merged_recognition(
 
 /// Extract the two sub-arrays from the envelope and re-serialize each as a JSON array string.
 /// Tolerant: if the envelope is malformed, returns "[]" for the missing side rather than erroring
-/// (a parse failure must not masquerade as a gate decision).
+/// (the caller treats malformed or missing sides as no recognized artifacts/arcs).
 pub fn split_envelope(raw: &str) -> (String, String) {
     // Find the outermost JSON object.
     let obj_str = extract_json_object(raw);

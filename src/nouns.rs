@@ -346,7 +346,7 @@ impl RealnessNoun {
 
 /// Index a C3 registry by canonical key (alias-normalized) for enrichment lookup. Both the entry's
 /// display NAME and its deslugged SLUG are canonicalized so a user noun matches a guide by either.
-/// The richest definition wins when several C3 entries share a canonical key.
+/// The first defined entry wins when several C3 entries share a canonical key.
 fn c3_by_canonical(c3: &[NounEntry]) -> std::collections::HashMap<String, &NounEntry> {
     let mut map: std::collections::HashMap<String, &NounEntry> = std::collections::HashMap::new();
     for e in c3 {
@@ -496,8 +496,8 @@ fn realness_max_refs() -> usize {
 ///
 /// Per session it:
 ///   1. reads the USER turns only (agent/code turns carry no stance — Approach A scores the user);
-///   2. extracts entity-filtered noun candidates (T-0 carry-forward #1: `is_entity_candidate` drops
-///      code symbols / `file:line` refs / snippet fragments that have no stance);
+///   2. extracts entity-filtered noun candidates (T-0 carry-forward #1: the production noun-mining
+///      filter drops code symbols / `file:line` refs / snippet fragments that have no stance);
 ///   3. classifies each (noun, turn) reference's stance via the THINKING-ON batched transport (T-0
 ///      carry-forward #2: `realness::classify_batched`, reasoning ON, off the hot path);
 ///   4. accumulates the signed Approach-A delta per ALIAS-CANONICAL noun (`alias::canonical_key`, so
@@ -532,12 +532,12 @@ pub fn run_realness_stage(
         }
         // Strip pc's own injected briefing so we never read stance from text pc inserted, and skip
         // turns that are about pc itself / transcript-tool artifacts (mirror the realness miner).
-        let text = crate::eval::strip_injected_context(&m.text);
+        let text = crate::noun_mining::strip_injected_context(&m.text);
         let t = text.trim();
         if t.len() < 25 || t.len() > 4000 {
             continue;
         }
-        if crate::eval::is_pc_self_referential(t) {
+        if crate::noun_mining::is_pc_self_referential(t) {
             continue;
         }
         let head = t.chars().take(40).collect::<String>().to_lowercase();
@@ -553,9 +553,9 @@ pub fn run_realness_stage(
         let turn_clip: String = t.chars().take(600).collect();
         let context_clip: String = this_prev.chars().take(300).collect();
         let mut seen_in_turn: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for cand in crate::eval_run13::extract_noun_candidates(t) {
+        for cand in crate::noun_mining::extract_noun_candidates(t) {
             let noun = cand.trim().to_string();
-            if !crate::eval_realness::is_entity_candidate(&noun) {
+            if !crate::noun_mining::is_entity_candidate(&noun) {
                 continue;
             }
             let key = crate::alias::canonical_key(&noun);

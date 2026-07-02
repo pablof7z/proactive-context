@@ -30,8 +30,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::eval::{is_pc_self_referential, strip_injected_context};
-use crate::eval_run13::extract_noun_candidates;
+use crate::noun_mining::{extract_noun_candidates, is_pc_self_referential, strip_injected_context};
 use crate::provider::ModelSpec;
 use crate::realness::{self, NounRef, Stance};
 

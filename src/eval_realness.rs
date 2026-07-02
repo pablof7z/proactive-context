@@ -40,8 +40,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::eval::{is_pc_self_referential, strip_injected_context};
-use crate::eval_run13::extract_noun_candidates;
+use crate::noun_mining::{extract_noun_candidates, is_pc_self_referential, strip_injected_context};
 use crate::provider::ModelSpec;
 use crate::realness::{
     self, apply_dormancy, judge_holistic, run_lifecycle, score_ledger, CostSnapshot, HolisticStatus,
@@ -56,104 +55,15 @@ use crate::realness::{
 // named components, concepts, NIPs, commands, files-as-entities the USER names.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const STOP: &[&str] = &[
-    "user", "assistant", "human", "system", "we", "i", "the", "this", "that", "these", "those",
-    "add", "make", "let", "lets", "let's", "can", "could", "should", "would", "when", "what", "why",
-    "how", "if", "so", "but", "and", "also", "now", "then", "here", "there", "it", "is", "are", "do",
-    "does", "please", "ok", "okay", "yes", "no", "maybe", "you", "your", "my", "our", "a", "an", "to",
-    "for", "of", "in", "on", "use", "using", "want", "need", "first", "next", "great", "good",
-    "thanks", "hmm", "wait", "actually", "just", "like", "see", "look", "got", "get", "im", "ive",
-    "dont", "didnt", "doesnt", "eg", "ie", "etc", "none", "current", "known", "future", "upon",
-    "non-goals", "hello",
-];
-
-const KNOWN_EXTS: &[&str] = &[
-    ".rs", ".ts", ".tsx", ".js", ".md", ".json", ".toml", ".py", ".txt", ".sh", ".yaml", ".yml",
-    ".html", ".css", ".sql",
-];
-
-/// A `name.ext:line` or `path/to/file:line` reference — a code location, not a project entity. Pure.
+/// Compatibility wrapper for the production noun-mining helper.
+#[cfg(test)]
 fn is_file_line_ref(c: &str) -> bool {
-    if let Some(idx) = c.rfind(':') {
-        let head = &c[..idx];
-        let tail = &c[idx + 1..];
-        if !tail.is_empty()
-            && tail.chars().all(|d| d.is_ascii_digit())
-            && (head.contains('.') || head.contains('/'))
-        {
-            return true;
-        }
-    }
-    false
+    crate::noun_mining::is_file_line_ref(c)
 }
 
-/// Whether a raw candidate is a genuine PROJECT NOUN rather than a code symbol / snippet fragment /
-/// file:line ref / transcript artifact / conversational filler. Pure — unit-tested against the
-/// junk classes T-0 flagged.
+/// Compatibility wrapper for the production noun-mining helper.
 pub(crate) fn is_entity_candidate(c: &str) -> bool {
-    let c = c.trim();
-    let nchars = c.chars().count();
-    if nchars < 3 || nchars > 50 {
-        return false;
-    }
-    // file:line code location (message.rs:413, src/foo.rs:12) → drop.
-    if is_file_line_ref(c) {
-        return false;
-    }
-    // Mid-token "label: Word" heading/transcript fragment ("Briefing: This", "X: Fixing") → drop.
-    // (kind:7375 / NIP-60 have no space after the colon, so they survive.)
-    if c.contains(": ") {
-        return false;
-    }
-    // Hex commit-hash / id artifact (90993c3, deadbeef) → drop.
-    let lc0 = c.to_lowercase();
-    if c.len() >= 6
-        && lc0.chars().all(|ch| ch.is_ascii_hexdigit())
-        && lc0.chars().any(|ch| ch.is_ascii_digit())
-    {
-        return false;
-    }
-    // Code / JSON / snippet punctuation anywhere → a pasted fragment, not a named entity. (Note `:`
-    // is allowed so `kind:7375` survives; file:line was already excluded above.)
-    const CODE_PUNCT: &[char] = &[
-        '(', ')', '{', '}', '[', ']', ';', '=', '<', '>', '"', '\'', '\\', '|', '&', '*', '/', '%',
-        '@', '$', '+', '~', '^', '`',
-    ];
-    if c.chars().any(|ch| CODE_PUNCT.contains(&ch)) {
-        return false;
-    }
-    // Rust/namespace path operator → code symbol.
-    if c.contains("::") {
-        return false;
-    }
-    // Two-or-more dots → attribute/path access (a.b.c, obj.field.sub); a single dot (a filename)
-    // is allowed below.
-    if c.matches('.').count() >= 2 {
-        return false;
-    }
-    // Leading conversational / transcript-role token → fragment.
-    let first = c.split_whitespace().next().unwrap_or("");
-    let first_l = first
-        .trim_matches(|ch: char| !ch.is_alphanumeric())
-        .to_lowercase();
-    if STOP.contains(&first_l.as_str()) {
-        return false;
-    }
-    let words: Vec<&str> = c.split_whitespace().collect();
-    let lc = c.to_lowercase();
-    let is_filename =
-        words.len() == 1 && c.matches('.').count() == 1 && KNOWN_EXTS.iter().any(|e| lc.ends_with(e));
-    let has_ident = c
-        .chars()
-        .any(|ch| ch == '_' || ch == '-' || ch == ':' || ch.is_ascii_digit())
-        || c.chars().skip(1).any(|ch| ch.is_uppercase());
-    let leading_cap = c
-        .chars()
-        .next()
-        .map(|x| x.is_uppercase())
-        .unwrap_or(false);
-    let multiword = words.len() >= 2;
-    has_ident || multiword || is_filename || leading_cap
+    crate::noun_mining::is_entity_candidate(c)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -28,11 +28,12 @@
 
 use crate::alias;
 use crate::config::Config;
-use crate::eval::{is_pc_self_referential, strip_injected_context};
-use crate::eval_realness::is_entity_candidate;
+use crate::noun_mining::{
+    extract_noun_candidates, is_entity_candidate, is_pc_self_referential, strip_injected_context,
+};
 use crate::eval_run13::{
-    b0_claims_briefing, extract_noun_candidates, grounding_judge, ground_truth_for_noun,
-    prepend_primer, warm_ollama_model, NounMoment,
+    b0_claims_briefing, grounding_judge, ground_truth_for_noun, prepend_primer, warm_ollama_model,
+    NounMoment,
 };
 use crate::nouns::{
     self, build_registry_from_disk, compose_primer, realness_gated_registry, NounEntry,
