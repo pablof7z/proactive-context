@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::archeologist::{ProjectInfo, SessionInfo};
 use crate::capture::archeologist_is_already_captured;
 use crate::config::normalize_path;
+use crate::db::configure_sqlite_connection;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -247,6 +248,7 @@ fn query_user_conversations(
     since_filter: &Option<String>,
 ) -> Result<Vec<ConvMeta>> {
     let conn = Connection::open(db_path)?;
+    configure_sqlite_connection(&conn)?;
 
     // Find conversations where the user sent at least one message
     let mut stmt = conn.prepare(
@@ -342,6 +344,7 @@ fn synthesize_conversation_jsonl(
     out_path: &Path,
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
+    configure_sqlite_connection(&conn)?;
 
     let mut stmt = conn.prepare(
         "SELECT role, content, sequence

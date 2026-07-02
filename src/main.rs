@@ -785,6 +785,7 @@ fn main() -> Result<()> {
                 print!("\x1b[2J\x1b[H");
                 loop {
                     let conn = rusqlite::Connection::open(&db_path)?;
+                    crate::db::configure_sqlite_connection(&conn)?;
                     let stats = crate::db::index_stats_full(&conn, &db_path)?;
                     let pid = crate::daemon::daemon_pid(&root);
                     print!("\x1b[H"); // move cursor to top-left without clearing (avoids flicker)
@@ -793,6 +794,7 @@ fn main() -> Result<()> {
                 }
             } else {
                 let conn = rusqlite::Connection::open(&db_path)?;
+                crate::db::configure_sqlite_connection(&conn)?;
                 let stats = crate::db::index_stats_full(&conn, &db_path)?;
                 let pid = crate::daemon::daemon_pid(&root);
                 print_stats(&root, &db_path, &stats, pid, false);

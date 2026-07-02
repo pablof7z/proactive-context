@@ -5,8 +5,10 @@ use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Once;
+use std::time::Duration;
 
 static SQLITE_VEC_INIT: Once = Once::new();
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// Register the sqlite-vec extension exactly once for the process.
 pub fn ensure_vec_extension() {
@@ -17,6 +19,11 @@ pub fn ensure_vec_extension() {
             )));
         }
     });
+}
+
+pub fn configure_sqlite_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    Ok(())
 }
 
 /// Open (or create) the index database at an explicit path and ensure schema.
@@ -30,6 +37,8 @@ pub fn open_db_at(db_path: &Path, embedder: &dyn Embedder) -> Result<Connection>
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .with_context(|| format!("Failed to open sqlite-vec DB at {}", db_path.display()))?;
+
+    configure_sqlite_connection(&conn)?;
 
     // Enable foreign keys etc. (good practice)
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -272,4 +281,46 @@ pub fn index_stats_full(conn: &Connection, db_path: &Path) -> Result<IndexStats>
     let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
     Ok(IndexStats { file_count, chunk_count, embed_dim, embed_provider, db_size_bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DimOnlyEmbedder;
+
+    impl Embedder for DimOnlyEmbedder {
+        fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            unreachable!("open_db_at only reads the embedder dimension")
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    fn busy_timeout_ms(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn configure_sqlite_connection_sets_busy_timeout() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        configure_sqlite_connection(&conn).unwrap();
+
+        assert_eq!(busy_timeout_ms(&conn), SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn open_db_at_configures_busy_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let embedder = DimOnlyEmbedder;
+
+        let conn = open_db_at(&db_path, &embedder).unwrap();
+
+        assert_eq!(busy_timeout_ms(&conn), SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
 }

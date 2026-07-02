@@ -2,6 +2,7 @@
 //! index; recall is guaranteed by reading everything, this just supports drills.
 
 use anyhow::{Context, Result};
+use crate::db::configure_sqlite_connection;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -38,9 +39,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(text, id UNINDEXED, toke
 
 impl Store {
     pub fn open() -> Result<Self> {
-        let p = db_path();
+        Self::open_at(db_path())
+    }
+
+    fn open_at(p: PathBuf) -> Result<Self> {
         if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
         let conn = Connection::open(&p).with_context(|| format!("open {}", p.display()))?;
+        configure_sqlite_connection(&conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
@@ -208,5 +213,22 @@ impl Store {
         }
         self.conn.execute("DELETE FROM turns WHERE raw_path=?", [raw_path])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_at_configures_busy_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("recall.db")).unwrap();
+        let timeout_ms: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(timeout_ms, crate::db::SQLITE_BUSY_TIMEOUT_MS as i64);
     }
 }
