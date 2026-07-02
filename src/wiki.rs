@@ -533,11 +533,25 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
 }
 
 /// Write AGENTS.md files that tell future coding agents how to treat generated
-/// wiki artifacts. Idempotent: unchanged files are left alone.
+/// wiki artifacts. Root and guides guidance is structural; typed artifact
+/// guidance is written only for typed dirs that already exist. Idempotent:
+/// unchanged files are left alone.
 pub fn ensure_agents_files(wiki_dir: &Path) -> Result<()> {
-    let entries = [
+    let required_entries = [
         ("", ROOT_AGENTS),
         ("guides", GUIDES_AGENTS),
+    ];
+    for (rel, body) in required_entries {
+        let dir = if rel.is_empty() {
+            wiki_dir.to_path_buf()
+        } else {
+            wiki_dir.join(rel)
+        };
+        fs::create_dir_all(&dir)?;
+        write_if_changed(&dir.join("AGENTS.md"), body)?;
+    }
+
+    let optional_entries = [
         ("research", RESEARCH_AGENTS),
         ("episodes", EPISODES_AGENTS),
         ("episodes/transcripts", TRANSCRIPTS_AGENTS),
@@ -545,13 +559,11 @@ pub fn ensure_agents_files(wiki_dir: &Path) -> Result<()> {
         ("nouns", NOUNS_AGENTS),
         ("_citations", CITATIONS_AGENTS),
     ];
-    for (rel, body) in entries {
-        let dir = if rel.is_empty() {
-            wiki_dir.to_path_buf()
-        } else {
-            wiki_dir.join(rel)
-        };
-        fs::create_dir_all(&dir)?;
+    for (rel, body) in optional_entries {
+        let dir = wiki_dir.join(rel);
+        if !dir.exists() {
+            continue;
+        }
         write_if_changed(&dir.join("AGENTS.md"), body)?;
     }
     Ok(())
@@ -2157,11 +2169,15 @@ More info.
     fn agents_files_are_not_treated_as_guides() {
         let tmp = tempfile::tempdir().unwrap();
         let wiki = tmp.path();
+        fs::create_dir_all(wiki.join("research")).unwrap();
 
         ensure_agents_files(wiki).unwrap();
 
         assert!(wiki.join("AGENTS.md").exists());
         assert!(wiki.join("guides/AGENTS.md").exists());
+        assert!(wiki.join("research/AGENTS.md").exists());
+        assert!(!wiki.join("episodes").exists(), "absent typed dirs must not be created");
+        assert!(!wiki.join("nouns").exists(), "absent typed dirs must not be created");
         assert_eq!(guide_files(wiki).len(), 0, "AGENTS.md must not be a guide");
         assert_eq!(
             migrate_guides_to_subdir(wiki),
@@ -2213,6 +2229,10 @@ More info.
         rebuild_index(wiki, "2026-06-15").unwrap();
         let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
         assert!(!index.contains("## Nouns"), "nouns section must be absent when no nouns/ dir");
+        assert!(!wiki.join("nouns").exists(), "rebuild_index must not create empty nouns/");
+        assert!(!wiki.join("research").exists(), "rebuild_index must not create empty research/");
+        assert!(!wiki.join("episodes").exists(), "rebuild_index must not create empty episodes/");
+        assert!(!wiki.join("_citations").exists(), "rebuild_index must not create empty _citations/");
     }
 
     #[test]
