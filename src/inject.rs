@@ -1567,20 +1567,9 @@ async fn wiki_navigate_and_compile(
     }
     let focal: &str = resolved_query.as_deref().unwrap_or(current_prompt);
 
-    if sel.is_empty() || sel.to_uppercase().contains("NOTHING_RELEVANT") {
-        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
-    }
-
     // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
     let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
-    let selected: Vec<String> = sel
-        .lines()
-        .map(|l| l.trim().trim_start_matches(['-', '*', '•', ' ']).trim())
-        .filter(|l| !l.is_empty())
-        .filter(|l| valid.contains(*l))
-        .take(max_guides)
-        .map(|s| s.to_string())
-        .collect();
+    let selected = parse_selected_keys(sel, &valid, max_guides);
 
     if selected.is_empty() {
         return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
@@ -1616,6 +1605,18 @@ async fn wiki_navigate_and_compile(
     )
     .await
     .map(|text| NavigateResult::Briefing { text, guides_read })
+}
+
+fn parse_selected_keys(selection: &str, valid: &HashSet<&str>, max_guides: usize) -> Vec<String> {
+    selection
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*', '•', ' ']).trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.eq_ignore_ascii_case("NOTHING_RELEVANT"))
+        .filter(|l| valid.contains(*l))
+        .take(max_guides)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Eval-only entry point: run the FULL inject path (build_catalog + SELECT + compile) against a
@@ -1926,8 +1927,9 @@ fn format_guides(guides: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_query_line;
+    use super::{parse_query_line, parse_selected_keys};
     use super::{build_catalog, read_catalog_content, EPISODE_KEY_PREFIX};
+    use std::collections::HashSet;
     use std::fs;
 
     // Serialize the env-mutating prompt-variant tests (env vars are process-global).
@@ -2099,6 +2101,20 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         assert_eq!(parse_query_line("inject-subcommand"), None);
         assert_eq!(parse_query_line("QUERY:"), None);
         assert_eq!(parse_query_line("NOTHING_RELEVANT"), None);
+    }
+
+    #[test]
+    fn parse_selected_keys_does_not_let_nothing_relevant_veto_valid_keys() {
+        let valid: HashSet<&str> = ["oauth-guide", "episode:decision"].into_iter().collect();
+        let selected = parse_selected_keys(
+            "QUERY: Does OAuth support Google?\nNOTHING_RELEVANT\noauth-guide\n- episode:decision\n",
+            &valid,
+            8,
+        );
+        assert_eq!(selected, vec!["oauth-guide", "episode:decision"]);
+
+        let none = parse_selected_keys("NOTHING_RELEVANT\nnot-in-catalog", &valid, 8);
+        assert!(none.is_empty());
     }
 
     // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────
