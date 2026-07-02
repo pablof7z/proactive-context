@@ -18,26 +18,6 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub call_type: String,
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    pub arguments: String,
 }
 
 pub struct ChatResponse {
@@ -50,9 +30,6 @@ pub fn system_msg(content: &str) -> ChatMessage {
     ChatMessage {
         role: "system".into(),
         content: Some(content.into()),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
     }
 }
 
@@ -60,9 +37,6 @@ pub fn user_msg(content: &str) -> ChatMessage {
     ChatMessage {
         role: "user".into(),
         content: Some(content.into()),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
     }
 }
 
@@ -84,20 +58,16 @@ pub async fn chat_once(
     api_key: &str,
     model: &str,
     messages: &[ChatMessage],
-    tools: Option<&Value>,
     max_tokens: u32,
     turn: usize,
 ) -> Result<ChatResponse> {
-    let mut body = json!({
+    let body = json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens
     });
-    if let Some(t) = tools {
-        body["tools"] = t.clone();
-    }
 
-    // Preview from the last non-tool user message
+    // Preview from the last user message.
     let prompt_preview = messages
         .iter()
         .rev()
@@ -114,7 +84,7 @@ pub async fn chat_once(
             "turn": turn,
             "n_messages": messages.len(),
             "max_tokens": max_tokens,
-            "has_tools": tools.is_some(),
+            "has_tools": false,
             "prompt_preview": prompt_preview
         }),
     );
@@ -160,15 +130,6 @@ pub async fn chat_once(
         .unwrap_or("stop")
         .to_string();
 
-    let tool_calls: Vec<ToolCall> = choice["tool_calls"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-
     let usage = parse_usage(&resp_json["usage"]);
 
     // Write sidecar: full prompt messages + full response text
@@ -187,7 +148,7 @@ pub async fn chat_once(
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
             "cost_usd": usage.cost,
-            "n_tool_calls": tool_calls.len(),
+            "n_tool_calls": 0,
             "response_preview": crate::events::truncate(&content, 150),
             "generation_id": &generation_id,
             "sidecar": sidecar_path.as_ref().map(|p| p.to_string_lossy().to_string())
@@ -297,5 +258,27 @@ fn parse_usage(u: &Value) -> Usage {
                             .and_then(|v| v.as_u64()).unwrap_or(0),
         total_tokens:      u["total_tokens"].as_u64().unwrap_or(0),
         cost:              u["cost"].as_f64(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_serializes_text_only_shape() {
+        let msg = user_msg("hello");
+        let value = serde_json::to_value(&msg).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "role": "user",
+                "content": "hello"
+            })
+        );
+        assert!(value.get("tool_calls").is_none());
+        assert!(value.get("tool_call_id").is_none());
+        assert!(value.get("name").is_none());
     }
 }

@@ -1702,7 +1702,7 @@ async fn wiki_navigate_and_compile(
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &select_spec.model, &msgs, None, 300, 1).await?.content
+            chat_once(&client, api_key, &select_spec.model, &msgs, 300, 1).await?.content
         }
         Provider::Ollama => {
             let t0 = std::time::Instant::now();
@@ -1922,7 +1922,7 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &spec.model, &msgs, None, max_tokens as u32, 2).await?.content
+            chat_once(&client, api_key, &spec.model, &msgs, max_tokens as u32, 2).await?.content
         }
         Provider::Ollama => {
             let t0 = std::time::Instant::now();
