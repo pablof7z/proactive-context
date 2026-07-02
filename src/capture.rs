@@ -2870,17 +2870,19 @@ pub(crate) fn summary_from_text(text: &str) -> String {
 /// text intact). Used so a derived summary never carries a raw citation marker.
 fn strip_inline_citation_markers(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'^' {
+    while i < s.len() {
+        if s[i..].starts_with("[^") {
             if let Some(close) = s[i..].find(']') {
                 i += close + 1; // skip the whole [^...] marker
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let Some(ch) = s[i..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -4269,6 +4271,11 @@ synchronization remains active.\n",
         assert_eq!(
             summary_from_text("Profile updates use optimistic locking [^abc12-3]"),
             "Profile updates use optimistic locking"
+        );
+        // UTF-8 is copied by character, not by raw byte.
+        assert_eq!(
+            summary_from_text("café → résumé stays ≥ valid [^utf8-1]. Next sentence."),
+            "café → résumé stays ≥ valid"
         );
     }
 
