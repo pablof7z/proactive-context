@@ -486,12 +486,42 @@ fn should_skip_prompt(prompt: &str, min_words: usize) -> bool {
 
 // ─── No-index bootstrap logic ────────────────────────────────────────────────
 
-/// Called when no project DB exists. Silently starts the daemon if >5 indexable files exist.
-fn handle_no_index(root: &Path, _out: &OutMode) -> Result<()> {
+fn no_index_payload(indexable_files: usize, daemon_started: bool) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "empty",
+        "reason": "no_index",
+        "indexable_files": indexable_files,
+        "daemon_started": daemon_started
+    })
+}
+
+fn config_error_payload(error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "empty",
+        "reason": "config_error",
+        "error": truncate(error, 200)
+    })
+}
+
+/// Called when no project DB exists. Starts the daemon if >5 indexable files exist.
+fn handle_no_index(root: &Path, out: &OutMode, elapsed_ms: u64) -> Result<()> {
     let candidates = scan_indexable_files(root);
-    if candidates.len() > 5 {
-        let _ = crate::daemon::daemonize(root);
-    }
+    let daemon_started = if candidates.len() > 5 {
+        crate::daemon::daemonize(root).is_ok()
+    } else {
+        false
+    };
+    log_event("inject.done", Some(elapsed_ms), no_index_payload(candidates.len(), daemon_started));
+    emit(
+        out,
+        None,
+        &format!(
+            "inject [{}ms] | no index | {} indexable files | daemon_started={}",
+            elapsed_ms,
+            candidates.len(),
+            daemon_started
+        ),
+    );
     Ok(())
 }
 
@@ -531,6 +561,8 @@ fn scan_indexable_files(root: &Path) -> Vec<(PathBuf, usize)> {
 
 /// Always returns Ok(()). Every internal failure is swallowed and degrades gracefully.
 pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
+    let start = Instant::now();
+
     // Read stdin
     let mut raw = String::new();
     let _ = io::stdin().read_to_string(&mut raw);
@@ -547,25 +579,53 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     let input: InjectInput = match serde_json::from_str(&normalized) {
         Ok(i) => i,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            let err = e.to_string();
+            log_event("error", None, serde_json::json!({
+                "stage": "inject.stdin",
+                "error": truncate(&err, 200)
+            }));
+            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+                "outcome": "empty",
+                "reason": "invalid_stdin"
+            }));
+            return Ok(());
+        }
     };
 
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
+    // Seed event context as soon as stdin gives us cwd/session. Every later early-exit is
+    // now session-visible instead of looking like pre-API silence.
+    let project = normalize_path(&root);
+    init_context(&project, &input.session_id);
+
     let db_path = project_db_path(&root);
     if !db_path.exists() {
-        return handle_no_index(&root, &out_mode);
+        return handle_no_index(&root, &out_mode, start.elapsed().as_millis() as u64);
     }
 
     let cfg = match load_config() {
         Ok(c) => c,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            let err = e.to_string();
+            log_event("error", None, serde_json::json!({
+                "stage": "inject.config",
+                "error": truncate(&err, 200)
+            }));
+            log_event(
+                "inject.done",
+                Some(start.elapsed().as_millis() as u64),
+                config_error_payload(&err),
+            );
+            emit(
+                &out_mode,
+                None,
+                &format!("inject [{}ms] | config error", start.elapsed().as_millis()),
+            );
+            return Ok(());
+        }
     };
 
-    // Seed event context early so all events have correct project/session
-    let project = normalize_path(&root);
-    init_context(&project, &input.session_id);
-
-    let start = Instant::now();
     let context_turns_used = cfg.inject_context_turns;
 
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
@@ -1963,7 +2023,10 @@ fn format_guides(guides: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
-    use super::{build_catalog, read_catalog_content, source_label_for_key, EPISODE_KEY_PREFIX};
+    use super::{
+        build_catalog, config_error_payload, no_index_payload, read_catalog_content,
+        source_label_for_key, EPISODE_KEY_PREFIX,
+    };
     use std::collections::HashSet;
     use std::fs;
 
@@ -2194,6 +2257,29 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
 
         let none = parse_selected_keys("NOTHING_RELEVANT\nnot-in-catalog", &valid, 8);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn no_index_payload_is_an_observable_empty_inject_outcome() {
+        let payload = no_index_payload(7, true);
+
+        assert_eq!(payload.get("outcome").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(payload.get("reason").and_then(|v| v.as_str()), Some("no_index"));
+        assert_eq!(payload.get("indexable_files").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(payload.get("daemon_started").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn config_error_payload_is_truncated_and_observable() {
+        let payload = config_error_payload(&"x".repeat(300));
+        let error = payload
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("config error payload should include error text");
+
+        assert_eq!(payload.get("outcome").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(payload.get("reason").and_then(|v| v.as_str()), Some("config_error"));
+        assert!(error.len() <= 203, "error should be truncated, got {}", error.len());
     }
 
     // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────
