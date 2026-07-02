@@ -1177,7 +1177,7 @@ fn run_linelog(
     let project_keys: std::collections::HashSet<String> =
         projects.iter().map(|p| p.normalized_cwd.clone()).collect();
     let log_path = events_log_path();
-    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<crate::tail::Record>(1000);
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TailerMsg>(1000);
     spawn_archeologist_tailer(log_path, project_keys, since_ms, ev_tx);
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1196,9 +1196,7 @@ fn run_linelog(
 
     for msg in rx.iter() {
         // Fold any new events into the live counters before handling the worker msg.
-        while let Ok(rec) = ev_rx.try_recv() {
-            counters.apply(&rec.ev.event, &rec.ev.payload);
-        }
+        drain_tailer_counters(&ev_rx, &mut counters);
 
         match msg {
             WorkerMsg::SessionStart { item } => {
@@ -1248,9 +1246,7 @@ fn run_linelog(
         }
     }
     // Drain trailing events so the final summary is accurate.
-    while let Ok(rec) = ev_rx.try_recv() {
-        counters.apply(&rec.ev.event, &rec.ev.payload);
-    }
+    drain_tailer_counters(&ev_rx, &mut counters);
     let _ = worker.join();
     counters.seen = grand_seen;
     let total_elapsed = fmt_duration(run_start.elapsed());
@@ -1466,6 +1462,125 @@ impl RunView {
     }
 }
 
+enum TailerMsg {
+    Record(crate::tail::Record),
+    Unavailable(String),
+}
+
+fn drain_tailer_counters(
+    ev_rx: &std::sync::mpsc::Receiver<TailerMsg>,
+    counters: &mut RunCounters,
+) {
+    while let Ok(msg) = ev_rx.try_recv() {
+        match msg {
+            TailerMsg::Record(rec) => counters.apply(&rec.ev.event, &rec.ev.payload),
+            TailerMsg::Unavailable(message) => eprintln!("archeologist: {}", message),
+        }
+    }
+}
+
+fn drain_tailer_view(
+    ev_rx: &std::sync::mpsc::Receiver<TailerMsg>,
+    view: &mut RunView,
+    include_feed: bool,
+) {
+    while let Ok(msg) = ev_rx.try_recv() {
+        match msg {
+            TailerMsg::Record(rec) => apply_record_to_view(view, rec, include_feed),
+            TailerMsg::Unavailable(message) if include_feed => {
+                push_feed_line_preserving_scroll(view, tailer_unavailable_feed_line(message));
+            }
+            TailerMsg::Unavailable(_) => {}
+        }
+    }
+}
+
+fn apply_record_to_view(view: &mut RunView, rec: crate::tail::Record, include_feed: bool) {
+    view.counters.seen = view.seen; // keep too_short() base in sync
+    view.counters.apply(&rec.ev.event, &rec.ev.payload);
+    // Capture each session's transcript the moment its first (EXTRACT) llm.response
+    // arrives, so scrolling back to any "Reading conversation" line shows what we sent
+    // the model. We read the sidecar eagerly and store the rendered text, not the path:
+    // every LLM call in a session reuses one sidecar filename (req_id is fixed per
+    // init_context, turn stays 1), so a later reconcile call overwrites EXTRACT's file
+    // within ~20s. Insert-if-absent -> the first (EXTRACT) response wins; triage emits no
+    // sidecar, so the first response is always EXTRACT.
+    if rec.ev.event == "llm.response"
+        && !rec.ev.session_id.is_empty()
+        && !view.transcript_by_session.contains_key(&rec.ev.session_id)
+    {
+        if let Some(path) = rec.ev.payload.get("sidecar").and_then(|v| v.as_str()) {
+            if let Some(text) = load_transcript_sidecar(path) {
+                view.transcript_by_session
+                    .insert(rec.ev.session_id.clone(), text);
+            }
+        }
+    }
+    // Refine the live "current" phase from this session's own events so the
+    // headline keeps narrating even through a long, event-silent LLM call.
+    if view.current.active && rec.ev.session_id == view.current.session_id {
+        match rec.ev.event.as_str() {
+            "llm.request" => view.current.waiting_on_model = true,
+            "llm.response" => {
+                view.current.waiting_on_model = false;
+                if let Some(s) = rec.ev.payload.get("sidecar").and_then(|v| v.as_str()) {
+                    view.last_sidecar = Some(s.to_string());
+                }
+            }
+            other => {
+                if let Some(stage) = stage_label_for_event(other) {
+                    view.current.stage = stage.to_string();
+                    view.current.waiting_on_model = false;
+                }
+            }
+        }
+    }
+    if include_feed {
+        if let Some(line) = feed_line_for_event(&rec) {
+            push_feed_line_preserving_scroll(view, line);
+        }
+    }
+}
+
+fn push_feed_line_preserving_scroll(view: &mut RunView, line: FeedLine) {
+    let was_at_bottom = view.feed_scroll == 0;
+    view.push_feed(line);
+    // If the user is scrolled up (reading history) or has paused, hold their
+    // position as new lines arrive instead of letting the view drift toward the
+    // bottom: bump feed_scroll in lock-step with the growing feed so the cursor
+    // stays on the same logical line. Live-follow resumes once they scroll back to
+    // the bottom (feed_scroll == 0). The .min keeps it valid as the ring drops rows.
+    if view.feed_paused || !was_at_bottom {
+        view.feed_scroll = (view.feed_scroll + 1).min(view.feed.len());
+    }
+}
+
+fn tailer_unavailable_feed_line(message: String) -> FeedLine {
+    FeedLine {
+        ts: String::new(),
+        project: "archeologist".to_string(),
+        glyph: "!",
+        text: message.clone(),
+        highlight: true,
+        detail: message,
+        session_id: String::new(),
+        is_conversation: false,
+    }
+}
+
+fn send_tailer_unavailable(tx: &std::sync::mpsc::SyncSender<TailerMsg>, message: String) {
+    let _ = tx.try_send(TailerMsg::Unavailable(message));
+}
+
+fn archeologist_tailer_should_reopen(
+    inode_now: Option<u64>,
+    current_inode: Option<u64>,
+    path_len: u64,
+    offset: u64,
+) -> bool {
+    inode_now != current_inode || path_len < offset
+}
+
 /// Redirects fd 2 (stderr) to a file for the TUI's lifetime; restores on Drop.
 struct StderrRedirect {
     saved_fd: i32,
@@ -1581,7 +1696,7 @@ fn run_tui_mode(
     let _guard = TGuard;
 
     // ── Spawn the events tailer thread (run-start window, project-set filter) ──
-    let (ev_tx, ev_rx) = mpsc::sync_channel::<crate::tail::Record>(1000);
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<TailerMsg>(1000);
     let log_path = events_log_path();
     spawn_archeologist_tailer(log_path, project_keys, since_ms, ev_tx);
 
@@ -1653,59 +1768,7 @@ fn run_tui_mode(
         }
 
         // Drain events → counters + feed
-        while let Ok(rec) = ev_rx.try_recv() {
-            view.counters.seen = view.seen; // keep too_short() base in sync
-            view.counters.apply(&rec.ev.event, &rec.ev.payload);
-            // Capture each session's transcript the moment its first (EXTRACT) llm.response
-            // arrives, so scrolling back to any "Reading conversation" line shows what we sent
-            // the model. We read the sidecar *eagerly* and store the rendered text, not the path:
-            // every LLM call in a session reuses one sidecar filename (req_id is fixed per
-            // init_context, turn stays 1), so a later reconcile call overwrites EXTRACT's file
-            // within ~20s. Insert-if-absent → the first (EXTRACT) response wins; triage emits no
-            // sidecar, so the first response is always EXTRACT.
-            if rec.ev.event == "llm.response"
-                && !rec.ev.session_id.is_empty()
-                && !view.transcript_by_session.contains_key(&rec.ev.session_id)
-            {
-                if let Some(path) = rec.ev.payload.get("sidecar").and_then(|v| v.as_str()) {
-                    if let Some(text) = load_transcript_sidecar(path) {
-                        view.transcript_by_session
-                            .insert(rec.ev.session_id.clone(), text);
-                    }
-                }
-            }
-            // Refine the live "current" phase from this session's own events so the
-            // headline keeps narrating even through a long, event-silent LLM call.
-            if view.current.active && rec.ev.session_id == view.current.session_id {
-                match rec.ev.event.as_str() {
-                    "llm.request" => view.current.waiting_on_model = true,
-                    "llm.response" => {
-                        view.current.waiting_on_model = false;
-                        if let Some(s) = rec.ev.payload.get("sidecar").and_then(|v| v.as_str()) {
-                            view.last_sidecar = Some(s.to_string());
-                        }
-                    }
-                    other => {
-                        if let Some(stage) = stage_label_for_event(other) {
-                            view.current.stage = stage.to_string();
-                            view.current.waiting_on_model = false;
-                        }
-                    }
-                }
-            }
-            if let Some(line) = feed_line_for_event(&rec) {
-                let was_at_bottom = view.feed_scroll == 0;
-                view.push_feed(line);
-                // If the user is scrolled up (reading history) or has paused, hold their
-                // position as new lines arrive instead of letting the view drift toward the
-                // bottom: bump feed_scroll in lock-step with the growing feed so the cursor
-                // stays on the same logical line. Live-follow resumes once they scroll back to
-                // the bottom (feed_scroll == 0). The .min keeps it valid as the ring drops rows.
-                if view.feed_paused || !was_at_bottom {
-                    view.feed_scroll = (view.feed_scroll + 1).min(view.feed.len());
-                }
-            }
-        }
+        drain_tailer_view(&ev_rx, &mut view, true);
 
         // Draw
         terminal.draw(|frame| render_run_view(frame, &mut view))?;
@@ -1777,13 +1840,7 @@ fn run_tui_mode(
         if view.finished {
             // Give the tailer a moment to flush trailing events, then drain once more.
             std::thread::sleep(std::time::Duration::from_millis(150));
-            while let Ok(rec) = ev_rx.try_recv() {
-                view.counters.seen = view.seen;
-                view.counters.apply(&rec.ev.event, &rec.ev.payload);
-                if let Some(line) = feed_line_for_event(&rec) {
-                    view.push_feed(line);
-                }
-            }
+            drain_tailer_view(&ev_rx, &mut view, true);
             break;
         }
     }
@@ -1805,10 +1862,7 @@ fn run_tui_mode(
     // events in — otherwise that just-finished session misreports as interrupted/too-short
     // when it was actually captured.
     std::thread::sleep(std::time::Duration::from_millis(250));
-    while let Ok(rec) = ev_rx.try_recv() {
-        view.counters.seen = view.seen;
-        view.counters.apply(&rec.ev.event, &rec.ev.payload);
-    }
+    drain_tailer_view(&ev_rx, &mut view, false);
 
     // Final summary to the (restored) real stdout.
     let c = &view.counters;
@@ -1844,7 +1898,7 @@ fn spawn_archeologist_tailer(
     log_path: PathBuf,
     project_keys: std::collections::HashSet<String>,
     since_ms: u64,
-    tx: std::sync::mpsc::SyncSender<crate::tail::Record>,
+    tx: std::sync::mpsc::SyncSender<TailerMsg>,
 ) {
     use crate::tail::{inode_of, parse_ts_to_millis, EventLine, Record};
     use std::io::Read;
@@ -1856,17 +1910,30 @@ fn spawn_archeologist_tailer(
             std::thread::sleep(std::time::Duration::from_millis(200));
             waited += 1;
             if waited > 150 {
-                return; // ~30s with no log — give up silently
+                send_tailer_unavailable(
+                    &tx,
+                    format!(
+                        "event log unavailable: {} did not appear within ~30s; live counters/feed may stay empty",
+                        log_path.display()
+                    ),
+                );
+                return;
             }
         }
         let mut file = match std::fs::File::open(&log_path) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(e) => {
+                send_tailer_unavailable(
+                    &tx,
+                    format!("event log unavailable: failed to open {}: {}", log_path.display(), e),
+                );
+                return;
+            }
         };
         let mut current_inode = inode_of(&log_path);
         let mut offset: u64;
 
-        let pass = |line: &str, tx: &std::sync::mpsc::SyncSender<Record>| {
+        let pass = |line: &str, tx: &std::sync::mpsc::SyncSender<TailerMsg>| {
             if line.trim().is_empty() {
                 return;
             }
@@ -1880,10 +1947,10 @@ fn spawn_archeologist_tailer(
                 if !project_keys.contains(ev.project.as_str()) {
                     return;
                 }
-                let _ = tx.try_send(Record {
+                let _ = tx.try_send(TailerMsg::Record(Record {
                     raw: line.to_string(),
                     ev,
-                });
+                }));
             }
         };
 
@@ -1902,9 +1969,13 @@ fn spawn_archeologist_tailer(
         // Follow.
         loop {
             std::thread::sleep(std::time::Duration::from_millis(150));
-            // Rotation check: inode changed → reopen from start.
+            // Rotation/truncation check: inode changed or in-place truncation -> reopen from start.
             let inode_now = inode_of(&log_path);
-            if inode_now != current_inode {
+            let path_len = std::fs::metadata(&log_path)
+                .ok()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if archeologist_tailer_should_reopen(inode_now, current_inode, path_len, offset) {
                 if let Ok(f) = std::fs::File::open(&log_path) {
                     file = f;
                     current_inode = inode_now;
@@ -3660,6 +3731,26 @@ mod tests {
         assert_eq!(est.post_capture_calls_high, 24);
         assert_eq!(est.tokens_in_low, 1_027_000);
         assert_eq!(est.tokens_in_high, 1_306_000);
+    }
+
+    #[test]
+    fn archeologist_tailer_reopens_on_rotation_or_truncation() {
+        assert!(archeologist_tailer_should_reopen(Some(2), Some(1), 100, 100));
+        assert!(archeologist_tailer_should_reopen(Some(1), Some(1), 20, 100));
+        assert!(!archeologist_tailer_should_reopen(Some(1), Some(1), 100, 20));
+    }
+
+    #[test]
+    fn tailer_unavailable_feed_line_is_visible() {
+        let line = tailer_unavailable_feed_line(
+            "event log unavailable: /tmp/events.jsonl did not appear".to_string(),
+        );
+
+        assert_eq!(line.glyph, "!");
+        assert!(line.highlight);
+        assert!(line.text.contains("event log unavailable"));
+        assert_eq!(line.detail, line.text);
+        assert!(!line.is_conversation);
     }
 
     #[test]
