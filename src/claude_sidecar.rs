@@ -99,17 +99,17 @@ struct WarmChild {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     stdout: TokioBufReader<tokio::process::ChildStdout>,
-    model: String,
     spawned_at: Instant,
 }
 
 struct Pool {
     idle: std::collections::HashMap<String, Vec<WarmChild>>,
+    warming: std::collections::HashMap<String, usize>,
 }
 
 impl Pool {
     fn new() -> Self {
-        Self { idle: Default::default() }
+        Self { idle: Default::default(), warming: Default::default() }
     }
 
     fn checkout(&mut self, model: &str) -> Option<WarmChild> {
@@ -118,15 +118,44 @@ impl Pool {
         slot.pop().filter(|w| w.spawned_at.elapsed() < MAX_CHILD_AGE)
     }
 
-    fn checkin(&mut self, child: WarmChild) {
-        self.idle.entry(child.model.clone()).or_default().push(child);
-    }
-
     fn reap_stale(&mut self) {
         for slot in self.idle.values_mut() {
             slot.retain(|w| w.spawned_at.elapsed() < MAX_CHILD_AGE);
         }
     }
+
+    fn reserve_refill(&mut self, model: &str) -> usize {
+        let idle = self.idle.get(model).map(Vec::len).unwrap_or(0);
+        let warming = self.warming.get(model).copied().unwrap_or(0);
+        let deficit = refill_deficit(idle, warming);
+        if deficit > 0 {
+            *self.warming.entry(model.to_string()).or_default() += deficit;
+        }
+        deficit
+    }
+
+    fn finish_refill(&mut self, model: &str, reserved: usize, children: Vec<WarmChild>) {
+        let remove_warming = if let Some(warming) = self.warming.get_mut(model) {
+            *warming = warming.saturating_sub(reserved);
+            *warming == 0
+        } else {
+            false
+        };
+        if remove_warming {
+            self.warming.remove(model);
+        }
+
+        let slot = self.idle.entry(model.to_string()).or_default();
+        for child in children {
+            if slot.len() < POOL_SIZE {
+                slot.push(child);
+            }
+        }
+    }
+}
+
+fn refill_deficit(idle: usize, warming: usize) -> usize {
+    POOL_SIZE.saturating_sub(idle.saturating_add(warming))
 }
 
 async fn spawn_warm(model: &str) -> Result<WarmChild> {
@@ -156,7 +185,7 @@ async fn spawn_warm(model: &str) -> Result<WarmChild> {
     let stdin = child.stdin.take().context("claude stdin")?;
     let stdout = TokioBufReader::new(child.stdout.take().context("claude stdout")?);
 
-    Ok(WarmChild { child, stdin, stdout, model: model.to_string(), spawned_at: Instant::now() })
+    Ok(WarmChild { child, stdin, stdout, spawned_at: Instant::now() })
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -234,11 +263,7 @@ async fn run_server(listener: UnixListener) -> Result<()> {
                     }
                 })
                 .unwrap_or_else(|| "sonnet".to_string());
-            for _ in 0..POOL_SIZE {
-                if let Ok(child) = spawn_warm(&default_model).await {
-                    pool.lock().await.checkin(child);
-                }
-            }
+            refill_pool_to_target(pool, default_model).await;
         });
     }
 
@@ -345,23 +370,29 @@ async fn serve_one(pool: Arc<Mutex<Pool>>, req: ChatRequest) -> Result<(String, 
     // and refill the pool in the background so the next request finds a warm slot.
     drop(warm);
     let model = req.model.clone();
-    tokio::spawn(async move {
-        let mut children = Vec::new();
-        for _ in 0..POOL_SIZE {
-            match spawn_warm(&model).await {
-                Ok(c) => children.push(c),
-                Err(e) => { eprintln!("claude sidecar: warm spawn failed: {e:#}"); break; }
-            }
-        }
-        let mut p = pool.lock().await;
-        let slot = p.idle.entry(model).or_default();
-        // Only refill up to POOL_SIZE
-        for c in children {
-            if slot.len() < POOL_SIZE { slot.push(c); }
-        }
-    });
+    tokio::spawn(refill_pool_to_target(Arc::clone(&pool), model));
 
     Ok(result)
+}
+
+async fn refill_pool_to_target(pool: Arc<Mutex<Pool>>, model: String) {
+    let deficit = pool.lock().await.reserve_refill(&model);
+    if deficit == 0 {
+        return;
+    }
+
+    let mut children = Vec::new();
+    for _ in 0..deficit {
+        match spawn_warm(&model).await {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                eprintln!("claude sidecar: warm spawn failed: {e:#}");
+                break;
+            }
+        }
+    }
+
+    pool.lock().await.finish_refill(&model, deficit, children);
 }
 
 async fn read_until_result(warm: &mut WarmChild) -> Result<(String, Usage)> {
@@ -508,4 +539,30 @@ pub fn start_sidecar() -> Result<()> {
         .spawn()
         .context("spawn `pc claude serve`")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refill_deficit_counts_idle_and_inflight_children() {
+        assert_eq!(refill_deficit(0, 0), POOL_SIZE);
+        assert_eq!(refill_deficit(1, 0), POOL_SIZE - 1);
+        assert_eq!(refill_deficit(POOL_SIZE, 0), 0);
+        assert_eq!(refill_deficit(0, POOL_SIZE), 0);
+        assert_eq!(refill_deficit(1, 1), 0);
+    }
+
+    #[test]
+    fn refill_reservation_prevents_concurrent_overspawn() {
+        let mut pool = Pool::new();
+
+        let first = pool.reserve_refill("sonnet");
+        assert_eq!(first, POOL_SIZE);
+        assert_eq!(pool.reserve_refill("sonnet"), 0);
+
+        pool.finish_refill("sonnet", first, Vec::new());
+        assert_eq!(pool.reserve_refill("sonnet"), POOL_SIZE);
+    }
 }
