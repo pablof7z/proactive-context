@@ -28,6 +28,7 @@ pub struct GuideFrontmatter {
     pub verified: String,      // YYYY-MM-DD
     pub compiled_from: String, // "conversation"
     pub sources: Vec<String>,  // ["session:<id>"]
+    pub extra: Vec<String>,    // unknown frontmatter entries preserved verbatim
 }
 
 /// A parsed guide: frontmatter + raw body text (everything after the closing `---`).
@@ -74,44 +75,41 @@ pub fn parse_guide(content: &str) -> Option<Guide> {
         .to_string();
 
     let mut fm = GuideFrontmatter::default();
-    let mut current_key: Option<String> = None;
-    let mut current_list: Vec<String> = Vec::new();
-    let mut in_list = false;
+    let lines: Vec<&str> = fm_text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
 
-    for line in fm_text.lines() {
-        // Dash-list continuation
-        if in_list && (line.starts_with("  - ") || line.starts_with("- ")) {
-            let item = line.trim_start_matches(' ').trim_start_matches('-').trim().to_string();
-            current_list.push(item);
-            continue;
-        }
-
-        // Flush any pending list
-        if in_list {
-            if let Some(ref k) = current_key {
-                assign_list_field(&mut fm, k, &current_list);
-            }
-            current_list.clear();
-            in_list = false;
-        }
-
-        // Skip blank lines
+        // Skip blank lines between entries; preserve blank lines only inside unknown blocks.
         if line.trim().is_empty() {
+            i += 1;
             continue;
         }
 
-        // Split on first ':'
         let colon = match line.find(':') {
             Some(i) => i,
-            None => continue,
+            None => {
+                fm.extra.push(line.to_string());
+                i += 1;
+                continue;
+            }
         };
         let key = line[..colon].trim().to_string();
         let val = line[colon + 1..].trim().to_string();
 
         if val.is_empty() {
-            // Starts a dash list block
-            current_key = Some(key);
-            in_list = true;
+            if is_known_scalar_key(&key) {
+                assign_scalar_field(&mut fm, &key, String::new());
+                i += 1;
+                continue;
+            }
+            let (block, items, next_i) = collect_frontmatter_block(&lines, i);
+            if is_known_list_key(&key) {
+                assign_list_field(&mut fm, &key, &items);
+            } else {
+                fm.extra.push(block.join("\n"));
+            }
+            i = next_i;
             continue;
         }
 
@@ -121,22 +119,28 @@ pub fn parse_guide(content: &str) -> Option<Guide> {
             let items: Vec<String> = if inner.trim().is_empty() {
                 vec![]
             } else {
-                inner.split(',').map(|s| s.trim().trim_matches('"').to_string()).collect()
+                inner
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .collect()
             };
-            assign_list_field(&mut fm, &key, &items);
+            if is_known_list_key(&key) {
+                assign_list_field(&mut fm, &key, &items);
+            } else {
+                fm.extra.push(line.to_string());
+            }
+            i += 1;
             continue;
         }
 
         // Scalar
         let val = val.trim_matches('"').to_string();
-        assign_scalar_field(&mut fm, &key, val);
-    }
-
-    // Flush trailing list
-    if in_list {
-        if let Some(ref k) = current_key {
-            assign_list_field(&mut fm, k, &current_list);
+        if is_known_scalar_key(&key) {
+            assign_scalar_field(&mut fm, &key, val);
+        } else {
+            fm.extra.push(line.to_string());
         }
+        i += 1;
     }
 
     // Derive slug from title if not set
@@ -159,7 +163,7 @@ fn assign_scalar_field(fm: &mut GuideFrontmatter, key: &str, val: String) {
         "updated"       => fm.updated = val,
         "verified"      => fm.verified = val,
         "compiled-from" => fm.compiled_from = val,
-        _               => {} // ignore unknown keys
+        _               => {}
     }
 }
 
@@ -169,6 +173,51 @@ fn assign_list_field(fm: &mut GuideFrontmatter, key: &str, items: &[String]) {
         "sources" => fm.sources = items.to_vec(),
         _         => {}
     }
+}
+
+fn is_known_scalar_key(key: &str) -> bool {
+    matches!(
+        key,
+        "title"
+            | "slug"
+            | "topic"
+            | "summary"
+            | "volatility"
+            | "confidence"
+            | "created"
+            | "updated"
+            | "verified"
+            | "compiled-from"
+    )
+}
+
+fn is_known_list_key(key: &str) -> bool {
+    matches!(key, "tags" | "sources")
+}
+
+fn is_frontmatter_continuation(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t') || line.starts_with("- ") || line.trim().is_empty()
+}
+
+fn collect_frontmatter_block(lines: &[&str], start: usize) -> (Vec<String>, Vec<String>, usize) {
+    let mut block = vec![lines[start].to_string()];
+    let mut items = Vec::new();
+    let mut i = start + 1;
+    while i < lines.len() && is_frontmatter_continuation(lines[i]) {
+        let line = lines[i];
+        if line.starts_with("  - ") || line.starts_with("- ") {
+            items.push(
+                line.trim_start_matches(' ')
+                    .trim_start_matches('-')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+        block.push(line.to_string());
+        i += 1;
+    }
+    (block, items, i)
 }
 
 /// Serialize a Guide back to markdown with frontmatter.
@@ -192,12 +241,26 @@ pub fn serialize_guide(guide: &Guide) -> String {
     write_scalar(&mut out, "verified", &fm.verified);
     write_scalar(&mut out, "compiled-from", &fm.compiled_from);
     write_list(&mut out, "sources", &fm.sources);
+    write_extra_frontmatter(&mut out, &fm.extra);
     out.push_str("---\n\n");
     out.push_str(&guide.body);
     if !guide.body.ends_with('\n') {
         out.push('\n');
     }
     out
+}
+
+fn write_extra_frontmatter(out: &mut String, extra: &[String]) {
+    for entry in extra {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(entry.trim_end_matches('\n'));
+        out.push('\n');
+    }
 }
 
 fn write_scalar(out: &mut String, key: &str, val: &str) {
@@ -1040,6 +1103,7 @@ pub fn new_guide(
             verified: today.to_string(),
             compiled_from: "conversation".to_string(),
             sources: vec![format!("session:{}", session_id)],
+            extra: Vec::new(),
         },
         body: body.to_string(),
     }
@@ -1581,6 +1645,83 @@ custom-local-key: keep me\n\
         assert_eq!(reparsed.frontmatter.title, guide.frontmatter.title);
         assert_eq!(reparsed.frontmatter.tags, guide.frontmatter.tags);
         assert_eq!(reparsed.frontmatter.sources, guide.frontmatter.sources);
+    }
+
+    #[test]
+    fn serialize_preserves_unknown_frontmatter_entries() {
+        let input = concat!(
+            "---\n",
+            "title: My Guide\n",
+            "slug: my-guide\n",
+            "summary: A test guide\n",
+            "tags: [rust]\n",
+            "volatility: warm\n",
+            "confidence: high\n",
+            "created: 2026-01-01\n",
+            "updated: 2026-01-02\n",
+            "verified: 2026-01-02\n",
+            "compiled-from: conversation\n",
+            "sources: [session:abc123]\n",
+            "owner: pablo\n",
+            "reviewers:\n",
+            "  - alice\n",
+            "  - bob\n",
+            "x-settings:\n",
+            "  enabled: true\n",
+            "  mode: strict\n",
+            "---\n\n",
+            "# My Guide\n\nSome content here.\n",
+        );
+        let mut guide = parse_guide(input).expect("parse failed");
+        guide.frontmatter.summary = "Updated summary".to_string();
+
+        let serialized = serialize_guide(&guide);
+
+        assert!(serialized.contains("summary: Updated summary"));
+        assert!(serialized.contains("owner: pablo"));
+        assert!(serialized.contains("reviewers:\n  - alice\n  - bob\n"));
+        assert!(serialized.contains("x-settings:\n  enabled: true\n  mode: strict\n"));
+        assert_eq!(serialized.matches("owner: pablo").count(), 1);
+
+        let reparsed = parse_guide(&serialized).expect("reparse failed");
+        let serialized_again = serialize_guide(&reparsed);
+        assert_eq!(serialized_again.matches("owner: pablo").count(), 1);
+        assert!(serialized_again.contains("reviewers:\n  - alice\n  - bob\n"));
+        assert!(serialized_again.contains("x-settings:\n  enabled: true\n  mode: strict\n"));
+    }
+
+    #[test]
+    fn save_guide_preserves_unknown_frontmatter_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = guide_path(tmp.path(), "my-guide");
+        let input = concat!(
+            "---\n",
+            "title: My Guide\n",
+            "slug: my-guide\n",
+            "summary: A test guide\n",
+            "tags: []\n",
+            "volatility: warm\n",
+            "confidence: high\n",
+            "created: 2026-01-01\n",
+            "updated: 2026-01-02\n",
+            "verified: 2026-01-02\n",
+            "compiled-from: conversation\n",
+            "sources: []\n",
+            "local-owner: pablo\n",
+            "local-flags:\n",
+            "  - do-not-drop\n",
+            "---\n\n",
+            "# My Guide\n\nSome content here. [^abc-1]\n",
+        );
+        let mut guide = parse_guide(input).expect("parse failed");
+        guide.body.push_str("\nMore content.\n");
+
+        save_guide(&path, &guide).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+
+        assert!(saved.contains("local-owner: pablo"));
+        assert!(saved.contains("local-flags:\n  - do-not-drop\n"));
+        assert!(saved.contains("Some content here. <!-- [^abc-1] -->"));
     }
 
     #[test]
