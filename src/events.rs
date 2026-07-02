@@ -1,5 +1,5 @@
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -14,6 +14,7 @@ struct Ctx {
 
 static CTX: OnceLock<RwLock<Ctx>> = OnceLock::new();
 static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+const MAX_EVENT_LINE_BYTES: usize = 4095;
 
 fn ctx() -> &'static RwLock<Ctx> {
     CTX.get_or_init(|| {
@@ -88,7 +89,7 @@ fn default_log_path() -> PathBuf {
 
 // ─── Event struct ─────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Event {
     ts: String,
     project: String,
@@ -127,17 +128,10 @@ pub fn log_event(event: &str, lat_ms: Option<u64>, payload: Value) {
         payload,
     };
 
-    // Serialize to one line; skip oversized to be safe.
-    let mut line = match serde_json::to_string(&ev) {
-        Ok(s) => s,
-        Err(_) => return,
+    let line = match event_line_with_limit(&ev, MAX_EVENT_LINE_BYTES) {
+        Some(line) => line,
+        None => return,
     };
-    line.push('\n');
-
-    // Truncate if somehow over PIPE_BUF (4096 - 1 for newline)
-    if line.len() > 4095 {
-        return;
-    }
 
     // Open with O_APPEND | O_CREATE | O_WRONLY; ensure parent exists
     let path = &cfg.path;
@@ -162,6 +156,76 @@ pub fn log_event(event: &str, lat_ms: Option<u64>, payload: Value) {
     let count = WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
     if count % 256 == 255 {
         maybe_rotate(path, cfg.max_bytes, cfg.retention);
+    }
+}
+
+fn event_line_with_limit(ev: &Event, max_bytes: usize) -> Option<String> {
+    let line = serialize_event_line(ev)?;
+    if line.len() <= max_bytes {
+        return Some(line);
+    }
+
+    let original_bytes = line.len();
+    for string_limit in [1024usize, 512, 256, 128, 64, 32, 16] {
+        let mut truncated = ev.clone();
+        truncate_payload_strings(&mut truncated.payload, string_limit);
+        mark_payload_truncated(&mut truncated.payload, original_bytes);
+        let line = serialize_event_line(&truncated)?;
+        if line.len() <= max_bytes {
+            return Some(line);
+        }
+    }
+
+    let mut minimal = ev.clone();
+    minimal.payload = serde_json::json!({
+        "_pc_truncated": true,
+        "original_bytes": original_bytes,
+        "message": "payload truncated to fit log line"
+    });
+    let line = serialize_event_line(&minimal)?;
+    (line.len() <= max_bytes).then_some(line)
+}
+
+fn serialize_event_line(ev: &Event) -> Option<String> {
+    let mut line = serde_json::to_string(ev).ok()?;
+    line.push('\n');
+    Some(line)
+}
+
+fn truncate_payload_strings(value: &mut Value, max_bytes: usize) {
+    match value {
+        Value::String(s) => {
+            if s.len() > max_bytes {
+                *s = truncate(s, max_bytes);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                truncate_payload_strings(item, max_bytes);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                truncate_payload_strings(value, max_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mark_payload_truncated(payload: &mut Value, original_bytes: usize) {
+    match payload {
+        Value::Object(map) => {
+            map.insert("_pc_truncated".to_string(), Value::Bool(true));
+            map.insert("original_bytes".to_string(), Value::from(original_bytes as u64));
+        }
+        other => {
+            let mut map = Map::new();
+            map.insert("_pc_truncated".to_string(), Value::Bool(true));
+            map.insert("original_bytes".to_string(), Value::from(original_bytes as u64));
+            map.insert("value".to_string(), other.take());
+            *other = Value::Object(map);
+        }
     }
 }
 
@@ -289,5 +353,58 @@ pub fn truncate(s: &str, max: usize) -> String {
             boundary -= 1;
         }
         format!("{}…", &s[..boundary])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(payload: Value) -> Event {
+        Event {
+            ts: "2026-07-02T12:00:00.000Z".to_string(),
+            project: "project".to_string(),
+            session_id: "session".to_string(),
+            req: "req".to_string(),
+            event: "claude_cli.call".to_string(),
+            lat_ms: Some(42),
+            payload,
+        }
+    }
+
+    #[test]
+    fn event_line_with_limit_preserves_small_events() {
+        let ev = event(serde_json::json!({"system": "short", "user": "prompt"}));
+
+        let line = event_line_with_limit(&ev, MAX_EVENT_LINE_BYTES).expect("line");
+        let parsed: Value = serde_json::from_str(line.trim()).expect("valid json");
+
+        assert_eq!(parsed.get("event").and_then(|v| v.as_str()), Some("claude_cli.call"));
+        assert_eq!(
+            parsed.pointer("/payload/system").and_then(|v| v.as_str()),
+            Some("short")
+        );
+        assert!(parsed.pointer("/payload/_pc_truncated").is_none());
+    }
+
+    #[test]
+    fn event_line_with_limit_truncates_oversized_payload_instead_of_dropping() {
+        let ev = event(serde_json::json!({
+            "system": "s".repeat(6000),
+            "user": "u".repeat(6000),
+            "small": "kept"
+        }));
+
+        let line = event_line_with_limit(&ev, MAX_EVENT_LINE_BYTES).expect("oversized event should still fit");
+        assert!(line.len() <= MAX_EVENT_LINE_BYTES, "line len {}", line.len());
+
+        let parsed: Value = serde_json::from_str(line.trim()).expect("valid json");
+        let payload = parsed.get("payload").expect("payload");
+        assert_eq!(parsed.get("event").and_then(|v| v.as_str()), Some("claude_cli.call"));
+        assert_eq!(payload.get("_pc_truncated").and_then(|v| v.as_bool()), Some(true));
+        assert!(payload.get("original_bytes").and_then(|v| v.as_u64()).unwrap_or(0) > MAX_EVENT_LINE_BYTES as u64);
+        assert_eq!(payload.get("small").and_then(|v| v.as_str()), Some("kept"));
+        assert!(payload.get("system").and_then(|v| v.as_str()).unwrap().len() < 6000);
+        assert!(payload.get("user").and_then(|v| v.as_str()).unwrap().len() < 6000);
     }
 }
