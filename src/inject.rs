@@ -744,7 +744,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     );
 
     // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
-    let hits = match run_query(&root, &enriched_query, cfg.inject_top_k, cfg.inject_rerank, true) {
+    let hits = match run_query(&root, &enriched_query, cfg.inject_top_k, cfg.inject_rerank) {
         Ok(h) => h,
         Err(e) => {
             log_event("error", None, serde_json::json!({
