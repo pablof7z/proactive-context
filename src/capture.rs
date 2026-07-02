@@ -2603,7 +2603,7 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     let project_key = project_wiki_lock_key_for_root(&project_root);
     let ctx = Arc::new(WikiAgentCtx::new(
         wiki_path.clone(),
-        project_key,
+        project_key.clone(),
         input.session_id.clone(),
         transcript_lines,
         transcript_roles,
@@ -2776,14 +2776,18 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // batch-classifies each entity noun reference's stance (thinking-ON), and folds the signed
     // deltas into <wiki>/nouns/realness.jsonl so real nouns accumulate past +3 over sessions while
     // confabulations stay suppressed (≤ −2) and never prime.
-    match crate::nouns::run_realness_stage(
-        &wiki_path,
-        &input.transcript_path,
-        &capture_spec,
-        &openrouter_api_key,
-        &ollama_base_url,
-        ollama_api_key.as_deref(),
-    ) {
+    let realness_result = match acquire_project_wiki_lock(&project_key) {
+        Ok(_lock) => crate::nouns::run_realness_stage(
+            &wiki_path,
+            &input.transcript_path,
+            &capture_spec,
+            &openrouter_api_key,
+            &ollama_base_url,
+            ollama_api_key.as_deref(),
+        ),
+        Err(e) => Err(anyhow::anyhow!("failed to acquire realness project lock: {}", e)),
+    };
+    match realness_result {
         Ok(n) if n > 0 => {
             log_event("capture.realness", None, serde_json::json!({ "nouns": n }));
         }

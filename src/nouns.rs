@@ -401,6 +401,50 @@ fn realness_registry_path(wiki_dir: &Path) -> PathBuf {
     wiki_dir.join("nouns").join("realness.jsonl")
 }
 
+static REALNESS_ATOMIC_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn write_realness_file_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cannot atomically write path without file name: {}", path.display()),
+        )
+    })?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = REALNESS_ATOMIC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".{}.{}.{}.tmp", std::process::id(), timestamp, sequence));
+    let tmp = parent.join(tmp_name);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Read the persisted user-stance realness registry. Missing file / parse errors degrade to an
 /// empty vec (never an error) — an absent registry simply means the gate primes nothing.
 pub fn read_realness_registry(wiki_dir: &Path) -> Vec<RealnessNoun> {
@@ -428,7 +472,7 @@ pub fn write_realness_registry(wiki_dir: &Path, nouns: &[RealnessNoun]) -> std::
         body.push_str(&serde_json::to_string(n).unwrap_or_default());
         body.push('\n');
     }
-    fs::write(&path, body)?;
+    write_realness_file_atomic(&path, &body)?;
     Ok(path)
 }
 
@@ -2218,6 +2262,32 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].name, "context injection");
         assert_eq!(back[0].signed, 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn realness_registry_write_replaces_atomically_without_temp_leftovers() {
+        let dir = std::env::temp_dir().join(format!("pc-realreg-atomic-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&wiki).unwrap();
+
+        write_realness_registry(&wiki, &[RealnessNoun::new("context injection", 4)]).unwrap();
+        write_realness_registry(&wiki, &[RealnessNoun::new("fabric-provider", -6)]).unwrap();
+
+        let back = read_realness_registry(&wiki);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "fabric-provider");
+        assert_eq!(back[0].signed, -6);
+
+        let leftovers: Vec<_> = fs::read_dir(wiki.join("nouns"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".realness.jsonl.") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {:?}", leftovers);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
