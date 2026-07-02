@@ -1,12 +1,11 @@
 //! Per-session injection ledger.
 //!
-//! Every briefing the inject hook surfaces on a turn is *still sitting in
-//! Claude's transcript* as a persisted `<system-reminder>` on subsequent turns.
-//! The ledger models exactly that: "what has this session already injected, and
-//! is therefore already visible to the assistant." The compile model is handed
-//! this block and told to surface ONLY facts that add to it — so a follow-up
-//! ("…and does it support Google?") re-injects nothing already shown, while a
-//! narrowing question still surfaces genuinely new source lines.
+//! Every briefing the inject hook surfaces on a turn is written as a
+//! `<system-reminder>` and mirrored here. The ledger is only an optimization:
+//! before a later turn uses it for dedup, the current transcript window must
+//! still contain the injected reminder body. If visibility cannot be proven
+//! (missing transcript, harness compaction, rewritten transcript), we return an
+//! empty block and let inject resurface the context.
 //!
 //! Storage is a JSONL file per `session_id` under the project's data dir. Each
 //! inject process is a short-lived hook, so state must round-trip through disk;
@@ -15,10 +14,11 @@
 use crate::config::project_context_dir;
 use crate::events::now_rfc3339;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LedgerEntry {
     ts: String,
     #[serde(default)]
@@ -61,39 +61,31 @@ fn cap_tail(s: &str, char_cap: usize) -> String {
     s[boundary..].to_string()
 }
 
-/// Build the "already injected this session" block to feed the compile model,
-/// or an empty string when the ledger is disabled / empty / unreadable.
-///
-/// Returns at most the last `max_entries` briefings, the whole block tail-capped
-/// to `char_cap` bytes. All failures degrade to "" (no dedup, never an error).
-pub fn read_recent(
-    root: &Path,
-    session_id: &str,
-    max_entries: usize,
-    char_cap: usize,
-) -> String {
-    if max_entries == 0 || session_id.is_empty() {
-        return String::new();
+fn read_entries(root: &Path, session_id: &str) -> Vec<LedgerEntry> {
+    if session_id.is_empty() {
+        return Vec::new();
     }
     let path = ledger_path(root, session_id);
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
 
-    let entries: Vec<LedgerEntry> = raw
-        .lines()
+    raw.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<LedgerEntry>(l).ok())
-        .collect();
-    if entries.is_empty() {
+        .collect()
+}
+
+fn render_recent(entries: &[LedgerEntry], max_entries: usize, char_cap: usize) -> String {
+    if max_entries == 0 || entries.is_empty() {
         return String::new();
     }
 
     let tail = if entries.len() > max_entries {
         &entries[entries.len() - max_entries..]
     } else {
-        &entries[..]
+        entries
     };
 
     let mut out = String::new();
@@ -107,6 +99,103 @@ pub fn read_recent(
         out.push_str("\n\n");
     }
     cap_tail(out.trim_end(), char_cap)
+}
+
+/// Build the raw "already injected this session" block without checking whether
+/// the current assistant context can still see it.
+///
+/// Kept for tests and diagnostics. Production inject should use
+/// `read_visible_recent` so compaction cannot turn dedup into under-injection.
+pub fn read_recent(
+    root: &Path,
+    session_id: &str,
+    max_entries: usize,
+    char_cap: usize,
+) -> String {
+    if max_entries == 0 || session_id.is_empty() {
+        return String::new();
+    }
+    render_recent(&read_entries(root, session_id), max_entries, char_cap)
+}
+
+/// Build the "already injected this session" block to feed the compile model,
+/// but only from entries whose exact reminder body is still present in the
+/// current transcript window.
+///
+/// All failures degrade to "" (no dedup, never an error). That is deliberate:
+/// repeating context is safer than telling COMPILE to suppress facts the
+/// assistant can no longer see after compaction.
+pub fn read_visible_recent(
+    root: &Path,
+    session_id: &str,
+    transcript_path: Option<&str>,
+    visibility_turns: usize,
+    max_entries: usize,
+    char_cap: usize,
+) -> String {
+    if max_entries == 0 || visibility_turns == 0 || session_id.is_empty() {
+        return String::new();
+    }
+    let Some(path) = transcript_path else {
+        return String::new();
+    };
+    let visible = transcript_string_window(path, visibility_turns);
+    if visible.is_empty() {
+        return String::new();
+    }
+
+    let visible_entries: Vec<LedgerEntry> = read_entries(root, session_id)
+        .into_iter()
+        .filter(|entry| {
+            let body = entry.body.trim();
+            !body.is_empty() && visible.contains(body)
+        })
+        .collect();
+    render_recent(&visible_entries, max_entries, char_cap)
+}
+
+fn transcript_string_window(path: &str, max_messages: usize) -> String {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    let mut messages = Vec::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let mut strings = Vec::new();
+        collect_strings(&value, &mut strings);
+        let text = strings
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            messages.push(text);
+        }
+    }
+
+    let start = messages.len().saturating_sub(max_messages);
+    messages[start..].join("\n")
+}
+
+fn collect_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_strings(value, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Append one injected briefing to the session ledger. Best-effort: any error
@@ -140,6 +229,7 @@ pub fn append(root: &Path, session_id: &str, title: Option<&str>, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn cap_tail_keeps_most_recent() {
@@ -179,5 +269,63 @@ mod tests {
         assert!(!one.contains("OAuth"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_visible_recent_empty_when_transcript_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sess = "sess-missing";
+
+        append(root, sess, Some("OAuth"), "Google is supported.");
+
+        let block = read_visible_recent(root, sess, None, 8, 8, 3000);
+        assert_eq!(block, "");
+
+        let absent = root.join("missing.jsonl");
+        let block = read_visible_recent(root, sess, absent.to_str(), 8, 8, 3000);
+        assert_eq!(block, "");
+    }
+
+    #[test]
+    fn read_visible_recent_keeps_only_entries_still_in_transcript_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sess = "sess-visible";
+        let alpha = "Alpha reminder line one.\nAlpha reminder line two.";
+        let beta = "Beta reminder survives compaction.";
+
+        append(root, sess, Some("Alpha"), alpha);
+        append(root, sess, Some("Beta"), beta);
+
+        let mut transcript = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({"role": "user", "content": format!("<system-reminder>\n{alpha}\n</system-reminder>")})
+        )
+        .unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({"role": "assistant", "content": "ok"})
+        )
+        .unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({"role": "user", "content": format!("<system-reminder>\n{beta}\n</system-reminder>")})
+        )
+        .unwrap();
+
+        let path = transcript.path().to_str();
+        let block = read_visible_recent(root, sess, path, 4, 8, 3000);
+        assert!(block.contains("[Alpha]"), "got: {block}");
+        assert!(block.contains("Alpha reminder line two"), "got: {block}");
+        assert!(block.contains("[Beta]"), "got: {block}");
+
+        let compacted = read_visible_recent(root, sess, path, 1, 8, 3000);
+        assert!(!compacted.contains("Alpha"), "got: {compacted}");
+        assert!(compacted.contains("[Beta]"), "got: {compacted}");
     }
 }
