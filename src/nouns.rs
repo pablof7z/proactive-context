@@ -819,6 +819,12 @@ pub fn record_primed(project_dir: &Path, session_id: &str, slugs: &[String]) {
         for s in slugs {
             let _ = writeln!(f, "{}", s);
         }
+        let _ = crate::ledger::prune_old_session_files_preserving(
+            &project_dir.join("noun-ledger"),
+            ".txt",
+            crate::ledger::SESSION_LEDGER_FILE_RETENTION,
+            Some(&path),
+        );
     }
 }
 
@@ -2649,6 +2655,39 @@ mod tests {
         // Empty session id is a no-op.
         record_primed(&dir, "", &["x".to_string()]);
         assert!(read_primed(&dir, "").is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primed_ledger_retention_caps_session_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "pc-nounled-retention-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ledger_dir = dir.join("noun-ledger");
+        fs::create_dir_all(&ledger_dir).unwrap();
+        for i in 0..crate::ledger::SESSION_LEDGER_FILE_RETENTION + 3 {
+            fs::write(ledger_dir.join(format!("sess-{i}.txt")), "mint\n").unwrap();
+        }
+
+        record_primed(&dir, "zz-current", &["token-event".to_string()]);
+
+        let remaining = fs::read_dir(&ledger_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.ends_with(".txt"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(remaining, crate::ledger::SESSION_LEDGER_FILE_RETENTION);
+        assert!(read_primed(&dir, "zz-current").contains("token-event"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

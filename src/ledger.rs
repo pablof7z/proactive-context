@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) const SESSION_LEDGER_FILE_RETENTION: usize = 512;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct LedgerEntry {
@@ -44,6 +47,93 @@ fn ledger_path(root: &Path, session_id: &str) -> PathBuf {
     project_context_dir(root)
         .join("ledger")
         .join(format!("{}.jsonl", sanitize_session(session_id)))
+}
+
+pub(crate) fn prune_old_session_files(dir: &Path, suffix: &str, keep: usize) -> usize {
+    prune_old_session_files_preserving(dir, suffix, keep, None)
+}
+
+pub(crate) fn prune_old_session_files_preserving(
+    dir: &Path,
+    suffix: &str,
+    keep: usize,
+    preserve: Option<&Path>,
+) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let preserve = preserve.and_then(|path| path.file_name().map(|name| name.to_owned()));
+
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?;
+            if !name.ends_with(suffix) {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+
+    if files.len() <= keep {
+        return 0;
+    }
+
+    let preserve_present = preserve.as_ref().map(|name| {
+        files
+            .iter()
+            .any(|(_, path)| {
+                path.file_name()
+                    .map(|path_name| path_name == name)
+                    .unwrap_or(false)
+            })
+    })
+    .unwrap_or(false);
+    let non_preserved_keep = if preserve_present && keep > 0 {
+        keep - 1
+    } else {
+        keep
+    };
+
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut kept_non_preserved = 0usize;
+    let mut removed = 0usize;
+    for (_, path) in files {
+        let is_preserved = preserve
+            .as_ref()
+            .and_then(|name| path.file_name().map(|path_name| path_name == name))
+            .unwrap_or(false);
+        if is_preserved && keep > 0 {
+            continue;
+        }
+        if kept_non_preserved < non_preserved_keep {
+            kept_non_preserved += 1;
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn prune_project_ledgers(root: &Path, preserve: &Path) {
+    let dir = project_context_dir(root).join("ledger");
+    let _ = prune_old_session_files_preserving(
+        &dir,
+        ".jsonl",
+        SESSION_LEDGER_FILE_RETENTION,
+        Some(preserve),
+    );
 }
 
 /// Keep at most `char_cap` bytes from the tail of `s` (most recent entries),
@@ -223,6 +313,8 @@ pub fn append(root: &Path, session_id: &str, title: Option<&str>, body: &str) {
 
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
+        drop(f);
+        prune_project_ledgers(root, &path);
     }
 }
 
@@ -269,6 +361,61 @@ mod tests {
         assert!(!one.contains("OAuth"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_old_session_files_caps_matching_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("sess-{i}.jsonl")), "{}\n").unwrap();
+        }
+        std::fs::write(dir.path().join("keep.txt"), "not a ledger").unwrap();
+
+        let removed = prune_old_session_files(dir.path(), ".jsonl", 2);
+        assert_eq!(removed, 3);
+
+        let remaining = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.ends_with(".jsonl"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(remaining, 2);
+        assert!(dir.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn prune_old_session_files_preserves_current_inside_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("aaa-current.jsonl");
+        for name in ["zzz-old.jsonl", "yyy-old.jsonl", "xxx-old.jsonl"] {
+            std::fs::write(dir.path().join(name), "{}\n").unwrap();
+        }
+        std::fs::write(&current, "{}\n").unwrap();
+
+        let removed = prune_old_session_files_preserving(dir.path(), ".jsonl", 2, Some(&current));
+        assert_eq!(removed, 2);
+        assert!(current.exists(), "current session ledger must not be pruned");
+
+        let remaining = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.ends_with(".jsonl"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(remaining, 2);
     }
 
     #[test]

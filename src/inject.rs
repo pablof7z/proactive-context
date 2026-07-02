@@ -367,6 +367,20 @@ fn log_noun_primer(noun: &crate::nouns::NounResolution, standalone: bool) {
     }));
 }
 
+fn missing_session_id_warning_payload() -> serde_json::Value {
+    serde_json::json!({
+        "warning": "missing_session_id",
+        "disabled": ["session_ledger_dedup", "noun_priming_dedup"],
+        "impact": "already-injected and already-primed ledgers cannot be keyed without session_id"
+    })
+}
+
+fn warn_missing_session_id(session_id: &str) {
+    if session_id.trim().is_empty() {
+        log_event("inject.warning", None, missing_session_id_warning_payload());
+    }
+}
+
 // ─── Fallback renderer ────────────────────────────────────────────────────────
 
 fn wrap_context_reminder(project_name: &str, body: &str) -> String {
@@ -622,6 +636,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     // now session-visible instead of looking like pre-API silence.
     let project = normalize_path(&root);
     init_context(&project, &input.session_id);
+    warn_missing_session_id(&input.session_id);
 
     let db_path = project_db_path(&root);
     if !db_path.exists() {
@@ -2084,8 +2099,8 @@ fn format_guides(guides: &[String]) -> String {
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
     use super::{
-        build_catalog, commit_raw_fallback, config_error_payload, no_index_payload, read_catalog_content,
-        source_label_for_key, EPISODE_KEY_PREFIX,
+        build_catalog, commit_raw_fallback, config_error_payload, missing_session_id_warning_payload,
+        no_index_payload, read_catalog_content, source_label_for_key, EPISODE_KEY_PREFIX,
     };
     use crate::config::project_context_dir;
     use std::collections::HashSet;
@@ -2341,6 +2356,18 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         assert_eq!(payload.get("outcome").and_then(|v| v.as_str()), Some("empty"));
         assert_eq!(payload.get("reason").and_then(|v| v.as_str()), Some("config_error"));
         assert!(error.len() <= 203, "error should be truncated, got {}", error.len());
+    }
+
+    #[test]
+    fn missing_session_id_warning_payload_declares_disabled_dedup() {
+        let payload = missing_session_id_warning_payload();
+        assert_eq!(payload.get("warning").and_then(|v| v.as_str()), Some("missing_session_id"));
+        let disabled = payload
+            .get("disabled")
+            .and_then(|v| v.as_array())
+            .expect("warning should list disabled behaviors");
+        assert!(disabled.iter().any(|v| v.as_str() == Some("session_ledger_dedup")));
+        assert!(disabled.iter().any(|v| v.as_str() == Some("noun_priming_dedup")));
     }
 
     #[test]
