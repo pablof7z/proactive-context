@@ -6,7 +6,7 @@
 
 use super::selector::{self, Item};
 use super::{registry, HarnessSpec, InstallStrategy, Scope, Wiring};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
@@ -224,13 +224,7 @@ fn is_installed(spec: &HarnessSpec, path: &Path) -> bool {
 // ─── Strategy: JSON merge (Claude, Codex, TENEX hook JSON) ───────────────
 
 fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<String> {
-    let mut root: serde_json::Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let mut root = read_json_config_for_merge(path)?;
     if spec.id == "codex" {
         migrate_codex_root_events(&mut root);
     }
@@ -242,19 +236,25 @@ fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
-        *hooks = serde_json::json!({});
+        return Err(anyhow!(
+            "refusing to overwrite {}; existing `hooks` value is {}, expected object",
+            path.display(),
+            json_type_name(hooks)
+        ));
     }
     let hooks = hooks.as_object_mut().unwrap();
 
     for w in spec.wirings {
         let arr = hooks.entry(w.event).or_insert_with(|| serde_json::json!([]));
-        let groups = match arr.as_array_mut() {
-            Some(a) => a,
-            None => {
-                *arr = serde_json::json!([]);
-                arr.as_array_mut().unwrap()
-            }
-        };
+        let event_type = json_type_name(arr);
+        let groups = arr.as_array_mut().ok_or_else(|| {
+            anyhow!(
+                "refusing to overwrite {}; existing hooks.{} value is {}, expected array",
+                path.display(),
+                w.event,
+                event_type
+            )
+        })?;
         // Drop any prior group of ours (idempotent re-install).
         groups.retain(|g| !group_is_ours(g, &bin_prefix));
         let mut hook = serde_json::json!({
@@ -270,19 +270,88 @@ fn json_merge(spec: &HarnessSpec, bin: &Path, path: &Path, dry: bool) -> Result<
         groups.push(serde_json::Value::Object(group));
     }
 
-    if spec.statusline {
-        root.as_object_mut().unwrap().insert(
-            "statusLine".into(),
-            serde_json::json!({ "type": "command", "command": format!("{} hook statusline", bin_prefix) }),
-        );
-    }
+    let statusline_summary = if spec.statusline {
+        install_statusline(&mut root, &bin_prefix)
+    } else {
+        String::new()
+    };
 
     let pretty = serde_json::to_string_pretty(&root)?;
     if dry {
-        return Ok(format!("would write {} hook event(s) to JSON\n{}", spec.wirings.len(), indent(&pretty)));
+        return Ok(format!(
+            "would write {} hook event(s){} to JSON\n{}",
+            spec.wirings.len(),
+            statusline_summary,
+            indent(&pretty)
+        ));
     }
     write_with_parents(path, &pretty)?;
-    Ok(format!("wired {} hook event(s){}", spec.wirings.len(), if spec.statusline { " + statusline" } else { "" }))
+    Ok(format!("wired {} hook event(s){}", spec.wirings.len(), statusline_summary))
+}
+
+fn read_json_config_for_merge(path: &Path) -> Result<serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::json!({})),
+        Err(e) => {
+            return Err(anyhow!(
+                "could not read existing JSON config {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+    let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow!(
+            "refusing to overwrite {}; existing config is not valid JSON: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if !root.is_object() {
+        return Err(anyhow!(
+            "refusing to overwrite {}; existing config is {}, expected object",
+            path.display(),
+            json_type_name(&root)
+        ));
+    }
+    Ok(root)
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn install_statusline(root: &mut serde_json::Value, bin_prefix: &str) -> String {
+    let obj = root.as_object_mut().unwrap();
+    if obj
+        .get("statusLine")
+        .map(|existing| !statusline_is_ours(existing, bin_prefix))
+        .unwrap_or(false)
+    {
+        return "; preserved existing statusLine".into();
+    }
+
+    obj.insert(
+        "statusLine".into(),
+        serde_json::json!({ "type": "command", "command": format!("{} hook statusline", bin_prefix) }),
+    );
+    " + statusline".into()
+}
+
+fn statusline_is_ours(statusline: &serde_json::Value, bin_prefix: &str) -> bool {
+    statusline
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(|c| c == format!("{} hook statusline", bin_prefix))
+        .unwrap_or(false)
 }
 
 fn group_is_ours(group: &serde_json::Value, bin_prefix: &str) -> bool {
@@ -596,6 +665,13 @@ fn indent(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn harness(id: &str) -> HarnessSpec {
+        crate::harness::registry()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} spec exists"))
+    }
+
     #[test]
     fn codex_install_writes_hooks_json_and_migrates_root_events() {
         let temp = tempfile::tempdir().unwrap();
@@ -648,5 +724,87 @@ mod tests {
         assert!(config_toml.contains("trusted_hash = \"sha256:abc\""));
         assert!(!config_toml.contains(SENTINEL_OPEN));
         assert!(!config_toml.contains("[[hooks.Stop]]"));
+    }
+
+    #[test]
+    fn json_install_refuses_malformed_existing_config_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let original = r#"{ "permissions": { "allow": ["Bash(git status)"] }, "#;
+        std::fs::write(&settings_path, original).unwrap();
+
+        let claude = harness("claude");
+        let err = install_one(&claude, Path::new("/tmp/pc"), &settings_path, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("not valid JSON"));
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
+    }
+
+    #[test]
+    fn json_install_refuses_existing_non_object_config_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks_path = temp.path().join(".codex").join("hooks.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        let original = r#"["not", "an", "object"]"#;
+        std::fs::write(&hooks_path, original).unwrap();
+
+        let codex = harness("codex");
+        let err = install_one(&codex, Path::new("/tmp/pc"), &hooks_path, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expected object"));
+        assert_eq!(std::fs::read_to_string(&hooks_path).unwrap(), original);
+    }
+
+    #[test]
+    fn json_install_creates_missing_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks_path = temp.path().join(".codex").join("hooks.json");
+        let codex = harness("codex");
+
+        install_one(&codex, Path::new("/tmp/pc"), &hooks_path, false).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(root.is_object());
+        assert!(root.pointer("/hooks/UserPromptSubmit").is_some());
+        assert!(root.pointer("/hooks/Stop").is_some());
+    }
+
+    #[test]
+    fn claude_install_preserves_foreign_statusline() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{
+  "model": "sonnet",
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/other-statusline"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let claude = harness("claude");
+        let summary = install_one(&claude, Path::new("/tmp/pc"), &settings_path, false).unwrap();
+
+        assert!(summary.contains("preserved existing statusLine"));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            root.pointer("/statusLine/command").and_then(|v| v.as_str()),
+            Some("/usr/local/bin/other-statusline")
+        );
+        assert_eq!(root.pointer("/model").and_then(|v| v.as_str()), Some("sonnet"));
+        assert!(root.pointer("/hooks/UserPromptSubmit").is_some());
+        assert!(root.pointer("/hooks/SessionEnd").is_some());
+        assert!(root.pointer("/hooks/Stop").is_some());
     }
 }
