@@ -605,8 +605,33 @@ const CHARS_PER_TOKEN: f64 = 4.0;
 const CAPTURE_TRUNCATION: usize = 250_000;
 /// Triage transcript truncation limit (200 K chars → capture.rs:1390)
 const TRIAGE_TRUNCATION: usize = 200_000;
+/// Research recognizer excerpt: first 10K + last 80K when long.
+const RESEARCH_RECOGNITION_TRUNCATION: usize = 90_000;
+/// Episode recognizer excerpt: first 10K + last 70K when long.
+const EPISODE_RECOGNITION_TRUNCATION: usize = 80_000;
+/// Realness classifies clipped noun references, not the full transcript; this models
+/// the typical one-batch session while keeping the dry-run estimate bounded.
+const REALNESS_STAGE_ESTIMATE_CHARS: usize = 12_000;
+/// Structured recognizer outputs are usually compact relative to their transcript input.
+const POST_CAPTURE_OUTPUT_RATIO: f64 = 0.10;
 /// Average agent turns per captured session (heuristic)
 const AVG_AGENT_TURNS: f64 = 8.0;
+
+#[derive(Debug, Clone, Copy)]
+struct StageEstimateConfig {
+    capture_research: bool,
+    capture_episode_cards: bool,
+}
+
+impl StageEstimateConfig {
+    fn from_runtime_config() -> Self {
+        let cfg = crate::config::load_config().unwrap_or_default();
+        Self {
+            capture_research: cfg.capture_research,
+            capture_episode_cards: cfg.capture_episode_cards,
+        }
+    }
+}
 
 struct CostEstimate {
     triage_calls_low: usize,
@@ -614,6 +639,8 @@ struct CostEstimate {
     triage_calls_high: usize,
     capture_calls_low: usize,
     capture_calls_high: usize,
+    post_capture_calls_low: usize,
+    post_capture_calls_high: usize,
     tokens_in_low: u64,
     tokens_in_high: u64,
     #[allow(dead_code)] // reserved for output-token display
@@ -625,6 +652,18 @@ struct CostEstimate {
 }
 
 fn estimate_cost(project: &ProjectInfo, synth_every: usize) -> CostEstimate {
+    estimate_cost_with_stage_config(
+        project,
+        synth_every,
+        StageEstimateConfig::from_runtime_config(),
+    )
+}
+
+fn estimate_cost_with_stage_config(
+    project: &ProjectInfo,
+    synth_every: usize,
+    stage_cfg: StageEstimateConfig,
+) -> CostEstimate {
     let new = project.new_sessions;
     // Sessions too short to even reach triage (< 500 chars / < 3 exchanges) — rough heuristic.
     // Use ceiling to avoid zeroing single-session projects: a session is either triageable or not.
@@ -667,6 +706,21 @@ fn estimate_cost(project: &ProjectInfo, synth_every: usize) -> CostEstimate {
         * (capture_toks_in as f64 * AVG_AGENT_TURNS * CAPTURE_COST_PER_TOK_IN
             + capture_toks_out as f64 * CAPTURE_COST_PER_TOK_OUT);
 
+    let post_capture = estimate_post_capture_stages(avg_bytes as usize, stage_cfg);
+    let post_capture_calls_low = capture_calls_low * post_capture.calls_per_capture;
+    let post_capture_calls_high = capture_calls_high * post_capture.calls_per_capture;
+    let post_capture_tokens_in_low = capture_calls_low as u64 * post_capture.tokens_in_per_capture;
+    let post_capture_tokens_in_high =
+        capture_calls_high as u64 * post_capture.tokens_in_per_capture;
+    let post_capture_tokens_out_low = capture_calls_low as u64 * post_capture.tokens_out_per_capture;
+    let post_capture_tokens_out_high = capture_calls_high as u64 * post_capture.tokens_out_per_capture;
+    let cost_post_capture_low = capture_calls_low as f64
+        * (post_capture.tokens_in_per_capture as f64 * CAPTURE_COST_PER_TOK_IN
+            + post_capture.tokens_out_per_capture as f64 * CAPTURE_COST_PER_TOK_OUT);
+    let cost_post_capture_high = capture_calls_high as f64
+        * (post_capture.tokens_in_per_capture as f64 * CAPTURE_COST_PER_TOK_IN
+            + post_capture.tokens_out_per_capture as f64 * CAPTURE_COST_PER_TOK_OUT);
+
     let _checkpoints = if synth_every > 0 {
         new.div_ceil(synth_every)
     } else {
@@ -678,13 +732,53 @@ fn estimate_cost(project: &ProjectInfo, synth_every: usize) -> CostEstimate {
         triage_calls_high,
         capture_calls_low,
         capture_calls_high,
-        tokens_in_low,
-        tokens_in_high,
-        tokens_out_low,
-        tokens_out_high,
-        cost_low: cost_triage + cost_capture_low,
-        cost_high: cost_triage + cost_capture_high,
+        post_capture_calls_low,
+        post_capture_calls_high,
+        tokens_in_low: tokens_in_low + post_capture_tokens_in_low,
+        tokens_in_high: tokens_in_high + post_capture_tokens_in_high,
+        tokens_out_low: tokens_out_low + post_capture_tokens_out_low,
+        tokens_out_high: tokens_out_high + post_capture_tokens_out_high,
+        cost_low: cost_triage + cost_capture_low + cost_post_capture_low,
+        cost_high: cost_triage + cost_capture_high + cost_post_capture_high,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PostCaptureStageEstimate {
+    calls_per_capture: usize,
+    tokens_in_per_capture: u64,
+    tokens_out_per_capture: u64,
+}
+
+fn estimate_post_capture_stages(
+    avg_session_chars: usize,
+    cfg: StageEstimateConfig,
+) -> PostCaptureStageEstimate {
+    if avg_session_chars == 0 {
+        return PostCaptureStageEstimate::default();
+    }
+
+    let mut est = PostCaptureStageEstimate::default();
+    let mut add_stage = |chars: usize| {
+        let toks_in = (chars as f64 / CHARS_PER_TOKEN) as u64;
+        est.calls_per_capture += 1;
+        est.tokens_in_per_capture += toks_in;
+        est.tokens_out_per_capture += (toks_in as f64 * POST_CAPTURE_OUTPUT_RATIO) as u64;
+    };
+
+    if cfg.capture_research {
+        add_stage(avg_session_chars.min(RESEARCH_RECOGNITION_TRUNCATION));
+    }
+    if cfg.capture_episode_cards {
+        add_stage(avg_session_chars.min(EPISODE_RECOGNITION_TRUNCATION));
+    }
+
+    // The live capture pipeline always attempts definitional-noun recognition and
+    // the user-stance realness pass after triage-approved captures.
+    add_stage(avg_session_chars);
+    add_stage(avg_session_chars.min(REALNESS_STAGE_ESTIMATE_CHARS));
+
+    est
 }
 
 fn fmt_bytes(bytes: u64) -> String {
@@ -714,10 +808,10 @@ fn print_dry_run_report(projects: &[ProjectInfo], synth_every: usize) {
         projects.len()
     );
     println!(
-        "{:<30}  {:>8}  {:>5}  {:>6}  {:>8}  {:>12}  {:>14}",
-        "Project", "Sessions", "New", "Size", "~Triage", "~Capture", "~$"
+        "{:<30}  {:>8}  {:>5}  {:>6}  {:>8}  {:>12}  {:>12}  {:>14}",
+        "Project", "Sessions", "New", "Size", "~Triage", "~Capture", "~Stages", "~$"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(104));
 
     let mut total_sessions = 0usize;
     let mut total_new = 0usize;
@@ -735,13 +829,17 @@ fn print_dry_run_report(projects: &[ProjectInfo], synth_every: usize) {
             1
         };
         println!(
-            "{:<30}  {:>8}  {:>5}  {:>6}  {:>8}  {:>14}  {:>14}",
+            "{:<30}  {:>8}  {:>5}  {:>6}  {:>8}  {:>14}  {:>12}  {:>14}",
             truncate_str(&p.display_name, 30),
             p.sessions.len(),
             p.new_sessions,
             fmt_bytes(p.total_bytes),
             format!("~{}", est.triage_calls_low),
             format!("~{}-{}", est.capture_calls_low, est.capture_calls_high),
+            format!(
+                "~{}-{}",
+                est.post_capture_calls_low, est.post_capture_calls_high
+            ),
             format!("${:.2}-${:.2}", est.cost_low, est.cost_high),
         );
         println!(
@@ -762,7 +860,7 @@ fn print_dry_run_report(projects: &[ProjectInfo], synth_every: usize) {
         total_toks_in_high += est.tokens_in_high;
     }
 
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(104));
     println!(
         "archeologist: TOTAL  sessions={}  new={}  size={}  ~${:.2}-${:.2}  ~{}+{} tok-in",
         total_sessions,
@@ -772,6 +870,9 @@ fn print_dry_run_report(projects: &[ProjectInfo], synth_every: usize) {
         total_cost_high,
         fmt_tokens(total_toks_in_low),
         fmt_tokens(total_toks_in_high - total_toks_in_low),
+    );
+    println!(
+        "archeologist: estimate includes configured post-capture stage calls plus always-on noun/realness; card cleanup and supersession fan-out are not modeled"
     );
     println!("archeologist: dry-run complete — no LLM calls made");
 }
@@ -3347,6 +3448,37 @@ mod tests {
         }
     }
 
+    fn project_for_cost_estimate(
+        session_count: usize,
+        new_sessions: usize,
+        total_bytes: u64,
+    ) -> ProjectInfo {
+        let per_session = if session_count == 0 {
+            0
+        } else {
+            total_bytes / session_count as u64
+        };
+        ProjectInfo {
+            normalized_cwd: "Users_pablo_src_cost".to_string(),
+            display_name: "cost".to_string(),
+            sessions: (0..session_count)
+                .map(|i| SessionInfo {
+                    path: PathBuf::from(format!("session-{i}.jsonl")),
+                    session_id: format!("session-{i}"),
+                    first_ts: None,
+                    cwd: Some("/Users/pablo/src/cost".to_string()),
+                    size_bytes: per_session,
+                    message_count: 4,
+                })
+                .collect(),
+            new_sessions,
+            total_bytes,
+            total_messages: session_count * 4,
+            first_date: None,
+            last_date: None,
+        }
+    }
+
     #[test]
     fn claude_project_path_encoder_matches_directory_shape() {
         assert_eq!(
@@ -3488,6 +3620,46 @@ mod tests {
         assert_eq!(c.tokens_in, 1500);
         assert_eq!(c.tokens_out, 300);
         assert!((c.cost_usd - 0.0023).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_estimate_includes_default_post_capture_stage_calls_and_tokens() {
+        let project = project_for_cost_estimate(20, 20, 800_000);
+        let est = estimate_cost_with_stage_config(
+            &project,
+            12,
+            StageEstimateConfig {
+                capture_research: true,
+                capture_episode_cards: true,
+            },
+        );
+
+        assert_eq!(est.capture_calls_low, 9);
+        assert_eq!(est.capture_calls_high, 12);
+        assert_eq!(est.post_capture_calls_low, 36);
+        assert_eq!(est.post_capture_calls_high, 48);
+        assert_eq!(est.tokens_in_low, 1_207_000);
+        assert_eq!(est.tokens_in_high, 1_546_000);
+    }
+
+    #[test]
+    fn cost_estimate_respects_optional_post_capture_stage_flags() {
+        let project = project_for_cost_estimate(20, 20, 800_000);
+        let est = estimate_cost_with_stage_config(
+            &project,
+            12,
+            StageEstimateConfig {
+                capture_research: false,
+                capture_episode_cards: false,
+            },
+        );
+
+        assert_eq!(est.capture_calls_low, 9);
+        assert_eq!(est.capture_calls_high, 12);
+        assert_eq!(est.post_capture_calls_low, 18);
+        assert_eq!(est.post_capture_calls_high, 24);
+        assert_eq!(est.tokens_in_low, 1_027_000);
+        assert_eq!(est.tokens_in_high, 1_306_000);
     }
 
     #[test]
