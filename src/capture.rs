@@ -2707,12 +2707,14 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     // pass and is fully independent of it: recognizes investigation artifacts and
     // persists immutable research records under <wiki>/research/. Best-effort — a
     // failure here never breaks the normal capture path. When `capture_research`
-    // is false (the default) this block is a no-op and behavior is unchanged.
+    // is false this block is a no-op and behavior is unchanged. `today_str` honors
+    // replay overrides, so archeologist records keep the session's historical date.
     if cfg.capture_research {
         match crate::research_capture::run_research_stage(
             &wiki_path,
             &input.transcript_path,
             &input.session_id,
+            Some(&today_str),
         ) {
             Ok(records) if !records.is_empty() => {
                 log_event(

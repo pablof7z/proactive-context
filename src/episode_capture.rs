@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use crate::capture::{call_model_blocking, rfc3339_now};
 use crate::config::load_config;
 use crate::provider::ModelSpec;
-use crate::research_capture::{build_research_transcript_with_spans, TurnSpan};
+use crate::research_capture::{
+    artifact_filename_stem, build_research_transcript_with_spans, session_owned_markdown_path,
+    TurnSpan,
+};
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
@@ -113,9 +116,8 @@ pub fn run_episode_capture(
         }
 
         let slug = slugify_arc(&arc.title, idx + 1);
-        let card_stem = format!("{}-{}", date, slug);
-        let filename = format!("{}.md", card_stem);
-        let card_path = out_dir.join(&filename);
+        let (card_stem, card_path) =
+            episode_card_path_for_session(out_dir, &date, &session_id, &slug);
 
         // Persist transcripts named to match the card: cleaned at transcripts/<stem>.json,
         // raw at transcripts/raw/<stem>.json. The card links to both.
@@ -262,9 +264,8 @@ pub fn run_episode_stage(
             continue;
         }
         let slug = slugify_arc(&arc.title, idx + 1);
-        let card_stem = format!("{}-{}", date, slug);
-        let filename = format!("{}.md", card_stem);
-        let card_path = episodes_dir.join(&filename);
+        let (card_stem, card_path) =
+            episode_card_path_for_session(&episodes_dir, &date, session_id, &slug);
         // Immutability: never overwrite an existing card.
         if card_path.exists() {
             persisted.push(card_path);
@@ -1826,6 +1827,27 @@ fn derive_session_id(transcript_path: &str) -> String {
         .to_string()
 }
 
+fn episode_card_path_for_session(
+    episodes_dir: &Path,
+    date: &str,
+    session_id: &str,
+    slug: &str,
+) -> (String, PathBuf) {
+    let stem = artifact_filename_stem(date, session_id, slug);
+    let path = session_owned_markdown_path(episodes_dir, &stem, session_id, episode_card_session);
+    let actual_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&stem)
+        .to_string();
+    (actual_stem, path)
+}
+
+fn episode_card_session(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    parse_episode_card_frontmatter(&content).map(|fm| fm.session)
+}
+
 fn slugify_arc(title: &str, idx: usize) -> String {
     let base: String = title
         .to_lowercase()
@@ -2459,6 +2481,45 @@ Z adopted.
         assert!(cards_for_session(&episodes, "missing").is_empty());
         // Missing dir is a clean empty result, not a panic.
         assert!(cards_for_session(&tmp.path().join("nope"), "s1").is_empty());
+    }
+
+    #[test]
+    fn episode_card_path_includes_session_component_and_avoids_other_session_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let episodes = tmp.path().join("episodes");
+        fs::create_dir_all(&episodes).unwrap();
+
+        let slug = "1-same-title";
+        let (stem, path) =
+            episode_card_path_for_session(&episodes, "2025-05-04", "sess-A", slug);
+        assert!(stem.starts_with("2025-05-04-sessa-"), "got: {stem}");
+        assert!(stem.ends_with("-1-same-title"), "got: {stem}");
+
+        fs::write(
+            &path,
+            "---\ntype: episode-card\ndate: 2025-05-04\nsession: sess-B\n\
+             transcript: /t.jsonl\nsalience: reversal\nstatus: active\n\
+             subjects:\n  - x\ncaptured_at: 2025-05-04T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let (collision_stem, collision_path) =
+            episode_card_path_for_session(&episodes, "2025-05-04", "sess-A", slug);
+        assert_ne!(collision_path, path);
+        assert!(collision_stem.ends_with("-collision-2"), "got: {collision_stem}");
+
+        fs::write(
+            &collision_path,
+            "---\ntype: episode-card\ndate: 2025-05-04\nsession: sess-A\n\
+             transcript: /t.jsonl\nsalience: reversal\nstatus: active\n\
+             subjects:\n  - x\ncaptured_at: 2025-05-04T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let (owned_stem, owned_path) =
+            episode_card_path_for_session(&episodes, "2025-05-04", "sess-A", slug);
+        assert_eq!(owned_path, collision_path);
+        assert_eq!(owned_stem, collision_stem);
     }
 
     #[test]
