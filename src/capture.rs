@@ -523,7 +523,6 @@ fn append_citation_log(
     sliced_text: &str,
 ) -> Result<()> {
     fs::create_dir_all(wiki_dir)?;
-    crate::wiki::ensure_agents_files(wiki_dir)?;
 
     let rec = CitationRecord {
         id: id.to_string(),
@@ -535,6 +534,7 @@ fn append_citation_log(
     if let Some(parent) = record_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    crate::wiki::ensure_agents_files(wiki_dir)?;
     if record_path.exists() {
         let existing = fs::read_to_string(&record_path)?;
         let existing_rec: CitationRecord = serde_json::from_str(&existing)?;
