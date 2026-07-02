@@ -53,6 +53,29 @@ pub fn open_db(root: &Path, embedder: &dyn Embedder) -> Result<Connection> {
     open_db_at(&db_path, embedder)
 }
 
+/// Open an existing index database for retrieval only.
+///
+/// Query/inject callers must not run schema initialization: `init_schema` can
+/// drop and recreate `vec_chunks` on version or embedding-dimension skew, and a
+/// hook process has no authority to repair the index afterward.
+pub fn open_query_db_at(db_path: &Path) -> Result<Connection> {
+    ensure_vec_extension();
+
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!("Failed to open sqlite-vec DB for query at {}", db_path.display())
+        })?;
+    configure_sqlite_connection(&conn)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
+/// Open the project index database for retrieval only.
+pub fn open_query_db(root: &Path) -> Result<Connection> {
+    let db_path = project_db_path(root);
+    open_query_db_at(&db_path)
+}
+
 fn init_schema(conn: &mut Connection, embedder: &dyn Embedder) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -287,7 +310,7 @@ pub fn index_stats_full(conn: &Connection, db_path: &Path) -> Result<IndexStats>
 mod tests {
     use super::*;
 
-    struct DimOnlyEmbedder;
+    struct DimOnlyEmbedder(usize);
 
     impl Embedder for DimOnlyEmbedder {
         fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -295,7 +318,7 @@ mod tests {
         }
 
         fn dimension(&self) -> usize {
-            4
+            self.0
         }
     }
 
@@ -317,10 +340,53 @@ mod tests {
     fn open_db_at_configures_busy_timeout() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
-        let embedder = DimOnlyEmbedder;
+        let embedder = DimOnlyEmbedder(4);
 
         let conn = open_db_at(&db_path, &embedder).unwrap();
 
         assert_eq!(busy_timeout_ms(&conn), SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn open_query_db_at_does_not_initialize_or_wipe_on_metadata_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let embedder = DimOnlyEmbedder(4);
+        {
+            let conn = open_db_at(&db_path, &embedder).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = 'old-test-version' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = open_query_db_at(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let vec_schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let query_only: i64 = conn
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(schema_version, "old-test-version");
+        assert!(
+            vec_schema.contains("FLOAT[4]"),
+            "vec schema was rewritten: {vec_schema}"
+        );
+        assert_eq!(busy_timeout_ms(&conn), SQLITE_BUSY_TIMEOUT_MS as i64);
+        assert_eq!(query_only, 1);
     }
 }

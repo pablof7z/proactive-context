@@ -1,5 +1,5 @@
 use crate::config::load_config;
-use crate::db::{open_db, open_db_at, vector_search, SearchHit};
+use crate::db::{open_query_db, open_query_db_at, vector_search, SearchHit};
 use crate::embed::{build_embedder, fastembed_cache_dir};
 use crate::events::{log_event, truncate};
 use anyhow::Result;
@@ -64,14 +64,14 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
     let candidate_k = if rerank { (top_k * 4).max(30) } else { top_k };
 
     // Query the project index
-    let conn = open_db(root, embedder.as_ref())?;
+    let conn = open_query_db(root)?;
     let project_hits = vector_search(&conn, q_emb, candidate_k, DEFAULT_MAX_DISTANCE)?;
 
     // Optionally query global db
     let global_hits: Vec<SearchHit> = if global {
         if let Some(gdb_path) = global_db_path() {
             if gdb_path.exists() {
-                match open_db_at(&gdb_path, embedder.as_ref()) {
+                match open_query_db_at(&gdb_path) {
                     Ok(gconn) => {
                         match vector_search(&gconn, q_emb, candidate_k, DEFAULT_MAX_DISTANCE) {
                             Ok(hits) => hits,
