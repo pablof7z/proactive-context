@@ -513,7 +513,7 @@ fn extract_json_array(text: &str) -> String {
 /// Build the replacement text for a stale statement: terminal truth + supersession breadcrumb
 /// citing the newer guide. Never deletes the old wording — it is preserved inside the breadcrumb.
 pub fn build_revision(old_text: &str, terminal_truth: &str, newer_slug: &str) -> String {
-    let old_clean = strip_inline_markers(old_text).trim().trim_end_matches('.').to_string();
+    let old_clean = old_text.trim().trim_end_matches('.').to_string();
     let truth = terminal_truth.trim().trim_end_matches('.').to_string();
     format!(
         "{truth}. (Previously: {old}, superseded — see {slug}.)",
@@ -953,6 +953,29 @@ mod tests {
         );
         assert!(r.contains("verified and closed via #1080"));
         assert!(r.contains("(Previously: NIP-17 DM receive-side cold-start is unverified, superseded — see publish-action-ledger.)"), "got: {r}");
+    }
+
+    #[test]
+    fn build_revision_preserves_old_inline_citation_marker() {
+        let old = "The hook cwd lock is still raw and can diverge by worktree. [^abc12-1]";
+        let r = build_revision(
+            old,
+            "The hook cwd lock is keyed by the resolved project root",
+            "project-locking",
+        );
+        assert!(
+            r.contains(
+                "Previously: The hook cwd lock is still raw and can diverge by worktree. [^abc12-1], superseded"
+            ),
+            "got: {r}"
+        );
+        assert_eq!(wiki::collect_citation_markers(&r), vec!["[^abc12-1]"]);
+
+        let body = "## Locking\n\nThe hook cwd lock is still raw and can diverge by worktree. [^abc12-1]\n";
+        let start = body.find("The hook").unwrap();
+        let end = body[start..].find('\n').map(|n| start + n).unwrap();
+        let applied = apply_revisions(body, vec![(start, end, r)]);
+        assert_eq!(wiki::collect_citation_markers(&applied), vec!["[^abc12-1]"]);
     }
 
     #[test]
