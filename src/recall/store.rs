@@ -63,8 +63,10 @@ impl Store {
         {
             let mut s1 = tx.prepare(
                 "INSERT OR REPLACE INTO turns VALUES (?,?,?,?,?,?,?,?,?,?)")?;
+            let mut delete_fts = tx.prepare("DELETE FROM turns_fts WHERE id=?")?;
             let mut s2 = tx.prepare("INSERT INTO turns_fts (text, id) VALUES (?,?)")?;
             for (i, t) in turns.iter().enumerate() {
+                delete_fts.execute([&t.id])?;
                 s1.execute(rusqlite::params![
                     t.id, t.source, t.project, t.session, t.line, i as i64, t.ts,
                     t.text.chars().count() as i64, t.text, t.raw_path])?;
@@ -230,5 +232,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(timeout_ms, crate::db::SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
+
+    fn turn(id: &str, text: &str) -> Turn {
+        Turn {
+            id: id.to_string(),
+            source: "codex".to_string(),
+            project: "project".to_string(),
+            session: "session".to_string(),
+            line: 1,
+            ts: "2026-07-02T12:00:00Z".to_string(),
+            text: text.to_string(),
+            raw_path: "/tmp/session.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn insert_batch_replaces_existing_fts_rows_for_same_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_at(tmp.path().join("recall.db")).unwrap();
+        let id = "codex/project/session/L1";
+
+        store.insert_batch(&[turn(id, "alpha original text")]).unwrap();
+        store.insert_batch(&[turn(id, "beta replacement text")]).unwrap();
+
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(store.search("alpha", 10).is_empty());
+        let hits = store.search("beta", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "beta replacement text");
+
+        let fts_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM turns_fts WHERE id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_rows, 1);
     }
 }
