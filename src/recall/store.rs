@@ -18,6 +18,12 @@ pub struct Turn {
     pub raw_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileState {
+    pub mtime: i64,
+    pub size: i64,
+}
+
 pub fn db_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -183,23 +189,56 @@ impl Store {
     // ── incremental indexing (skip unchanged transcript files) ───────────────
     pub fn ensure_files_table(&self) -> Result<()> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime INTEGER);")?;
+            "CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                mtime INTEGER,
+                size INTEGER NOT NULL DEFAULT -1
+             );")?;
+        if !self.files_table_has_size()? {
+            self.conn
+                .execute_batch("ALTER TABLE files ADD COLUMN size INTEGER NOT NULL DEFAULT -1;")?;
+        }
         Ok(())
     }
 
-    pub fn known_files(&self) -> std::collections::HashMap<String, i64> {
+    fn files_table_has_size(&self) -> Result<bool> {
+        let mut st = self.conn.prepare("PRAGMA table_info(files)")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+        let has_size = rows.filter_map(|r| r.ok()).any(|name| name == "size");
+        Ok(has_size)
+    }
+
+    pub fn known_files(&self) -> std::collections::HashMap<String, FileState> {
         let mut m = std::collections::HashMap::new();
-        if let Ok(mut st) = self.conn.prepare("SELECT path, mtime FROM files") {
-            if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+        if let Ok(mut st) = self.conn.prepare("SELECT path, mtime, size FROM files") {
+            if let Ok(rows) = st.query_map([], |r| Ok((
+                r.get::<_, String>(0)?,
+                FileState {
+                    mtime: r.get::<_, i64>(1)?,
+                    size: r.get::<_, i64>(2)?,
+                },
+            ))) {
                 for row in rows.flatten() { m.insert(row.0, row.1); }
             }
         }
         m
     }
 
-    pub fn upsert_file(&self, path: &str, mtime: i64) -> Result<()> {
-        self.conn.execute("INSERT OR REPLACE INTO files VALUES (?,?)",
-            rusqlite::params![path, mtime])?;
+    pub fn upsert_file(&self, path: &str, state: FileState) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?,?,?)",
+            rusqlite::params![path, state.mtime, state.size],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_file(&self, path: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM files WHERE path=?", [path])?;
+        Ok(())
+    }
+
+    pub fn clear_files(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM files", [])?;
         Ok(())
     }
 
@@ -271,5 +310,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fts_rows, 1);
+    }
+
+    #[test]
+    fn files_table_migration_adds_size_and_forces_unknown_old_rows_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("recall.db")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE files (path TEXT PRIMARY KEY, mtime INTEGER);
+                 INSERT INTO files (path, mtime) VALUES ('/tmp/a.jsonl', 123);",
+            )
+            .unwrap();
+
+        store.ensure_files_table().unwrap();
+
+        let known = store.known_files();
+        assert_eq!(
+            known.get("/tmp/a.jsonl"),
+            Some(&FileState { mtime: 123, size: -1 })
+        );
+    }
+
+    #[test]
+    fn known_files_tracks_size_and_file_rows_can_be_removed_or_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("recall.db")).unwrap();
+        store.ensure_files_table().unwrap();
+
+        store
+            .upsert_file("/tmp/a.jsonl", FileState { mtime: 123, size: 456 })
+            .unwrap();
+        assert_eq!(
+            store.known_files().get("/tmp/a.jsonl"),
+            Some(&FileState { mtime: 123, size: 456 })
+        );
+
+        store.delete_file("/tmp/a.jsonl").unwrap();
+        assert!(!store.known_files().contains_key("/tmp/a.jsonl"));
+
+        store
+            .upsert_file("/tmp/b.jsonl", FileState { mtime: 124, size: 1 })
+            .unwrap();
+        store.clear_files().unwrap();
+        assert!(store.known_files().is_empty());
     }
 }
