@@ -162,14 +162,11 @@ pub fn run_episode_stage(
 ) -> Result<Vec<PathBuf>> {
     let episodes_dir = wiki_dir.join("episodes");
 
-    // ── Idempotency fast-path (no LLM) ───────────────────────────────────────
-    // If episode cards already exist on disk for this session, the recognition
-    // stage has already run for it. Re-running the LLM would be redundant (and
-    // immutability would discard any new arcs anyway), so instead we just make the
-    // artifact set whole: backfill any missing transcript JSON files for those
-    // cards via pure file I/O. This is what makes `pc archeologist` naturally
-    // idempotent — a re-run converges to a complete set without paying for LLM
-    // calls on sessions it has already processed.
+    // ── Existing-card repair (no LLM) ───────────────────────────────────────
+    // Existing cards may be missing their transcript JSON sidecars, so always repair
+    // those by pure file I/O first. In repair-only mode this remains a convergent,
+    // no-LLM path for archeologist. In live mode, do NOT return here: the session may
+    // have grown since the first Stop-hook capture, and recognition must see later arcs.
     let existing_cards = cards_for_session(&episodes_dir, session_id);
     if !existing_cards.is_empty() {
         for card_path in &existing_cards {
@@ -204,8 +201,9 @@ pub fn run_episode_stage(
             let _ = write_transcript_json(&episodes_dir, "", &stem, &raw_dialogue);
             let _ = write_transcript_json(&episodes_dir, "raw", &stem, &raw_dialogue);
         }
-        // Session already recognized — skip the recognition LLM entirely.
-        return Ok(existing_cards);
+        if repair_only {
+            return Ok(existing_cards);
+        }
     }
 
     // No cards exist yet for this session. In repair-only mode we never run the
@@ -2570,6 +2568,35 @@ Z adopted.
         let again = run_episode_stage(&wiki, transcript.to_str().unwrap(), "sess-x", None, true)
             .expect("second repair must succeed");
         assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn run_episode_stage_existing_cards_do_not_short_circuit_live_mode() {
+        // Live capture (`repair_only=false`) must not return just because the session
+        // already has a card: growing sessions need recognition to see later turns.
+        // This empty transcript keeps the test LLM-free after the existing-card branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let episodes = wiki.join("episodes");
+        fs::create_dir_all(&episodes).unwrap();
+
+        let transcript = tmp.path().join("empty.jsonl");
+        fs::write(&transcript, "").unwrap();
+
+        let card = format!(
+            "---\ntype: episode-card\ndate: 2026-06-01\nsession: sess-grow\n\
+             transcript: {}\nsalience: product\nstatus: active\n\
+             subjects:\n  - x\ncaptured_at: 2026-06-01T00:00:00Z\n---\nbody\n",
+            transcript.to_str().unwrap()
+        );
+        fs::write(episodes.join("2026-06-01-sessgrow-abc123-1-arc.md"), card).unwrap();
+
+        let out = run_episode_stage(&wiki, transcript.to_str().unwrap(), "sess-grow", None, false)
+            .expect("live path should still be a clean no-op for an empty transcript");
+        assert!(
+            out.is_empty(),
+            "live mode should not short-circuit by returning existing cards"
+        );
     }
 
     #[test]
