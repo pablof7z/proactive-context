@@ -31,6 +31,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 // ─── Feature flag ─────────────────────────────────────────────────────────────
@@ -261,6 +262,10 @@ pub fn append_claim_with_status(
         .context("embedding claim assertion failed")?;
     let emb = embs.into_iter().next().context("embedder returned no vectors")?;
 
+    // Serialize the JSONL idempotency check with the derived DB state. Otherwise two
+    // recapture workers can both observe the old file and append the same deterministic id.
+    let _claim_lock = acquire_claim_store_lock(project_dir)?;
+
     // ── Supersedes-edge detection (Run 6) — BEFORE writing the new claim, so candidates are
     // strictly EARLIER claims. ─────────────────────────────────────────────────────────────
     let supersedes: Vec<String> = if let Some(linker) = linker {
@@ -292,21 +297,12 @@ pub fn append_claim_with_status(
         status,
     };
     let jsonl_path = claims_jsonl_path(project_dir);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&jsonl_path)
-        .with_context(|| format!("failed to open {}", jsonl_path.display()))?;
-    let line = serde_json::to_string(&rec)?;
-    writeln!(f, "{}", line)?;
+    append_claim_jsonl_once(&jsonl_path, &rec)?;
 
     // Insert embedding into vec_claims, keyed by a rowid derived from the claim id.
     let rowid = claim_id_to_rowid(id);
     let emb_bytes = floats_to_bytes(&emb);
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO vec_claims(rowid, embedding) VALUES (?1, ?2)",
-        params![rowid, emb_bytes],
-    );
+    replace_claim_embedding(&conn, rowid, emb_bytes);
 
     // Map claim → cluster.
     conn.execute(
@@ -444,6 +440,8 @@ pub fn append_claim_typed_with_status(
     let embs = embedder.embed(&[assertion.to_string()]).context("embedding claim assertion failed")?;
     let emb = embs.into_iter().next().context("embedder returned no vectors")?;
 
+    let _claim_lock = acquire_claim_store_lock(project_dir)?;
+
     let tau: f32 = std::env::var("PC_CLAIMS_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(0.55);
     let cluster_id = find_or_create_cluster(&conn, id, &emb, tau)?;
 
@@ -456,13 +454,11 @@ pub fn append_claim_typed_with_status(
         status,
     };
     let jsonl_path = claims_jsonl_path(project_dir);
-    let mut f = OpenOptions::new().create(true).append(true).open(&jsonl_path)
-        .with_context(|| format!("failed to open {}", jsonl_path.display()))?;
-    writeln!(f, "{}", serde_json::to_string(&rec)?)?;
+    append_claim_jsonl_once(&jsonl_path, &rec)?;
 
     let rowid = claim_id_to_rowid(id);
     let emb_bytes = floats_to_bytes(&emb);
-    let _ = conn.execute("INSERT OR REPLACE INTO vec_claims(rowid, embedding) VALUES (?1, ?2)", params![rowid, emb_bytes]);
+    replace_claim_embedding(&conn, rowid, emb_bytes);
     conn.execute("INSERT OR REPLACE INTO claim_cluster_map(claim_id, cluster_id) VALUES (?1, ?2)", params![id, cluster_id])?;
     Ok(())
 }
@@ -470,6 +466,7 @@ pub fn append_claim_typed_with_status(
 /// Bump the `confirmed_ts` of an existing claim (a `confirms` op). Rewrites claims.jsonl in place;
 /// cheap at these sizes (hundreds of lines). No-op if the target id is absent.
 pub fn confirm_claim(project_dir: &Path, target_id: &str, ts: &str) -> Result<bool> {
+    let _claim_lock = acquire_claim_store_lock(project_dir)?;
     let jsonl_path = claims_jsonl_path(project_dir);
     if !jsonl_path.exists() { return Ok(false); }
     let content = fs::read_to_string(&jsonl_path)?;
@@ -626,6 +623,58 @@ fn parse_index_array(resp: &str) -> Vec<usize> {
     Vec::new()
 }
 
+fn acquire_claim_store_lock(project_dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(project_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(project_dir.join(".claims.lock"))
+        .with_context(|| format!("failed to open claim store lock under {}", project_dir.display()))?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        anyhow::bail!("failed to acquire claim store lock for {}", project_dir.display());
+    }
+    Ok(file)
+}
+
+fn append_claim_jsonl_once(jsonl_path: &Path, rec: &ClaimRecord) -> Result<bool> {
+    if claim_jsonl_contains_id(jsonl_path, &rec.id)? {
+        return Ok(false);
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(jsonl_path)
+        .with_context(|| format!("failed to open {}", jsonl_path.display()))?;
+    writeln!(f, "{}", serde_json::to_string(rec)?)?;
+    Ok(true)
+}
+
+fn claim_jsonl_contains_id(jsonl_path: &Path, id: &str) -> Result<bool> {
+    if !jsonl_path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(jsonl_path)
+        .with_context(|| format!("failed to read {}", jsonl_path.display()))?;
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("id").and_then(|v| v.as_str()) == Some(id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn replace_claim_embedding(conn: &Connection, rowid: i64, emb_bytes: Vec<u8>) {
+    let _ = conn.execute("DELETE FROM vec_claims WHERE rowid = ?1", params![rowid]);
+    let _ = conn.execute(
+        "INSERT INTO vec_claims(rowid, embedding) VALUES (?1, ?2)",
+        params![rowid, emb_bytes],
+    );
+}
+
 /// Deterministic rowid from a UUID-style claim id: take first 15 hex digits → i64.
 fn claim_id_to_rowid(id: &str) -> i64 {
     let hex: String = id.chars().filter(|c| c.is_ascii_hexdigit()).take(15).collect();
@@ -639,6 +688,14 @@ fn find_or_create_cluster(
     emb: &[f32],
     tau: f32,
 ) -> Result<String> {
+    if let Ok(existing) = conn.query_row(
+        "SELECT cluster_id FROM claim_cluster_map WHERE claim_id = ?1",
+        params![claim_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        return Ok(existing);
+    }
+
     // Load all cluster centroids and compute cosine.
     let mut stmt = conn.prepare("SELECT cluster_id, centroid FROM clusters")?;
     let rows: Vec<(String, Vec<f32>)> = stmt
@@ -1087,6 +1144,29 @@ pub fn count_clusters(project_dir: &Path, dim: usize) -> usize {
 mod status_tests {
     use super::*;
 
+    struct FakeEmbedder;
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| vec![text.len() as f32, text.bytes().next().unwrap_or_default() as f32])
+                .collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    fn read_claim_records(project_dir: &Path) -> Vec<ClaimRecord> {
+        fs::read_to_string(claims_jsonl_path(project_dir))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ClaimRecord>(line).ok())
+            .collect()
+    }
+
     /// (a) An OLD claim JSON line with NO `status` field must still deserialize, to `Unknown`.
     #[test]
     fn old_claim_without_status_deserializes_to_unknown() {
@@ -1130,5 +1210,137 @@ mod status_tests {
             .unwrap();
 
         assert_eq!(timeout_ms, crate::db::SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn append_claim_with_status_is_idempotent_in_jsonl_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let mut embedder = FakeEmbedder;
+        let id = "abc123";
+
+        append_claim_with_status(
+            project,
+            &mut embedder,
+            id,
+            "2026-07-02",
+            "sess-1",
+            "old assertion",
+            "explicit",
+            "evidence",
+            &[EvidenceRange { start: 1, end: 1 }],
+            None,
+            ClaimStatus::Settled,
+        )
+        .unwrap();
+        append_claim_with_status(
+            project,
+            &mut embedder,
+            id,
+            "2026-07-02",
+            "sess-1",
+            "newer assertion with refreshed embedding",
+            "explicit",
+            "evidence",
+            &[EvidenceRange { start: 1, end: 1 }],
+            None,
+            ClaimStatus::Settled,
+        )
+        .unwrap();
+
+        let records = read_claim_records(project);
+        assert_eq!(records.len(), 1, "duplicate id must not append a second JSONL row");
+        assert_eq!(records[0].id, id);
+
+        let conn = open_claims_db(&claims_db_path(project), embedder.dimension()).unwrap();
+        let rowid = claim_id_to_rowid(id);
+        let emb: Vec<u8> = conn
+            .query_row("SELECT embedding FROM vec_claims WHERE rowid = ?1", params![rowid], |r| r.get(0))
+            .unwrap();
+        let floats = bytes_to_floats(&emb);
+        assert_eq!(floats[0], "newer assertion with refreshed embedding".len() as f32);
+    }
+
+    #[test]
+    fn append_claim_typed_is_idempotent_in_jsonl_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let mut embedder = FakeEmbedder;
+        let id = "def456";
+
+        append_claim_typed_with_status(
+            project,
+            &mut embedder,
+            id,
+            "2026-07-02",
+            "sess-1",
+            "typed assertion",
+            "implicit",
+            "evidence",
+            &[EvidenceRange { start: 2, end: 3 }],
+            vec!["old-claim".into()],
+            ClaimStatus::Proposed,
+        )
+        .unwrap();
+        append_claim_typed_with_status(
+            project,
+            &mut embedder,
+            id,
+            "2026-07-02",
+            "sess-1",
+            "typed assertion",
+            "implicit",
+            "evidence",
+            &[EvidenceRange { start: 2, end: 3 }],
+            vec!["different-edge-that-should-not-append".into()],
+            ClaimStatus::Proposed,
+        )
+        .unwrap();
+
+        let records = read_claim_records(project);
+        assert_eq!(records.len(), 1, "duplicate typed id must not append");
+        assert_eq!(records[0].id, id);
+        assert_eq!(records[0].supersedes, vec!["old-claim"]);
+    }
+
+    #[test]
+    fn duplicate_scan_ignores_malformed_legacy_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        fs::write(claims_jsonl_path(project), "not json\n{\"missing\":\"id\"}\n").unwrap();
+        let mut embedder = FakeEmbedder;
+
+        append_claim_with_status(
+            project,
+            &mut embedder,
+            "feed01",
+            "2026-07-02",
+            "sess-1",
+            "claim survives malformed legacy lines",
+            "explicit",
+            "evidence",
+            &[],
+            None,
+            ClaimStatus::Settled,
+        )
+        .unwrap();
+        append_claim_with_status(
+            project,
+            &mut embedder,
+            "feed01",
+            "2026-07-02",
+            "sess-1",
+            "claim survives malformed legacy lines",
+            "explicit",
+            "evidence",
+            &[],
+            None,
+            ClaimStatus::Settled,
+        )
+        .unwrap();
+
+        let records = read_claim_records(project);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "feed01");
     }
 }
