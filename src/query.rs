@@ -1,10 +1,10 @@
 use crate::config::load_config;
-use crate::db::{open_query_db, open_query_db_at, vector_search, SearchHit};
+use crate::db::{open_query_db, vector_search, SearchHit};
 use crate::embed::{build_embedder, fastembed_cache_dir};
 use crate::events::{log_event, truncate};
 use anyhow::Result;
 use fastembed::{RerankerModel, RerankResult, TextRerank};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Cosine-distance threshold: anything above this is treated as "not relevant".
 /// sqlite-vec distance = 1 - cosine_similarity, so:
@@ -23,14 +23,9 @@ pub struct QueryResult {
     pub score: f64,
 }
 
-/// Returns the path to the global index db (~/.proactive-context/global/index.db), if home is available.
-fn global_db_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".proactive-context/global/index.db"))
-}
-
-/// Run a semantic query against the local index, optionally also querying the global db.
+/// Run a semantic query against the project index.
 /// Emits query.start, retrieve.subquery (primary), retrieve.hit* events.
-pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: bool) -> Result<Vec<QueryResult>> {
+pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool) -> Result<Vec<QueryResult>> {
     let cfg = load_config()?;
     let mut embedder = build_embedder(&cfg)?;
 
@@ -45,8 +40,7 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
     log_event("query.start", None, serde_json::json!({
         "query_chars": query.len(),
         "top_k": top_k,
-        "rerank": rerank,
-        "global": global
+        "rerank": rerank
     }));
 
     // Emit retrieve.subquery for this primary query
@@ -65,46 +59,7 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool, global: b
 
     // Query the project index
     let conn = open_query_db(root)?;
-    let project_hits = vector_search(&conn, q_emb, candidate_k, DEFAULT_MAX_DISTANCE)?;
-
-    // Optionally query global db
-    let global_hits: Vec<SearchHit> = if global {
-        if let Some(gdb_path) = global_db_path() {
-            if gdb_path.exists() {
-                match open_query_db_at(&gdb_path) {
-                    Ok(gconn) => {
-                        match vector_search(&gconn, q_emb, candidate_k, DEFAULT_MAX_DISTANCE) {
-                            Ok(hits) => hits,
-                            Err(e) => {
-                                eprintln!("Warning: failed to query global index: {}", e);
-                                vec![]
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: failed to open global index: {}", e);
-                        vec![]
-                    }
-                }
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
-
-    // Merge hits from project and global, deduplicate by content_hash
-    let mut merged: Vec<SearchHit> = Vec::with_capacity(project_hits.len() + global_hits.len());
-    let mut seen_hashes = std::collections::HashSet::new();
-
-    for hit in project_hits.into_iter().chain(global_hits.into_iter()) {
-        if seen_hashes.insert(hit.content_hash.clone()) {
-            merged.push(hit);
-        }
-    }
+    let mut merged = vector_search(&conn, q_emb, candidate_k, DEFAULT_MAX_DISTANCE)?;
 
     // Sort by distance ascending (best first)
     merged.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));

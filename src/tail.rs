@@ -366,7 +366,7 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
             trunc(&format!("[{}·{}]{} {}", cat, vol, global_hint, slug), budget)
         }
         "synth.write" => {
-            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("PRODUCT_MODEL.md");
+            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("docs/wiki/_index.md");
             let bytes = p.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let lessons_in = p.get("lessons_in").and_then(|v| v.as_u64()).unwrap_or(0);
             trunc(
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn golden_synth_write_no_color() {
-        // At width=120 body_budget=60. The body is "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/PRODUCT_MODEL.md · 1615 bytes · 1 lessons"
+        // At width=120 body_budget=60. The body is "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/docs/wiki/_index.md · 1615 bytes · 1 lessons"
         // which is >60 chars → truncated to 59+ellipsis.
         let ev = make_ev(
             "2026-05-28T20:54:58.698Z",
@@ -1292,7 +1292,7 @@ mod tests {
             "c3d9-1780001677524",
             "synth.write",
             None,
-            json!({"bytes": 1615, "lessons_in": 1, "path": "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/PRODUCT_MODEL.md"}),
+            json!({"bytes": 1615, "lessons_in": 1, "path": "/Users/pablofernandez/.proactive-context/projects/Users_pablofernandez_src_proactive-context/docs/wiki/_index.md"}),
         );
         let result = render_line(&ev, false, true, Verbosity::Default, 120).unwrap();
         assert_eq!(result, "20:54:58  524  proactive…  = synth.write  /Users/pablofernandez/.proactive-context/projects/Users_pab…");

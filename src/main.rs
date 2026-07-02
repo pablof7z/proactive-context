@@ -102,9 +102,6 @@ enum Commands {
         #[arg(long, short)]
         rerank: bool,
 
-        /// Also query the global lessons index (~/.proactive-context/global/index.db) and merge results
-        #[arg(long)]
-        global: bool,
     },
 
     /// Index markdown files in a specific directory into the project index.
@@ -735,11 +732,11 @@ fn main() -> Result<()> {
             recall::run(action)?;
         }
 
-        Commands::Query { query, top_k, rerank, global } => {
+        Commands::Query { query, top_k, rerank } => {
             // Seed event context so run_query emits with correct project/req
             let project = normalize_path(&root);
             init_context(&project, "");
-            let results = run_query(&root, &query, top_k, rerank, global)?;
+            let results = run_query(&root, &query, top_k, rerank)?;
             print_results(&results, &root);
         }
 
