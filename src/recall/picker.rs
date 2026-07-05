@@ -176,58 +176,67 @@ pub fn fetch_models() -> Vec<Entry> {
     v
 }
 
+fn try_ollama_tags(c: &reqwest::blocking::Client, base: &str) -> Vec<Entry> {
+    let Ok(resp) = c.get(format!("{}/api/tags", base)).send() else {
+        return vec![];
+    };
+    let Ok(j) = resp.json::<Value>() else {
+        return vec![];
+    };
+    let Some(models) = j.get("models").and_then(|d| d.as_array()) else {
+        return vec![];
+    };
+    models
+        .iter()
+        .filter_map(|m| m.get("name").and_then(|x| x.as_str()).map(|name| Entry {
+            spec: format!("ollama:{}", name),
+            provider: Provider::Ollama,
+            ctx: m.pointer("/details/context_length").and_then(|x| x.as_u64()).unwrap_or(0),
+            price_in: 0.0,
+            price_out: 0.0,
+            note: m.get("size").and_then(|s| s.as_u64())
+                .map(|b| format!("{:.1}GB", b as f64 / 1e9)),
+        }))
+        .collect()
+}
+
+fn try_ollama_v1_models(c: &reqwest::blocking::Client, base: &str) -> Vec<Entry> {
+    let Ok(resp) = c.get(format!("{}/v1/models", base)).send() else {
+        return vec![];
+    };
+    let Ok(j) = resp.json::<Value>() else {
+        return vec![];
+    };
+    j.get("data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(|id| Entry {
+            spec: format!("ollama:{}", id),
+            provider: Provider::Ollama,
+            ctx: m.get("context_length").and_then(|x| x.as_u64()).unwrap_or(0),
+            price_in: 0.0,
+            price_out: 0.0,
+            note: m.get("name").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        }))
+        .collect()
+}
+
 fn fetch_ollama_models(c: &reqwest::blocking::Client) -> Vec<Entry> {
-    let base = super::llm::ollama_base().trim_end_matches('/').to_string();
-    let mut out = vec![];
+    const STANDARD: &str = "http://localhost:11434";
+    let configured = super::llm::ollama_base();
+    let base = configured.trim_end_matches('/');
 
-    if let Ok(resp) = c.get(format!("{}/api/tags", base)).send() {
-        if let Ok(j) = resp.json::<Value>() {
-            if let Some(models) = j.get("models").and_then(|d| d.as_array()) {
-                for m in models {
-                    if let Some(name) = m.get("name").and_then(|x| x.as_str()) {
-                        out.push(Entry {
-                            spec: format!("ollama:{}", name),
-                            provider: Provider::Ollama,
-                            ctx: 0,
-                            price_in: 0.0,
-                            price_out: 0.0,
-                            note: m
-                                .get("size")
-                                .and_then(|s| s.as_u64())
-                                .map(|b| format!("{:.1}GB", b as f64 / 1e9)),
-                        });
-                    }
-                }
-                return out;
-            }
-        }
+    // Try configured URL first; if empty, also try the standard daemon port.
+    let mut out = try_ollama_tags(c, base);
+    if out.is_empty() {
+        out = try_ollama_v1_models(c, base);
     }
-
-    if let Ok(resp) = c.get(format!("{}/v1/models", base)).send() {
-        if let Ok(j) = resp.json::<Value>() {
-            for m in j
-                .get("data")
-                .and_then(|d| d.as_array())
-                .cloned()
-                .unwrap_or_default()
-            {
-                if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
-                    out.push(Entry {
-                        spec: format!("ollama:{}", id),
-                        provider: Provider::Ollama,
-                        ctx: m
-                            .get("context_length")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                        price_in: 0.0,
-                        price_out: 0.0,
-                        note: m
-                            .get("name")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string()),
-                    });
-                }
-            }
+    if out.is_empty() && base != STANDARD {
+        out = try_ollama_tags(c, STANDARD);
+        if out.is_empty() {
+            out = try_ollama_v1_models(c, STANDARD);
         }
     }
     out

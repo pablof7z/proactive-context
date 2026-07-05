@@ -8,7 +8,7 @@ interface Props {
 const { item } = Astro.props;
 ---
 
-<article class={`refusal-card surface is-${item.tone}`} data-reveal>
+<article class={`refusal-card surface is-${item.tone}`}>
   <span class="refusal-mark">⊘</span>
   <h3>{item.title}</h3>
   <p>{item.body}</p>

@@ -5,10 +5,13 @@ const hookExample = `{
   "UserPromptSubmit": "pc inject",
   "Stop": "pc capture --in"
 }`;
+
+const installCommand = `cargo build --release
+just install`;
 ---
 
 <section id="install" class="section install-section" aria-labelledby="install-heading">
-  <div class="section-intro" data-reveal>
+  <div class="section-intro">
     <p class="eyebrow">Install</p>
     <h2 id="install-heading">Install the binary. Wire the hooks. Let the wiki grow.</h2>
     <p>
@@ -19,20 +22,26 @@ const hookExample = `{
 
   <div class="install-grid">
     <TerminalCard title="quick start" label="local checkout">
-      <div class="terminal-row command">git clone https://github.com/pablof7z/proactive-context</div>
-      <div class="terminal-row command">cd proactive-context</div>
-      <div class="terminal-row command">cargo install --path .</div>
-      <div class="terminal-row command">pc configure</div>
-      <div class="terminal-row command">pc install</div>
-      <div class="terminal-row command">pc archeologist</div>
+      <div class="copy-row">
+        <code><span>$</span> cargo build --release</code>
+        <button type="button" data-copy={installCommand} aria-label="Copy install commands">copy</button>
+      </div>
+      <div class="terminal-row command">$ just install</div>
+      <div class="terminal-gap"></div>
+      <div class="terminal-row event"><span>local</span><span>cfg</span><span>pc</span><span class="is-blue">pc configure</span><span>models and providers</span></div>
+      <div class="terminal-row event"><span>local</span><span>hook</span><span>pc</span><span class="is-green">pc install</span><span>wire lifecycle hooks</span></div>
+      <div class="terminal-row event"><span>local</span><span>hist</span><span>pc</span><span class="is-amber">pc archeologist</span><span>replay existing transcripts</span></div>
     </TerminalCard>
 
-    <article class="hook-block surface" data-reveal>
+    <article class="hook-block surface">
       <div class="card-meta">
         <span class="badge is-magenta">hook shape</span>
         <code>agent lifecycle</code>
       </div>
-      <pre aria-label="Hook example"><code>{hookExample}</code></pre>
+      <div class="code-copy">
+        <pre aria-label="Hook example"><code>{hookExample}</code></pre>
+        <button type="button" data-copy={hookExample} aria-label="Copy hook example">copy</button>
+      </div>
       <p>
         Claude Code is the current primary host integration. The architecture is not limited to Claude Code.
       </p>

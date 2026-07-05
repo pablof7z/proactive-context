@@ -259,10 +259,10 @@ struct ReplState {
 }
 
 impl ReplState {
-    fn new(spec: &ModelSpec) -> Self {
+    fn new(proc_spec: &ModelSpec, gate_spec: &ModelSpec) -> Self {
         Self {
-            proc_spec: spec.clone(),
-            gate_spec: ModelSpec::parse(GATE_DEFAULT),
+            proc_spec: proc_spec.clone(),
+            gate_spec: gate_spec.clone(),
             mode: AnswerMode::Full,
             last_question: None,
             history: Vec::new(),
@@ -736,7 +736,7 @@ fn friendly_error(e: &anyhow::Error) {
     }
 }
 
-pub fn run(spec: &ModelSpec, wiki: bool) -> Result<()> {
+pub fn run(spec: &ModelSpec, gate_spec: &ModelSpec, wiki: bool) -> Result<()> {
     configure_color();
 
     let (corpus_txt, corpus_view, store) = if wiki {
@@ -767,7 +767,7 @@ pub fn run(spec: &ModelSpec, wiki: bool) -> Result<()> {
         (txt, view, Some(store))
     };
 
-    let mut state = ReplState::new(spec);
+    let mut state = ReplState::new(spec, gate_spec);
     let mut ledger = Ledger::default();
 
     print_banner(&state, &corpus_view);
@@ -843,7 +843,7 @@ mod tests {
 
     fn fixture_state() -> (ReplState, Ledger, CorpusView) {
         (
-            ReplState::new(&ModelSpec::parse("openrouter:test/model")),
+            ReplState::new(&ModelSpec::parse("openrouter:test/model"), &ModelSpec::parse("openrouter:test/gate")),
             Ledger::default(),
             CorpusView {
                 source: CorpusSource::Transcripts,

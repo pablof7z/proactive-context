@@ -18,9 +18,8 @@ use clap::Subcommand;
 
 use crate::provider::ModelSpec;
 
-/// Default 1M-context model. Uses pc's existing OpenRouter key (the user's pc runs
-/// on OpenRouter). Override e.g. --model "ollama:gemini-3-flash-preview:cloud".
-const DEFAULT_MODEL: &str = "openrouter:google/gemini-3-flash-preview";
+const DEFAULT_ANSWER_MODEL: &str = "openrouter:google/gemini-3-flash-preview";
+const DEFAULT_GATE_MODEL: &str = "openrouter:deepseek/deepseek-v4-flash";
 
 #[derive(Subcommand)]
 pub enum RecallCmd {
@@ -65,8 +64,23 @@ pub enum RecallCmd {
     },
 }
 
+fn cfg_answer_model() -> String {
+    crate::config::load_config().ok()
+        .map(|c| c.recall_answer_model)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ANSWER_MODEL.to_string())
+}
+
+fn cfg_gate_model() -> String {
+    crate::config::load_config().ok()
+        .map(|c| c.recall_gate_model)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_GATE_MODEL.to_string())
+}
+
 fn spec_of(model: &Option<String>) -> ModelSpec {
-    ModelSpec::parse(model.as_deref().unwrap_or(DEFAULT_MODEL))
+    let default = cfg_answer_model();
+    ModelSpec::parse(model.as_deref().unwrap_or(&default))
 }
 
 pub fn run(cmd: RecallCmd) -> Result<()> {
@@ -81,7 +95,11 @@ pub fn run(cmd: RecallCmd) -> Result<()> {
                 ask::run_once(&spec_of(&model), &q, brief)
             }
         }
-        RecallCmd::Repl { model, wiki } => repl::run(&spec_of(&model), wiki),
+        RecallCmd::Repl { model, wiki } => {
+            let answer = spec_of(&model);
+            let gate = ModelSpec::parse(&cfg_gate_model());
+            repl::run(&answer, &gate, wiki)
+        }
         RecallCmd::Gate { model } => gate::build_gate(
             &ModelSpec::parse(model.as_deref().unwrap_or(gate::GATE_DEFAULT))),
     }

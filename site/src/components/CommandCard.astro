@@ -8,10 +8,12 @@ interface Props {
 const { item } = Astro.props;
 ---
 
-<article class={`command-card surface is-${item.tone}`} data-reveal>
+<article class={`command-card surface is-${item.tone}`}>
+  <span class="card-glyph" aria-hidden="true">{item.glyph}</span>
   <div class="command-head">
     <code>{item.command}</code>
     <span>{item.state}</span>
   </div>
   <p>{item.description}</p>
+  <div class="command-trace">{item.trace}</div>
 </article>

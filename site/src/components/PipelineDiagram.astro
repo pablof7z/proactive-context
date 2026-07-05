@@ -2,7 +2,7 @@
 ---
 
 <section id="how-it-works" class="section pipeline-section" aria-labelledby="pipeline-heading">
-  <div class="section-intro" data-reveal>
+  <div class="section-intro">
     <p class="eyebrow">Capture - Wiki - Inject</p>
     <h2 id="pipeline-heading">Capture → Wiki → Inject</h2>
     <p>
@@ -20,9 +20,9 @@
     </aside>
 
     <div class="pipeline-grid">
-      <article id="capture-panel" class="pipeline-panel surface is-blue" data-reveal>
+      <article id="capture-panel" class="pipeline-panel surface is-cyan">
         <div class="panel-index">01</div>
-        <p class="eyebrow">Capture</p>
+        <p class="eyebrow">◆ Capture</p>
         <h3>Turn completed sessions into cited claims.</h3>
         <p>
           At session end, pc reads the transcript and extracts atomic claims: decisions,
@@ -30,33 +30,43 @@
           at transcript line ranges. Rust slices the evidence.
         </p>
         <p class="microcopy">The model proposes evidence. Rust verifies it.</p>
+        <div class="badge-row">
+          <span class="badge is-blue">explicit</span>
+          <span class="badge is-green">verified</span>
+          <span class="badge is-amber">line-anchored</span>
+        </div>
         <div class="line-snippet" aria-label="Line-numbered transcript excerpt">
-          <span><b>128</b> user: No, do not make this a generic memory system.</span>
-          <span><b>129</b> user: The point is provenance over fluency.</span>
+          <span><b>128</b> user: No, not generic memory.</span>
+          <span><b>129</b> user: Preserve provenance. The correction is the asset.</span>
           <span><b>130</b> assistant: Understood, position around cited human discernment.</span>
         </div>
       </article>
 
-      <article id="wiki-panel" class="pipeline-panel surface is-amber" data-reveal>
+      <article id="wiki-panel" class="pipeline-panel surface is-green">
         <div class="panel-index">02</div>
-        <p class="eyebrow">Wiki</p>
+        <p class="eyebrow">⬡ Wiki</p>
         <h3>Distill messy conversation into durable project knowledge.</h3>
         <p>
           Claims become a project wiki: guides for current truth, episode cards for direction
           changes, research records for investigations, and an append-only claim log underneath it all.
         </p>
         <p class="microcopy">A wiki, not a landfill.</p>
+        <div class="badge-row">
+          <span class="badge is-green">current</span>
+          <span class="badge is-amber">historical</span>
+          <span class="badge is-magenta">append-only</span>
+        </div>
         <div class="artifact-stack" aria-label="Wiki artifact folders">
-          <code>docs/wiki/guides/</code>
-          <code>docs/wiki/episodes/</code>
-          <code>docs/wiki/research/</code>
+          <code>docs/wiki/guides/project-positioning.md</code>
+          <code>docs/wiki/episodes/context-dump-reversal.md</code>
+          <code>docs/wiki/research/inject-redesign-validation.md</code>
           <code>claims.jsonl</code>
         </div>
       </article>
 
-      <article id="inject-panel" class="pipeline-panel surface is-magenta" data-reveal>
+      <article id="inject-panel" class="pipeline-panel surface is-magenta">
         <div class="panel-index">03</div>
-        <p class="eyebrow">Inject</p>
+        <p class="eyebrow">✎ Inject</p>
         <h3>Push the right context before the agent acts.</h3>
         <p>
           On each prompt, pc retrieves candidate sources, selects the relevant guides and episode
@@ -64,11 +74,15 @@
           seen, and injects the result as a system reminder.
         </p>
         <p class="microcopy">Context window is attention.</p>
+        <div class="badge-row">
+          <span class="badge is-blue">selected</span>
+          <span class="badge is-cyan">deduped</span>
+          <span class="badge is-magenta">injected</span>
+        </div>
         <div class="trace-block" aria-label="Inject trace">
-          <span>▶ inject.start "why did we reject context dumps?"</span>
-          <span>⟜ select sources</span>
-          <span>✎ compile briefing</span>
-          <span>✓ inject.done 312c</span>
+          <span>TITLE: Relevant project direction</span>
+          <span>The product is positioned around cited human discernment,</span>
+          <span>not generic memory. (docs/wiki/guides/positioning.md:18)</span>
         </div>
       </article>
     </div>

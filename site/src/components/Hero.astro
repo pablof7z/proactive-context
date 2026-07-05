@@ -5,7 +5,7 @@ import { trustItems } from "@data/home";
 ---
 
 <section id="top" class="hero section" aria-labelledby="hero-heading">
-  <div class="hero-copy" data-reveal>
+  <div class="hero-copy">
     <p class="eyebrow">Provenance-first context infrastructure for AI agents</p>
     <h1 id="hero-heading">Stop losing the decisions behind the work.</h1>
     <p class="hero-subhead">
@@ -17,15 +17,15 @@ import { trustItems } from "@data/home";
     </p>
     <div class="hero-actions">
       <a class="button primary" href="#install">Install pc</a>
-      <a class="button secondary" href="#how-it-works">Read how it works</a>
+      <a class="button secondary" href="#how-it-works">Read the architecture</a>
     </div>
     <ul class="trust-strip" aria-label="Product properties">
       {trustItems.map((item) => <li>{item}</li>)}
     </ul>
   </div>
 
-  <div class="hero-instrument" aria-label="Capture to wiki to inject flow" data-reveal>
-    <div class="provenance-flow">
+  <div class="hero-instrument" aria-label="Capture to wiki to inject flow">
+    <div class="provenance-flow hero-flow">
       <article class="flow-column">
         <span class="flow-label">Transcript</span>
         <div class="evidence-lines">
@@ -52,24 +52,23 @@ import { trustItems } from "@data/home";
       </article>
     </div>
 
-    <TerminalCard title="$ pc" label="hook trace">
-      <div class="terminal-row command">$ pc capture --in</div>
-      <div class="terminal-row is-blue">◆ distilling session</div>
-      <div class="terminal-row muted">  extracted 17 cited claims</div>
-      <div class="terminal-row muted">  updated docs/wiki/guides/inject-pipeline.md</div>
-      <div class="terminal-row muted">  wrote episode card: "raw dumps replaced by selective injection"</div>
+    <TerminalCard title="pc tail" label="local">
+      <div class="terminal-row event"><span>14:02:08</span><span>a3f</span><span>proactive</span><span class="is-blue">◆ capture.start</span><span>Stop hook · session closed</span></div>
+      <div class="terminal-row event"><span>14:02:09</span><span>a3f</span><span>proactive</span><span class="is-cyan">✚ claims</span><span>17 cited · explicit/implicit</span></div>
+      <div class="terminal-row event"><span>14:02:10</span><span>a3f</span><span>proactive</span><span class="is-green">✓ wiki.update</span><span>docs/wiki/guides/positioning.md</span></div>
+      <div class="terminal-row event"><span>14:02:10</span><span>a3f</span><span>proactive</span><span class="is-amber">◆ episode</span><span>context-dump-reversal.md</span></div>
       <div class="terminal-gap"></div>
-      <div class="terminal-row command">$ pc inject</div>
-      <div class="terminal-row is-cyan">▶ selecting relevant sources</div>
-      <div class="terminal-row is-magenta">✎ compiled 312c briefing</div>
-      <div class="terminal-row is-green">✓ injected system reminder</div>
+      <div class="terminal-row event"><span>14:02:11</span><span>a3f</span><span>proactive</span><span class="is-magenta">▶ inject.start</span><span>"Should we make this generic?"</span></div>
+      <div class="terminal-row event"><span>14:02:11</span><span>a3f</span><span>proactive</span><span class="is-blue">⟜ select.sources</span><span>2 guides · 1 episode</span></div>
+      <div class="terminal-row event"><span>14:02:12</span><span>a3f</span><span>proactive</span><span class="is-magenta">✎ briefing</span><span>287c · cited</span></div>
+      <div class="terminal-row event"><span>14:02:12</span><span>a3f</span><span>proactive</span><span class="is-green">✓ inject.done</span><span>1.2s · compiled</span></div>
     </TerminalCard>
 
     <div class="status-citations">
-      <span class="statusline">⬡ ✎ 312c · 14g</span>
+      <span class="statusline">⬡ ✎ 287c · 14g</span>
       <div>
-        <CitationChip>(docs/wiki/guides/inject-pipeline.md:42)</CitationChip>
-        <CitationChip tone="blue">(docs/wiki/episodes/2026-06-04-context-dump-reversal.md:18)</CitationChip>
+        <CitationChip>(docs/wiki/guides/positioning.md:18)</CitationChip>
+        <CitationChip tone="blue">(docs/wiki/episodes/context-dump-reversal.md:12)</CitationChip>
       </div>
     </div>
   </div>

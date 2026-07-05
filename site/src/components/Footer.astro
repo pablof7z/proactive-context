@@ -10,6 +10,7 @@ const footerLinks = [
 <footer class="site-footer">
   <div>
     <a class="brand footer-brand" href="#top">
+      <span class="brand-sigil" aria-hidden="true">⬡</span>
       <span class="brand-mark">pc</span>
       <span class="brand-sub">Provenance over fluency.</span>
     </a>
@@ -18,4 +19,5 @@ const footerLinks = [
   <nav aria-label="Footer">
     {footerLinks.map(([label, href]) => <a href={href}>{label}</a>)}
   </nav>
+  <span class="footer-statusline">⬡ ✎ 312c · 14g</span>
 </footer>

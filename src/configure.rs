@@ -1,75 +1,65 @@
-/// Interactive TUI for configuring LLM models across all roles.
-///
-/// Layout:
-///   Left pane  — role list (generate, decompose, inject_select, …)
-///   Right pane — scrollable, filterable model list (OpenRouter + Ollama)
-///
-/// Keys:
-///   Tab / ←/→   switch pane
-///   ↑/↓ j/k     navigate
-///   /            enter filter mode (type to narrow models)
-///   Esc          exit filter / cancel
-///   Enter        assign selected model to selected role
-///   s            save & quit
-///   q / Ctrl-C   quit (shows unsaved indicator)
-use std::io;
+//! Interactive `pc configure` — menu-based model configuration.
+//!
+//! Built on the `inquire` crate. Models are fetched up-front (with a brief
+//! progress message), then a main menu lets the user dive into each section
+//! (Inject / Capture / Recall). Each section lists its roles; picking a role
+//! opens a `Select` over the fetched model list. Esc backs out at every level.
+
 use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::{
-    event::{self as ct_event, Event as CtEvent, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
-};
+use inquire::{InquireError, Select, Text};
 
 use crate::config::{load_config, save_config, Config};
-use crate::provider::{ModelSpec, Provider};
+use crate::provider::Provider;
 
 // ─── Role descriptors ─────────────────────────────────────────────────────────
 
-struct Role {
+struct RoleDef {
     key: &'static str,
-    /// Short name shown in the list
-    label: &'static str,
-    /// One sentence — what does this model DO?
+    /// Short name shown in the section submenu (e.g. "Gate (fast)").
+    name: &'static str,
+    /// One-line explanation shown as the picker help message.
     description: &'static str,
-    /// What kind of model to pick
-    suggestion: &'static str,
 }
 
-const ROLES: &[Role] = &[
-    Role {
+const INJECT_ROLES: &[RoleDef] = &[
+    RoleDef {
         key: "inject_select_model",
-        label: "Context scan",
-        description: "Runs before EVERY prompt — scans your wiki and picks what's relevant",
-        suggestion: "→ Must be fast  e.g. haiku, gpt-4o-mini, qwen2.5:7b",
+        name: "Gate (fast)",
+        description: "Scans wiki to decide what's relevant. Runs on EVERY prompt — must be cheap & fast",
     },
-    Role {
+    RoleDef {
         key: "inject_compile_model",
-        label: "Context write",
-        description: "Runs before EVERY prompt — writes the context block Claude reads",
-        suggestion: "→ Use a capable model  e.g. sonnet, gpt-4o, llama3.3:70b",
+        name: "Compile (capable)",
+        description: "Writes the context block injected before your answer. Runs on EVERY prompt",
     },
-    Role {
+];
+
+const CAPTURE_ROLES: &[RoleDef] = &[
+    RoleDef {
         key: "capture_model",
-        label: "Wiki update",
-        description: "After sessions end — reads the conversation, updates the project wiki",
-        suggestion: "→ Use a capable model with tool-calling  e.g. sonnet, gpt-4o",
+        name: "Distill (capable)",
+        description: "Reads the conversation after sessions end and updates your wiki",
     },
-    Role {
+    RoleDef {
         key: "capture_triage_model",
-        label: "Skip check",
-        description: "Quick yes/no: does this session have anything worth capturing?",
-        suggestion: "→ Use the cheapest model you have  e.g. haiku, gpt-4o-mini, qwen:3b",
+        name: "Triage (fast)",
+        description: "Quick yes/no — is this session worth capturing? Runs first to skip empty sessions",
+    },
+];
+
+const RECALL_ROLES: &[RoleDef] = &[
+    RoleDef {
+        key: "recall_gate_model",
+        name: "Gate (fast)",
+        description: "Decides if the corpus answers the question before calling the answer model",
+    },
+    RoleDef {
+        key: "recall_answer_model",
+        name: "Answer (capable, large-context)",
+        description: "Reads the whole transcript corpus and synthesizes the answer",
     },
 ];
 
@@ -79,6 +69,8 @@ fn get_role_value(cfg: &Config, key: &str) -> String {
         "inject_compile_model" => cfg.inject_compile_model.clone(),
         "capture_model" => cfg.capture_model.clone(),
         "capture_triage_model" => cfg.capture_triage_model.clone(),
+        "recall_gate_model" => cfg.recall_gate_model.clone(),
+        "recall_answer_model" => cfg.recall_answer_model.clone(),
         _ => String::new(),
     }
 }
@@ -89,6 +81,8 @@ fn set_role_value(cfg: &mut Config, key: &str, value: String) {
         "inject_compile_model" => cfg.inject_compile_model = value,
         "capture_model" => cfg.capture_model = value,
         "capture_triage_model" => cfg.capture_triage_model = value,
+        "recall_gate_model" => cfg.recall_gate_model = value,
+        "recall_answer_model" => cfg.recall_answer_model = value,
         _ => {}
     }
 }
@@ -100,6 +94,7 @@ pub struct ModelEntry {
     /// Full spec: "openrouter:anthropic/claude-sonnet-4-6" or "ollama:llama3.2"
     pub spec: String,
     /// Human-friendly name (may equal spec for Ollama)
+    #[allow(dead_code)]
     pub display: String,
     /// Optional context length in tokens
     pub ctx_len: Option<u64>,
@@ -118,14 +113,70 @@ impl ModelEntry {
             Provider::ClaudeCli => "CC",
         }
     }
+}
 
-    fn badge_color(&self) -> Color {
-        match self.provider {
-            Provider::OpenRouter => Color::Cyan,
-            Provider::Ollama => Color::Green,
-            Provider::ClaudeCli => Color::Magenta,
-        }
+fn provider_rank(p: &Provider) -> u8 {
+    // Sort: ClaudeCli → Ollama → OpenRouter
+    match p {
+        Provider::ClaudeCli => 0,
+        Provider::Ollama => 1,
+        Provider::OpenRouter => 2,
     }
+}
+
+fn fmt_ctx(ctx: Option<u64>) -> String {
+    match ctx {
+        Some(c) if c >= 1_000_000 => format!("{}M ctx", c / 1_000_000),
+        Some(c) if c >= 1_000 => format!("{}K ctx", c / 1_000),
+        Some(c) if c > 0 => format!("{} ctx", c),
+        _ => String::new(),
+    }
+}
+
+/// Format a single model entry as a one-line Select option, e.g.
+///   `[CC] claude-cli:sonnet                            1M ctx`
+///   `[OL] ollama:glm-5.2:cloud                         1M ctx  (cloud)`
+///   `[OR] openrouter:anthropic/claude-sonnet-4-6       1M ctx  $3.00/M`
+fn entry_label(m: &ModelEntry) -> String {
+    let badge = m.provider_badge();
+    let mut meta = fmt_ctx(m.ctx_len);
+
+    match m.provider {
+        Provider::OpenRouter => {
+            if let Some(p) = m.price_prompt {
+                let per_m = p * 1_000_000.0;
+                if per_m > 0.0 {
+                    let price = format!("${:.2}/M", per_m);
+                    meta = if meta.is_empty() {
+                        price
+                    } else {
+                        format!("{:<8}  {}", meta, price)
+                    };
+                }
+            }
+        }
+        Provider::Ollama => {
+            let tail = if let Some(gb) = m.size_gb {
+                Some(format!("{:.1}GB", gb))
+            } else if m.spec.contains("cloud") {
+                Some("(cloud)".to_string())
+            } else {
+                None
+            };
+            if let Some(tail) = tail {
+                meta = if meta.is_empty() {
+                    tail
+                } else {
+                    format!("{:<8}  {}", meta, tail)
+                };
+            }
+        }
+        Provider::ClaudeCli => {}
+    }
+
+    format!("[{}] {:<44} {}", badge, m.spec, meta)
+        .trim_end()
+        .to_string()
 }
 
 // ─── Model fetching (background thread) ───────────────────────────────────────
@@ -146,9 +197,9 @@ pub fn fetch_models_async(
 
         // ── Claude CLI (static entries — always available if `claude` is in PATH) ──
         for (model, display, ctx_len) in [
-            ("opus",   "Claude Opus (latest)",   Some(1_000_000u64)),
+            ("opus", "Claude Opus (latest)", Some(1_000_000u64)),
             ("sonnet", "Claude Sonnet (latest)", Some(1_000_000u64)),
-            ("haiku",  "Claude Haiku (latest)",  Some(1_000_000u64)),
+            ("haiku", "Claude Haiku (latest)", Some(1_000_000u64)),
         ] {
             all.push(ModelEntry {
                 spec: format!("claude-cli:{model}"),
@@ -225,12 +276,13 @@ fn fetch_openrouter_models(api_key: &str) -> Result<Vec<ModelEntry>> {
     Ok(entries)
 }
 
-fn fetch_ollama_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEntry>> {
-    let base = base_url.trim_end_matches('/');
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()?;
-
+/// Fetch Ollama models from a single base URL. Network/parse failures degrade to
+/// an empty Vec (never an Err) so the caller can transparently fall back.
+fn fetch_ollama_from(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    api_key: Option<&str>,
+) -> Vec<ModelEntry> {
     let make_req = |url: &str| {
         let mut r = client.get(url);
         if let Some(k) = api_key.filter(|k| !k.is_empty()) {
@@ -239,953 +291,263 @@ fn fetch_ollama_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<Mode
         r
     };
 
-    // Try local-style /api/tags first, fall back to OpenAI-compat /v1/models
-    // (Ollama cloud at api.ollama.com uses the /v1/models endpoint)
-    let resp = make_req(&format!("{}/api/tags", base)).send();
-
-    let (resp_json, use_tags_format) = match resp {
-        Ok(r) if r.status().is_success() => {
-            let j: serde_json::Value = r.json()?;
-            // /api/tags returns {"models": [...]}
-            if j.get("models").and_then(|v| v.as_array()).is_some() {
-                (j, true)
-            } else {
-                // Got 200 but wrong shape — try /v1/models
-                let r2 = make_req(&format!("{}/v1/models", base)).send()?;
-                (r2.json()?, false)
-            }
-        }
-        _ => {
-            // /api/tags failed — try /v1/models (Ollama cloud)
-            let r2 = make_req(&format!("{}/v1/models", base)).send()?;
-            (r2.json()?, false)
-        }
+    // Try local-style /api/tags first; if it yields nothing, try the
+    // OpenAI-compat /v1/models endpoint (Ollama cloud).
+    let mut entries = match make_req(&format!("{}/api/tags", base)).send() {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>() {
+            Ok(j) => parse_ollama_tags(&j),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
     };
 
-    let mut entries = Vec::new();
+    if entries.is_empty() {
+        if let Ok(r) = make_req(&format!("{}/v1/models", base)).send() {
+            if let Ok(j) = r.json::<serde_json::Value>() {
+                entries = parse_ollama_v1(&j);
+            }
+        }
+    }
 
-    if use_tags_format {
-        // Local format: {"models": [{"name": "llama3.2:latest", ...}]}
-        if let Some(models) = resp_json["models"].as_array() {
-            for m in models {
-                let name = m["name"].as_str().unwrap_or("").to_string();
-                if name.is_empty() { continue; }
-                let size_gb = m["size"].as_u64().map(|b| b as f64 / 1e9);
-                entries.push(ModelEntry {
-                    spec: format!("ollama:{}", name),
-                    display: name.clone(),
-                    ctx_len: None,
-                    price_prompt: None,
-                    size_gb,
-                    provider: Provider::Ollama,
-                });
+    entries
+}
+
+fn parse_ollama_tags(j: &serde_json::Value) -> Vec<ModelEntry> {
+    let mut entries = Vec::new();
+    if let Some(models) = j["models"].as_array() {
+        for m in models {
+            let name = m["name"].as_str().unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
             }
+            let size_gb = m["size"].as_u64().map(|b| b as f64 / 1e9);
+            entries.push(ModelEntry {
+                spec: format!("ollama:{}", name),
+                display: name.clone(),
+                ctx_len: m.pointer("/details/context_length").and_then(|v| v.as_u64()),
+                price_prompt: None,
+                size_gb,
+                provider: Provider::Ollama,
+            });
         }
-    } else {
-        // OpenAI-compat format: {"data": [{"id": "llama3.2", ...}]}
-        if let Some(data) = resp_json["data"].as_array() {
-            for m in data {
-                let id = m["id"].as_str().unwrap_or("").to_string();
-                if id.is_empty() { continue; }
-                let display = m["name"].as_str()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&id)
-                    .to_string();
-                entries.push(ModelEntry {
-                    spec: format!("ollama:{}", id),
-                    display,
-                    ctx_len: m["context_length"].as_u64(),
-                    price_prompt: None,
-                    size_gb: None,
-                    provider: Provider::Ollama,
-                });
+    }
+    entries
+}
+
+fn parse_ollama_v1(j: &serde_json::Value) -> Vec<ModelEntry> {
+    let mut entries = Vec::new();
+    if let Some(data) = j["data"].as_array() {
+        for m in data {
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
             }
+            let display = m["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            entries.push(ModelEntry {
+                spec: format!("ollama:{}", id),
+                display,
+                ctx_len: m["context_length"].as_u64(),
+                price_prompt: None,
+                size_gb: None,
+                provider: Provider::Ollama,
+            });
         }
+    }
+    entries
+}
+
+fn fetch_ollama_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEntry>> {
+    const STANDARD: &str = "http://localhost:11434";
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
+
+    // Try the configured URL first. If it yields 0 models and it isn't already the
+    // standard local daemon, fall back to http://localhost:11434 (same fix as picker.rs).
+    let mut entries = fetch_ollama_from(&client, base, api_key);
+    if entries.is_empty() && base != STANDARD {
+        entries = fetch_ollama_from(&client, STANDARD, api_key);
     }
 
     entries.sort_by(|a, b| a.spec.cmp(&b.spec));
     Ok(entries)
 }
 
-// ─── App state ────────────────────────────────────────────────────────────────
+// ─── Interactive menus ────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
-enum Pane {
-    Roles,
-    Models,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum ProviderTab {
-    All,
-    ClaudeCli,
-    OpenRouter,
-    Ollama,
-}
-
-impl ProviderTab {
-    const ALL: &'static [ProviderTab] = &[
-        ProviderTab::All,
-        ProviderTab::ClaudeCli,
-        ProviderTab::OpenRouter,
-        ProviderTab::Ollama,
-    ];
-
-    fn next(self) -> Self {
-        let pos = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        Self::ALL[(pos + 1) % Self::ALL.len()]
+/// Open a model picker for one role. Returns the chosen spec, or None if cancelled.
+fn pick_model(role: &RoleDef, current: &str, models: &[ModelEntry]) -> Result<Option<String>> {
+    // No models available — fall back to manual text entry.
+    if models.is_empty() {
+        let res = Text::new(&format!("{} — enter a model spec:", role.name))
+            .with_help_message(role.description)
+            .with_initial_value(current)
+            .prompt();
+        return match res {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        };
     }
 
-    fn prev(self) -> Self {
-        let pos = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        Self::ALL[if pos == 0 { Self::ALL.len() - 1 } else { pos - 1 }]
-    }
+    let labels: Vec<String> = models.iter().map(entry_label).collect();
+    let start = models.iter().position(|m| m.spec == current).unwrap_or(0);
+    let prompt = format!("{}  (current: {})", role.name, current);
 
-    fn label(self) -> &'static str {
-        match self {
-            ProviderTab::All => "All",
-            ProviderTab::ClaudeCli => "Claude CLI",
-            ProviderTab::OpenRouter => "OpenRouter",
-            ProviderTab::Ollama => "Ollama",
-        }
-    }
+    let res = Select::new(&prompt, labels)
+        .with_help_message(role.description)
+        .with_starting_cursor(start)
+        .with_page_size(15)
+        .raw_prompt();
 
-    fn matches(self, p: &Provider) -> bool {
-        match self {
-            ProviderTab::All => true,
-            ProviderTab::ClaudeCli => *p == Provider::ClaudeCli,
-            ProviderTab::OpenRouter => *p == Provider::OpenRouter,
-            ProviderTab::Ollama => *p == Provider::Ollama,
-        }
+    match res {
+        Ok(opt) => Ok(Some(models[opt.index].spec.clone())),
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
-#[allow(dead_code)]
-enum LoadState {
-    Loading,
-    Done,
-    Error(String),
-}
-
-struct AppState {
-    cfg: Config,
-    pane: Pane,
-    role_sel: usize,
-    // model list (all loaded entries)
-    models: Vec<ModelEntry>,
-    load_state: LoadState,
-    // filtered view (indices into self.models)
-    filtered: Vec<usize>,
-    model_sel: usize,
-    // filter text
-    filter: String,
-    filter_mode: bool,
-    // active provider tab
-    provider_tab: ProviderTab,
-    // pending errors (from background thread)
-    fetch_errors: Vec<String>,
-    dirty: bool,
-    // spinner frame counter
-    tick: usize,
-}
-
-impl AppState {
-    fn new(cfg: Config) -> Self {
-        AppState {
-            cfg,
-            pane: Pane::Roles,
-            role_sel: 0,
-            models: Vec::new(),
-            load_state: LoadState::Loading,
-            filtered: Vec::new(),
-            model_sel: 0,
-            filter: String::new(),
-            filter_mode: false,
-            provider_tab: ProviderTab::All,
-            fetch_errors: Vec::new(),
-            dirty: false,
-            tick: 0,
-        }
-    }
-
-    fn set_models(&mut self, entries: Vec<ModelEntry>) {
-        self.models = entries;
-        self.load_state = LoadState::Done;
-        self.apply_filter();
-    }
-
-    fn apply_filter(&mut self) {
-        let q = self.filter.to_lowercase();
-        let tab = self.provider_tab;
-        self.filtered = self
-            .models
+/// Run a section submenu (Inject / Capture / Recall). Loops until the user backs out.
+fn run_section(
+    title: &str,
+    roles: &[RoleDef],
+    cfg: &mut Config,
+    dirty: &mut bool,
+    models: &[ModelEntry],
+) -> Result<()> {
+    loop {
+        let mut opts: Vec<String> = roles
             .iter()
-            .enumerate()
-            .filter(|(_, m)| tab.matches(&m.provider))
-            .filter(|(_, m)| {
-                if q.is_empty() {
-                    return true;
-                }
-                m.spec.to_lowercase().contains(&q)
-                    || m.display.to_lowercase().contains(&q)
-            })
-            .map(|(i, _)| i)
+            .map(|r| format!("{:<32} {}", r.name, get_role_value(cfg, r.key)))
             .collect();
-        // Clamp selection
-        if self.model_sel >= self.filtered.len() && !self.filtered.is_empty() {
-            self.model_sel = self.filtered.len() - 1;
+        opts.push("← Back".to_string());
+
+        let res = Select::new(title, opts)
+            .with_page_size(10)
+            .raw_prompt();
+
+        let idx = match res {
+            Ok(opt) => opt.index,
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                return Ok(())
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Last entry is "← Back".
+        if idx >= roles.len() {
+            return Ok(());
         }
-    }
 
-    fn filter_push(&mut self, ch: char) {
-        self.filter.push(ch);
-        self.model_sel = 0;
-        self.apply_filter();
-    }
-
-    fn filter_pop(&mut self) {
-        self.filter.pop();
-        self.model_sel = 0;
-        self.apply_filter();
-    }
-
-    fn current_role(&self) -> &Role {
-        &ROLES[self.role_sel]
-    }
-
-    fn assign_selected_model(&mut self) {
-        if let Some(&idx) = self.filtered.get(self.model_sel) {
-            let spec = self.models[idx].spec.clone();
-            let key = self.current_role().key;
-            set_role_value(&mut self.cfg, key, spec);
-            self.dirty = true;
-            // Auto-advance to next role
-            if self.role_sel + 1 < ROLES.len() {
-                self.role_sel += 1;
+        let role = &roles[idx];
+        let current = get_role_value(cfg, role.key);
+        if let Some(spec) = pick_model(role, &current, models)? {
+            if !spec.is_empty() && spec != current {
+                set_role_value(cfg, role.key, spec);
+                *dirty = true;
             }
         }
     }
-
-    fn model_up(&mut self) {
-        if self.model_sel > 0 {
-            self.model_sel -= 1;
-        }
-    }
-
-    fn model_down(&mut self) {
-        if !self.filtered.is_empty() && self.model_sel + 1 < self.filtered.len() {
-            self.model_sel += 1;
-        }
-    }
-
-    fn role_up(&mut self) {
-        if self.role_sel > 0 {
-            self.role_sel -= 1;
-        }
-    }
-
-    fn role_down(&mut self) {
-        if self.role_sel + 1 < ROLES.len() {
-            self.role_sel += 1;
-        }
-    }
-
-    fn tab_next(&mut self) {
-        self.provider_tab = self.provider_tab.next();
-        self.model_sel = 0;
-        self.apply_filter();
-    }
-
-    fn tab_prev(&mut self) {
-        self.provider_tab = self.provider_tab.prev();
-        self.model_sel = 0;
-        self.apply_filter();
-    }
-
-    fn tab_count(&self, tab: ProviderTab) -> usize {
-        self.models.iter().filter(|m| tab.matches(&m.provider)).count()
-    }
-}
-
-// ─── Terminal guard ────────────────────────────────────────────────────────────
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = execute!(io::stdout(), crossterm::cursor::Show);
-    }
-}
-
-// ─── Rendering ────────────────────────────────────────────────────────────────
-
-fn render(frame: &mut Frame, state: &AppState, role_list_state: &mut ListState, model_list_state: &mut ListState) {
-    let area = frame.area();
-
-    // Outer block
-    let outer = Block::default()
-        .title(" ⚙  LLM Model Configuration ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    // Main split: roles (left, wider) | models (right)
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(38), Constraint::Min(40)])
-        .split(inner);
-
-    render_roles(frame, h_chunks[0], state, role_list_state);
-    render_models(frame, h_chunks[1], state, model_list_state);
-
-    // Status bar at very bottom of the outer box
-    render_help(frame, {
-        // Carve out bottom 1 line from outer inner
-        let mut r = inner;
-        r.y = r.y + r.height.saturating_sub(1);
-        r.height = 1;
-        r
-    }, state);
-}
-
-fn render_roles(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
-    let active = state.pane == Pane::Roles;
-    let border_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let block = Block::default()
-        .title(" Roles ")
-        .borders(Borders::RIGHT)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Leave bottom 6 lines for description (wraps) + suggestion (wraps)
-    let info_lines = 6u16;
-    let list_area = Rect {
-        height: inner.height.saturating_sub(info_lines),
-        ..inner
-    };
-
-    let items: Vec<ListItem> = ROLES
-        .iter()
-        .enumerate()
-        .map(|(i, role)| {
-            let is_sel = i == state.role_sel;
-            let current = get_role_value(&state.cfg, role.key);
-            let spec = ModelSpec::parse(&current);
-            let badge = match spec.provider {
-                Provider::OpenRouter => Span::styled(
-                    "[OR]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                ),
-                Provider::Ollama => Span::styled(
-                    "[OL]",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
-                ),
-                Provider::ClaudeCli => Span::styled(
-                    "[CC]",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
-                ),
-            };
-
-            let model_id = spec.model;
-            let pane_width = inner.width as usize;
-            // label takes ~14 chars, badge 4, leave rest for model id
-            let max_id = pane_width.saturating_sub(20);
-            let model_short = if model_id.len() > max_id && max_id > 3 {
-                format!("{}…", &model_id[..max_id - 1])
-            } else {
-                model_id
-            };
-
-            let label_style = if is_sel && active {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else if is_sel {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let value_style = if is_sel {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
-            };
-
-            let prefix = if is_sel { "▶ " } else { "  " };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{}{:<14}", prefix, role.label), label_style),
-                badge,
-                Span::styled(format!(" {}", model_short), value_style),
-            ]))
-        })
-        .collect();
-
-    list_state.select(Some(state.role_sel));
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, list_area, list_state);
-
-    // Info block: divider + description (wraps) + suggestion (wraps)
-    let info_y = inner.y + inner.height.saturating_sub(info_lines);
-    let w = inner.width as usize;
-    let role = &ROLES[state.role_sel];
-
-    // Divider
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "─".repeat(w),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-        )),
-        Rect { x: inner.x, y: info_y, width: inner.width, height: 1 },
-    );
-
-    // Description (up to 3 lines, word-wrapped)
-    frame.render_widget(
-        Paragraph::new(Span::styled(role.description, Style::default().fg(Color::White)))
-            .wrap(Wrap { trim: true }),
-        Rect { x: inner.x, y: info_y + 1, width: inner.width, height: 3 },
-    );
-
-    // Suggestion (up to 2 lines, word-wrapped)
-    frame.render_widget(
-        Paragraph::new(Span::styled(role.suggestion, Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)))
-            .wrap(Wrap { trim: true }),
-        Rect { x: inner.x, y: info_y + 4, width: inner.width, height: 2 },
-    );
-}
-
-fn render_provider_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, &tab) in ProviderTab::ALL.iter().enumerate() {
-        let count = state.tab_count(tab);
-        let is_active = state.provider_tab == tab;
-        let label = format!(" {} ({}) ", tab.label(), count);
-        let style = if is_active {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if count == 0 {
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(label, style));
-        if i < ProviderTab::ALL.len() - 1 {
-            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-        }
-    }
-    spans.push(Span::styled(
-        "  [/] switch",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn render_models(frame: &mut Frame, area: Rect, state: &AppState, list_state: &mut ListState) {
-    let active = state.pane == Pane::Models;
-
-    let current_model = get_role_value(&state.cfg, state.current_role().key);
-
-    let title = format!(
-        " Models for '{}'{} ",
-        state.current_role().label,
-        if state.dirty { " *" } else { "" }
-    );
-
-    let border_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::NONE)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Tab bar (1 line) + filter bar (1 line) + list + optional error lines
-    let error_lines = state.fetch_errors.len() as u16;
-    let v_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),              // provider tab bar
-            Constraint::Length(1),              // filter bar
-            Constraint::Min(1),                 // model list
-            Constraint::Length(error_lines),    // fetch errors (0 if none)
-        ])
-        .split(inner);
-
-    render_provider_tabs(frame, v_chunks[0], state);
-
-    // Filter bar
-    let filter_bar = if state.filter_mode {
-        Line::from(vec![
-            Span::styled("/ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(&state.filter, Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(Color::Yellow).add_modifier(Modifier::SLOW_BLINK)),
-        ])
-    } else if !state.filter.is_empty() {
-        Line::from(vec![
-            Span::styled("/ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&state.filter, Style::default().fg(Color::Gray)),
-            Span::styled("  (/ to edit)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(
-                if active { " / to filter" } else { "" },
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-            ),
-        ])
-    };
-    frame.render_widget(Paragraph::new(filter_bar), v_chunks[1]);
-
-    // Model list
-    match &state.load_state {
-        LoadState::Loading => {
-            const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let f = FRAMES[state.tick % FRAMES.len()];
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!(" {} ", f), Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        "Fetching models from OpenRouter and Ollama…",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
-                v_chunks[2],
-            );
-        }
-        LoadState::Error(e) => {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" ✗ {}", e),
-                    Style::default().fg(Color::Red),
-                ))),
-                v_chunks[2],
-            );
-        }
-        LoadState::Done => {
-            if state.filtered.is_empty() {
-                let msg = if state.models.is_empty() {
-                    " No models loaded. Check API keys / Ollama connection."
-                } else {
-                    " No models match the filter."
-                };
-                frame.render_widget(
-                    Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
-                    v_chunks[2],
-                );
-                return;
-            }
-
-            let total = state.filtered.len();
-            let items: Vec<ListItem> = state
-                .filtered
-                .iter()
-                .enumerate()
-                .map(|(i, &idx)| {
-                    let m = &state.models[idx];
-                    let is_sel = i == state.model_sel && active;
-                    let is_current = m.spec == current_model;
-
-                    let badge = Span::styled(
-                        format!("[{}]", m.provider_badge()),
-                        Style::default().fg(m.badge_color()).add_modifier(Modifier::DIM),
-                    );
-
-                    let check = if is_current {
-                        Span::styled(" ✓ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-                    } else {
-                        Span::raw("   ")
-                    };
-
-                    let id_style = if is_current {
-                        Style::default().fg(Color::Green)
-                    } else if is_sel {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    let id_span = Span::styled(format!(" {}", m.display), id_style);
-
-                    let meta = build_meta_span(m, area.width);
-
-                    let base = if is_sel {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-
-                    let line = Line::from(vec![badge, check, id_span, meta]);
-
-                    if is_sel {
-                        ListItem::new(line).style(base)
-                    } else {
-                        ListItem::new(line)
-                    }
-                })
-                .collect();
-
-            // Count display
-            let count_area = Rect {
-                x: v_chunks[2].x,
-                y: v_chunks[2].y,
-                width: v_chunks[2].width,
-                height: 1,
-            };
-            let count_str = if state.filter.is_empty() {
-                format!(" {} models", total)
-            } else {
-                format!(" {}/{} models", total, state.models.len())
-            };
-            let list_area = if v_chunks[2].height > 2 {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(&count_str, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))),
-                    count_area,
-                );
-                Rect {
-                    y: v_chunks[2].y + 1,
-                    height: v_chunks[2].height - 1,
-                    ..v_chunks[2]
-                }
-            } else {
-                v_chunks[2]
-            };
-
-            list_state.select(Some(state.model_sel));
-            let list = List::new(items)
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-            frame.render_stateful_widget(list, list_area, list_state);
-        }
-    }
-
-    // Fetch errors (bottom of model pane, always visible)
-    if !state.fetch_errors.is_empty() && v_chunks[3].height > 0 {
-        let err_lines: Vec<Line> = state
-            .fetch_errors
-            .iter()
-            .map(|e| {
-                Line::from(vec![
-                    Span::styled(" ⚠ ", Style::default().fg(Color::Yellow)),
-                    Span::styled(e.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
-                ])
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(err_lines), v_chunks[3]);
-    }
-}
-
-fn build_meta_span(m: &ModelEntry, _pane_width: u16) -> Span<'static> {
-    let mut parts = Vec::new();
-    if let Some(ctx) = m.ctx_len {
-        if ctx >= 1_000_000 {
-            parts.push(format!("{}M ctx", ctx / 1_000_000));
-        } else if ctx >= 1_000 {
-            parts.push(format!("{}k ctx", ctx / 1_000));
-        }
-    }
-    if let Some(p) = m.price_prompt {
-        let per_m = p * 1_000_000.0;
-        if per_m > 0.0 {
-            parts.push(format!("${:.2}/M", per_m));
-        }
-    }
-    if let Some(gb) = m.size_gb {
-        parts.push(format!("{:.1}GB", gb));
-    }
-    if parts.is_empty() {
-        Span::raw("")
-    } else {
-        Span::styled(
-            format!("  {}", parts.join("  ")),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-        )
-    }
-}
-
-fn render_help(frame: &mut Frame, area: Rect, state: &AppState) {
-    let help = if state.filter_mode {
-        Line::from(vec![
-            Span::styled(" type", Style::default().fg(Color::Yellow)),
-            Span::styled(":filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::styled(":done  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Backspace", Style::default().fg(Color::Yellow)),
-            Span::styled(":delete char", Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        let dirty_indicator = if state.dirty {
-            Span::styled(" [unsaved] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        } else {
-            Span::raw("")
-        };
-        Line::from(vec![
-            dirty_indicator,
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::styled(":pane  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[/]", Style::default().fg(Color::Cyan)),
-            Span::styled(":provider  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓/jk", Style::default().fg(Color::Cyan)),
-            Span::styled(":navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::styled(":assign  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::styled(":filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("s", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(":save  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Red)),
-            Span::styled(":quit", Style::default().fg(Color::DarkGray)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(help), area);
-}
-
-fn render_saved_toast(frame: &mut Frame) {
-    let area = frame.area();
-    let toast = Rect {
-        x: area.width.saturating_sub(26),
-        y: 1,
-        width: 24,
-        height: 3,
-    };
-    frame.render_widget(Clear, toast);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-    let inner = block.inner(toast);
-    frame.render_widget(block, toast);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            " ✓  Config saved",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )),
-        inner,
-    );
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run_configure() -> Result<()> {
-    let cfg = load_config()?;
+    let mut cfg = load_config()?;
 
-    let openrouter_key = cfg.openrouter_api_key.clone();
-    let ollama_base = cfg.ollama_base_url.clone();
-    let ollama_key = cfg.ollama_api_key.clone();
-
-    // Set up terminal
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = execute!(io::stdout(), crossterm::cursor::Show);
-        hook(info);
-    }));
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let _guard = TerminalGuard;
-
-    // Background model fetch
+    // Fetch models up-front so the user isn't waiting mid-flow.
+    println!("Fetching models…");
     let (tx, rx) = mpsc::sync_channel::<FetchMsg>(4);
-    fetch_models_async(openrouter_key, ollama_base, ollama_key, tx);
+    fetch_models_async(
+        cfg.openrouter_api_key.clone(),
+        cfg.ollama_base_url.clone(),
+        cfg.ollama_api_key.clone(),
+        tx,
+    );
 
-    let mut app = AppState::new(cfg);
-    let mut role_ls = ListState::default();
-    let mut model_ls = ListState::default();
+    let mut models: Vec<ModelEntry> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    loop {
+        match rx.recv() {
+            Ok(FetchMsg::Models(entries)) => {
+                models = entries;
+                break;
+            }
+            Ok(FetchMsg::Error(e)) => errors.push(e),
+            Err(_) => break,
+        }
+    }
 
-    let mut show_saved_toast = false;
-    let mut saved_toast_ticks: u8 = 0;
+    // Sort: ClaudeCli → Ollama → OpenRouter, then by spec.
+    models.sort_by(|a, b| {
+        provider_rank(&a.provider)
+            .cmp(&provider_rank(&b.provider))
+            .then(a.spec.cmp(&b.spec))
+    });
+
+    for e in &errors {
+        eprintln!("⚠ {}", e);
+    }
+    if models.is_empty() {
+        eprintln!("⚠ No models fetched — check your OpenRouter key / Ollama connection.");
+        eprintln!("  You can still enter model specs manually.");
+    }
+
+    let mut dirty = false;
 
     loop {
-        app.tick = app.tick.wrapping_add(1);
+        let quit_label = if dirty {
+            "Quit without saving"
+        } else {
+            "Quit"
+        };
+        let opts = vec![
+            "Inject  — context injected before every prompt".to_string(),
+            "Capture — wiki update after sessions end".to_string(),
+            "Recall  — question answering (pc recall repl)".to_string(),
+            "───".to_string(),
+            "Save & quit".to_string(),
+            quit_label.to_string(),
+        ];
 
-        // Drain fetch results
-        loop {
-            match rx.try_recv() {
-                Ok(FetchMsg::Models(entries)) => {
-                    app.set_models(entries);
+        let res = Select::new("pc configure", opts)
+            .with_page_size(10)
+            .raw_prompt();
+
+        let idx = match res {
+            Ok(opt) => opt.index,
+            // Esc / Ctrl-C at the top level discards.
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                if dirty {
+                    println!("Changes discarded.");
                 }
-                Ok(FetchMsg::Error(e)) => {
-                    app.fetch_errors.push(e);
-                }
-                Err(_) => break,
+                return Ok(());
             }
-        }
-
-        // Toast countdown
-        if show_saved_toast {
-            saved_toast_ticks += 1;
-            if saved_toast_ticks > 15 {
-                show_saved_toast = false;
-                saved_toast_ticks = 0;
-            }
-        }
-
-        // Draw
-        terminal.draw(|frame| {
-            render(frame, &app, &mut role_ls, &mut model_ls);
-            if show_saved_toast {
-                render_saved_toast(frame);
-            }
-        })?;
-
-        // Input (~100ms poll)
-        if !ct_event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-
-        let CtEvent::Key(key) = ct_event::read()? else {
-            continue;
+            Err(e) => return Err(e.into()),
         };
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        // Global quit
-        if key.code == KeyCode::Char('c') && ctrl {
-            break;
-        }
-
-        if app.filter_mode {
-            match key.code {
-                KeyCode::Esc => {
-                    app.filter_mode = false;
-                }
-                KeyCode::Backspace => {
-                    app.filter_pop();
-                    if app.filter.is_empty() {
-                        app.filter_mode = false;
-                    }
-                }
-                KeyCode::Enter => {
-                    app.filter_mode = false;
-                }
-                KeyCode::Char(c) => {
-                    app.filter_push(c);
-                }
-                KeyCode::Up if ctrl => {
-                    app.filter_mode = false;
-                    app.model_up();
-                }
-                KeyCode::Down if ctrl => {
-                    app.filter_mode = false;
-                    app.model_down();
-                }
-                _ => {}
+        match idx {
+            0 => run_section("Inject", INJECT_ROLES, &mut cfg, &mut dirty, &models)?,
+            1 => run_section("Capture", CAPTURE_ROLES, &mut cfg, &mut dirty, &models)?,
+            2 => run_section("Recall", RECALL_ROLES, &mut cfg, &mut dirty, &models)?,
+            3 => { /* divider — re-show the menu */ }
+            4 => {
+                save_config(&cfg)?;
+                println!("✓ Config saved.");
+                return Ok(());
             }
-        } else {
-            match key.code {
-                // Quit
-                KeyCode::Char('q') => break,
-
-                // Save
-                KeyCode::Char('s') => {
-                    save_config(&app.cfg)?;
-                    app.dirty = false;
-                    show_saved_toast = true;
-                    saved_toast_ticks = 0;
-                }
-
-                // Switch pane
-                KeyCode::Tab => {
-                    app.pane = if app.pane == Pane::Roles {
-                        Pane::Models
-                    } else {
-                        Pane::Roles
-                    };
-                }
-                KeyCode::Left => {
-                    app.pane = Pane::Roles;
-                }
-                KeyCode::Right => {
-                    app.pane = Pane::Models;
-                }
-
-                // Navigation
-                KeyCode::Up | KeyCode::Char('k') => match app.pane {
-                    Pane::Roles => app.role_up(),
-                    Pane::Models => app.model_up(),
-                },
-                KeyCode::Down | KeyCode::Char('j') => match app.pane {
-                    Pane::Roles => app.role_down(),
-                    Pane::Models => app.model_down(),
-                },
-
-                // Page scroll in models
-                KeyCode::PageUp => {
-                    for _ in 0..10 {
-                        app.model_up();
-                    }
-                }
-                KeyCode::PageDown => {
-                    for _ in 0..10 {
-                        app.model_down();
-                    }
-                }
-
-                // Provider tabs
-                KeyCode::Char('[') => {
-                    app.pane = Pane::Models;
-                    app.tab_prev();
-                }
-                KeyCode::Char(']') => {
-                    app.pane = Pane::Models;
-                    app.tab_next();
-                }
-
-                // Filter
-                KeyCode::Char('/') => {
-                    app.pane = Pane::Models;
-                    app.filter_mode = true;
-                }
-
-                // Assign model to role
-                KeyCode::Enter => {
-                    if app.pane == Pane::Models {
-                        app.assign_selected_model();
-                    } else {
-                        // Enter on roles pane → jump to models
-                        app.pane = Pane::Models;
-                    }
-                }
-
-                // Clear filter with Esc
-                KeyCode::Esc => {
-                    if !app.filter.is_empty() {
-                        app.filter.clear();
-                        app.apply_filter();
-                    }
-                }
-
-                _ => {}
+            5 => {
+                println!("Changes discarded.");
+                return Ok(());
             }
+            _ => {}
         }
     }
-
-    // If dirty and not saved, offer a final save
-    if app.dirty {
-        // Restore terminal first so we can print
-        drop(_guard);
-        eprint!("\nUnsaved changes. Save? [y/N] ");
-        let mut input = String::new();
-        let _ = io::stdin().read_line(&mut input);
-        if input.trim().to_lowercase() == "y" {
-            save_config(&app.cfg)?;
-            eprintln!("Saved.");
-        } else {
-            eprintln!("Discarded.");
-        }
-    }
-
-    Ok(())
 }

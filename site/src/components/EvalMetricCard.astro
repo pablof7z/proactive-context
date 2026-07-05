@@ -8,8 +8,9 @@ interface Props {
 const { item } = Astro.props;
 ---
 
-<article class={`metric-card surface is-${item.tone}`} data-reveal>
-  <span class="metric-sigil">⬡</span>
+<article class={`metric-card surface is-${item.tone}`}>
+  <span class="metric-sigil">{item.glyph}</span>
   <h3>{item.metric}</h3>
   <p>{item.question}</p>
+  <span class="metric-label">{item.label}</span>
 </article>

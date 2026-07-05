@@ -150,6 +150,17 @@ pub struct Config {
     #[serde(default = "default_inject_max_link_hops")]
     pub inject_max_link_hops: usize,
 
+    // ---- Recall (pc recall repl) ----
+    /// Fast/cheap model for the recall gate step (decides relevance before the answer model).
+    /// Default: openrouter:deepseek/deepseek-v4-flash
+    #[serde(default = "default_recall_gate_model")]
+    pub recall_gate_model: String,
+
+    /// Large-context capable model for synthesizing recall answers from the full corpus.
+    /// Default: openrouter:google/gemini-flash-1.5
+    #[serde(default = "default_recall_answer_model")]
+    pub recall_answer_model: String,
+
     /// Minimum number of words in the prompt to attempt wiki navigation.
     /// Prompts below this threshold are skipped (outcome="skipped").
     /// Default: 4
@@ -308,6 +319,14 @@ fn default_inject_max_guides() -> usize {
 
 fn default_inject_max_link_hops() -> usize {
     2
+}
+
+fn default_recall_gate_model() -> String {
+    "openrouter:deepseek/deepseek-v4-flash".into()
+}
+
+fn default_recall_answer_model() -> String {
+    "openrouter:google/gemini-flash-1.5".into()
 }
 
 fn default_inject_min_prompt_words() -> usize {
@@ -489,6 +508,9 @@ impl Default for Config {
             inject_browse_timeout_ms: default_inject_browse_timeout_ms(),
             inject_max_guides: default_inject_max_guides(),
             inject_max_link_hops: default_inject_max_link_hops(),
+            // Recall
+            recall_gate_model: default_recall_gate_model(),
+            recall_answer_model: default_recall_answer_model(),
             inject_min_prompt_words: default_inject_min_prompt_words(),
             // Cross-turn dedup (inject v3)
             inject_resolve_query: default_inject_resolve_query(),

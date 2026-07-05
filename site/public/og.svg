@@ -1,14 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
   <title id="title">pc - Provenance-first context for AI agents</title>
-  <desc id="desc">Dark preview image for proactive-context showing Capture to Wiki to Inject.</desc>
+  <desc id="desc">Dark preview image for pc showing cited context moving from capture to wiki to inject.</desc>
   <rect width="1200" height="630" fill="#08090A"/>
-  <rect x="64" y="64" width="1072" height="502" rx="10" fill="#111214" stroke="#38342F"/>
-  <text x="104" y="154" fill="#F1EFE7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28">pc</text>
-  <text x="104" y="266" fill="#F1EFE7" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="66" font-weight="700">Stop losing the decisions</text>
-  <text x="104" y="346" fill="#F1EFE7" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="66" font-weight="700">behind the work.</text>
-  <text x="104" y="432" fill="#A8A29E" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="27">Capture -&gt; Wiki -&gt; Inject</text>
-  <text x="104" y="494" fill="#D6A657" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28">verified</text>
-  <text x="254" y="494" fill="#56B6C2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28">current</text>
-  <text x="396" y="494" fill="#C678DD" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28">injected</text>
-  <text x="874" y="494" fill="#F1EFE7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="32">⬡ ✎ 312c · 14g</text>
+  <path d="M0 0h1200v630H0z" fill="url(#grid)" opacity=".34"/>
+  <defs>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0v48" fill="none" stroke="#F1EFE7" stroke-opacity=".09"/>
+    </pattern>
+  </defs>
+  <rect x="64" y="64" width="1072" height="502" rx="24" fill="#111214" stroke="#38342F"/>
+  <path d="M111 126 132 138v24l-21 12-21-12v-24l21-12Z" fill="none" stroke="#D6A657" stroke-width="4" stroke-linejoin="round"/>
+  <text x="154" y="161" fill="#F1EFE7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="34" font-weight="700">pc</text>
+  <text x="104" y="274" fill="#F1EFE7" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="66" font-weight="700">Stop losing the decisions</text>
+  <text x="104" y="354" fill="#F1EFE7" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="66" font-weight="700">behind the work.</text>
+  <text x="104" y="438" fill="#C9C3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="25">human correction → cited claim → wiki artifact → injected briefing</text>
+  <text x="104" y="502" fill="#D6A657" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="27">(docs/wiki/guides/project-positioning.md:18)</text>
+  <text x="864" y="502" fill="#F1EFE7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="31">⬡ ✎ 287c · 14g</text>
 </svg>

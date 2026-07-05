@@ -44,9 +44,6 @@ const description =
     <meta name="twitter:image" content="/og.svg" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>{title}</title>
-    <script is:inline>
-      document.documentElement.classList.add("js");
-    </script>
   </head>
   <body>
     <Header />
@@ -54,31 +51,72 @@ const description =
       <Hero />
 
       <section id="problem" class="section problem-section" aria-labelledby="problem-heading">
-        <div class="section-intro" data-reveal>
-          <p class="eyebrow">Problem</p>
-          <h2 id="problem-heading">The real bug is not context length. It is amnesia.</h2>
+        <div class="section-intro problem-intro">
+          <p class="eyebrow">The correction is the asset</p>
+          <h2 id="problem-heading">The valuable part of an agent session is rarely the transcript.</h2>
           <p>
-            You spend weeks steering an agent through a project. You correct assumptions.
-            You reject abstractions. You change direction. You explain why something matters.
+            It is the moment you corrected the model. The abstraction you rejected.
+            The constraint you clarified. The reversal you made after watching the system fight back.
           </p>
           <p>
-            Then the session ends. The next agent can read the files, but not the judgment that shaped them.
-            It repeats dead ideas, misses reversals, and asks you to re-teach decisions you already paid for with attention.
+            pc captures those moments as cited project knowledge, not as a fog of embeddings.
           </p>
         </div>
 
+        <div class="correction-transform">
+          <article class="transcript-snippet surface is-amber" aria-label="Line-numbered correction transcript">
+            <div class="card-meta">
+              <span class="badge is-amber">transcript</span>
+              <code>session:105d3450 · lines 127-130</code>
+            </div>
+            <div class="source-lines">
+              <p><span>127</span><b>assistant</b> I'll position this as a generic memory category.</p>
+              <p class="highlight"><span>128</span><b>user</b> No. Do not make this a generic memory system.</p>
+              <p class="highlight"><span>129</span><b>user</b> The point is provenance over fluency.</p>
+              <p><span>130</span><b>assistant</b> Understood.</p>
+            </div>
+          </article>
+
+          <div class="transform-line" aria-hidden="true">
+            <span>human correction</span>
+            <span>cited claim</span>
+            <span>wiki artifact</span>
+            <span>injected briefing</span>
+          </div>
+
+          <article class="claim-card surface is-green" aria-label="Verified claim card">
+            <div class="claim-row">
+              <span>claim</span>
+              <p>The project rejects generic memory positioning and anchors on provenance over fluency.</p>
+            </div>
+            <div class="claim-row">
+              <span>source</span>
+              <p>session:105d3450 lines 128-129</p>
+            </div>
+            <div class="claim-row">
+              <span>artifact</span>
+              <p>docs/wiki/guides/project-positioning.md:<em>18</em></p>
+            </div>
+            <div class="badge-row">
+              <span class="badge is-blue">explicit</span>
+              <span class="badge is-green">verified</span>
+              <span class="badge is-cyan">current</span>
+            </div>
+          </article>
+        </div>
+
         <div class="problem-grid">
-          <article class="surface problem-card" data-reveal>
+          <article class="surface problem-card">
             <span class="card-sigil">01</span>
             <h3>Repeated direction</h3>
-            <p>The same product judgment gets explained again and again because it was never made durable.</p>
+            <p>The same product judgment gets explained again because it was never made durable.</p>
           </article>
-          <article class="surface problem-card" data-reveal>
+          <article class="surface problem-card">
             <span class="card-sigil">02</span>
             <h3>Stale summaries</h3>
-            <p>A summary can sound coherent while quietly erasing reversals, uncertainty, and provenance.</p>
+            <p>A summary can sound coherent while erasing reversals, uncertainty, and provenance.</p>
           </article>
-          <article class="surface problem-card" data-reveal>
+          <article class="surface problem-card">
             <span class="card-sigil">03</span>
             <h3>Context landfill</h3>
             <p>Dumping everything into the prompt wastes the model's attention. Selection is the product.</p>
@@ -86,54 +124,22 @@ const description =
         </div>
       </section>
 
-      <section class="section split-section correction-section" aria-labelledby="correction-heading">
-        <div data-reveal>
-          <p class="eyebrow">The correction is the asset</p>
-          <h2 id="correction-heading">The valuable part of an agent session is rarely the transcript.</h2>
-          <p>
-            It is the moment you corrected the model. The decision you refused to let it override.
-            The abstraction you rejected. The constraint you clarified. The reversal you made after seeing the system fight back.
-          </p>
-          <p>
-            pc captures those moments as cited project knowledge, not as a fog of embeddings.
-          </p>
-        </div>
-        <div class="judgment-ledger surface" data-reveal>
-          <div class="ledger-row">
-            <span>explicit</span>
-            <p>No, do not make this a generic memory system.</p>
-          </div>
-          <div class="ledger-row">
-            <span>decision</span>
-            <p>Position around cited human discernment and project-specific provenance.</p>
-          </div>
-          <div class="ledger-row">
-            <span>evidence</span>
-            <p>transcript:127-130 → docs/wiki/guides/project-positioning.md:18</p>
-          </div>
-          <div class="ledger-row">
-            <span>inject</span>
-            <p>Relevant future prompt receives the constraint before action.</p>
-          </div>
-        </div>
-      </section>
-
       <section id="agent-mess" class="section mess-section" aria-labelledby="mess-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">The current agent mess</p>
-          <h2 id="mess-heading">Developers are managing context with folklore.</h2>
+          <h2 id="mess-heading">Built for the current agent mess.</h2>
           <p>
-            Teams stitch together AGENTS.md, CLAUDE.md, Cursor rules, MCP servers, markdown notes,
-            vector stores, git logs, shell hooks, and manual rituals just to keep agents pointed in the right direction.
+            Developers are stitching together AGENTS.md, CLAUDE.md, Cursor rules, MCP memory,
+            markdown notes, vector stores, shell hooks, git logs, and manual rituals just to keep agents pointed in the right direction.
           </p>
           <p>
-            pc turns the useful parts into a system: capture after the session, reconcile into cited artifacts,
-            inject before action, and leave an audit trail.
+            That is not a workflow. It is folklore. pc turns the useful parts into a system:
+            capture after the session, reconcile into cited artifacts, inject before action, and leave an audit trail.
           </p>
         </div>
 
         <div class="mess-grid">
-          <article class="surface list-panel is-red" data-reveal>
+          <article class="surface list-panel is-red">
             <h3>Before pc</h3>
             <ul>
               {messBefore.map(([name, note]) => (
@@ -144,7 +150,7 @@ const description =
               ))}
             </ul>
           </article>
-          <article class="surface list-panel is-green" data-reveal>
+          <article class="surface list-panel is-green">
             <h3>With pc</h3>
             <ul>
               {messAfter.map(([name, note]) => (
@@ -161,7 +167,7 @@ const description =
       <PipelineDiagram />
 
       <section class="section control-section" aria-labelledby="control-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Context discipline</p>
           <h2 id="control-heading">Context engineering is the new control plane.</h2>
           <p>
@@ -171,7 +177,7 @@ const description =
         </div>
 
         <div class="control-grid">
-          <article class="surface control-card is-amber" data-reveal>
+          <article class="surface control-card is-amber">
             <h3>Static context is a blunt instrument.</h3>
             <p>
               AGENTS.md and CLAUDE.md are useful. They are also blunt. A file loaded every session has no idea what the agent is about to do.
@@ -184,11 +190,11 @@ const description =
             </div>
           </article>
 
-          <article class="surface control-card is-magenta" data-reveal>
-            <h3>The agent should not have to remember to remember.</h3>
+          <article class="surface control-card is-magenta">
+            <h3>Instructions are not memory.</h3>
             <p>
-              Tool-call memory is brittle. The agent has to notice it needs context, choose the right tool,
-              query the right thing, and correctly interpret what comes back.
+              A standing instruction file is useful for stable basics. It is not a prompt-specific authority model.
+              Memory is not truth. Truth needs provenance.
             </p>
             <TerminalCard title="pre-action injection" compact>
               <div class="terminal-row muted">User prompt: "Should we make this generic?"</div>
@@ -198,7 +204,7 @@ const description =
             </TerminalCard>
           </article>
 
-          <article class="surface control-card is-cyan" data-reveal>
+          <article class="surface control-card is-cyan">
             <h3>Summaries are not provenance.</h3>
             <p>
               A summary can keep the agent moving and still erase why a decision mattered.
@@ -207,7 +213,7 @@ const description =
             <p class="callout-line">Compaction preserves continuity. pc preserves evidence.</p>
           </article>
 
-          <article class="surface control-card is-blue" data-reveal>
+          <article class="surface control-card is-blue">
             <h3>The harness matters.</h3>
             <p>
               A coding agent is not just a model. It is prompts, tools, memory, compaction, cache behavior,
@@ -227,7 +233,7 @@ const description =
       </section>
 
       <section id="artifacts" class="section artifacts-section" aria-labelledby="artifacts-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Artifact system</p>
           <h2 id="artifacts-heading">Four artifacts. One job each.</h2>
           <p>
@@ -242,64 +248,82 @@ const description =
         <EpisodeCard />
       </section>
 
-      <section class="section decay-section" aria-labelledby="decay-heading">
-        <div class="section-intro" data-reveal>
-          <p class="eyebrow">Memory hygiene</p>
-          <h2 id="decay-heading">The agent ecosystem has enough generation. It lacks memory hygiene.</h2>
+      <section class="section injection-section" aria-labelledby="injection-heading">
+        <div class="section-intro">
+          <p class="eyebrow">Hot-path injection</p>
+          <h2 id="injection-heading">The agent should not have to remember to remember.</h2>
           <p>
-            Context decays through tool calls, logs, repeated file reads, compaction, and stale summaries.
-            pc cuts across that decay by turning human correction into cited artifacts.
+            Tool-call memory is brittle. The agent has to notice it needs context, choose the right tool,
+            query the right thing, and interpret what comes back.
+          </p>
+          <p>
+            pc moves the critical path earlier. It selects and injects relevant project knowledge before the agent acts.
           </p>
         </div>
-        <div class="decay-grid">
-          <article class="surface decay-card is-red" data-reveal>
-            <h3>Context decay</h3>
-            <ol class="flow-list">
-              <li>Prompt</li>
-              <li>Tool calls</li>
-              <li>Logs</li>
-              <li>Repeated file reads</li>
-              <li>Compaction</li>
-              <li>Lost rationale</li>
-              <li>User correction repeated</li>
-            </ol>
+
+        <div class="injection-grid">
+          <article class="injection-demo surface is-magenta">
+            <div class="prompt-card">
+              <span>User prompt</span>
+              <p>"Should we make this generic?"</p>
+            </div>
+            <div class="reminder-card">
+              <span>Injected reminder</span>
+              <h3>TITLE: Relevant project direction</h3>
+              <p>
+                The project has repeatedly rejected generic memory positioning. Position around
+                cited human discernment and project-specific provenance.
+              </p>
+              <code>Source: docs/wiki/guides/project-positioning.md:<em>18</em></code>
+            </div>
           </article>
-          <article class="surface decay-card is-green" data-reveal>
-            <h3>pc intervention</h3>
-            <ol class="flow-list">
-              <li>User correction</li>
-              <li>Cited claim</li>
-              <li>Guide or episode</li>
-              <li>Relevant future injection</li>
-              <li>Audit event</li>
-            </ol>
+
+          <TerminalCard title="pc tail" label="audit trace">
+            <div class="terminal-row event"><span>14:02:11</span><span>a3f</span><span>proactive</span><span class="is-magenta">▶ inject.start</span><span>"Should we make this generic?"</span></div>
+            <div class="terminal-row event"><span>14:02:11</span><span>a3f</span><span>proactive</span><span class="is-blue">⟜ select.sources</span><span>2 guides · 1 episode</span></div>
+            <div class="terminal-row event"><span>14:02:12</span><span>a3f</span><span>proactive</span><span class="is-magenta">✎ briefing</span><span>287c · cited</span></div>
+            <div class="terminal-row event"><span>14:02:12</span><span>a3f</span><span>proactive</span><span class="is-green">✓ inject.done</span><span>1.2s · compiled</span></div>
+          </TerminalCard>
+        </div>
+
+        <p class="audit-callout">Injection without audit is just another hidden prompt.</p>
+      </section>
+
+      <section class="section supersession-section" aria-labelledby="supersession-heading">
+        <div class="section-intro">
+          <p class="eyebrow">Staleness and supersession</p>
+          <h2 id="supersession-heading">Current truth, with history.</h2>
+          <p>
+            When direction changes, pc does not erase the old state and does not inject it as current truth.
+            Superseded direction is demoted, linked, and preserved as product archaeology.
+          </p>
+        </div>
+        <div class="supersession-grid">
+          <article class="supersession-card old surface is-warning">
+            <span class="badge is-warning">old belief</span>
+            <p>"We use Jest."</p>
           </article>
-          <article class="surface stale-card is-amber" data-reveal>
-            <h3>Stale memory handling</h3>
-            <dl>
-              <div>
-                <dt>Old belief</dt>
-                <dd>"We use Jest."</dd>
-              </div>
-              <div>
-                <dt>Evidence</dt>
-                <dd>docs/wiki/episodes/2026-03-18-test-runner-migration.md</dd>
-              </div>
-              <div>
-                <dt>Current truth</dt>
-                <dd>"We migrated to Vitest for package tests."</dd>
-              </div>
-              <div>
-                <dt>Status</dt>
-                <dd>superseded → current</dd>
-              </div>
-            </dl>
+          <article class="supersession-card episode surface is-amber">
+            <span class="badge is-amber">episode</span>
+            <p>docs/wiki/episodes/2026-03-18-test-runner-migration.md</p>
+          </article>
+          <article class="supersession-card current surface is-green">
+            <span class="badge is-green">current truth</span>
+            <p>"We use Vitest for package tests."</p>
+          </article>
+          <article class="supersession-card briefing surface is-magenta">
+            <span class="badge is-magenta">injected briefing</span>
+            <p>Use Vitest for new package tests. Jest references are historical unless touching legacy packages.</p>
+            <div class="badge-row">
+              <span class="badge is-amber">superseded → current</span>
+              <span class="badge is-stone">historical · not injected as truth</span>
+            </div>
           </article>
         </div>
       </section>
 
       <section id="surfaces" class="section surfaces-section" aria-labelledby="surfaces-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Product surfaces</p>
           <h2 id="surfaces-heading">A CLI for the whole context lifecycle.</h2>
           <p>
@@ -314,7 +338,7 @@ const description =
       </section>
 
       <section id="evals" class="section evals-section" aria-labelledby="evals-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Evals and proof</p>
           <h2 id="evals-heading">Do not trust memory without evals.</h2>
           <p>
@@ -331,7 +355,7 @@ const description =
           {metrics.map((item) => <EvalMetricCard item={item} />)}
         </div>
 
-        <blockquote class="research-quote" data-reveal>
+        <blockquote class="research-quote">
           <p>
             The architecture has scars. Claims-only projection failed. Raw context dumps failed.
             Retrieval blending failed. Uncertainty-gated injection failed. The current hybrid exists because the evals forced it.
@@ -340,7 +364,7 @@ const description =
       </section>
 
       <section class="section fit-section" aria-labelledby="fit-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Where pc fits</p>
           <h2 id="fit-heading">Not another memory bucket.</h2>
           <p>
@@ -350,7 +374,7 @@ const description =
           </p>
         </div>
 
-        <div class="comparison-table-wrap surface" data-reveal>
+        <div class="comparison-table-wrap surface">
           <table class="comparison-table">
             <thead>
               <tr>
@@ -373,7 +397,7 @@ const description =
       </section>
 
       <section class="section refusals-section" aria-labelledby="refusals-heading">
-        <div class="section-intro" data-reveal>
+        <div class="section-intro">
           <p class="eyebrow">Product boundaries</p>
           <h2 id="refusals-heading">Refusals are part of the product.</h2>
           <p>
@@ -391,26 +415,22 @@ const description =
     </main>
     <Footer />
     <script is:inline>
-      const media = window.matchMedia("(prefers-reduced-motion: reduce)");
-      const revealItems = Array.from(document.querySelectorAll("[data-reveal]"));
-
-      if (media.matches || !("IntersectionObserver" in window)) {
-        revealItems.forEach((item) => item.classList.add("is-visible"));
-      } else {
-        const observer = new IntersectionObserver(
-          (entries) => {
-            entries.forEach((entry) => {
-              if (entry.isIntersecting) {
-                entry.target.classList.add("is-visible");
-                observer.unobserve(entry.target);
-              }
-            });
-          },
-          { rootMargin: "0px 0px -10% 0px", threshold: 0.16 }
-        );
-
-        revealItems.forEach((item) => observer.observe(item));
-      }
+      const copyButtons = Array.from(document.querySelectorAll("[data-copy]"));
+      copyButtons.forEach((button) => {
+        button.addEventListener("click", async () => {
+          const text = button.getAttribute("data-copy") || "";
+          try {
+            await navigator.clipboard.writeText(text);
+            button.textContent = "✓ copied";
+            button.setAttribute("aria-live", "polite");
+            window.setTimeout(() => {
+              button.textContent = "copy";
+            }, 1600);
+          } catch {
+            button.textContent = "copy failed";
+          }
+        });
+      });
     </script>
   </body>
 </html>
