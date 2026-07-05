@@ -10,8 +10,8 @@ use anyhow::{anyhow, Result};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
-const SENTINEL_OPEN: &str = "# >>> proactive-context (managed) — edit via `pc install` >>>";
-const SENTINEL_CLOSE: &str = "# <<< proactive-context <<<";
+pub(crate) const SENTINEL_OPEN: &str = "# >>> proactive-context (managed) — edit via `pc install` >>>";
+pub(crate) const SENTINEL_CLOSE: &str = "# <<< proactive-context <<<";
 const PLUGIN_BAKE_MARKER: &str = "const PC_BIN_BAKED = \"\"";
 const CODEX_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -571,7 +571,7 @@ fn file_drop(bin: &Path, path: &Path, dry: bool) -> Result<String> {
 // ─── Sentinel + file helpers ──────────────────────────────────────────────────
 
 /// Remove a previously-written sentinel block (and the blank line before it).
-fn strip_sentinel(text: &str) -> String {
+pub(crate) fn strip_sentinel(text: &str) -> String {
     let (Some(start), Some(end)) = (text.find(SENTINEL_OPEN), text.find(SENTINEL_CLOSE)) else {
         return text.to_string();
     };
@@ -649,7 +649,7 @@ fn strip_legacy_codex_toml_hooks(text: &str) -> String {
     out.join("\n")
 }
 
-fn write_with_parents(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_with_parents(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -14,8 +14,41 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 use tokio::runtime::Runtime;
+
+// ─── Git-hooks nudge (one-shot per process, see maybe_git_hooks_nudge) ────────
+
+static GIT_HOOKS_NUDGE: Mutex<Option<String>> = Mutex::new(None);
+
+/// If this repo has a `docs/wiki` worth protecting but no pc-managed git
+/// post-commit hook yet, and we haven't already nudged this session, return a
+/// message asking the agent to mention `pc install --git-hooks` to the user.
+/// Self-retiring: once the hook is installed, `git_hooks::is_installed`
+/// permanently short-circuits this.
+fn maybe_git_hooks_nudge(root: &Path, session_id: &str) -> Option<String> {
+    if !root.join("docs/wiki").is_dir() || !root.join(".git").exists() {
+        return None;
+    }
+    let marker = project_context_dir(root).join(format!("git-hooks-nudge-{session_id}"));
+    if marker.exists() {
+        return None;
+    }
+    if crate::git_hooks::is_installed(root) {
+        return None;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, "");
+    Some(
+        "This repository's docs/wiki/ captured-knowledge files are not auto-committed to git yet. \
+         Mention to the user that this can be configured with `pc install --git-hooks` (installs a \
+         git post-commit hook that auto-commits pending docs/wiki changes)."
+            .to_string(),
+    )
+}
 
 // ─── Trivial-prompt stoplist ──────────────────────────────────────────────────
 
@@ -291,6 +324,21 @@ enum OutMode {
 /// `{"context":…}` JSON (Hermes).
 fn emit(out: &OutMode, context_block: Option<&str>, verbose_msg: &str) {
     use crate::harness::OutputDialect;
+
+    let nudge = GIT_HOOKS_NUDGE.lock().ok().and_then(|mut g| g.take());
+    let spliced;
+    let context_block = match (&nudge, context_block) {
+        (Some(n), Some(b)) => {
+            spliced = format!("{}\n\n<system-reminder>\n{}\n</system-reminder>", b, n);
+            Some(spliced.as_str())
+        }
+        (Some(n), None) => {
+            spliced = format!("<system-reminder>\n{}\n</system-reminder>", n);
+            Some(spliced.as_str())
+        }
+        (None, block) => block,
+    };
+
     match out {
         OutMode::Verbose => {
             let obj = if let Some(block) = context_block {
@@ -637,6 +685,12 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     let project = normalize_path(&root);
     init_context(&project, &input.session_id);
     warn_missing_session_id(&input.session_id);
+
+    if let Some(nudge) = maybe_git_hooks_nudge(&root, &input.session_id) {
+        if let Ok(mut slot) = GIT_HOOKS_NUDGE.lock() {
+            *slot = Some(nudge);
+        }
+    }
 
     let db_path = project_db_path(&root);
     if !db_path.exists() {

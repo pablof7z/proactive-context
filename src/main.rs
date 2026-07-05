@@ -42,6 +42,7 @@ mod claude_cli;
 mod claude_sidecar;
 mod embed_sidecar;
 mod events;
+mod git_hooks;
 mod harness;
 mod inject;
 mod ledger;
@@ -253,6 +254,12 @@ enum Commands {
         /// Remove pc's hooks from the selected harnesses instead of installing.
         #[arg(long)]
         uninstall: bool,
+
+        /// Install a git `post-commit` hook instead: auto-commits pending
+        /// `docs/wiki` changes as a follow-up commit after each `git commit`.
+        /// Combine with --status/--uninstall/--dry-run as usual.
+        #[arg(long)]
+        git_hooks: bool,
     },
 
     /// Wiki maintenance commands (off-hot-path).
@@ -1004,15 +1011,19 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Install { all, harness, project, dry_run, status, uninstall } => {
-            crate::harness::install::run_install(crate::harness::install::InstallOpts {
-                harnesses: harness,
-                all,
-                project,
-                dry_run,
-                status,
-                uninstall,
-            })?;
+        Commands::Install { all, harness, project, dry_run, status, uninstall, git_hooks } => {
+            if git_hooks {
+                crate::git_hooks::run(crate::git_hooks::GitHooksOpts { dry_run, status, uninstall })?;
+            } else {
+                crate::harness::install::run_install(crate::harness::install::InstallOpts {
+                    harnesses: harness,
+                    all,
+                    project,
+                    dry_run,
+                    status,
+                    uninstall,
+                })?;
+            }
         }
 
         Commands::Eval {
