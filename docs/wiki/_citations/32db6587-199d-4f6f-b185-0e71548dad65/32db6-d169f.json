@@ -1,0 +1,6 @@
+{
+  "id": "32db6-d169f",
+  "ts": "2026-06-29T12:08:59Z",
+  "session": "32db6587-199d-4f6f-b185-0e71548dad65",
+  "text": "3. `render_catalog(&catalog)` — one line per source: `- {key} — {title} — {summary}  [similar {score}]` (summary and score omitted when absent) (`inject.rs:753-767`). The catalog = wiki guides (title/summary from frontmatter index) ∪ committed `*.md` (title from first `#`, summary from first non-empty line), annotated with vector-preselect scores, sorted score-desc, capped at **150** (`build_catalog`, `inject.rs:675-750`). [...] - Don't try to dedup at the *retrieval* layer — retrieval is just a seed hint; the gate over the full catalog and the delta-compile are where dedup belongs."
+}

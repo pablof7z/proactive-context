@@ -1,0 +1,6 @@
+{
+  "id": "94d06-808e7",
+  "ts": "2026-06-29T11:54:36Z",
+  "session": "94d06a3c-7fd2-47ef-8022-6f63e5793f71",
+  "text": "User: thus far the archeologist is only able to inject content from claude code conversations -- I also want it to support injecting nostr conversations generated in the ~/Work/TENEX-ff... approach, with clear attributions since they are nostr kind:1 notes -- or perhaps the simpler solution would be to simply use whatever database is already available in the backend like ~/.tenex/projects ? [...] Add a `--source tenex` flag (or `tenex` subcommand) to `archeologist` that:"
+}

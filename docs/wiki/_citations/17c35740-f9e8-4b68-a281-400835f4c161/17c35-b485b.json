@@ -1,0 +1,6 @@
+{
+  "id": "17c35-b485b",
+  "ts": "2026-06-29T12:41:35Z",
+  "session": "17c35740-f9e8-4b68-a281-400835f4c161",
+  "text": "User: let's instead allow the user to select multiple directories and they all merge into the current project (for when sessions exist in different paths for the same project) [...] Here's what changed: when you run `pc archeologist` interactively and pick projects from the picker, all their sessions now route to the wiki of your current working directory — regardless of what cwd those transcripts were originally from. `--yes` and `--project` keep routing to each session's own wiki, since those aren't \"selecting multiple directories to merge.\"\n\nOne thing worth knowing: capture markers are global, so a session merged into your current project's wiki won't later populate its original path's wiki if you run `--yes`. That's the right behavior for the stated use case (same logical project, scattered paths), but it's a one-way door. [...] User: if I'm running from /Users/pablofernandez/Work/serial-killer you could put at the top and pre-selected the conversations that match in the list"
+}

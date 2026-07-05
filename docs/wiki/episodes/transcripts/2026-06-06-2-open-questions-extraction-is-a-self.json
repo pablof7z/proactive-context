@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "there aere 253 conversations in this project, or more, yet I think the docs/wiki that was just re-generated from scratch with pc archeologist captured what looks like very little information -- what gives?"
+  ],
+  [
+    "assistant",
+    "Failed to respond due to a socket connection error."
+  ],
+  [
+    "user",
+    "continue"
+  ],
+  [
+    "assistant",
+    "Explained the wiki is sparse for three reasons: it's a convergent distillate by design (deduplication shrinks volume), 7 of the richest sessions timed out at 300s and were incorrectly marked as captured so they won't retry, and \"253\" is an overcount — there are only ~61 real main-thread transcripts, the rest being subagent sidechains that capture deliberately excludes."
+  ],
+  [
+    "user",
+    "where are these open-questions coming from?"
+  ],
+  [
+    "assistant",
+    "Traced the full pipeline: open-questions are produced by extract_open_questions() at the end of each capture, which asks the triage model to list nouns from the transcript not present in the wiki index, then appends them to open-questions.json (consumed by the SessionStart hook). They misfire because they form a self-perpetuating loop (injected questions re-enter transcripts and get re-extracted), the extractor never reads the actual codebase, and the file is append-only with no pruning."
+  ]
+]

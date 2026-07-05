@@ -1,0 +1,38 @@
+[
+  [
+    "user",
+    "if I'm in a directory and run pc archeologist and I select multiple paths, will the conversations from those paths will converge into the wiki of the current PWD?"
+  ],
+  [
+    "assistant",
+    "No — routing is by each transcript's internal cwd field, not the current PWD. Each selected project's sessions write to its own separate wiki."
+  ],
+  [
+    "user",
+    "let's instead allow the user to select multiple directories and they all merge into the current project (for when sessions exist in different paths for the same project)"
+  ],
+  [
+    "assistant",
+    "Implemented: interactive picker selections now route all sessions to the current PWD's wiki. The --yes and --project modes keep original per-session routing."
+  ],
+  [
+    "user",
+    "if I'm running from /Users/pablofernandez/Work/serial-killer you could put at the top and pre-selected the conversations that match in the list"
+  ],
+  [
+    "assistant",
+    "Done — the picker now floats the current directory's matching projects to the top and pre-checks them, with all selections routing to the current wiki."
+  ],
+  [
+    "user",
+    "[Image #1] what I see in pc archeologist's window is utterly useless... I would like to see \"I looked at conversation 123\", \"I discovered this fact\", \"Wrote guide abc\", etc, etc. This needs a rethink of this UI to make it human-compatible, not a log of a bunch of bullshit"
+  ],
+  [
+    "assistant",
+    "The advisor is right — I need to verify the data before building the UI. Two key checks first."
+  ],
+  [
+    "assistant",
+    "Completed the TUI redesign: feed now uses natural-language narration, pipeline-internal stages are hidden, a detail pane lets you open any feed line to see full content, and event payloads now include text excerpts, dates, and session IDs."
+  ]
+]

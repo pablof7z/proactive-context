@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-eae6e",
+  "ts": "2026-06-29T10:44:25Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "- New `wiki_*` rig tools — read: `wiki_list`, `wiki_read`; mutating: `wiki_create`/`add_statement`/`revise_statement`/`remove_statement`, each taking `evidence: [{start,end}]`.\n- Citation engine: line-number the transcript (same enumeration the slicer uses), mint `[^<5char-session>-<n>]`, Rust slices verbatim from the cited ranges → inserts the marker into the section prose → appends sliced text to per-wiki `_citations.log`."
+}

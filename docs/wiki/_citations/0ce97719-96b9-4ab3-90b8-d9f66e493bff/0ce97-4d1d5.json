@@ -1,0 +1,6 @@
+{
+  "id": "0ce97-4d1d5",
+  "ts": "2026-06-29T12:03:00Z",
+  "session": "0ce97719-96b9-4ab3-90b8-d9f66e493bff",
+  "text": "- **`wiki-publish-cleanup`** — Superset of wiki-doctor, also adds: auto-strip of raw citation markers and empty See Also on save (`normalize_for_publish`), `pc wiki tidy` bulk command, a ROUTE altitude fix (one coherent topic per guide), and a spec doc for topic-organized routing + staleness retirement. **6 commits ahead, active worktree at `/private/tmp/pc-wiki-cleanup`.** [...] - **`wiki-publish-cleanup`** — Broader set: normalize-on-publish (strips raw citations + empty See Also at save time), `pc wiki tidy` bulk command, ROUTE altitude fix (one topic per guide), and a spec doc for topic routing + staleness retirement. Active worktree at `/private/tmp/pc-wiki-cleanup`. [...] Assistant: Done. Master is now clean — only branch remaining is `master` itself. The merge brought in `doctor.rs` (`pc wiki doctor`), `pc wiki tidy`, normalize-on-publish, and the ROUTE altitude fix."
+}

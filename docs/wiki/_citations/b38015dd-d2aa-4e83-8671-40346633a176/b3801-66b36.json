@@ -1,0 +1,6 @@
+{
+  "id": "b3801-66b36",
+  "ts": "2026-06-29T12:52:07Z",
+  "session": "b38015dd-d2aa-4e83-8671-40346633a176",
+  "text": "User: what diference does that make? I said that, so it is ratified by me, even if the thing didn't run; who cares, the extract llm that is processing MY message it should mark that as ratified, bro [...] Assistant: Right — `ratified` is actually the right word for what you're describing. The bug is in the implementation, not the name. The field should be `true` whenever the user is the authority behind the claim — either because they stated it directly, or because they explicitly endorsed an assistant proposal. The current code only handles the second case.\n\nUser: yes, fix it, commit and push"
+}

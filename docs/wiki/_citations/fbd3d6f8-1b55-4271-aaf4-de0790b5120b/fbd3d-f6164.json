@@ -1,0 +1,6 @@
+{
+  "id": "fbd3d-f6164",
+  "ts": "2026-06-29T11:44:52Z",
+  "session": "fbd3d6f8-1b55-4271-aaf4-de0790b5120b",
+  "text": "1. **`main.rs`**: change `r#in: Option<u64>` → `Option<Option<u64>>` with `num_args = 0..=1`, so `--in` (no value) = \"debounce using config\" and `--in 60` = \"debounce, 60s override\". Update dispatch + doc comment. [...] 3. **`~/.claude/settings.json`**: drop the hardcoded `300` → `pc capture --in`, leaving `capture_debounce_secs` as the single source of truth. [...] Assistant: I'll make the config default fn public and reference it by full path (avoids duplicating the constant):"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "105d3-8e93f",
+  "ts": "2026-06-29T10:52:03Z",
+  "session": "105d3450-2ae4-4fc8-9c46-f74830a9dd97",
+  "text": "- **\"Why a wiki, and not a summary\"** — anchor-and-grow vs. dump-and-dilute, the PRODUCT_MODEL.md rejection turned into a confident architectural stance (\"We tried that. It's the wrong shape.\"). The fix-vs-rule distinction from llm-wiki. [...] - **\"What it refuses to do\"** — distill-don't-dump, evidence-with-decay, contradictions preserved, librarian-not-author. A memory system earns trust by its refusals. [...] On not overselling: the closing **Status** section is honest — \"research-grade, not a product you should trust with anything you can't afford to re-derive\" — and it's explicit that the loop is the active frontier while the local engine is the solid part."
+}

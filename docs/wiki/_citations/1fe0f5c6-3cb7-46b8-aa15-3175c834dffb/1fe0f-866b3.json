@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-866b3",
+  "ts": "2026-06-29T10:44:40Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "It turns capture from \"extract lessons\" into \"continuously reverse-engineer the product spec, citing the conversation passage that justifies every statement, with Rust verifying the citation actually occurs in the transcript.\" The wiki becomes a regenerable spec; provenance is structural, not prompted.\n\n## The strongest ideas\n- **Rust-verified `relevant_transcript`** is the standout. \"A citation is no longer *the model promises this was said* but *Rust confirmed this was said*\" — fabricated/uncited assertions become *unreachable states*, not things you validate after the fact. That's the right way to kill hallucinated requirements."
+}

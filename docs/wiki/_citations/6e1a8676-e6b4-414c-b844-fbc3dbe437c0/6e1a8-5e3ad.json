@@ -1,0 +1,6 @@
+{
+  "id": "6e1a8-5e3ad",
+  "ts": "2026-06-29T12:37:00Z",
+  "session": "6e1a8676-e6b4-414c-b844-fbc3dbe437c0",
+  "text": "On disk for this project: **61 top-level transcripts** (+1 in the Work dir). The other ~54 `*.jsonl` under that project dir are **subagent sidechains** (`<session>/subagents/…`), which capture deliberately excludes (`capture.rs:48`). They were never meant to be mined. So the real main-thread corpus is ~61, of which ~50 were processed at some point — decent coverage, not an enumeration gap. Wherever your 253 comes from (sidechains, TENEX, other project dirs), it's not 253 captureable conversations for *this* wiki."
+}

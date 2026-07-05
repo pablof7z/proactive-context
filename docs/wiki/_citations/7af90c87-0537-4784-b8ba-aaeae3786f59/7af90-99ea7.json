@@ -1,0 +1,6 @@
+{
+  "id": "7af90-99ea7",
+  "ts": "2026-06-29T10:54:51Z",
+  "session": "7af90c87-0537-4784-b8ba-aaeae3786f59",
+  "text": "If you want proactive-context to genuinely carry global lessons forward, the missing pieces are concrete and small: (a) a promotion path from `pending-lessons.md` into `global/index.db` (or a global wiki), and (b) wiring `inject` to query the global store alongside the project wiki. Want me to scope that out?"
+}

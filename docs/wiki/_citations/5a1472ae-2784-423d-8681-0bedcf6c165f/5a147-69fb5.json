@@ -1,0 +1,6 @@
+{
+  "id": "5a147-69fb5",
+  "ts": "2026-06-29T12:47:59Z",
+  "session": "5a1472ae-2784-423d-8681-0bedcf6c165f",
+  "text": "User: we are providing tools to the capture side? we are not giving it a full list of the currently available list of topics and wiki entries?\n\nAssistant: Correct — the capture agent gets tools, not a pre-loaded list. Specifically:\n\n- `wiki_list()` → returns the index `[{ slug, title, summary }]`\n- `wiki_read(slug)` → returns the full guide body\n\nThe agent must actively call these to discover what exists. Full catalog broadcast was explicitly considered and rejected because it doesn't scale (~130 guides, \"first 500 lines per guide\" ≈ the whole wiki in context)."
+}

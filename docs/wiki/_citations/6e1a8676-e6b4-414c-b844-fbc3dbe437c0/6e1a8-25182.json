@@ -1,0 +1,6 @@
+{
+  "id": "6e1a8-25182",
+  "ts": "2026-06-29T12:36:38Z",
+  "session": "6e1a8676-e6b4-414c-b844-fbc3dbe437c0",
+  "text": "**To recover them:** clear their markers (`pc archeologist reset` for those sessions, or `--all`) and re-run, ideally after bumping the 300s timeout. Re-running alone won't do it."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "b3801-1f6b3",
+  "ts": "2026-06-29T12:51:57Z",
+  "session": "b38015dd-d2aa-4e83-8671-40346633a176",
+  "text": "User: add a pc debug transcript --all that will use the current claude code's PWD path to get all files and generate transcript for all conversation files for the current PWD [...] Usage: `pc debug transcript --all` from any directory in the project — it resolves the project root, scans `~/.claude/projects/` for all sessions whose cwd maps to the same root, and prints each numbered transcript in mtime order. [...] User: add the same --all for extract [...] Assistant: Done. `pc debug extract --all` now scans `~/.claude/projects/` for all sessions matching the current CWD, running the full EXTRACT pipeline on each in mtime order. Progress is printed to stderr so you can pipe stdout to a file if needed."
+}

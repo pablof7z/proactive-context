@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-ea021",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "**CLI note:** `--project` and `--yes` are mutually exclusive; the leading-dash key must be passed as the real cwd path with `=`: `--project=/Users/pablofernandez/src/proactive-context`. The encoded `-Users-...` key does NOT match (it fell through to a 2-session phantom project). [...] Config fully restored (identical to all pristine stashes; `capture_model` back to real `ollama:deepseek-v4-pro`, not glm). All runs used `--output-dir`. Protected dirs (`gold-wiki`, `arch-route-27680`, `arch-iter3-69228`, `arch-full`) intact. Two commits touch only the two allowed files. Note: invocation used `--project` alone (no `--yes`) — the binary rejects `--project`+`--yes` as mutually exclusive, and `--project` already runs non-interactively."
+}

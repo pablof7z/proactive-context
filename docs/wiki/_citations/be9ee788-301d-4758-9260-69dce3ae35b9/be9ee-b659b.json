@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-b659b",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "   - **Archeologist**: bulk-historical replay; groups by `normalize_path(resolve_project_root(cwd))` (full path, NOT basename); `--project`, `--output-dir`, `--dry-run`, `--yes`, `--jobs`; serial chronological replay; idempotent via `is_already_captured`; `today_override` stamps verified date from transcript timestamp.\n   - **Gold-standard comparison methodology**; **regeneration eval** (\"dump wiki cold, one-shot rebuild\"); **routing is the bottleneck** (empirically confirmed 3×)."
+}

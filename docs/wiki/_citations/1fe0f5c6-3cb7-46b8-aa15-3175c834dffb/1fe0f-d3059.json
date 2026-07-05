@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-d3059",
+  "ts": "2026-06-29T10:44:49Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "1. `just install` — builds + copies the binary to `~/.bin/proactive-context` and codesigns it (the hooks invoke that path).\n2. Wire `~/.claude/settings.json`: `UserPromptSubmit` → `~/.bin/proactive-context inject` (timeout 10), `SessionEnd` → `~/.bin/proactive-context capture` (timeout 120). [...] Assistant: Live config is correct (timeout 25s, Haiku selector, Sonnet compiler). Now the outer hook timeout — I set it to 10s earlier, which would kill a 25s inject. Bumping `UserPromptSubmit` to 30s:\n [...] All on `master`, built, tested (34/34), installed to `~/.bin`, hooks wired (`inject` timeout 30s / inner 25s, `capture` 120s). Live for your real sessions now."
+}

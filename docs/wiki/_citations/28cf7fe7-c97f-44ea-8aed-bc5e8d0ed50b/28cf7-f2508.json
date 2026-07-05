@@ -1,0 +1,6 @@
+{
+  "id": "28cf7-f2508",
+  "ts": "2026-06-29T11:47:05Z",
+  "session": "28cf7fe7-c97f-44ea-8aed-bc5e8d0ed50b",
+  "text": "User: colorize the output of `pc agents [...] Assistant: Clean build. The `pc agents` output now has:\n- **Header**: bold white label + bold cyan repo path\n- **`●` bullet**: green (active), dimmed (done), yellow (expired)\n- **Session ID**: dimmed\n- **Status**: colored to match the bullet\n- **`[branch, age]`**: cyan\n- **Worktree path**: dimmed\n- **Footer hints**: dimmed"
+}

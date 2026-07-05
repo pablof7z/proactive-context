@@ -1,0 +1,6 @@
+{
+  "id": "26c90-6d399",
+  "ts": "2026-06-29T10:58:24Z",
+  "session": "26c909a1-6c07-4761-bac5-6e880cd7a063",
+  "text": "3. **Drop the `Hits:` section** from output — keep only the synthesized text (also fixes the 14KB \"output too large\" warnings, since synthesis is far denser than the ~19KB verbatim dumps). [...] **`src/inject.rs` — compile is now a synthesizer again, with enforced citations:**\n- **`COMPILE_PREAMBLE`** rewritten: produce a dense synthesized briefing, and *every claim must carry an inline `(path:line)` citation* (prompt-only enforcement, per your call).\n- **`render_guides_for_select`** now headers each source by its **absolute path**, so the model's citations point at openable locations.\n- **`compile_briefing`** returns the model's prose directly — deleted the old JSON line-range machinery (`CompileSelection`/`Selection`/`parse_selection`/`render_selection`) and the now-orphaned date helpers.\n- **`Hits:` section removed** from every verbose `emit` message — only the synthesized briefing is shown/injected.\n- SELECT (the gate) is untouched: still just picks which files."
+}

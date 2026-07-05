@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-dd620",
+  "ts": "2026-06-29T10:44:40Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "- **`revise_statement`'s `[^id]` carry-forward is the correctness landmine** — the model returns *new* prose that lacks the old markers, so Rust has to decide where to re-attach carried-forward citations. That's where citations get silently dropped; I'll require a test for it. [...] - `revise_statement` carries forward prior citations (the landmine — tested)."
+}

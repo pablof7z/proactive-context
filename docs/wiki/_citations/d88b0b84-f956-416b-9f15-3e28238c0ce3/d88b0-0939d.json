@@ -1,0 +1,6 @@
+{
+  "id": "d88b0-0939d",
+  "ts": "2026-06-29T12:24:58Z",
+  "session": "d88b0b84-f956-416b-9f15-3e28238c0ce3",
+  "text": "### 4. Four non-recursive directory scans would silently go blank\n`enforce_bidirectional_links` (`wiki.rs:367`), `rebuild_index` (`wiki.rs:506`), `read_index_live` (`wiki.rs:673`), and the statusline (`statusline.rs:390`) all do a flat `read_dir`. Under a foldered layout each sees **zero** guides until converted to a recursive walk. Miss one and you get a half-built index or broken backlink enforcement, with no error. [...] ### 5. Concurrency gets a new race class\nPeers run capture concurrently (your memory even notes multi-agent hazards on this repo). A flat layout gives each slug one stable path. Renames racing with a concurrent read/write of the same slug is a failure mode the flat layout simply doesn't have."
+}

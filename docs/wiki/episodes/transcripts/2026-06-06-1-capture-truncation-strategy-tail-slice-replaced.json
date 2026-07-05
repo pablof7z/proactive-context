@@ -1,0 +1,70 @@
+[
+  [
+    "user",
+    "how many system prompts do we have here? what are they?"
+  ],
+  [
+    "assistant",
+    "Identified ~6 distinct injected instruction sources in the session: core system prompt, advisor tool instructions, global CLAUDE.md, MEMORY.md, SessionStart hook context, and the tool/skill manifest."
+  ],
+  [
+    "user",
+    "no, I mean in this current codebase"
+  ],
+  [
+    "assistant",
+    "The codebase defines 10 distinct LLM system prompts across 4 pipelines (capture, inject, awareness, doctor), with an 11th conditional prefix."
+  ],
+  [
+    "user",
+    "which one does the pc archeologist importer use?"
+  ],
+  [
+    "assistant",
+    "The archeologist reuses the same 4 capture pipeline prompts (triage gate, EXTRACT, ROUTE, RECONCILE) plus the open-questions detector during structural maintenance — no archeologist-specific prompt."
+  ],
+  [
+    "user",
+    "so tell me during a normal archeologist session what do we send to the llm?"
+  ],
+  [
+    "assistant",
+    "Explained the fixed sequence of LLM calls per session: 1 triage + 1 extract + 1 route + N reconcile calls, plus periodic open-questions extraction, detailing the system and user content sent in each."
+  ],
+  [
+    "user",
+    "how can I see a typical plain-text transcript? (an example)"
+  ],
+  [
+    "assistant",
+    "Showed a sample plain transcript and noted that the real path strips tool_use/tool_result/reasoning blocks and sidechain/meta entries; offered to add a debug dump or standalone renderer for exact EXTRACT input."
+  ],
+  [
+    "user",
+    "what filtering/truncation does it do?"
+  ],
+  [
+    "assistant",
+    "Detailed the full chain: content filtering (text-blocks-only, `<`-prefix drop, role/empty filters), sidechain/meta filtering (archeologist only), substance gate, dedup, and tail-keep truncation at 200k/250k chars — flagging head-truncation as a likely cause of sparse wiki captures."
+  ],
+  [
+    "user",
+    "for truncation we should prefer to remove the in-between assistante messages, never user messages -- by in-between I mean assistant messages that are followed by assistant messages."
+  ],
+  [
+    "assistant",
+    "Implemented `reduce_turns_to_fit` to drop only in-between assistant turns (oldest-first, never user turns) at both truncation sites, with a char-boundary-safe tail-capped backstop; all 84 tests pass."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "user",
+    "commit directly"
+  ],
+  [
+    "assistant",
+    "Committed to `master` as `39ab0d9`, staging only `src/transcript.rs` and `src/capture.rs` and leaving other working-tree changes untouched."
+  ]
+]

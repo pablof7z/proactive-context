@@ -1,0 +1,82 @@
+[
+  [
+    "user",
+    "is there a chronological order to how the pc archeologist runs? i.e. we should send the first conversation of the project first, on the second one we should include the available guides that are available (I'm guessing that's already happening, right?)"
+  ],
+  [
+    "assistant",
+    "Yes, this is already the designed behavior. From the injected context:\n\n> The archeologist replays sessions within each project in ascending chronological order by their first message timestamp, oldest first. This is non-negotiable because each capture's agent loop calls `wiki_list`/`wiki_read` to see the wiki-so-far — so a later session's capture sees what earlier sessions wrote.\n\nThe key mechanism is that the capture agent itself calls `wiki_list`/`wiki_read` during its run, so by replaying chronologically, each session naturally \"sees\" whatever the earlier sessions already wrote to the wiki. It's not that the archeologist pre-loads the wiki state — it's that the agent reads it live, and the wiki accumulates as sessions are processed in order.\n\nWant me to look at the implementation in `src/archeologist.rs` to confirm the ordering logic is actually wired up correctly?"
+  ],
+  [
+    "user",
+    "we are providing tools to the capture side? we are not giving it a full list of the currently available list of topics and wiki entries?"
+  ],
+  [
+    "assistant",
+    "Correct — the capture agent gets tools, not a pre-loaded list. Specifically:\n\n- `wiki_list()` → returns the index `[{ slug, title, summary }]`\n- `wiki_read(slug)` → returns the full guide body\n\nThe agent must actively call these to discover what exists. Full catalog broadcast was explicitly considered and rejected because it doesn't scale (~130 guides, \"first 500 lines per guide\" ≈ the whole wiki in context).\n\nThe tradeoff is that this puts the burden on the model to actually *call* `wiki_list` before deciding to create a new guide — and per the capture redesign spec, the current failure mode is exactly this: the model tends to append-or-create rather than update-in-place because it never bothers to check what's already there. The proposed 4-stage pipeline (EXTRACT → ROUTE → RECONCILE → HISTORY) addresses this by using embedding RAG to surface candidate guides *before* the model makes a routing decision, so it's forced to consider existing content.\n\nSo the archeologist's chronological replay works because each session's agent calls `wiki_list`/`wiki_read` live and sees whatever prior sessions accumulated — but only if the agent actually calls those tools."
+  ],
+  [
+    "user",
+    "yes, the chrnological order must be respected"
+  ],
+  [
+    "assistant",
+    "The implementation is correct — line 471 does `sessions.sort_by` on RFC3339 timestamps lexicographically, which works because they're fixed-width UTC strings. The chronological guarantee is solid."
+  ],
+  [
+    "user",
+    "I don't get it, explain extract, route, reconcile, history with more detail"
+  ],
+  [
+    "assistant",
+    "Here's what each stage actually does:\n\n---\n\n**EXTRACT**\n\nReads the raw transcript and pulls out *atomic, cited claims* — one fact per claim. No wiki access at all. Pure extraction. Each claim gets tagged with its author (user turn = \"explicit direction\", agent turn = \"implicit direction\") and evidence line ranges. This stage is foundational — anything missed here is invisible to everything downstream.\n\n---\n\n**ROUTE**\n\nTakes each extracted claim and finds where it belongs in the wiki. It does this in two steps:\n1. **Embedding RAG** — finds top-K candidate guides by semantic similarity\n2. **Reasoning rerank** — catches cases where embedding similarity fails (e.g. \"use optimistic locking\" and \"profile edits race\" belong together but embed far apart)\n\nOutput per claim: a target slug, or \"new topic.\" This is the **highest-leverage stage** — if one topic gets split across two slugs, nothing downstream can fix it. This was the actual bottleneck in empirical testing (33 guides produced vs 27 in the gold wiki, all from over-splitting).\n\n---\n\n**RECONCILE**\n\nGroups all claims by their target guide, then processes **one guide at a time**. For each guide, the model sees:\n- The full current guide body\n- All claims routed to it this session\n\nAnd decides per claim: `add / revise / remove / propose-new`. The key mechanism is that **the model sees the contradiction it would create** — that's what prevents accretion. It's explicitly sequential (not parallel) because parallel workers would each see a stale snapshot and independently append, recreating the exact problem being solved.\n\n---\n\n**HISTORY**\n\nRecords the supersession chain. When a claim replaces an old one, the old one is *never deleted* — it's retained in the claim log marked superseded. What renders in the guide is:\n- The live tip (current claim, clean prose)\n- For genuine **user mind-changes**: a terse breadcrumb (\"Was A until session N — changed because X\")\n- Superseded *agent* claims: kept in the log for audit, not auto-rendered as \"previously\" (because an agent claim may have been wrong/hallucinated, and rendering it would imply the system once actually was that way)\n\n---\n\nThe whole pipeline's core insight: the current single-pass approach asks the model to solve routing + reconciliation as *side effects of writing prose* — and it always takes the cheap path (append/create). Splitting into stages hands it the candidates and constrains the choice instead."
+  ],
+  [
+    "user",
+    "ok, I bet extract itself is problematic -- add a pc debug extract <file> and use it to process some real transcripts, I bet it's dropping important things and we need to improve the prompting, context we provide to that llm call, etc -- include a pc debug transcript <file> so when you generate extractions you work with the same transcript as the llm we call is using -- do this investigation/iterations in a background agent and let me know the results and what (if you end up doing so) did to improve it. one thing I suspect is that the llm would benefit from at least having a list of existing topics and wiki entries."
+  ],
+  [
+    "assistant",
+    "The investigation is done. Here's what the agent found and built:\n\n## What was built\n\nTwo new commands, both working:\n- `pc debug transcript <file>` — prints the numbered transcript exactly as EXTRACT sees it\n- `pc debug extract <file> [--wiki-dir <dir>] [--no-wiki]` — runs only EXTRACT+authority-tagging, shows the full prompt, raw response, parsed claims, and summary. Also surfaces JSON parse failures that the live path silently swallows as 0 claims.\n\n## Key findings from real transcripts\n\n**EXTRACT is not systematically dropping facts.** Every headline architectural decision in the tested sessions appeared in every run. Zero evidence-invalid drops across ~20 runs — the Rust verification gate is not silently discarding things.\n\n**Important insight:** A 135KB `.jsonl` collapsed to 23 lines because `parse_transcript` strips all tool calls/results. EXTRACT only ever sees user + assistant *prose*, so tool-heavy sessions present far less content than their file size suggests.\n\n**One marginal failure mode confirmed:** late-session reversals (e.g. \"explicit/implicit tag is metadata-only, never rendered\") are intermittently missed across all conditions — caught sometimes, not others.\n\n## Your hypothesis about wiki index in EXTRACT\n\n**Tested empirically and rejected for live use.** Adding the wiki index to the EXTRACT prompt added variance and caused 2 complete extraction failures (0 claims) — the longer prompt pushed against the 6000-token cap, truncating the JSON mid-array. No coverage gain over the baseline. The `--wiki-dir` flag still works in the debug command for experimentation, but live capture passes an empty index to EXTRACT.\n\n## What changed in the prompt\n\nRefactored into a `build_extract_system(index_rows)` helper. Added a sweep-completeness nudge (read the whole transcript top to bottom, don't stop early, capture late-session reversals). Deliberately did *not* push for more granular/atomic splits — that feeds the over-splitting bottleneck you've already diagnosed.\n\n## Status\n\nThe work is committed in worktree branch `worktree-agent-a2304072bdf18c4ab`. One note from the agent: it worked off commit `31e2296` (3 behind master), and master has a different truncation strategy (`reduce_turns_to_fit` vs byte-tail) — when you merge, the truncation call in `debug_preprocess_transcript` should be updated to match master's path so debug output stays faithful to the live pipeline.\n\nWant me to review the diff and merge it?"
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "assistant",
+    "Done. Merged and fixed. You now have:\n\n- `pc debug transcript <file>` — prints what EXTRACT actually sees\n- `pc debug extract <file> [--wiki-dir <dir>] [--no-wiki]` — full EXTRACT+authority run with all intermediates visible, JSON parse failures surfaced (instead of silently becoming 0 claims)\n- The EXTRACT prompt gets a sweep-completeness nudge (read whole transcript top-to-bottom, capture late-session reversals) — `PC_EXTRACT_NO_GRANULARITY=1` to A/B against the original\n- Wiki index in EXTRACT is available via `--wiki-dir` for experimentation but not wired into live capture (empirically caused occasional complete failures at the 6000-token cap with no coverage gain)"
+  ],
+  [
+    "user",
+    "6000-token cap?"
+  ],
+  [
+    "assistant",
+    "That's the `max_tokens` limit on the *output* — it caps how many tokens the LLM is allowed to emit in its response. For EXTRACT, 6000 output tokens is the ceiling for the JSON array of claims. If the prompt gets long enough (like when the wiki index is appended), the model spends more tokens generating the response, and if it hits the cap mid-JSON-array, you get truncated/unparseable output.\n\nThe input (transcript) can be up to ~250K chars; the output cap is just what EXTRACT can write back. 6000 tokens is roughly 4500 words — enough for maybe 60-80 claims at typical verbosity. For a dense session it could be tight.\n\nIt's not a fundamental constraint — you could raise it. The agent's finding was specifically that adding the wiki index to the *input* prompt didn't help coverage but did push some responses to hit that output ceiling. The cap itself is probably fine for normal use."
+  ],
+  [
+    "user",
+    "why would the wiki index increase the OUTPUT?"
+  ],
+  [
+    "assistant",
+    "Good catch — it doesn't, directly. The wiki index is in the *input* (system prompt); the 6000-token cap is on the *output*. Longer input doesn't mechanically produce longer output.\n\nThe agent's explanation was imprecise. The more likely mechanisms for the 0-claim runs:\n\n1. **Model generates more claims** — seeing the wiki index, the model tries to cover all the topics it sees, producing more claims total → more output tokens → hits the cap mid-JSON-array → parse failure → 0 claims\n2. **Assertion verbosity** — each claim assertion gets longer because the model borrows vocabulary/context from the wiki index\n3. **Coincidence/nondeterminism** — the agent ran only 2-3 samples per condition; the 0-claim runs may have been unrelated to the wiki index and just nondeterminism at an unlucky seed\n\nThe agent didn't look at the raw responses for those 0-claim runs to distinguish \"truncated mid-array\" from \"model emitted garbage.\" The evidence is weak. The real question — does a wiki index in EXTRACT produce better claims at the same or slightly higher count — wasn't cleanly answered.\n\nIf you want to revisit it, `pc debug extract --wiki-dir docs/wiki <file>` lets you see the raw response directly and check whether it's hitting the cap or something else."
+  ],
+  [
+    "user",
+    "and after extract what's the next step in the pipeline?"
+  ],
+  [
+    "assistant",
+    "Authority tagging — but it's mechanical Rust, not an LLM call. It:\n\n1. Verifies each claim's evidence ranges actually exist in the transcript (Rust slice check — drops any claim with invalid/out-of-bounds line numbers)\n2. Tags each surviving claim `explicit` (evidence falls in a user turn) or `implicit` (agent turn) — derived from the line→role map, never trusted from the model\n\nThen ROUTE — the first post-EXTRACT LLM call. For each admitted claim, embed it and cosine-search the existing wiki guides (RECALL), then send the top-K candidates to the LLM to pick a target slug or declare \"new topic\" (RERANK)."
+  ],
+  [
+    "user",
+    "is this when the \"verified\" tagging is set?"
+  ],
+  [
+    "assistant",
+    "`ratified` and `verified` are different things. What you're asking about — `ratified` — is set by EXTRACT itself, not by authority tagging. EXTRACT sets `ratified: true` when an *assistant* proposal is explicitly endorsed by a later user turn (\"yes do that\", \"go ahead\"). Authority tagging ignores it — the `ratified` field is currently advisory only (§5 tag-don't-drop means even unratified agent claims are admitted).\n\nIf you're asking about a `verified:` field in guide frontmatter — that's separate, it's a staleness signal used by `wiki doctor` to track when a guide was last confirmed current. Not part of the capture pipeline at all.\n\nWhich \"verified\" did you mean?"
+  ]
+]

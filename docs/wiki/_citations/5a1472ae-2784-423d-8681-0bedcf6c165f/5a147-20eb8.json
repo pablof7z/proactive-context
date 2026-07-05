@@ -1,0 +1,6 @@
+{
+  "id": "5a147-20eb8",
+  "ts": "2026-06-29T12:47:20Z",
+  "session": "5a1472ae-2784-423d-8681-0bedcf6c165f",
+  "text": "User: is there a chronological order to how the pc archeologist runs? i.e. we should send the first conversation of the project first, on the second one we should include the available guides that are available (I'm guessing that's already happening, right?)\n\nAssistant: Yes, this is already the designed behavior. From the injected context:\n\n> The archeologist replays sessions within each project in ascending chronological order by their first message timestamp, oldest first. This is non-negotiable because each capture's agent loop calls `wiki_list`/`wiki_read` to see the wiki-so-far — so a later session's capture sees what earlier sessions wrote. [...] User: yes, the chrnological order must be respected"
+}

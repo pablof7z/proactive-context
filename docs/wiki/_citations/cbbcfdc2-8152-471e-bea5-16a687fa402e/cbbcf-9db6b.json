@@ -1,0 +1,6 @@
+{
+  "id": "cbbcf-9db6b",
+  "ts": "2026-06-29T11:50:44Z",
+  "session": "cbbcfdc2-8152-471e-bea5-16a687fa402e",
+  "text": "User: let's make paths in the inject flow be relative to the current dir\n\n/Users/pablofernandez/src/proactive-context/docs/wiki/capture-destination-event-sourced-projections.md:31 becomes ./docs/wiki/capture-destination-event-sourced-projections.md:31 [...] 1. **`compile_briefing`**: labels now use `strip_prefix(root)` to get a `./`-relative path; falls back to absolute only if the source lives outside the project root (e.g. an old-style external wiki dir).\n2. **`COMPILE_PREAMBLE`**: removed \"absolute\" from the citation instruction — the model just cites whatever path is in the source header.\n3. **`render_guides_for_select` comment**: updated to say \"cwd-relative\".\n\nCitations will now look like `./docs/wiki/capture-destination-event-sourced-projections.md:31` — openable directly from the project root."
+}

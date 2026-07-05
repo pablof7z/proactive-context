@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "the UX of pc configure is shit -- I want to be able to be able to select the provider (openrouter, ollama, etc) with tabs instead of a long list"
+  ],
+  [
+    "assistant",
+    "Clean build (only pre-existing warnings). Both changes are in:\n\n**Provider tabs:** `[` / `]` cycle through All / Claude CLI / OpenRouter / Ollama tabs at the top of the models pane, filtering the list to that provider. Each tab shows a live count; the active one is highlighted cyan-on-black.\n\n**Role descriptions:** bumped the info area from 3 → 6 lines and switched from `truncate_to` to `Paragraph::wrap`, so descriptions and suggestions now word-wrap instead of being cut off."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Done."
+  ]
+]

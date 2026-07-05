@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-f5d77",
+  "ts": "2026-06-29T10:44:25Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "Assistant: Capture needs ≥3 exchanges and ≥500 chars — so the teaching session must be genuinely multi-turn. Setting up the clean test environment: wipe any stale state, index the test project, confirm the index exists. [...] Worth noting the asymmetry you may be sensing: on the **capture** side you recently added `capture_triage_model` — a genuine fast-model \"is this transcript even worth distilling?\" triage *before* the expensive distillation. **Inject has no equivalent transcript-triage pre-check** — its fast model is the wiki *navigator*, not a \"should we bother looking\" gate."
+}

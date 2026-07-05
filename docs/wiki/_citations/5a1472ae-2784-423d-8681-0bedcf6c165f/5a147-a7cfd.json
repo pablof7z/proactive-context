@@ -1,0 +1,6 @@
+{
+  "id": "5a147-a7cfd",
+  "ts": "2026-06-29T12:48:28Z",
+  "session": "5a1472ae-2784-423d-8681-0bedcf6c165f",
+  "text": "**HISTORY**\n\nRecords the supersession chain. When a claim replaces an old one, the old one is *never deleted* — it's retained in the claim log marked superseded. What renders in the guide is:\n- The live tip (current claim, clean prose)\n- For genuine **user mind-changes**: a terse breadcrumb (\"Was A until session N — changed because X\")\n- Superseded *agent* claims: kept in the log for audit, not auto-rendered as \"previously\" (because an agent claim may have been wrong/hallucinated, and rendering it would imply the system once actually was that way) [...] \nAssistant: `ratified` and `verified` are different things. What you're asking about — `ratified` — is set by EXTRACT itself, not by authority tagging. EXTRACT sets `ratified: true` when an *assistant* proposal is explicitly endorsed by a later user turn (\"yes do that\", \"go ahead\"). Authority tagging ignores it — the `ratified` field is currently advisory only (§5 tag-don't-drop means even unratified agent claims are admitted)."
+}

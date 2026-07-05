@@ -1,0 +1,6 @@
+{
+  "id": "40a9b-8a7fc",
+  "ts": "2026-06-29T12:12:35Z",
+  "session": "40a9b852-21b4-4d3d-8ca4-0e6d42650e61",
+  "text": "Assistant: Here's the situation: the \"New\" count is computed against a capture ledger that lives in **`~/.proactive-context/captured-sessions/`** — completely separate from `docs/wiki`. That's why blowing away the wiki didn't reset anything. Right now there are **571 marker files** (`{session_id}.json`) there, one per captured session, keyed by session ID with no project grouping. [...] **Caveat:** that ledger is global/flat — it resets **all 38 projects**, not just `proactive-context`. The markers carry no project info, so there's no clean per-project wipe from the marker dir alone. If you ever used `--out <dir>` for an isolated run, the ledger is instead at `<dir>/captured-sessions/` (`archeologist.rs:591`)."
+}

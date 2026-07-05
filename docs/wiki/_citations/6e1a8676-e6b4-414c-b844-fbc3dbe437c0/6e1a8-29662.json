@@ -1,0 +1,6 @@
+{
+  "id": "6e1a8-29662",
+  "ts": "2026-06-29T12:37:00Z",
+  "session": "6e1a8676-e6b4-414c-b844-fbc3dbe437c0",
+  "text": "This is the part worth acting on. The log shows **7 `wiki.agent` \"timeout after 300s\" errors on this project**. The 300s cap (`capture.rs:2369`) bites exactly the *longest, densest* sessions — the ones with the most to capture. Their knowledge is dropped. [...] And here's the kicker — the code *intends* for failures to be retryable but isn't:\n\n```rust\n// capture.rs:2376–2401\nmatch agent_result {\n    Ok(Ok(summary)) => { ...agent_done... }\n    Ok(Err(e))      => { ...log error...   }   // no return\n    Err(_timeout)   => { ...log timeout... }   // no return\n}\nlet _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);  // runs UNCONDITIONALLY\n```\n\nThe comment says mark-after-loop avoids \"permanently suppressing retry\" — but timeouts and API errors are *caught*, so execution falls straight through and **marks the session captured anyway.** So a plain re-run will skip those 7 sessions. (This also corrects your `known-bugs.md` entry, which says mark runs *before* the loop — it's after, but unconditional, so the practical effect is the same: no retry on timeout.)"
+}

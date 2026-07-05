@@ -1,0 +1,6 @@
+{
+  "id": "77e65-d229e",
+  "ts": "2026-06-29T12:31:13Z",
+  "session": "77e655bc-c95a-48c4-8277-b38fff616eac",
+  "text": "2. **Replace with per-server wildcards** to actually get the auto-allow you wanted, e.g.:\n   - `mcp__plugin_vercel_vercel__*`\n   - `mcp__claude_ai_Gmail__*`, `mcp__claude_ai_Google_Calendar__*`, `mcp__claude_ai_Google_Drive__*`\n\n   Downside: you'd need to add a new entry whenever you connect a new MCP server. [...] That was the only issue `/doctor` reported. The fix clears the warning with no behavior change — the rule was already being skipped, so MCP tools were prompting per-use before and will continue to. If you later want to auto-allow specific MCP servers, the supported form is per-server: `mcp__<server>__*`."
+}

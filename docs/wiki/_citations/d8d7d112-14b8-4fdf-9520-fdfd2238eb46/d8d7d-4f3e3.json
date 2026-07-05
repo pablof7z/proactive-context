@@ -1,0 +1,6 @@
+{
+  "id": "d8d7d-4f3e3",
+  "ts": "2026-06-29T10:41:48Z",
+  "session": "d8d7d112-14b8-4fdf-9520-fdfd2238eb46",
+  "text": "User: the UX of pc configure is shit -- I want to be able to be able to select the provider (openrouter, ollama, etc) with tabs instead of a long list [...] **Provider tabs:** `[` / `]` cycle through All / Claude CLI / OpenRouter / Ollama tabs at the top of the models pane, filtering the list to that provider. Each tab shows a live count; the active one is highlighted cyan-on-black. [...] Assistant: Now I have a clear picture. I'll add a provider tab bar to the models pane — `[` / `]` to cycle tabs (All / Claude CLI / OpenRouter / Ollama), filtering the list to that provider. Tab stays as the pane switcher. [...] Assistant: Now add `[` / `]` key handling in the event loop, and update the help bar: [...] Assistant: Now update the help bar to mention `[/]` for tabs:"
+}

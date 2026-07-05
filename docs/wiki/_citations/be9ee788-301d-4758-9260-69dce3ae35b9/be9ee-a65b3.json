@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-a65b3",
+  "ts": "2026-06-29T11:10:29Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "- Tuning knobs: `PC_ROUTE_TOP_K` (default 8), `PC_ROUTE_TAU` (default 0.30). Best config: K=8, τ=0.30 — and the key lesson is that τ was NOT the lever; the preamble was."
+}

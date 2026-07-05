@@ -1,0 +1,6 @@
+{
+  "id": "77e65-0a38b",
+  "ts": "2026-06-29T12:31:13Z",
+  "session": "77e655bc-c95a-48c4-8277-b38fff616eac",
+  "text": "A note on your setup: editing this file will itself trigger a permission prompt because you have `Edit(~/.claude/settings.json)` in your `ask` list — that's expected and fine."
+}

@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "when I run this it takes ages and it doesn't do anything -- can I get some insight into what its doing while its running?"
+  ],
+  [
+    "assistant",
+    "The command makes one blocking, non-streaming call to a slow cloud reasoning model with a 600s timeout, printing nothing until it returns. Added a heartbeat spinner to stderr showing elapsed time during the call."
+  ],
+  [
+    "user",
+    "is it multistep? or does it literally take all that long in a single call? how many tokens do we send?"
+  ],
+  [
+    "assistant",
+    "It's a single call sending roughly 1,700 tokens (catalog of guide titles/summaries, no bodies). The latency comes from the model's reasoning chain and cloud queueing, not payload size; suggested using a lighter model or enabling streaming if faster feedback is needed."
+  ]
+]

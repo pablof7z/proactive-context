@@ -1,0 +1,34 @@
+[
+  [
+    "user",
+    "we have a 5 minute gate, for capture, right?"
+  ],
+  [
+    "assistant",
+    "Confirmed there's a 5-minute debounce gate on capture (`capture_debounce_secs`, default 300) plus a separate 5-minute agent timeout, and noted the docs are stale on this point."
+  ],
+  [
+    "user",
+    "is there a hook we could use so that when the agent stops running it runs capture 1 minute after? or is that something we're already doing?"
+  ],
+  [
+    "assistant",
+    "You're already doing this — a Stop hook fires `pc capture --in 300`, and to make it 1 minute you'd just change `capture_debounce_secs` to `60` in config. Offered to flip it."
+  ],
+  [
+    "user",
+    "why is there both a --in 300 and a debounce_secs 300?"
+  ],
+  [
+    "assistant",
+    "The `300` in `--in 300` is dead — only `Some` vs `None` matters; the actual delay comes solely from `capture_debounce_secs`. Suggested two cleanups and asked which to pursue."
+  ],
+  [
+    "user",
+    "1"
+  ],
+  [
+    "assistant",
+    "Implemented option 1: `--in` now overrides config as the debounce delay, with `capture_debounce_secs` as the default; updated main.rs, capture.rs, config.rs, and the Stop hook in settings.json, then built, installed, and verified. Noted the delay is still 300s and asked whether to set it to 60 and commit."
+  ]
+]

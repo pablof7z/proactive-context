@@ -1,0 +1,6 @@
+{
+  "id": "6e1a8-7c54b",
+  "ts": "2026-06-29T12:37:00Z",
+  "session": "6e1a8676-e6b4-414c-b844-fbc3dbe437c0",
+  "text": "The pipeline is `triage → EXTRACT → ROUTE → reconcile`, and every stage is designed to *shrink* volume: [...] - **Triage** gets the *current wiki index* and returns NO for transcripts whose knowledge is \"already fully specified\" (`capture.rs:408`). So the more the wiki fills, the more later sessions get dropped as redundant. This is the intended convergence."
+}

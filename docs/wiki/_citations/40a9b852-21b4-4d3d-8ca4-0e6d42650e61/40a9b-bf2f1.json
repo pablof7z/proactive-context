@@ -1,0 +1,6 @@
+{
+  "id": "40a9b-bf2f1",
+  "ts": "2026-06-29T12:12:35Z",
+  "session": "40a9b852-21b4-4d3d-8ca4-0e6d42650e61",
+  "text": "**`NEW:9`** = the number of Claude Code sessions for that project that the archeologist **has not yet captured/ingested**. [...] - **`NEW:9`** — of those 52, 9 are new (not in the capture ledger yet), so 43 have already been processed in a previous archeologist run\n\nIt's the **backlog count** — how much work selecting that project would actually do. The total at the bottom/header sums `new_sessions` across selected projects (`total_new`, line 138), and it's also what drives the synthesis-checkpoint estimate (line 515-516: `new_sessions.div_ceil(synth_every)`). [...] - If `new_sessions` is 0, the `NEW:` label is omitted entirely (line 1712). [...] - The date `2026-05-28..` is the project's session date range (`first_date`, line 340-343 — first 10 chars of the earliest session timestamp), **not** the last-capture date."
+}

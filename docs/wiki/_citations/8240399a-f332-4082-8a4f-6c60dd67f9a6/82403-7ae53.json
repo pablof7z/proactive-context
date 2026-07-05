@@ -1,0 +1,6 @@
+{
+  "id": "82403-7ae53",
+  "ts": "2026-06-29T12:57:38Z",
+  "session": "8240399a-f332-4082-8a4f-6c60dd67f9a6",
+  "text": "**Cross-session non-reconciliation (expected, but visible):** because `extract --all` runs per-session, session 1 still asserts \"the wallet allows users to send payments, check balance\" as working, while session 3 asserts \"balance/send are not yet implemented, no stubs.\" Both sit in the dump contradicting each other. That's RECONCILE's job, not EXTRACT's — but it's a good illustration of why the per-session dump isn't the final wiki."
+}

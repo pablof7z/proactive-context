@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-ae821",
+  "ts": "2026-06-29T10:44:40Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "2. **Marker placement deviation:** citations are stored as a per-section trailing `<!-- citations: [^id] … -->` comment (the agent's clean solution to carry-forward), not strictly inline at each statement. The round-trip and inject preamble both work with it; flagging in case you want markers inline per-statement instead."
+}

@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "let's make paths in the inject flow be relative to the current dir /Users/pablofernandez/src/proactive-context/docs/wiki/capture-destination-event-sourced-projections.md:31 becomes ./docs/wiki/capture-destination-event-sourced-projections.md:31"
+  ],
+  [
+    "assistant",
+    "Updated compile_briefing to use strip_prefix(root) for ./-relative paths, removed \"absolute\" from the citation instruction, and updated the render_guides_for_select comment."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as 4e5a9a1, bundling the relative citation paths change with other in-flight work."
+  ]
+]

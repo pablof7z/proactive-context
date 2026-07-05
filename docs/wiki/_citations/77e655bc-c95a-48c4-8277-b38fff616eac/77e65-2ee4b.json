@@ -1,0 +1,6 @@
+{
+  "id": "77e65-2ee4b",
+  "ts": "2026-06-29T12:31:13Z",
+  "session": "77e655bc-c95a-48c4-8277-b38fff616eac",
+  "text": "1. **Remove the line.** Cleanest. MCP tools will then prompt for permission per-use (the default). Since the rule is already being skipped, this changes nothing about current behavior — it just clears the warning. [...] Assistant: Done. Removed the invalid `\"mcp__*\"` rule from `permissions.allow`.\n\nThat was the only issue `/doctor` reported. The fix clears the warning with no behavior change — the rule was already being skipped, so MCP tools were prompting per-use before and will continue to. If you later want to auto-allow specific MCP servers, the supported form is per-server: `mcp__<server>__*`.\n\nThe edit is valid JSON (I removed the trailing comma cleanly). Re-running `/doctor` should now come back clean."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "105d3-1d1a2",
+  "ts": "2026-06-29T10:51:17Z",
+  "session": "105d3450-2ae4-4fc8-9c46-f74830a9dd97",
+  "text": "Assistant: I have a deep, accurate picture now. The current README sells a stale v0.1 (vector RAG). The real product is a self-improving memory for coding agents built on the capture→wiki→inject loop. Let me write the new README.\n\nAssistant: Done. I rewrote `README.md` from the ground up.\n\nThe old one sold the stale v0.1 — \"live vector index + RAG over markdown.\" The real product, as it now stands across your specs, source, and the wiki-model decision, is a **self-improving memory for coding agents**: the capture→wiki→inject loop. So I led with that, and let the engine details settle into a \"How it's built\" section near the bottom where they belong. [...] proactive-context: single Rust binary, local fastembed + sqlite-vec, zero cloud."
+}

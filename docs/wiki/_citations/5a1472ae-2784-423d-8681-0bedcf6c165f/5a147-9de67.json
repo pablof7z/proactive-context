@@ -1,0 +1,6 @@
+{
+  "id": "5a147-9de67",
+  "ts": "2026-06-29T12:48:37Z",
+  "session": "5a1472ae-2784-423d-8681-0bedcf6c165f",
+  "text": "If you're asking about a `verified:` field in guide frontmatter — that's separate, it's a staleness signal used by `wiki doctor` to track when a guide was last confirmed current. Not part of the capture pipeline at all.\n"
+}

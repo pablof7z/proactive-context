@@ -1,0 +1,6 @@
+{
+  "id": "94d06-a97e9",
+  "ts": "2026-06-29T11:54:36Z",
+  "session": "94d06a3c-7fd2-47ef-8022-6f63e5793f71",
+  "text": "Assistant: Now add the `--tenex` flag to the CLI in `main.rs`: [...] - New `--tenex` flag; TENEX projects merge into the picker alongside Claude Code sessions [...] ```\npc archeologist --tenex\n``` [...] I think we should only import conversations where the user was participant instead of agent<>agent communication [...] - Scans `~/.tenex/projects/*/conversation.db` for conversations where the user's pubkey appears in at least one message [...] - Skips conversations with fewer than 3 messages (matches existing capture threshold) [...] - Resolves local cwd as `projectsBase/<slug>` — skips projects where that directory doesn't exist [...] 1. Path resolution is `projectsBase/<slug>` (from config), not git-remote matching [...] - Deduplicates consecutive identical assistant messages (TENEX retry chatter) [...] - The `TempDir` for synthesized files is held alive through the entire run, then auto-cleaned up on drop"
+}

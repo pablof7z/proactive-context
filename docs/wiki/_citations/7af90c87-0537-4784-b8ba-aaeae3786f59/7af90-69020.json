@@ -1,0 +1,6 @@
+{
+  "id": "7af90-69020",
+  "ts": "2026-06-29T10:54:43Z",
+  "session": "7af90c87-0537-4784-b8ba-aaeae3786f59",
+  "text": "**1. Per-project wiki — this is the real carry-forward.**\nCapture distills each session's transcript into interlinked topic guides at `~/.proactive-context/projects/<path>/wiki/`, and `inject` reads that wiki on every prompt (`inject.rs:354` → `wiki::wiki_dir(&proj_dir)`). This works and compounds — but it's scoped to one codebase. It won't surface in another project. [...] **2. Global / \"how the user thinks\" — detected, queued, then abandoned.**\nThe capture prompt *does* explicitly classify scope (`capture.rs:326`): *\"scope 'global' only for universal user preferences across ALL projects.\"* So the distillation step recognizes cross-project, user-level lessons. But look at where they go:"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-e3458",
+  "ts": "2026-06-29T10:45:20Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "- **UX spec §1** says `query.start` should fire *only inside inject* (tail watches background hooks/daemons, not standalone CLI `query`/`generate`).\n- **System spec §4** emits `query.start`/`retrieve.hit` from `run_query` itself — so standalone `query`/`generate` would also emit \"for free.\"\n\nThe system spec's placement is simpler (one call site covers inject) and standalone queries showing up in `tail` is harmless — arguably desirable for \"a live view into what's going on.\" I'll rule **system spec wins**: emit from `run_query`; standalone CLI emission is acceptable."
+}

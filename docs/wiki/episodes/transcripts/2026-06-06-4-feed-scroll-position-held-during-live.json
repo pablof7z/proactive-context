@@ -1,0 +1,58 @@
+[
+  [
+    "user",
+    "in all those 2m I didn't see a single log update, I had no idea what the thing was doing -- I want it to tell me what its going on more proactively"
+  ],
+  [
+    "assistant",
+    "Diagnosed that the TUI was silent during a long LLM EXTRACT call; added live phase labels in the headline, lifecycle feed lines for each capture stage, and truthful summary counters (including an `interrupted` bucket) in archeologist.rs."
+  ],
+  [
+    "user",
+    "Continue from where you left off."
+  ],
+  [
+    "assistant",
+    "No response requested."
+  ],
+  [
+    "user",
+    "it shows me new guide lines a bunch of times, but it doesn't show me any of the claims that were discovered when it shows me reading conversation xxx I would like to select that item and on the detail pane see the transcript of the conversation as we are sending it to the llm also, selecting is weird, instead of showing the row selected it stops-rendering the rows under the current row -- its very strange"
+  ],
+  [
+    "assistant",
+    "Fixed three issues: duplicate \"New guide\" events in capture.rs (now only fires on genuine creation), added a scrollable transcript drill-down when selecting \"Reading conversation\" lines, and rewrote the feed window as bottom-anchored so the cursor stays within the rendered rows."
+  ],
+  [
+    "user",
+    "when I scroll past the viewport I don't see the position since the container doesn't scroll down"
+  ],
+  [
+    "assistant",
+    "Fixed live-update scroll drift by holding the scroll position when not at the bottom, added a `feed · line N/M` position indicator in the feed title, and extracted the window math into a tested `feed_window()` helper."
+  ],
+  [
+    "user",
+    "commit your work"
+  ],
+  [
+    "assistant",
+    "Committed the scroll-position fix to master as `77d3389`, noting the first-round changes (transcript drill-down, selection windowing, duplicate wiki.create fix) were already swept in by a peer commit."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "assistant",
+    "Committed a `.gitignore` for `.DS_Store` and derived wiki caches, tracked the 9 wiki guides under `docs/wiki`, and pushed everything to origin/master as a clean fast-forward."
+  ],
+  [
+    "user",
+    "git pull"
+  ],
+  [
+    "assistant",
+    "Reported already up to date with origin/master; explained the pull error was caused by a dirty working tree from a concurrent capture regenerating wiki guides, and left the tree untouched."
+  ]
+]

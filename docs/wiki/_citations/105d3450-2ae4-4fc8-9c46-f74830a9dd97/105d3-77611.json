@@ -1,0 +1,6 @@
+{
+  "id": "105d3-77611",
+  "ts": "2026-06-29T10:52:03Z",
+  "session": "105d3450-2ae4-4fc8-9c46-f74830a9dd97",
+  "text": "**Dropped the coding-agent anchor.** The lead now talks about \"an AI\" and \"your knowledge\" generically. The differentiator — verbatim, cited, no-paraphrase — is about *how knowledge is held*, which has nothing to do with code, so the framing follows the thesis instead of the host. Concrete changes:\n- Example in \"show your work\" is now domain-neutral (primary-sources-vs-blog-posts, not bun/typing).\n- The wiki example is \"a single subject you've worked out,\" not \"how auth works in this project.\"\n- The Claude Code section is retitled **\"The assistant integration\"** and explicitly says *\"Nothing about capture-then-inject is specific to Claude Code, or to code… Claude Code is simply the host that exposes those seams today.\"*\n- Quick-start now notes the engine \"stands on its own, no assistant required.\""
+}

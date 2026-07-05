@@ -1,0 +1,6 @@
+{
+  "id": "105d3-a7264",
+  "ts": "2026-06-29T10:51:47Z",
+  "session": "105d3450-2ae4-4fc8-9c46-f74830a9dd97",
+  "text": "User: those wiki tools are being built right now [...] Assistant: Confirmed: this tree still runs the old `distill_lessons → plan_wiki_ops → apply_wiki_ops` capture pipeline — the `wiki_*` citation tools aren't landed here yet, so I'll frame them as *in active build*, not shipped, and not claim the integrity guarantee in present tense. [...] **Reframed the citation work as in-flight, not someday.** I checked the tree — capture still runs the old `distill_lessons → plan_wiki_ops → apply_wiki_ops` path and there's no `wiki_*`/`_citations` code landed yet, so I can't claim the integrity guarantee in present tense without crossing into oversell. But \"Where this is going\" now opens with *\"What's **being built right now**…\"* and leads with **integrity by construction** (the point-don't-rewrite trick turned onto capture) → then the regenerable-spec payoff → then decay. The Status line says it's \"under construction, not yet landed.\" When the tools land, that section graduates to present tense and the anchor itself can sharpen from \"shows its work\" to \"knowledge that can't fabricate a requirement you never gave.\""
+}

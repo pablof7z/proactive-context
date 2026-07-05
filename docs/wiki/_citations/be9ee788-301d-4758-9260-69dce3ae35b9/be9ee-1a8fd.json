@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-1a8fd",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "User: btw, docs/wiki should be committed in each repo after you regenerate it\n\nAssistant: Got it — I'll commit `docs/wiki/` in each repo after its backfill. A few specifics on how I'll do it safely:\n\n- **Scoped add only** — `git add docs/wiki/` (not `-A`), so I never touch any *other* uncommitted work-in-progress in your repos. Commit message like `docs(wiki): regenerate project wiki via proactive-context archeologist` + the Claude co-author line.\n- **On the repo's current branch, commit-only (not push)** — you said \"committed,\" so I'll commit locally. Say the word if you also want them pushed."
+}

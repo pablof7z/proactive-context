@@ -1,0 +1,6 @@
+{
+  "id": "d8d7d-b985c",
+  "ts": "2026-06-29T10:42:02Z",
+  "session": "d8d7d112-14b8-4fdf-9520-fdfd2238eb46",
+  "text": "Assistant: Now fix the roles pane to show multiline description/suggestion instead of truncating. Currently the info area is 3 lines (divider + description + suggestion), but the description gets cut off. Let me look at the current role info rendering and make it wrap properly:\n\nAssistant: The info block uses `truncate_to` — I need to replace that with proper wrapping via `Paragraph::wrap`. I'll expand it to 6 lines: [...] Assistant: Also remove the now-unused `truncate_to` function: [...] **Role descriptions:** bumped the info area from 3 → 6 lines and switched from `truncate_to` to `Paragraph::wrap`, so descriptions and suggestions now word-wrap instead of being cut off."
+}

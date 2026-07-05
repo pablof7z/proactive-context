@@ -1,0 +1,6 @@
+{
+  "id": "fbd3d-3f73a",
+  "ts": "2026-06-29T11:44:52Z",
+  "session": "fbd3d6f8-1b55-4271-aaf4-de0790b5120b",
+  "text": "2. **`capture.rs`**: resolve `delay = override.unwrap_or(cfg.capture_debounce_secs)`, store it in `PendingCapture`, and make the deferred runner sleep on *that* (not re-read config) — so the value actually drives timing and the log line stops lying. [...] Assistant: Note line 1997: `delay_secs` *is* used — but only in a log message (`delay={}s`), which actively lies if it ever diverges from config. Since peer agents are editing this file concurrently, let me re-read the whole function fresh before I touch anything. [...] This refactor **did not change the delay** — it's still **300s (5 min)**. The whole thread started from \"make capture run 1 minute after stop,\" but you picked the refactor over \"just set it to 60,\" and never confirmed the value itself.\n"
+}

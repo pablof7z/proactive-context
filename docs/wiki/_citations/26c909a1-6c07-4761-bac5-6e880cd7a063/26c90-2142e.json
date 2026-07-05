@@ -1,0 +1,6 @@
+{
+  "id": "26c90-2142e",
+  "ts": "2026-06-29T10:58:24Z",
+  "session": "26c909a1-6c07-4761-bac5-6e880cd7a063",
+  "text": "User: try it with glm-5.1:cloud [...] - **Config is now live**: `inject_select_model` and `inject_compile_model` → `ollama:glm-5.1:cloud` (was deepseek). Backup at `/tmp/config.backup.json` — revert with `cp /tmp/config.backup.json ~/.proactive-context/config.json`.\n- `src/inject.rs` is **unchanged** (I reverted the `think` experiment; the fix is config, not code)."
+}

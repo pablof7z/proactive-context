@@ -1,0 +1,6 @@
+{
+  "id": "26c90-9d987",
+  "ts": "2026-06-29T10:58:53Z",
+  "session": "26c909a1-6c07-4761-bac5-6e880cd7a063",
+  "text": "Assistant: Important correction to my earlier theory: vector retrieval *did* surface real grounding content — `docs/product-spec/tail-ux.md` (\"Anatomy of a line\"), `tail-system.md` (filtering & rendering). Those committed specs ARE the \"tail tui.\" So content exists, yet the gate still bailed. Let me capture what the select model actually received and returned. [...] - **Retrieval worked.** Vector search surfaced the right docs at the top: `docs/product-spec/tail-system.md` (0.52), `docs/product-spec/tail-ux.md` (0.43). `tail-ux.md` literally has an \"Anatomy of a line\" section with the gutter/rendering layout. **The grounding content for \"tail tui\" exists, is committed, is in the catalog, and was retrieved.**\n- **The gate (`deepseek-v4-flash`) threw it away** — logged output was exactly `NOTHING_RELEVANT`."
+}

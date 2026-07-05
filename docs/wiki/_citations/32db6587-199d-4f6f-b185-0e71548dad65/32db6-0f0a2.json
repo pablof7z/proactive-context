@@ -1,0 +1,6 @@
+{
+  "id": "32db6-0f0a2",
+  "ts": "2026-06-29T12:08:59Z",
+  "session": "32db6587-199d-4f6f-b185-0e71548dad65",
+  "text": "- **No API key** when OpenRouter models configured (`inject.rs:338-363`): emits `render_raw_reminder` (raw vector chunks, verbatim) as fallback — deterministic, no model. [...] - **Empty catalog but non-empty hits** (`inject.rs:804-813` → `render_hits_librarian`): renders raw chunks verbatim with `TITLE:` line — no LLM, so no paraphrase (`inject.rs:1010-1023`). [...] - **Timeout / compile error** (`inject.rs:483-539`): degrades to the same `fallback_block` (raw chunks) if any hits exist, else nothing."
+}

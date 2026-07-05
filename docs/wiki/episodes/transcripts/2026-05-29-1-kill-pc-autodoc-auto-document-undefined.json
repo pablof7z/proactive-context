@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "what is this `pc autodoc` command? it writes some bullshit guide???!"
+  ],
+  [
+    "assistant",
+    "`pc autodoc` is a background command that auto-writes wiki definition guides for code entities triggered by dangling wiki links; it greps Rust source files, calls the capture model with excerpts, and writes a low-confidence guide or abstains. The quality issues likely stem from the capture model's limitations."
+  ],
+  [
+    "user",
+    "no, this is a heaviliy stupid idea and obviously poorly baked (what happens if this is used in a non-rust project?!) plus, who's writing these [[slug]] links? this is completely incorrect and something that will hurt more than help -- what was it role? why was this shit built?"
+  ],
+  [
+    "assistant",
+    "It was meant to fill \"Layer 2\" entity definitions that can't be mined from transcripts, but the implementation is flawed: the trigger rarely fires correctly, it's hardcoded to Rust, uses a weak model with thin context, and low-confidence guides pollute retrieval. The recommendation is to cut it entirely and pursue a cleaner approach separately if desired."
+  ]
+]

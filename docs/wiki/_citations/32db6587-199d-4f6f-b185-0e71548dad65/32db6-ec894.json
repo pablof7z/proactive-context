@@ -1,0 +1,6 @@
+{
+  "id": "32db6-ec894",
+  "ts": "2026-06-29T12:08:59Z",
+  "session": "32db6587-199d-4f6f-b185-0e71548dad65",
+  "text": "Assistant: The isolated log has 12 entries — so my temp config **did** load (it wrote there). The catch: `sanitize` clamps `inject_browse_timeout_ms` to **60000 max**, so 180s became 60s, and even 60s wasn't enough for two `gemma4:26b` calls. Let me read the isolated log to quantify per-call latency."
+}

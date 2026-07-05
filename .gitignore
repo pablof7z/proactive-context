@@ -1,10 +1,10 @@
 /target
 /.fastembed_cache
 /.claude
+/site/.astro
+/site/dist
+/site/node_modules
+/site/.vercel
 
 # macOS finder cruft
 .DS_Store
-
-# Derived wiki artifacts — rebuilt by proactive-context after each capture
-docs/wiki/_index.md
-docs/wiki/_citations.log

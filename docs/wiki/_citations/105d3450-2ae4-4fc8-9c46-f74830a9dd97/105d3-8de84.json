@@ -1,0 +1,6 @@
+{
+  "id": "105d3-8de84",
+  "ts": "2026-06-29T10:51:17Z",
+  "session": "105d3450-2ae4-4fc8-9c46-f74830a9dd97",
+  "text": "The old one sold the stale v0.1 — \"live vector index + RAG over markdown.\" The real product, as it now stands across your specs, source, and the wiki-model decision, is a **self-improving memory for coding agents**: the capture→wiki→inject loop. So I led with that, and let the engine details settle into a \"How it's built\" section near the bottom where they belong.\n\nWhat I leaned into, lightly:\n\n- **The one idea up front** — your golden rule about corrections, framed as the cost asymmetry (tokens vs. attention) rather than a feature list. That's the technophilosopher beat, but kept to a few lines.\n- **Two motions** — capture (slow, careful, off the hot path) and inject (fast, quiet), with the point that *separating* them is the design, not an accident.\n- **\"Why a wiki, and not a summary\"** — anchor-and-grow vs. dump-and-dilute, the PRODUCT_MODEL.md rejection turned into a confident architectural stance (\"We tried that. It's the wrong shape.\"). The fix-vs-rule distinction from llm-wiki."
+}

@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "the UX of pc configure is shit -- I want to be able to be able to select the provider (openrouter, ollama, etc) with tabs instead of a long list"
+  ],
+  [
+    "assistant",
+    "Implemented provider tabs cycling through All/Claude CLI/OpenRouter/Ollama with live counts, and enabled word-wrapping for role descriptions."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Done."
+  ]
+]

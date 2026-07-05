@@ -1,0 +1,6 @@
+{
+  "id": "48ee4-288f7",
+  "ts": "2026-06-29T12:33:09Z",
+  "session": "48ee4b84-0ddc-419e-8f94-1c5c75774d29",
+  "text": "Assistant: The archeologist doesn't define any prompts of its own — it's just a bulk driver. It calls `run_capture_for_archeologist`, which reuses the normal **capture pipeline**. Let me confirm the exact path.\n\nAssistant: `run_capture_for_archeologist` (capture.rs:2648) just delegates into `run_capture_from_input` — the exact same path as live capture. So the archeologist uses the **capture pipeline prompts**, in this order per session: [...] So: **no archeologist-specific prompt.** It's the same 4 capture prompts (+ the open-questions one via maintenance) as normal live capture — by design, per the file's own doc comment (\"reuses the existing per-session capture pipeline, chronologically oldest-first\")."
+}

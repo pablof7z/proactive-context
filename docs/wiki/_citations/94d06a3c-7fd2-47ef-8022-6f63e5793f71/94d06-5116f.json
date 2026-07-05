@@ -1,0 +1,6 @@
+{
+  "id": "94d06-5116f",
+  "ts": "2026-06-29T11:55:21Z",
+  "session": "94d06a3c-7fd2-47ef-8022-6f63e5793f71",
+  "text": "Let me check if `human_readable` is ever populated:\n\nAssistant: `human_readable` is 0/1048 and 0/2644 — never populated in either project. The current implementation using `content` directly is correct; no change needed. [...] 2. `human_readable` is never populated, so `content` is used for both roles"
+}

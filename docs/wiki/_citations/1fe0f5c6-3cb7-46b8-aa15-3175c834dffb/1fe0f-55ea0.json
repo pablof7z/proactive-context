@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-55ea0",
+  "ts": "2026-06-29T10:44:40Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "- Citation engine: line-number the transcript (same enumeration the slicer uses), mint `[^<5char-session>-<n>]`, Rust slices verbatim from the cited ranges → inserts the marker into the section prose → appends sliced text to per-wiki `_citations.log`. [...] - **Evidence = transcript line ranges, Rust slices verbatim** — integrity by construction, no string-matching/fuzzy. The model never types transcript text or a `[^id]`.\n- Citations: `[^<session>-<n>]` markers in guides + per-wiki `_citations.log`; **round-trip proven** (marker → log → real transcript span)."
+}

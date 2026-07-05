@@ -1,0 +1,6 @@
+{
+  "id": "32db6-cd672",
+  "ts": "2026-06-29T12:08:59Z",
+  "session": "32db6587-199d-4f6f-b185-0e71548dad65",
+  "text": "- **Storage:** key by `session_id` in the events DB you already open via `init_context` (`inject.rs:269`). Each inject process is a fresh, short-lived hook, so state *must* persist to disk between turns — the events DB is the natural home. On entry, `SELECT` this session's prior injected bodies to build the \"already-known\" block. [...] **2. Per-session injection ledger** (`src/ledger.rs`)\n- JSONL at `~/.proactive-context/projects/<proj>/ledger/<session_id>.jsonl`. It models *what's already in Claude's live context* — every prior briefing is still a visible system-reminder. [...] - Config: `inject_ledger_entries` (default 8, 0=off), `inject_ledger_char_cap` (default 3000, tail-capped)."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "26c90-6fdfb",
+  "ts": "2026-06-29T10:58:24Z",
+  "session": "26c909a1-6c07-4761-bac5-6e880cd7a063",
+  "text": "| **4. SELECT** (\"gate\") | **model #1, fast** | the catalog (titles+summaries only) | **which files** → list of keys, or `NOTHING_RELEVANT` |\n| 5. Read | Rust, no model | the selected keys | full line-numbered text of those files |\n| **6. COMPILE** (\"librarian\") | **model #2** | full text of selected files | **which lines** → JSON `{slug, start, end}` ranges |\n| 7. Slice + emit | Rust, no model | those ranges | verbatim excerpts → injected `<system-reminder>` |\n\nSo the two model roles are the **same job at two zoom levels**:\n\n- **SELECT = \"which documents are relevant?\"** It only sees titles + summaries (it reads no file contents), and spits out a shortlist of file keys. Cheap, fast, tool-free. This is the one that was bailing with deepseek."
+}

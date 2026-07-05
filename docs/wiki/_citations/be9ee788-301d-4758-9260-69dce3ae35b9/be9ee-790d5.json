@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-790d5",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "Assistant: Verified both ways — **\"app\" is a single project: `/Users/pablofernandez/src/app`** (all 235 sessions share that exact cwd). It is **not** clamping different `*-app` projects together.\n\nTo be crystal clear on your worry:\n- **Grouping key is the full path** (`normalize_path(resolve_project_root(cwd))`), not the basename. So `/Users/.../src/app` and `/Users/.../Work/foo/ios-app` are **separate buckets → separate wikis**, always.\n- The basename is *only the picker's display label*. Generic labels like `app`, `win`, `main`, `src` *can* collide visually (two different full-path projects both showing as \"app\" would appear as two separate rows with the same label) — but they're never *merged*. In your case there's only one `src/app`, so it's unambiguous.\n- Your examples don't even collide: `…/ios-app` shows as **\"ios-app\"**, `…/win-the-day-app` shows as **\"win-the-day-app\"** (separate row, 18 sessions). Different labels entirely."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "d88b0-7a4a1",
+  "ts": "2026-06-29T12:24:58Z",
+  "session": "d88b0b84-f956-416b-9f15-3e28238c0ce3",
+  "text": "Assistant: This is the crux: the wiki is architecturally **slug-flat**. `guide_path()` is `wiki_dir/slug.md`, `enforce_bidirectional_links` does a non-recursive `read_dir`, links are same-dir `[[slug]]`/`[slug.md]`, and the index uses same-dir relative hrefs. Moving to `docs/wiki/<topic>/slug.md` means: topic-relative links, file *moves* when a topic changes (reconcile back-fill, `doctor --retopic`), and updating every `read_dir`/`guide_path` call site. That's precisely why the team chose flat-files-grouped-only-in-index. Let me measure the blast radius before proposing how to do it. [...] ### 3. slug→path resolution stops being O(1)\n`guide_path(wiki_dir, slug)` is `wiki_dir/slug.md` — deterministic, and many callers only have a slug, not a topic (`inject.rs:700`, the capture loaders). With folders you'd either thread the topic everywhere or do a recursive `**/slug.md` search — and any stale marker pointing at an old path silently misses."
+}

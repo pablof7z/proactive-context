@@ -1,0 +1,58 @@
+[
+  [
+    "user",
+    "at each inject path, what do we send, exactly, to the model?"
+  ],
+  [
+    "assistant",
+    "Explained that there are two LLM calls (SELECT gate and COMPILE) plus several no-model paths, detailing what system and user messages each call receives."
+  ],
+  [
+    "user",
+    "I mean, what messages[] array do we send to the model? what are we providing it and asking from it?"
+  ],
+  [
+    "assistant",
+    "Showed the literal two-message wire shape for both SELECT and COMPILE calls: a system message containing catalog/sources plus recent convo, and a user message containing the raw prompt, with no tools array."
+  ],
+  [
+    "user",
+    "we should box the transcript in a way so that we are adding context only on what the user recently said -- since we are providing the running transcript we are injecting stuff that has already been injected before for prior messages from the user. This is a more complex problem that apparent, because for example if the user says \"What is the oauth support like?\" we might inject some stuff, then if the user says \"and do we support google as a provider?\" we would need to a) know that the context from the previous question is \"oauth\" and that the new question is about a specific provider; so the new question adds some dimension to the question that narrows down what we actually need to search on. how should we improve this?"
+  ],
+  [
+    "assistant",
+    "Recommended two mechanisms: fold query resolution into the existing gate call (emit a standalone QUERY line), and add a per-session injection ledger for delta-compile so compile suppresses facts already in Claude's context — zero added LLM round-trips."
+  ],
+  [
+    "user",
+    "implement"
+  ],
+  [
+    "assistant",
+    "Encountered a socket connection error."
+  ],
+  [
+    "user",
+    "continue"
+  ],
+  [
+    "assistant",
+    "Implemented query resolution folded into the gate and a per-session injection ledger in src/ledger.rs, with 77 tests passing, but could not run live validation without API key or Ollama config."
+  ],
+  [
+    "user",
+    "run the validation with the ollama model -- its configured already"
+  ],
+  [
+    "assistant",
+    "Ran the live two-turn sequence against Ollama; both query resolution and cross-turn dedup worked correctly, fixed weak dedup wording, and noted the configured gemma4:26b-mlx model always times out and falls back to raw vector hits."
+  ],
+  [
+    "user",
+    "I moved down to gemma4:12b-mlx -- see if this one makes it work"
+  ],
+  [
+    "assistant",
+    "Configured both inject models to gemma4:31b-cloud after a six-way model comparison showed 12b-mlx still too slow; validated the full feature end-to-end with compiled output in 5.3s and warned that peer sessions may revert the config."
+  ]
+]

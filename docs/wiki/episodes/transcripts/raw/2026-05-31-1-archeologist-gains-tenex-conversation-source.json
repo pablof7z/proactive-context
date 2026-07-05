@@ -1,0 +1,26 @@
+[
+  [
+    "user",
+    "thus far the archeologist is only able to inject content from claude code conversations -- I also want it to support injecting nostr conversations generated in the ~/Work/TENEX-ff... approach, with clear attributions since they are nostr kind:1 notes -- or perhaps the simpler solution would be to simply use whatever database is already available in the backend like ~/.tenex/projects ?"
+  ],
+  [
+    "assistant",
+    "I have enough context now. Here's the picture:\n\n**TENEX data structure (per `~/.tenex/projects/<slug>/`):**\n- `event.json` — Nostr kind:31933 with `repo` git-remote tag and `title` tag\n- `conversation.db` — SQLite with `conversations` (id, title, created_at) and `messages` (role=user/assistant, author_pubkey, content, timestamp, human_readable)\n\n**What the existing pipeline needs:** just a flat `{\"role\": \"...\", \"content\": \"...\"}` JSONL file + a `cwd` for wiki routing. The `parse_transcript` flat-format branch handles exactly this.\n\n---\n\nThe design breaks into two sub-problems:\n\n**1. Project → cwd mapping**\n\nTENEX projects don't record the local path — only a git remote (`repo` tag). The options, in order of reliability:\n- Use the `repo` tag to scan common local dirs (`~/Work/`, `~/src/`) for a matching git remote — feasible since git stores the remote in `.git/config`\n- Fall back to name-matching slug against directory basename\n- Worst case: present unmapped projects in the picker and let the user confirm/skip\n\n**2. Transcript synthesis**\n\nFor each `conversation` row in `conversation.db`, synthesize a temp JSONL with:\n```json\n{\"role\": \"user\", \"content\": \"[Nostr conversation: <title>]\\n<content>\"}\n{\"role\": \"assistant\", \"content\": \"<content>\"}\n```\nAttribution can be prepended to the first user turn (`[via TENEX, pubkey <short>]`). The `human_readable` field is cleaner than `content` for assistant messages (already rendered). Conversations map to sessions; conversations group by `conversation_id`.\n\n---\n\n**Recommended approach:**\n\nAdd a `--source tenex` flag (or `tenex` subcommand) to `archeologist` that:\n1. Scans `~/.tenex/projects/*/event.json`  \n2. Resolves local path via git-remote scan (same `resolve_project_root` logic)  \n3. Synthesizes each conversation into a temp JSONL file on disk  \n4. Feeds them through `run_capture_for_archeologist` with the resolved `cwd`\n\nThe TENEX-originated sessions get a marker in their session_id (e.g., `tenex-<conv_id_prefix>`) so `archeologist_is_already_captured` deduplicates correctly.\n\nThe **counter-option** (the simpler one you mentioned) would be to skip the path-resolution problem entirely and just use `~/.tenex/projects/<slug>` as the synthetic cwd. That gives each TENEX project its own wiki namespace, separate from any Claude Code sessions on the same repo. That's actually reasonable if you think of TENEX conversations as a different context (Nostr-based AI discussions vs. local coding sessions). The wiki merge only matters if the TENEX work and Claude Code work are about the same repo.\n\n**My recommendation:** resolve the local path via git-remote matching (best effort, skip on failure), which unifies knowledge from both sources into the same wiki. The synthesis approach is clean and keeps all the existing triage/capture logic working unchanged.\n\nWant me to implement this? The main new pieces would be:\n- `src/tenex.rs` — TENEX project scanner + conversation synthesizer (~200 lines)\n- Small additions to `archeologist.rs` — new `--source` flag, call the tenex scanner, unify into the same `ProjectInfo`/`SessionInfo` flow"
+  ],
+  [
+    "user",
+    "tenex has a ~/.tenex/config.json that defines the directory where all projects are stored (no need to scan) I think we should only import conversations where the user was participant instead of agent<>agent communication we need some stable id for the conversation (the equivalent of session) so importing is idempotent -- tenex itself is now wired up to use pc itself via a new hooks mechanism, so we want to avoid duplicating -- I think we use the conversation id as the pc session id"
+  ],
+  [
+    "assistant",
+    "`human_readable` is 0/1048 and 0/2644 — never populated in either project. The current implementation using `content` directly is correct; no change needed.\n\nThe wiki entry has two inaccuracies worth noting for when it gets updated:\n1. Path resolution is `projectsBase/<slug>` (from config), not git-remote matching\n2. `human_readable` is never populated, so `content` is used for both roles\n\nBoth are already correct in the code — just the wiki lags."
+  ],
+  [
+    "user",
+    "fix the wiki then"
+  ],
+  [
+    "assistant",
+    "Done."
+  ]
+]

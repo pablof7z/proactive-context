@@ -1,0 +1,6 @@
+{
+  "id": "9c66c-6fae5",
+  "ts": "2026-06-29T12:16:01Z",
+  "session": "9c66cf85-c0e0-4e36-aa6f-c802d8cb0efd",
+  "text": "   - `pc archeologist`: replays `~/.claude/projects/**/*.jsonl` transcripts through the capture pipeline to populate a per-project wiki"
+}

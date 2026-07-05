@@ -1,0 +1,17 @@
+{"canonical":"encode ask","name":"encode_ask","signed":1,"status":"provisional"}
+{"canonical":"handle thread event","name":"handle_thread_event","signed":1,"status":"provisional"}
+{"canonical":"is tool use","name":"is_tool_use","signed":1,"status":"provisional"}
+{"canonical":"john vervaeke","name":"John Vervaeke","signed":0,"status":"provisional"}
+{"canonical":"kind 1","name":"kind:1","signed":1,"status":"provisional"}
+{"canonical":"modular nostr client","name":"Modular NostrClient","signed":1,"status":"provisional"}
+{"canonical":"nip 60","name":"NIP-60","signed":1,"status":"provisional"}
+{"canonical":"nip 61","name":"NIP-61","signed":1,"status":"provisional"}
+{"canonical":"nostr client","name":"NostrClient","signed":1,"status":"provisional"}
+{"canonical":"pc autodoc","name":"pc autodoc","signed":-2,"status":"suppressed"}
+{"canonical":"pc debug extract all","name":"pc debug extract --all","signed":1,"status":"provisional"}
+{"canonical":"pc debug transcript all","name":"pc debug transcript --all","signed":1,"status":"provisional"}
+{"canonical":"proactive context tail","name":"proactive-context tail","signed":1,"status":"provisional"}
+{"canonical":"project wiki","name":"Project Wiki","signed":1,"status":"provisional"}
+{"canonical":"q tag","name":"q_tags","signed":1,"status":"provisional"}
+{"canonical":"tool name","name":"tool_name","signed":1,"status":"provisional"}
+{"canonical":"wiki tidy","name":"wiki-tidy","signed":-2,"status":"suppressed"}

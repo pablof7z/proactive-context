@@ -1,0 +1,206 @@
+[
+  [
+    "user",
+    "we need to ensure we detect when we are running from within a git worktree so that we don't constantly reindex everything and that the indexed stuff from the main tree is made available in the git worktree"
+  ],
+  [
+    "assistant",
+    "Implemented worktree detection across four call sites: config.rs, main.rs, capture.rs, and inject.rs. Non-git directories and the main worktree fall through unchanged."
+  ],
+  [
+    "user",
+    "validate that it works"
+  ],
+  [
+    "user",
+    "btw, if there's something obvious to fix first just fix it"
+  ],
+  [
+    "assistant",
+    "Validated all three paths: main tree falls through unchanged, worktree resolves to main tree, and stats/inject from worktree hit the same DB and get real results. Fixed a stale doc heading along the way."
+  ],
+  [
+    "user",
+    "commit"
+  ],
+  [
+    "assistant",
+    "Committed as 6ce654b."
+  ],
+  [
+    "user",
+    "Continue from where you left off."
+  ],
+  [
+    "assistant",
+    "No response requested."
+  ],
+  [
+    "user",
+    "per the goals of this very project, whenever I say something it should be captured as something that turns into part of the product spec we keep -- was what I requested in this make it into the awareness of the full product's spec nunace? (meaning, is that part of the product working?)"
+  ],
+  [
+    "assistant",
+    "Partially working: the inject hook retrieved relevant wiki context, and capture runs at session end, but the v0.4 mechanism that guarantees every user statement becomes a first-class spec entry with citation anchoring wasn't yet built."
+  ],
+  [
+    "user",
+    "that 0.4 stuff hasn't been done? I thought it had! why hasn't it?"
+  ],
+  [
+    "assistant",
+    "v0.4 is actually fully implemented — all 7 wiki tools and the agent loop run on every session end. My previous answer was wrong because I trusted stale spec docs that still said \"Proposed (v0.4).\" The gap is outdated docs, not missing functionality."
+  ],
+  [
+    "user",
+    "ok, so the session had ended (I ended it and resumed it afterwards) then why hasn't the product spec stuff been updated with the git worktree stuff I said? Do you get what I'm getting at? I want you to get to the bottom of what failed in the system that made the product spec that happens at session end / after 5 minutes NOT to gather the stuff"
+  ],
+  [
+    "assistant",
+    "The system actually worked — the git-worktree guide was correctly written at session end. The failure was a stale section heading in capture-v04-pipeline-status.md that still read \"v0.4 Is Not\" despite the body being updated. Fixed the doc to be internally consistent."
+  ],
+  [
+    "user",
+    "so is the all the current docs that have been gathered a good assessment of everything this project is? you know, that \"should be collect stuff so that it can be one-shotted from scratch\" -- is the stuff we're gathering getting close to that?"
+  ],
+  [
+    "assistant",
+    "Honest assessment: not close to one-shot-able yet. The decision/gotcha layer is ~70% complete, but the definitional/structural layer — what the product is, entity definitions, hook contract, DB schema, CLI surface, wiki format, system diagram — is only ~10% there."
+  ],
+  [
+    "user",
+    "ok, how about this; how about you run the archeologist with this repo and tell it to save its output to some temporary directory that we can safely delete afterwards and let's see what it comes up with, because, afaik, the archeologists simply uses all the exact same code that capture at the end of each session does, right? so if we reply it we would get roughly the same output? Let's see what we get, what do you think? or is that not a good test?"
+  ],
+  [
+    "assistant",
+    "Good instinct, but the archeologist has no --output-dir flag and writes directly to the real wiki with dedup. Suggested running a --dry-run first to see scope and cost."
+  ],
+  [
+    "user",
+    "what model will it use per my current configuration"
+  ],
+  [
+    "assistant",
+    "Both configured models are local Ollama, so the run is free — just time and compute."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "assistant",
+    "Started the archeologist run in the background."
+  ],
+  [
+    "user",
+    "but you didn't give it anything to write its findings to a temp dir, did you? so its going to skip the ones that are already indexed -- the idea is to replay everything from scratch, which means you'd need a fresh dir"
+  ],
+  [
+    "assistant",
+    "Stopped the run. The structural problem: no --output-dir flag, and dedup skips already-captured sessions. Offered a state-swap approach or letting it run normally for the 24 new sessions."
+  ],
+  [
+    "user",
+    "or... you could.... change... the code? maybe?...."
+  ],
+  [
+    "assistant",
+    "Added an --output-dir flag to the archeologist. Running it fresh into /tmp/pc-fresh-wiki, processing all 36 sessions without touching the real wiki."
+  ],
+  [
+    "user",
+    "yes"
+  ],
+  [
+    "assistant",
+    "Running. Will report back when it finishes."
+  ],
+  [
+    "user",
+    "and analyze what it comes out.... and iterate, research... fix it"
+  ],
+  [
+    "assistant",
+    "Two things running in parallel: the archeologist full replay and structural guide authoring for the 6 entity/definition guides the archeologist can never mine. Will analyze and compare both outputs."
+  ],
+  [
+    "user",
+    "The inject hook context already identified the 7 structural gaps that the archeologist can't fill (the conversations never stated them explicitly because both parties already knew). what do you mean?"
+  ],
+  [
+    "assistant",
+    "Summarized the session's work: the fresh wiki run found and fixed 3 real bugs, and the real wiki went from ~50 to ~106 guides after merging 31 new entity/pipeline definition guides, substantially closing the one-shot gap."
+  ],
+  [
+    "user",
+    "explain to me the idea of filling in the gaps -- what's the high-level idea you landed on?"
+  ],
+  [
+    "assistant",
+    "Two layers need different strategies: Layer 1 (decisions/gotchas) is mined by the archeologist from transcripts; Layer 2 (entity definitions) must be authored directly since they're never stated in conversation. The dev cycle iterates: run archeologist, analyze gaps, fix pipeline/prompts and author entity guides, re-run until the wiki passes the one-shot test."
+  ],
+  [
+    "user",
+    "ok, I have a different proposal because i'm not sure this is good enough. What if, on capture (so on session end) we ask the thing to assess from the transcript what are the nouns that are not currently properly described in the wiki and write them down as open-questions. Open questions \"what is the 'tui client'?\" \"what is the local database?\" and questions like that. Then we add in some spot that questions are to be run, for example on the next session start (before the user asks) maybe we can inject something that runs it? or something like that?"
+  ],
+  [
+    "assistant",
+    "The proposal is sound but noted there's no session-start hook available — suggested using SessionEnd for detection and first-UserPromptSubmit for resolution via background spawn."
+  ],
+  [
+    "user",
+    "no, there are many more hooks than that -- research"
+  ],
+  [
+    "assistant",
+    "Found SessionStart, CwdChanged, PreCompact, PostToolBatch, and FileChanged hooks. Revised the proposal: SessionEnd detects undefined nouns and writes open-questions.json; SessionStart fires before the user's first prompt and spawns a background agent to author definition guides."
+  ],
+  [
+    "user",
+    "yes, and I want you to test it thoroughly and see if it caches things, if it works, etc"
+  ],
+  [
+    "assistant",
+    "All tests passed: autodoc writes guides for real nouns, abstains on unrecognized ones, both guide-exists and attempt-marker caches work, session-start reads and filters open-questions, and the SessionStart hook is wired in settings.json."
+  ],
+  [
+    "user",
+    "what is the role of the autodoc thing? it seems retarded -- why does it exist? the idea is just to come up with questions from things the llm observes in the transcript -- why is there an \"autodoc\" at all?"
+  ],
+  [
+    "assistant",
+    "Agreed it's overcomplicated. Proposed a simpler design: SessionEnd detects undefined nouns, SessionStart injects them as additionalContext, and Claude naturally answers them during the session using existing tools — no background agent needed."
+  ],
+  [
+    "user",
+    "and by \"undefined nouns\" I don't mean fucking orphaned links on some wiki! I mean references to things that the wiki hasn't described! the autodoc thing is completley retarded and must be destroyed"
+  ],
+  [
+    "assistant",
+    "Ripped out the autodoc layer entirely — 280 lines deleted. The mechanism is now just: SessionEnd detects undefined nouns from the transcript and writes open-questions.json; SessionStart emits those as additionalContext, capped at 8."
+  ],
+  [
+    "user",
+    "how does it detect the open questions? what's the prompt, etc?"
+  ],
+  [
+    "assistant",
+    "The triage model receives the wiki index and the last 6000 chars of transcript, and is prompted to list up to 8 nouns used in the conversation that aren't described in the wiki. Output is a JSON array written to open-questions.json. Noted a weakness: the model compares against guide titles not slugs, causing false positives."
+  ],
+  [
+    "user",
+    "I think that prompt needs some massage 1. it shouldn't just be the 6000 char tail; it MUST include what the user actually said and all the text generation (minus any <system-reminder> thing or any other xml and without tool use -- and it should have it with attribution (i.e. User: ....., Assistant: ....)"
+  ],
+  [
+    "assistant",
+    "Fixed the transcript format: full attribution with User:/Assistant: labels per turn, XML tags stripped, truncation by whole turns (never mid-sentence), and tool results excluded."
+  ],
+  [
+    "user",
+    "test it in the testing harness and lets see what happens"
+  ],
+  [
+    "assistant",
+    "All tests passed: capture created a guide, detected 8 undefined nouns, transcript format was clean with attribution and no XML, and session-start output valid JSON with filtered questions. Found one slug-matching limitation where the detector generated a different slug than the wiki agent."
+  ]
+]

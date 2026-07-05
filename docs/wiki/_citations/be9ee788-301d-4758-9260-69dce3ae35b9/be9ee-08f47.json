@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-08f47",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "[Perhaps it would be good to first dedicate a sonnet agent to retrieve ALL transcripts that the archeologist would process, process them via an opus agent (so basically building an opus-generated/manually-constructed wiki) and then use that as a comparison to see what the archeologist (or iterations_) would generate [...] - **Track 1 (archeologist):** still running — dry-run → smoke → full 47-session replay → self-review, into a temp wiki.\n- **Track 2 (gold standard):** digest done (378 claims/44 sessions); Opus now assembling the idealized ~15-30 guide wiki as the yardstick.\n"
+}

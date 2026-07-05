@@ -1,0 +1,50 @@
+[
+  [
+    "user",
+    "per what you understand of this project -- what do you think a good wiki would be of a project with exclusively this transcript?"
+  ],
+  [
+    "assistant",
+    "Argued that a good wiki of that trivial hello-world transcript is essentially one thin guide capturing project intent (beginner-friendly, welcoming tone), since everything else is code-derivable. Declined to generate the hallucinated open-questions the SessionStart hook suggested."
+  ],
+  [
+    "user",
+    "ignore that stuff -- it's a hallucination"
+  ],
+  [
+    "assistant",
+    "Confirmed the clean answer: one thin guide on project intent and audience/voice, because that's the only durable, non-code-derivable signal in the transcript."
+  ],
+  [
+    "user",
+    "now review this: what would be a good list of assertions per the `extract` path?"
+  ],
+  [
+    "assistant",
+    "Produced a hand-written list of 11 assertions with evidence ranges and ratified flags for the Nostr wallet transcript, explaining the judgment calls around the L40 pivot, ratification authority, and granularity decisions."
+  ],
+  [
+    "user",
+    "did you generate these by hand from the transcript I gave you or did you use something else to generate them? (I was asking YOU to generate by hand)"
+  ],
+  [
+    "assistant",
+    "Confirmed the assertions were generated entirely by hand from the transcript and the EXTRACT contract source, not by running the pipeline or any LLM tool."
+  ],
+  [
+    "user",
+    "ok, good, read the files that were generated in /Users/pablofernandez/tmp/a123123/docs/wiki -- how did it do?"
+  ],
+  [
+    "assistant",
+    "Reviewed the generated wiki and found it solid overall: it correctly handled the demo-to-wallet pivot, produced one grounded guide, and used real citations. Flagged weaknesses: an over-captured file-tree section, a slightly inaccurate \"rather than a library\" phrasing, topic defaulting to slug, and coarse citation bundling."
+  ],
+  [
+    "user",
+    "now go to /Users/pablofernandez/tmp/a123123 and run `pc debug transcript --all` and then tell me what you would generate -- afterwards compare your version with what gets generated with `pc debug extract --all`"
+  ],
+  [
+    "assistant",
+    "Ran both commands, compared hand extraction against the tool's output, and found they track closely on visible material with the tool correctly handling intra-session reversals. Key findings: `pc debug transcript` and EXTRACT use different transcript lengths (compaction summaries cause line-number divergence making citations unverifiable), the NIP-88/NIP-87 correction didn't propagate into the guide, and a `ratified` flag was incorrectly set for an assistant-originated gotcha."
+  ]
+]

@@ -1,0 +1,6 @@
+{
+  "id": "48ee4-a33c9",
+  "ts": "2026-06-29T12:33:09Z",
+  "session": "48ee4b84-0ddc-419e-8f94-1c5c75774d29",
+  "text": "## 2. Sidechain/meta filter — **archeologist path only** (capture.rs:2194)\nWhen `filter_sidechains` is set (the archeologist default), it uses `parse_transcript_meta` and additionally drops turns with `isSidechain:true` (sub-agent / Task-tool turns) or `isMeta:true`. The **live hook path does not** do this step — though the `<`-prefix drop already removes most meta content anyway."
+}

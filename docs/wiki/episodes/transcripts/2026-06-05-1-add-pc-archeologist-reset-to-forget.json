@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "what does \"new:9\" mean?"
+  ],
+  [
+    "assistant",
+    "Confirmed from the code: \"NEW:9\" means the number of Claude Code sessions for that project the archeologist has not yet captured/ingested — it's a backlog count derived from sessions not found in the capture ledger."
+  ],
+  [
+    "user",
+    "I need a way to reset it for when I deleted docs/wiki to start over"
+  ],
+  [
+    "assistant",
+    "Added a `pc archeologist --reset` flag that removes the capture ledger so sessions count as new again, supporting full reset, per-project reset via `--project`, and a confirmation prompt with `--yes` to skip it. Files changed in `src/main.rs`, `src/archeologist.rs`, and `src/capture.rs`; not committed."
+  ]
+]

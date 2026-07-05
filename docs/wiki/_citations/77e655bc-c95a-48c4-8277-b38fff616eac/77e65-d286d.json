@@ -1,0 +1,6 @@
+{
+  "id": "77e65-d286d",
+  "ts": "2026-06-29T12:31:13Z",
+  "session": "77e655bc-c95a-48c4-8277-b38fff616eac",
+  "text": "- Settings (/Users/pablofernandez/.claude/settings.json › permissions.allow): Invalid permission rule \"mcp__*\" was skipped: Wildcard tool name \"mcp__*\" is not supported in allow rules. An allow pattern must name the scope it widens — globs are permitted only in the tool position after a literal mcp__<server>__ prefix. Deny and ask rules accept wildcards anywhere [...] **What's wrong:** Line 27 of `~/.claude/settings.json` has `\"mcp__*\"` in `permissions.allow`. Claude Code doesn't accept a bare wildcard there — in **allow** rules, a glob is only valid in the tool position *after* a literal `mcp__<server>__` prefix (e.g. `mcp__github__*`). So the rule is silently skipped, meaning it's doing nothing today regardless."
+}

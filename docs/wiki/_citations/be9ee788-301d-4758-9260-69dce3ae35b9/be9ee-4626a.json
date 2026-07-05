@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-4626a",
+  "ts": "2026-06-29T11:10:17Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "   - **rig-core 0.37 think=false default** (`providers/ollama.rs:473`): reasoning models (deepseek-v4-flash/pro) bail/degrade at think=false; non-reasoning instruct models (glm-5.1:cloud, qwen2.5, llama) are correct. This is why glm is the validated model choice throughout.\n   - **Capture pipeline v0.5**: staged EXTRACT → AUTHORITY GATE → ROUTE → RECONCILE → INDEX, replacing old free-edit `run_wiki_agent` loop."
+}

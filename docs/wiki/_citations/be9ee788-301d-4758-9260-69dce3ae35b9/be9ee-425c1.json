@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-425c1",
+  "ts": "2026-06-29T11:10:17Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "- `a2c3e93` — **latent crash fix**: `slice_transcript_ranges` now guards against inverted/empty evidence ranges (the model can emit `start>end`, which panicked the pipeline mid-replay). This was a real bug in the live capture pipeline, found via the router validation — worth it on its own.\n [...]      - `slice_transcript_ranges` (line ~484): CRASH FIX — added `|| start >= end` guard against inverted ranges (model emits start>end → panic `slice index starts at X but ends at Y`):\n       ```rust\n       let start = range.start.saturating_sub(1);\n       let end = range.end.min(lines.len());\n       if start >= lines.len() || start >= end { continue; }\n       let segment = lines[start..end].join(\"\\n\");\n       ```"
+}

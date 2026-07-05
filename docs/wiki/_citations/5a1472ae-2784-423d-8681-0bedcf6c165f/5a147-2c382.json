@@ -1,0 +1,6 @@
+{
+  "id": "5a147-2c382",
+  "ts": "2026-06-29T12:48:17Z",
+  "session": "5a1472ae-2784-423d-8681-0bedcf6c165f",
+  "text": "**RECONCILE**\n\nGroups all claims by their target guide, then processes **one guide at a time**. For each guide, the model sees:\n- The full current guide body\n- All claims routed to it this session\n\nAnd decides per claim: `add / revise / remove / propose-new`. The key mechanism is that **the model sees the contradiction it would create** — that's what prevents accretion. It's explicitly sequential (not parallel) because parallel workers would each see a stale snapshot and independently append, recreating the exact problem being solved."
+}

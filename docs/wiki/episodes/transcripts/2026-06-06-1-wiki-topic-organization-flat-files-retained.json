@@ -1,0 +1,18 @@
+[
+  [
+    "user",
+    "after deleing all docs/wiki and resetting I did pc archeologist -- it still didn't organize things by topic"
+  ],
+  [
+    "assistant",
+    "Agent offered to walk through several clarification options, including how --retopic differs from archeologist's routing, why per-session routing produces singletons, and whether retopic should run automatically."
+  ],
+  [
+    "user",
+    "why does it add fragility to have a topic-based organization?"
+  ],
+  [
+    "assistant",
+    "Agent explained that coupling a mutable attribute (topic) to file identity (path) causes link breakage on moves, resolver complexity, directory scan failures, concurrency races, and noisy git diffs; the flat layout keeps topic as a pure attribute with _index.md as a derived view, and offered to apply --retopic to fix singleton topics."
+  ]
+]

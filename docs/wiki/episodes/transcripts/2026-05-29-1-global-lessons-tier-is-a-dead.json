@@ -1,0 +1,10 @@
+[
+  [
+    "user",
+    "how are user-level lessons or wiki or whatever stored? is that something that we carry forward in some way such that lessons that are not so much about the current project but more global about how the user thinks, are they captured in any way?"
+  ],
+  [
+    "assistant",
+    "Per-project wiki lessons are captured and injected on every prompt, but global/user-level lessons are only written to a pending-lessons.md queue and never read back or injected—so they're effectively a dead end. The spec describes a full global promotion and injection loop, but it was never implemented; currently Claude Code's own MEMORY.md system is what actually carries cross-project \"how the user thinks\" facts."
+  ]
+]

@@ -1,0 +1,6 @@
+{
+  "id": "26c90-799c9",
+  "ts": "2026-06-29T10:58:24Z",
+  "session": "26c909a1-6c07-4761-bac5-6e880cd7a063",
+  "text": "| 3. Build catalog | Rust, no model | wiki guides + committed `.md` | list of `key — title — summary [similar 0.xx]` |\n| **4. SELECT** (\"gate\") | **model #1, fast** | the catalog (titles+summaries only) | **which files** → list of keys, or `NOTHING_RELEVANT` |"
+}

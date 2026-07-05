@@ -1,0 +1,6 @@
+{
+  "id": "6e1a8-df5b4",
+  "ts": "2026-06-29T12:37:12Z",
+  "session": "6e1a8676-e6b4-414c-b844-fbc3dbe437c0",
+  "text": "**Consumed** by `session_start.rs:44`: on the SessionStart hook it loads the file, drops any question whose `docs/wiki/<slug>.md` already exists, caps at 8, and injects the `<open-questions>` block you saw, instructing the session to document them via `wiki_create`."
+}

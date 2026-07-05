@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-4b13a",
+  "ts": "2026-06-29T10:44:25Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "3. Add **bidirectional** See-Also links; bump `verified`/`updated`; rebuild `_index.md`; re-index into `index.db`. (Capture can update aggressively — no human gate, since the session is authoritative; pitfall #9.) [...] 4. **Volatility-aware staleness.** Each guide carries `volatility: hot|warm|cold` and `verified: YYYY-MM-DD`. Inject flags or deprioritizes hot guides that haven't been verified recently. Capture updates `verified:` every time it touches a guide. [...] - Per-project wiki write-lock (optimistic re-read on contention); Rust-owned structural maintenance reuses `enforce_bidirectional_links`/`rebuild_index`/`index_files_into_db`. [...] - Per-project wiki write-lock; structural maintenance (bidir links, index rebuild, re-embed) Rust-owned."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "1fe0f-3db29",
+  "ts": "2026-06-29T10:45:20Z",
+  "session": "1fe0f5c6-3cb7-46b8-aa15-3175c834dffb",
+  "text": "**3. New Event Names Emitted** (for tail renderer)\n\n- `wiki.index_read` — payload: `{guide_count: N, action?: \"rebuilt\"}`\n- `generate.tool_call` — payload: `{tool: \"read_guides\", slugs: [...], count: N}`\n- `guide.read` — payload: `{slug: \"...\"}`\n- `link.follow` — payload: `{from_slug: \"...\", to_slug: \"...\"}`\n- `guide.create` — payload: `{slug: \"...\", title: \"...\"}`\n- `guide.update` — payload: `{slug: \"...\", rule_added: bool}`\n- `select.shortcircuit` — payload: `{reason: \"no_relevant_guides\"}`"
+}

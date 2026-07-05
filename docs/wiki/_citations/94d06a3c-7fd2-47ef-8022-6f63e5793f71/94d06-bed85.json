@@ -1,0 +1,6 @@
+{
+  "id": "94d06-bed85",
+  "ts": "2026-06-29T11:55:21Z",
+  "session": "94d06a3c-7fd2-47ef-8022-6f63e5793f71",
+  "text": "- Pre-synthesizes each conversation to a flat JSONL file (temp dir, alive for the run's duration) with a `[TENEX project: ..., conversation: \"...\"]` preamble on the first user turn"
+}

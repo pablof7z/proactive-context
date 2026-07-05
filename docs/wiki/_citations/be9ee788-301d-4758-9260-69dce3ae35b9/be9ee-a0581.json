@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-a0581",
+  "ts": "2026-06-29T11:10:17Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "**The diagnosis:** `exchanges < 3` is an **AND-veto that conflates \"few user turns\" with \"trivial.\"** It's wrong for agentic sessions — you give one directive, the agent does 147 messages of real engineering, and it's dropped as \"1 exchange\" despite 4,000 chars of substance. That's ~24/46 sessions on your own project.\n\n**The fix (small):** stop using turn-count as a veto; let the two filters that are *actually* designed for this do the job —\n- the **char gate** (`< 500`) catches genuinely empty sessions, and\n- **triage** (the model call right below) is literally \"is there a durable lesson here?\" — that's the real filter.\n\nConcretely: change `plain_ts.len() < 500 || exchanges < 3` → `plain_ts.len() < 500` (or keep a floor of `exchanges < 1` to skip pure tool-result noise). Then triage decides the rest.\n [...]      - Too-short gate (line ~2192): changed `exchanges < 3` → `exchanges < 1` (count user turns, let triage be the real filter):\n       ```rust\n       let exchanges = turns.iter().filter(|t| t.0 == \"user\").count();\n       if plain_ts.len() < 500 || exchanges < 1 { ... return Ok(()); }\n       ```"
+}

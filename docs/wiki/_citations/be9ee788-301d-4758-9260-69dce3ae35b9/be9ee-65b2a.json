@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-65b2a",
+  "ts": "2026-06-29T11:09:59Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "- Env lesson: `TaskStop` SIGKILLs, so a script EXIT trap does not fire — config must be restored manually after a kill, and concurrent archeologist runs must use private-HOME isolation, never patch the shared real config."
+}

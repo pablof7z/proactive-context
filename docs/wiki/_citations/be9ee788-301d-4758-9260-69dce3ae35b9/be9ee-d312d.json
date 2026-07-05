@@ -1,0 +1,6 @@
+{
+  "id": "be9ee-d312d",
+  "ts": "2026-06-29T11:10:29Z",
+  "session": "be9ee788-301d-4758-9260-69dce3ae35b9",
+  "text": "User: it's impossible to estimate what a healthy project's wiki in how many guides it has? that's nonsense! the prompt shouldn't say that at all.\n\nyes, a) route should output a topic -- and route should have in its context a full view of everything that currently exists and what each entry is about (i.e. title and summary). [...] **#1 — the count nonsense: FIXED and committed (`21617b2`).** You were right; I deleted *\"a healthy whole-project wiki is ~25-30 guides\"* entirely. The altitude rule is now your model — \"one coherent topic a reader opens under one title; split only at real topic seams\" — with an explicit *don't target any guide count*. I also ripped out the project-specific \"CONCRETE MERGES\" examples (they were pc's own inject/embeddings/daemon noise baked into a general prompt). This is a real capture-path change: future captures use the new altitude.\n [...] User: it's impossible to estimate what a healthy project's wiki in how many guides it has? that's nonsense! the prompt shouldn't say that at all.\n"
+}

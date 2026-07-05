@@ -1,0 +1,6 @@
+{
+  "id": "82403-534a8",
+  "ts": "2026-06-29T12:57:38Z",
+  "session": "8240399a-f332-4082-8a4f-6c60dd67f9a6",
+  "text": "1. **The NIP-88 error.** The user guessed \"a nip (88 iirc)\" at L54; the assistant *explicitly corrected* it to NIP-87/kind:38172 at L100/L118. The tool emitted both — claim 590 correctly says `kind:38172`, but claim 610 says **\"must actually implement *NIP-88* mint discovery,\"** and the routed guide summary literally reads **\"Mint Discovery uses NIP-88 (kind:38172 events)\"** — conflating NIP-88 with kind:38172, which is actually NIP-87. The intra-session correction didn't propagate; the user's misremembering got baked into a guide summary. My version flagged this as the supersession. [...] **The L40 pivot is the whole game.** Lines 1–38 build a generic \"core Nostr demo\" (keypair gen, relay connection in `main.rs`). At L40 the user reveals the *actual* product: a NIP-60 wallet. Per the reversal rule (\"emit the NEW decision, don't re-assert the old\"), the demo is **superseded scaffolding** — I deliberately did **not** emit \"main.rs demonstrates keypair generation and relay connection\" (L13, L24) as a durable spec fact. It's a throwaway placeholder, not how the product should work."
+}

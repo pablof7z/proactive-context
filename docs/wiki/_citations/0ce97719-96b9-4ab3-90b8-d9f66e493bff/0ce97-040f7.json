@@ -1,0 +1,6 @@
+{
+  "id": "0ce97-040f7",
+  "ts": "2026-06-29T12:03:18Z",
+  "session": "0ce97719-96b9-4ab3-90b8-d9f66e493bff",
+  "text": "- **`embedding-router`** — Added vector embedding + retrieve-then-rerank for the capture ROUTE stage. Instead of routing by text alone, claims are embedded and top-k similar wiki guides retrieved before a reranking pass. **Fully merged into master.**"
+}
