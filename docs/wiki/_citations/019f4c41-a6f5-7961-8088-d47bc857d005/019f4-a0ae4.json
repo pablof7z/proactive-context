@@ -1,0 +1,6 @@
+{
+  "id": "019f4-a0ae4",
+  "ts": "2026-07-10T15:13:56Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "The strongest doc is the realness bakeoff. It says the winning model is a signed-delta ledger over **USER-turn references**: `operate_on +1`, `reject -2`, `neutral 0`, with **real >= +3** and **suppress <= -2**. That is exactly your “multiple times” point, with the correction that repeated rejection is not realness. See [realness-scorer-bakeoff-results.md](/Users/pablofernandez/src/proactive-context/docs/product-spec/realness-scorer-bakeoff-results.md:17) and [realness-scorer-bakeoff-results.md](/Users/pablofernandez/src/proactive-context/docs/product-spec/realness-scorer-bakeoff-results.md:107)."
+}
