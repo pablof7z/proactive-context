@@ -255,8 +255,8 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
 
-        /// Install a git `post-commit` hook instead: auto-commits pending
-        /// `docs/wiki` changes as a follow-up commit after each `git commit`.
+        /// Manage the retired pc-managed git `post-commit` hook. Status and
+        /// uninstall still work; install no longer writes an auto-commit hook.
         /// Combine with --status/--uninstall/--dry-run as usual.
         #[arg(long)]
         git_hooks: bool,

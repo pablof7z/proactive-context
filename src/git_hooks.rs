@@ -1,23 +1,14 @@
-//! `pc install --git-hooks` — install a git `post-commit` hook that auto-commits
-//! `docs/wiki` changes the capture pipeline writes out-of-band (after a session
-//! ends, independent of the user's own commit cadence).
+//! Retired `pc install --git-hooks` support.
+//!
+//! The command remains available for status and uninstall so older pc-managed
+//! hooks can be cleaned up, but it no longer installs a hook that commits
+//! generated wiki files behind the user's back.
 
-use crate::harness::install::{strip_sentinel, write_with_parents, SENTINEL_CLOSE, SENTINEL_OPEN};
+use crate::harness::install::{strip_sentinel, write_with_parents, SENTINEL_OPEN};
 use anyhow::{anyhow, Result};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const HOOK_BODY: &str = r#"if [ -z "$PC_GIT_HOOKS_ACTIVE" ]; then
-  export PC_GIT_HOOKS_ACTIVE=1
-  if [ -n "$(git status --porcelain -- docs/wiki 2>/dev/null)" ]; then
-    git add docs/wiki >/dev/null 2>&1
-    if ! git diff --cached --quiet -- docs/wiki 2>/dev/null; then
-      git commit --no-verify -m "docs(wiki): auto-update captured knowledge" -- docs/wiki >/dev/null 2>&1
-    fi
-  fi
-fi
-"#;
 
 pub struct GitHooksOpts {
     pub dry_run: bool,
@@ -43,21 +34,21 @@ pub fn run(opts: GitHooksOpts) -> Result<()> {
         return Ok(());
     }
 
-    println!("{} git post-commit hook ({})", "Installing".bold(), path.display());
-    match install(&path, opts.dry_run) {
-        Ok(summary) => {
-            println!("  {} {}", "✓".green(), summary);
-            if !opts.dry_run {
-                println!(
-                    "  {} pending docs/wiki changes will be committed as a follow-up commit after each `git commit`",
-                    "note:".yellow()
-                );
-            }
-        }
-        Err(e) => println!("  {} {}", "✗".red(), e),
-    }
+    println!(
+        "{} git post-commit auto-commit installer is retired ({})",
+        "!".yellow(),
+        path.display()
+    );
+    println!(
+        "  {} pc no longer installs hooks that commit generated docs/wiki changes automatically",
+        "note:".yellow()
+    );
+    println!(
+        "  {} run `pc install --git-hooks --uninstall` to remove an old pc-managed hook",
+        "note:".yellow()
+    );
     if opts.dry_run {
-        println!("\n{}", "(dry run — nothing was written)".dimmed());
+        println!("\n{}", "(dry run - nothing was written)".dimmed());
     }
     Ok(())
 }
@@ -88,23 +79,6 @@ pub fn is_installed(root: &Path) -> bool {
     std::fs::read_to_string(dir.join("post-commit"))
         .map(|s| s.contains(SENTINEL_OPEN))
         .unwrap_or(false)
-}
-
-fn install(path: &Path, dry: bool) -> Result<String> {
-    let block = format!("{}\n{}{}", SENTINEL_OPEN, HOOK_BODY, SENTINEL_CLOSE);
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let already_managed = existing.contains(SENTINEL_OPEN);
-    let stripped = strip_sentinel(&existing);
-    let base = if stripped.trim().is_empty() { "#!/bin/sh".to_string() } else { stripped };
-    let sep = if base.trim().is_empty() { "" } else { "\n" };
-    let next = format!("{}{}{}\n", base.trim_end(), sep, block);
-
-    if dry {
-        return Ok(format!("would write {}:\n{}", path.display(), indent(&block)));
-    }
-    write_with_parents(path, &next)?;
-    make_executable(path)?;
-    Ok(if already_managed { "hook updated".to_string() } else { "hook installed".to_string() })
 }
 
 fn uninstall(path: &Path) -> Result<String> {
@@ -138,22 +112,4 @@ fn print_status(path: &Path) {
             path.display()
         );
     }
-}
-
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn indent(s: &str) -> String {
-    s.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
 }
