@@ -42,6 +42,7 @@ mod claude_cli;
 mod claude_sidecar;
 mod embed_sidecar;
 mod events;
+mod git_autocommit;
 mod git_hooks;
 mod harness;
 mod inject;

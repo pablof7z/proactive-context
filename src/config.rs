@@ -40,6 +40,11 @@ pub struct Config {
     #[serde(default = "default_capture_enabled")]
     pub capture_enabled: bool,
 
+    /// Commit generated docs/wiki changes after a successful live capture.
+    /// Default OFF because hidden background commits are a local workflow choice.
+    #[serde(default = "default_capture_auto_commit_wiki")]
+    pub capture_auto_commit_wiki: bool,
+
     /// Enable the research-capture stage: after the normal capture pass, a recognition
     /// pass detects investigation artifacts (structured reports with method + pre-registered
     /// criteria) and persists them as immutable research records under <wiki>/research/.
@@ -217,6 +222,10 @@ fn default_chunk_overlap() -> usize {
 
 fn default_capture_enabled() -> bool {
     true
+}
+
+fn default_capture_auto_commit_wiki() -> bool {
+    false
 }
 
 fn default_capture_episode_cards() -> bool {
@@ -483,6 +492,7 @@ impl Default for Config {
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
             capture_enabled: default_capture_enabled(),
+            capture_auto_commit_wiki: default_capture_auto_commit_wiki(),
             capture_research: default_capture_research(),
             capture_episode_cards: default_capture_episode_cards(),
             clean_episode_dialogue: default_clean_episode_dialogue(),

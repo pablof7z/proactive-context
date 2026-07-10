@@ -64,6 +64,8 @@ struct CaptureInput {
     /// Set by archeologist `--output-dir` for isolated test runs.
     #[serde(default)]
     output_dir: Option<PathBuf>,
+    #[serde(default)]
+    auto_commit_wiki: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -2888,6 +2890,39 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         run_structural_maintenance(&wiki_path, &proj_dir, &ctx.project_key, &today_str);
     }
 
+    if input.auto_commit_wiki && cfg.capture_auto_commit_wiki && input.output_dir.is_none() {
+        match acquire_project_wiki_lock(&project_key) {
+            Ok(_lock) => match crate::git_autocommit::commit_docs_wiki(&project_root) {
+                Ok(crate::git_autocommit::AutoCommitOutcome::Committed(commit)) => {
+                    eprintln!("capture: committed docs/wiki as {commit}");
+                    log_event(
+                        "git.autocommit",
+                        None,
+                        serde_json::json!({ "path": "docs/wiki", "commit": commit }),
+                    );
+                }
+                Ok(crate::git_autocommit::AutoCommitOutcome::NoChanges) => {}
+                Ok(crate::git_autocommit::AutoCommitOutcome::Skipped(reason)) => {
+                    eprintln!("capture: docs/wiki auto-commit skipped: {reason}");
+                }
+                Err(e) => {
+                    eprintln!("capture: docs/wiki auto-commit failed: {e}");
+                    log_event(
+                        "error",
+                        None,
+                        serde_json::json!({
+                            "stage": "git.autocommit",
+                            "message": truncate(&format!("{e}"), 300)
+                        }),
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!("capture: docs/wiki auto-commit lock failed: {e}");
+            }
+        }
+    }
+
     log_event(
         "capture.done",
         Some(capture_start.elapsed().as_millis() as u64),
@@ -3154,6 +3189,7 @@ pub(crate) fn run_capture_for_archeologist(
         skip_structural_maintenance: skip_maint,
         filter_sidechains,
         output_dir,
+        auto_commit_wiki: false,
     })
 }
 
@@ -3390,6 +3426,7 @@ pub fn run_deferred_capture(session_id: &str) -> Result<()> {
         skip_structural_maintenance: false,
         filter_sidechains: false,
         output_dir: None,
+        auto_commit_wiki: true,
     })
 }
 
