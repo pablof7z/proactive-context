@@ -463,14 +463,14 @@ These raw transcript JSON files preserve less-cleaned conversation evidence.
 
 const NOUNS_AGENTS: &str = r#"# Agent Notes
 
-Noun entries and `realness.jsonl` are generated entity-memory artifacts.
+`realness.jsonl` is the production noun population: it is folded from capture-time
+user stance, and only `real` rows are eligible for injection.
 
-- Do not hand-edit `realness.jsonl`; it is a registry folded from capture-time
-  user stance.
-- Existing extracted noun entries are transcript-cited and should be treated as
-  immutable unless a migration is explicitly correcting format.
-- Derived noun entries may refresh from guides, but the refresh should come from
-  code or `pc`, not casual manual edits.
+- Do not hand-edit `realness.jsonl`.
+- Markdown `noun-entry` files are legacy/debug definition records, not priming
+  authority and not proof that the user has adopted a noun.
+- Do not add noun-entry files by hand. If old entries are wrong, correct them
+  only through an explicit migration or delete/regenerate workflow.
 "#;
 
 const CITATIONS_AGENTS: &str = r#"# Agent Notes
@@ -1067,17 +1067,16 @@ fn write_index_file_with_research(
         out.push('\n');
     }
 
-    // Nouns registry (entity layer) — listed when a `nouns/` dir holds entries. When the
-    // noun layer is off and nothing was ever persisted, `scan_nouns` returns empty and this
-    // section is absent, so `_index.md` is byte-identical to the pre-entity-layer output.
+    // Legacy/debug noun definition files. Production noun population lives in
+    // nouns/realness.jsonl and is filtered to user-promoted real entries by inject.
     let nouns = crate::nouns::scan_nouns(wiki_dir);
     if !nouns.is_empty() {
         out.push_str(&format!(
-            "## Nouns ({} entit{})\n\n",
+            "## Noun Definition Files ({} record{})\n\n",
             nouns.len(),
-            if nouns.len() == 1 { "y" } else { "ies" }
+            if nouns.len() == 1 { "" } else { "s" }
         ));
-        out.push_str("| Noun | Name | Origin | Definition |\n");
+        out.push_str("| Record | Name | Origin | Definition |\n");
         out.push_str("|------|------|--------|------------|\n");
         for n in &nouns {
             let name = n.name.replace('|', "\\|");
@@ -2189,7 +2188,7 @@ More info.
     }
 
     #[test]
-    fn rebuild_index_lists_nouns_section_and_read_index_ignores_it() {
+    fn rebuild_index_lists_noun_definition_files_and_read_index_ignores_it() {
         let tmp = tempfile::tempdir().unwrap();
         let wiki = tmp.path();
         // One ordinary guide.
@@ -2209,7 +2208,7 @@ More info.
 
         rebuild_index(wiki, "2026-06-15").unwrap();
         let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
-        assert!(index.contains("## Nouns (1 entity)"), "nouns section header missing:\n{}", index);
+        assert!(index.contains("## Noun Definition Files (1 record)"), "noun file section header missing:\n{}", index);
         assert!(index.contains("](nouns/token-event.md)"), "noun link missing:\n{}", index);
         assert!(index.contains("kind:7375"), "noun definition missing");
 
@@ -2221,7 +2220,7 @@ More info.
     }
 
     #[test]
-    fn rebuild_index_has_no_nouns_section_when_dir_absent() {
+    fn rebuild_index_has_no_noun_definition_section_when_dir_absent() {
         // Byte-identical guarantee: with no nouns/ dir the section never appears.
         let tmp = tempfile::tempdir().unwrap();
         let wiki = tmp.path();
@@ -2229,7 +2228,7 @@ More info.
         fs::write(wiki.join("mint.md"), guide).unwrap();
         rebuild_index(wiki, "2026-06-15").unwrap();
         let index = fs::read_to_string(wiki.join("_index.md")).unwrap();
-        assert!(!index.contains("## Nouns"), "nouns section must be absent when no nouns/ dir");
+        assert!(!index.contains("## Noun Definition Files"), "noun definition section must be absent when no nouns/ dir");
         assert!(!wiki.join("nouns").exists(), "rebuild_index must not create empty nouns/");
         assert!(!wiki.join("research").exists(), "rebuild_index must not create empty research/");
         assert!(!wiki.join("episodes").exists(), "rebuild_index must not create empty episodes/");

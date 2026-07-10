@@ -2837,24 +2837,6 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
-    // Definitional-noun stage (C1). Recognizes transcript-cited "X is Y" definitions and
-    // persists them as immutable `extracted` entries under <wiki>/nouns/. Independent of the
-    // normal pass; best-effort — a failure here never breaks capture. Does NOT feed the wiki
-    // index into its prompt (finding F: that caused 0-claim EXTRACT failures).
-    match crate::nouns::run_definitional_stage(&wiki_path, &input.transcript_path) {
-        Ok(paths) if !paths.is_empty() => {
-            log_event(
-                "capture.nouns",
-                None,
-                serde_json::json!({ "entries": paths.len() }),
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("capture: definitional-noun stage failed: {}", e);
-        }
-    }
-
     // User-stance realness stage (Approach A) — the LIVE writer for the noun-primer's realness gate.
     // Mirrors the stages above: independent of the normal pass, BEST-EFFORT (errors logged, never
     // break capture), and OFF the inject hot path. Per session it reads the USER turns,

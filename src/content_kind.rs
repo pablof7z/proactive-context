@@ -24,7 +24,7 @@ pub enum ContentKind {
     ResearchRecord,
     /// An immutable historical decision/reversal card (`type: episode-card`, `<wiki>/episodes/`).
     EpisodeCard,
-    /// A project-specific entity definition (`type: noun-entry`, `<wiki>/nouns/`).
+    /// A legacy/debug project-entity definition record (`type: noun-entry`, `<wiki>/nouns/`).
     NounEntry,
     /// A user-stance realness ledger entry (`<wiki>/nouns/realness.jsonl`).
     RealnessNoun,

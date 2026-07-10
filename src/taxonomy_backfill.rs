@@ -135,7 +135,8 @@ pub fn build_index(wiki: &Path, project_dir: &Path) -> TaxonomyIndex {
         });
     }
 
-    // ── Noun entries: NounEntry / Current, path `nouns/<slug>.md` ────────────
+    // ── Noun definition files: NounEntry / Unknown, path `nouns/<slug>.md` ───
+    // These are legacy/debug definition records, not the production noun population.
     for row in crate::nouns::scan_nouns(wiki) {
         let kind = ContentKind::NounEntry;
         let title = if row.name.trim().is_empty() {
@@ -146,7 +147,7 @@ pub fn build_index(wiki: &Path, project_dir: &Path) -> TaxonomyIndex {
         entries.push(TaxonomyEntry {
             key: kind.render_key(&row.slug),
             kind: kind.label().to_string(),
-            currentness: currentness_label(Currentness::Current),
+            currentness: currentness_label(Currentness::Unknown),
             path: format!("nouns/{}.md", row.slug),
             title,
         });

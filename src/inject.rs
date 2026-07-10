@@ -202,9 +202,9 @@ guide does not. Selecting an episode card alongside a guide is the correct patte
 - [research-record] (key `research:`): an investigation/validation record — experiments, evidence, \
 method, and findings. PRIMARY for validation, experiment, investigation, and \"what did we learn\" \
 questions.\n\
-- [noun-entry] (key `noun:`): a project-specific entity definition. Select ONLY for entity \
-grounding / first-mention questions about what a specific named thing IS — never as general project \
-truth.\n\
+- [noun-entry] (key `noun:`): a promoted user-realness noun with definition enrichment. Select ONLY \
+for entity grounding / first-mention questions about what a specific named thing IS — never as \
+general project truth.\n\
 - [claim] (key `claim:`): an atomic evidence-backed fact. Select for a targeted factual point only \
 when no guide already covers it.\n\
 For a PURELY present-tense behavior question (no why/history/before/what-was-tried), prefer \
@@ -971,7 +971,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             // ── Noun first-mention primer (entity-layer) ──
             // Additive: a SEPARATE block prepended to the briefing body, placement held
             // constant, retrieval NOT blended (spec F16). The primer block was resolved up front
-            // (LLM-free, authority store) so the same resolution serves both this guide-briefing
+            // (LLM-free, user-realness gate) so the same resolution serves both this guide-briefing
             // path and the standalone short-circuit paths.
             let body_with_primer = match &noun_resolution.block {
                 Some(block) => format!("{}\n\n{}", block, body),
@@ -1281,6 +1281,7 @@ fn read_head(path: &Path, cap: usize) -> String {
 
 /// Full content of a catalog source by key. Resolution by key shape:
 ///   - `episode:<stem>`  → `<wiki_dir>/episodes/<stem>.md` (historical episode card)
+///   - `noun:<slug>` → rendered from the promoted user-realness noun registry
 ///   - `claim:<cluster_id>` → rendered from claims.jsonl records for that cluster (no .md file)
 ///   - `<path>` containing '/' or ending '.md' → `<root>/<path>` (committed project doc)
 ///   - bare slug → `<wiki_dir>/<slug>.md` (wiki guide)
@@ -1297,8 +1298,10 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, project_dir: &Path, key: &
             return std::fs::read_to_string(path).ok();
         }
         (ContentKind::NounEntry, slug) => {
-            let path = wiki_dir.join("nouns").join(format!("{}.md", slug));
-            return std::fs::read_to_string(path).ok();
+            return crate::nouns::primeable_noun_registry(wiki_dir, project_dir)
+                .into_iter()
+                .find(|entry| entry.slug == slug)
+                .map(|entry| crate::nouns::render_noun_record(&entry));
         }
         // Phase 5: claim rows have no backing .md file — content is rendered from ClaimRecords.
         // load_cluster resolves by cluster_id directly from claims.jsonl (no embedder needed,
@@ -1339,7 +1342,11 @@ fn source_label_for_key(
             label_for_path(root, &wiki_dir.join("research").join(format!("{}.md", stem)))
         }
         (ContentKind::NounEntry, slug) => {
-            label_for_path(root, &wiki_dir.join("nouns").join(format!("{}.md", slug)))
+            format!(
+                "{}#{}",
+                label_for_path(root, &wiki_dir.join("nouns").join("realness.jsonl")),
+                slug
+            )
         }
         (ContentKind::Claim, cluster_id) => {
             if let Some(project_dir) = project_dir {
@@ -1479,13 +1486,16 @@ fn build_catalog(
     }
 
     // Noun entries (`noun:<slug>`): off by default; gated by PC_NOUN_CATALOG.
-    // Current project-entity definitions. Subject to the same scoring/sort/cap path.
+    // Enumerates promoted user-realness nouns only; generated noun-entry files are not population.
     if taxonomy_flag("PC_NOUN_CATALOG") {
-        for nr in crate::nouns::scan_nouns(wiki_dir) {
+        for nr in crate::nouns::primeable_noun_registry(wiki_dir, project_dir)
+            .into_iter()
+            .filter(|entry| entry.has_definition())
+        {
             items.push(CatalogItem {
                 key: ContentKind::NounEntry.render_key(&nr.slug),
                 title: nr.name,
-                summary: nr.summary,
+                summary: truncate(&nr.definition, 100),
                 score: hit_score.get(&nr.slug).copied(),
                 kind: ContentKind::NounEntry,
                 currentness: Currentness::Current,
@@ -2257,6 +2267,49 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
     }
 
     #[test]
+    fn noun_catalog_uses_promoted_realness_not_noun_files() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("PC_NOUN_CATALOG", "1");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("docs/wiki");
+        let project_dir = root.join("pc-project");
+        fs::create_dir_all(wiki.join("nouns")).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+
+        fs::write(
+            wiki.join("nouns/junk-file.md"),
+            "---\ntype: noun-entry\nslug: junk-file\nname: \"Junk File\"\norigin: extracted\nsource_refs:\n  []\n---\n\n# Junk File\n\nShould not be cataloged.\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("real-thing.md"),
+            "---\ntitle: Real Thing\nsummary: Definition from guide.\n---\n\n# Real Thing\n\nDefinition from guide.\n",
+        )
+        .unwrap();
+        crate::nouns::write_realness_registry(&wiki, &[crate::nouns::RealnessNoun::new("Real Thing", 3)]).unwrap();
+
+        let catalog = build_catalog(root, &wiki, &project_dir, &[], &[], 150, "what is real thing?", None);
+        let noun_keys: Vec<_> = catalog
+            .iter()
+            .filter(|item| item.key.starts_with("noun:"))
+            .map(|item| item.key.as_str())
+            .collect();
+        assert_eq!(noun_keys, vec!["noun:real-thing"]);
+        assert!(!noun_keys.contains(&"noun:junk-file"));
+
+        let content = read_catalog_content(root, &wiki, &project_dir, "noun:real-thing")
+            .expect("realness-promoted noun should resolve");
+        assert!(content.contains("Definition from guide."));
+        assert!(read_catalog_content(root, &wiki, &project_dir, "noun:junk-file").is_none());
+
+        std::env::remove_var("PC_NOUN_CATALOG");
+    }
+
+    #[test]
     fn read_catalog_content_resolves_episode_key() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2291,7 +2344,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         );
         assert_eq!(
             source_label_for_key(root, &wiki, Some(&project_dir), "noun:mint"),
-            "./docs/wiki/nouns/mint.md"
+            "./docs/wiki/nouns/realness.jsonl#mint"
         );
         assert_eq!(
             source_label_for_key(root, &wiki, Some(&project_dir), "claim:cl-abc123"),
