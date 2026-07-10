@@ -1,0 +1,6 @@
+{
+  "id": "019f4-29e93",
+  "ts": "2026-07-10T14:06:36Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "In `pc`, nouns are the entity layer for grounding memory. They are the stable named things that facts, corrections, and guide content hang off. The live purpose is:\n\n1. Capture/project memory finds or derives project nouns.\n   [src/nouns.rs](/Users/pablofernandez/src/proactive-context/src/nouns.rs:6) calls them “the stable spine the volatile behavioral facts hang off.” [...] 1. Capture/project memory finds or derives project nouns.\n   [src/nouns.rs](/Users/pablofernandez/src/proactive-context/src/nouns.rs:6) calls them “the stable spine the volatile behavioral facts hang off.”"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "019f4-a302c",
+  "ts": "2026-07-10T14:06:36Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "3. Inject uses only real nouns as a first-mention primer.\n   If the current prompt mentions a real project noun for the first time in this session, `pc` prepends a small block with its definition and prompt-relevant facts. It is explicitly a separate primer, not blended into normal retrieval. See [src/nouns.rs](/Users/pablofernandez/src/proactive-context/src/nouns.rs:831), [src/nouns.rs](/Users/pablofernandez/src/proactive-context/src/nouns.rs:937), and [src/nouns.rs](/Users/pablofernandez/src/proactive-context/src/nouns.rs:1473). [...]    Run 14 confirmed that the facts-level noun primer improved noun grounding from 28.6% to 57.1% with zero drift, and recommended shipping `facts` as default. See [run14-noun-primer-results.md](/Users/pablofernandez/src/proactive-context/docs/product-spec/run14-noun-primer-results.md:27) and [run14-noun-primer-results.md](/Users/pablofernandez/src/proactive-context/docs/product-spec/run14-noun-primer-results.md:100)."
+}

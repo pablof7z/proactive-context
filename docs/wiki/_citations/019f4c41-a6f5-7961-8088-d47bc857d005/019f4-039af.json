@@ -1,0 +1,6 @@
+{
+  "id": "019f4-039af",
+  "ts": "2026-07-10T14:06:36Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "- [src/nouns.rs](/Users/pablofernandez/src/proactive-context-worktrees/noun-user-owned/src/nouns.rs): changed the C1 definitional noun policy from “capture the noun regardless of who said it” to “only admit a noun if a non-task-result human User turn actually names that subject.” This is the direct fix for assistant/tool-invented nouns becoming authority nouns. [...] Assistant: I’m patching the C1 path now: prompt, local verification, and tests. The model can still propose definitions, but Rust will now drop any definition whose subject was not actually named by a human user turn.\n\nAssistant: I’m adding the Rust-side gate now so this doesn’t depend on prompt compliance. Evidence can still come from an assistant explanation, but the subject has to be named in a real human turn. [...] - [src/research_capture.rs](/Users/pablofernandez/src/proactive-context-worktrees/noun-user-owned/src/research_capture.rs): added `is_user` to `TurnSpan` so the C1 gate can distinguish real user turns from assistant/task-result content."
+}

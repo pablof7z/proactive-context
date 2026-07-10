@@ -1,0 +1,6 @@
+{
+  "id": "019f4-7a172",
+  "ts": "2026-07-10T14:06:36Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "- It is explicitly generated entity memory, not hand-authored doctrine. [AGENTS.md](/Users/pablofernandez/src/tenex-edge/docs/wiki/nouns/AGENTS.md:3) says noun entries and `realness.jsonl` are generated artifacts, and existing extracted entries should be treated as immutable unless migrated."
+}

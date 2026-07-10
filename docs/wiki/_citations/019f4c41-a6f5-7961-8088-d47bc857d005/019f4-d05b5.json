@@ -1,0 +1,6 @@
+{
+  "id": "019f4-d05b5",
+  "ts": "2026-07-10T14:06:36Z",
+  "session": "019f4c41-a6f5-7961-8088-d47bc857d005",
+  "text": "2. Capture scores whether the user treats each noun as real.\n   The realness model reads user stance: operate on it, reject it, or merely mention it. A clear reject suppresses; repeated operate-on promotes. See [src/realness.rs](/Users/pablofernandez/src/proactive-context/src/realness.rs:58) and thresholds at [src/realness.rs](/Users/pablofernandez/src/proactive-context/src/realness.rs:582). [...] - [src/noun_mining.rs](/Users/pablofernandez/src/proactive-context-worktrees/noun-user-owned/src/noun_mining.rs): added filters for obvious realness garbage like `4.7 GB · 2 days ago`, `rm -rf`, and redacted key fragments like `sk-or-…4f2a`. [...] Assistant: I noticed one candidate guard was too broad for Nostr work: rejecting all `nsec*` would suppress legitimate domain nouns. I’m tightening that before running tests."
+}

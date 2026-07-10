@@ -2,7 +2,7 @@
 
 > Derived cache — do not hand-edit. Rebuilt by proactive-context after each capture.
 
-Last updated: 2026-07-06
+Last updated: 2026-07-10
 
 ## autodoc (1 guide)
 
@@ -16,13 +16,14 @@ Last updated: 2026-07-06
 |------|-------|---------|------|------------|----------|-------|
 | [build-and-install](guides/build-and-install.md) | Build and Install | After building with `cargo build --release`, run `just install` to deploy the freshly built binary to `~/.bin/pc` | capture | warm | 2026-05-29 | build-install |
 
-## capture-pipeline (7 guides)
+## capture-pipeline (8 guides)
 
 | Slug | Title | Summary | Tags | Volatility | Verified | Topic |
 |------|-------|---------|------|------------|----------|-------|
 | [archeologist](guides/archeologist.md) | Archeologist | The archeologist is the bulk-historical capture command that replays ~/.claude/projects/**/*.jsonl transcripts through the capture pipeline to populate a per-pr | capture | warm | 2026-05-29 | capture-pipeline |
 | [capture-pipeline](guides/capture-pipeline.md) | Capture Pipeline | proactive-context is a self-improving knowledge layer built on a captureâwikiâinject loop, local-first as a single Rust binary with fastembed + sqlite-vec | capture | warm | 2026-05-28 | capture-pipeline |
 | [inject-pipeline](guides/inject-pipeline.md) | Inject Pipeline | The production inject models (`inject_select_model` and `inject_compile_model`) are set to `ollama:gemma4:31b-cloud`, written to `~/.proactive-context/config.js | capture | warm | 2026-05-29 | capture-pipeline |
+| [project-nouns](guides/project-nouns.md) | Project Nouns | Nouns in pc are the entity layer for grounding memory: the stable named things that facts, corrections, and guide content hang off | capture | warm | 2026-07-10 | capture-pipeline |
 | [route-stage](guides/route-stage.md) | ROUTE Stage | ROUTE enforces one coherent topic per guide â the ROUTE altitude fix â defining a guide as one coherent topic a reader opens under one title (a subsystem/co | capture | warm | 2026-05-29 | capture-pipeline |
 | [supersession](guides/supersession.md) | Supersession and Claim Retention | Supersession retention is symmetric: superseded claims are kept in the log regardless of author, and nothing is ever deleted | capture | warm | 2026-05-29 | capture-pipeline |
 | [tenex-import](guides/tenex-import.md) | TENEX Import | TENEX project discovery reads `~/.tenex/config.json` for the projects base directory and the user's whitelisted pubkey, rather than scanning for projects. | capture | warm | 2026-05-31 | capture-pipeline |
