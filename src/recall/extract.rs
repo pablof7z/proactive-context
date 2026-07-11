@@ -3,7 +3,10 @@
 //! Python prototype (experiments/recall/recall/extract.py).
 
 use anyhow::Result;
+use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use super::store::Turn;
@@ -18,7 +21,8 @@ const WRAPPER_PREFIXES: &[&str] = &[
     "<subagent_notification>", "<user_prompt>", "<task_notification", "User:",
     "Assistant:", "<turn_context>", "<context_summary", "<environment_details>",
     "<teammate-message", "Respond only to the final user message", "# Your Identity",
-    "Another Claude session sent a message",
+    "Another Claude session sent a message", "<turn_aborted>", "<codex_internal_context",
+    "<skill>", "<user_shell_command>",
 ];
 
 const ACKS: &[&str] = &[
@@ -33,6 +37,34 @@ const PASTE_HEAD: usize = 9000;
 const PASTE_TAIL: usize = 2000;
 
 fn re(p: &str) -> regex::Regex { regex::Regex::new(p).unwrap() }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpSource {
+    Claude,
+    Codex,
+    Both,
+}
+
+#[derive(Debug, Clone)]
+pub struct DumpOptions {
+    pub source: DumpSource,
+    pub cwd: Option<PathBuf>,
+    pub include_subdirs: bool,
+    pub include_archived_codex: bool,
+    pub clean: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DumpRecord {
+    pub provider: String,
+    pub project: String,
+    pub cwd: String,
+    pub session_id: String,
+    pub timestamp: String,
+    pub line: i64,
+    pub transcript_path: String,
+    pub message: String,
+}
 
 // Rust's regex crate has no backreferences, so we can't match "same tag name".
 // Instead apply one lazy `<X>...</X>` remover per tag family (compiled once).
@@ -128,6 +160,69 @@ fn mk(source: &str, project: &str, session: &str, line: i64, ts: &str, text: Str
     }
 }
 
+fn prepare_dump_text(raw: &str, clean: bool) -> Option<String> {
+    let text = if clean { clean_text(raw) } else { raw.trim().to_string() };
+    if text.is_empty() || is_wrapper(&text) { return None; }
+    Some(text)
+}
+
+fn dump_record(
+    provider: &str,
+    cwd: &str,
+    session_id: &str,
+    line: i64,
+    timestamp: &str,
+    message: String,
+    transcript_path: &Path,
+) -> DumpRecord {
+    DumpRecord {
+        provider: provider.to_string(),
+        project: project_of(cwd, provider),
+        cwd: cwd.to_string(),
+        session_id: session_id.to_string(),
+        timestamp: timestamp.to_string(),
+        line,
+        transcript_path: transcript_path.to_string_lossy().to_string(),
+        message,
+    }
+}
+
+fn extract_claude_dump(
+    path: &Path,
+    clean: bool,
+    cwd_filter: &mut Option<CwdFilter>,
+    out: &mut Vec<DumpRecord>,
+) {
+    let session = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return };
+    for (i, raw) in content.lines().enumerate() {
+        if !raw.contains("\"type\"") { continue; }
+        let o: Value = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => continue };
+        if o.get("type").and_then(|t| t.as_str()) != Some("user") { continue; }
+        if o.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) { continue; }
+        match o.get("userType").and_then(|u| u.as_str()) {
+            None | Some("external") => {}
+            _ => continue,
+        }
+        let cwd = o.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(filter) = cwd_filter.as_mut() {
+            if !filter.matches(cwd) { continue; }
+        }
+        let msg = match o.get("message") { Some(m) => m, None => continue };
+        let raw_text = match msg.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(arr)) => arr.iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>().join("\n"),
+            _ => continue,
+        };
+        let Some(message) = prepare_dump_text(&raw_text, clean) else { continue };
+        let ts = o.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        out.push(dump_record("claude", cwd, &session, (i + 1) as i64, ts, message, path));
+    }
+}
+
 // ── Claude Code ────────────────────────────────────────────────────────────
 fn extract_claude(path: &Path, out: &mut Vec<Turn>) {
     let session = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -182,6 +277,13 @@ fn extract_codex(path: &Path, out: &mut Vec<Turn>) {
     out.extend(extract_codex_content(&content, &session, &path.to_string_lossy()));
 }
 
+fn codex_session_id(path: &Path) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    re(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+        .captures(stem).map(|c| c[1].to_string())
+        .unwrap_or_else(|| stem.chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect())
+}
+
 /// Pure, testable codex extraction. A human prompt is logged as EITHER a
 /// `response_item` user message OR an `event_msg`/`user_message` (sometimes both;
 /// dedup at corpus time collapses the overlap). Automation sessions are dropped
@@ -230,6 +332,124 @@ fn codex_user_text(payload: &Value) -> Option<String> {
     }
 }
 
+fn extract_codex_dump(
+    path: &Path,
+    clean: bool,
+    cwd_filter: &mut Option<CwdFilter>,
+    out: &mut Vec<DumpRecord>,
+) {
+    let session = codex_session_id(path);
+    let file = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return };
+    let lines = std::io::BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok);
+    out.extend(extract_codex_dump_lines(
+        lines,
+        &session,
+        path,
+        clean,
+        cwd_filter,
+    ));
+}
+
+#[cfg(test)]
+fn extract_codex_dump_content(
+    content: &str,
+    fallback_session: &str,
+    raw_path: &Path,
+    clean: bool,
+) -> Vec<DumpRecord> {
+    let mut cwd_filter = None;
+    extract_codex_dump_content_filtered(content, fallback_session, raw_path, clean, &mut cwd_filter)
+}
+
+#[cfg(test)]
+fn extract_codex_dump_content_filtered(
+    content: &str,
+    fallback_session: &str,
+    raw_path: &Path,
+    clean: bool,
+    cwd_filter: &mut Option<CwdFilter>,
+) -> Vec<DumpRecord> {
+    extract_codex_dump_lines(
+        content.lines().map(str::to_string),
+        fallback_session,
+        raw_path,
+        clean,
+        cwd_filter,
+    )
+}
+
+fn extract_codex_dump_lines<I>(
+    lines: I,
+    fallback_session: &str,
+    raw_path: &Path,
+    clean: bool,
+    cwd_filter: &mut Option<CwdFilter>,
+) -> Vec<DumpRecord>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut cwd = String::new();
+    let mut session = fallback_session.to_string();
+    let mut human = true;
+    let mut events: Vec<DumpRecord> = vec![];
+    let mut responses: Vec<DumpRecord> = vec![];
+
+    for (i, raw) in lines.into_iter().enumerate() {
+        let o: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
+        let typ = o.get("type").and_then(|t| t.as_str());
+        let payload = o.get("payload").cloned().unwrap_or(Value::Null);
+        if typ == Some("session_meta") {
+            cwd = payload.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            if let Some(id) = payload.get("id").and_then(|id| id.as_str()) {
+                session = id.to_string();
+            }
+            human = codex_is_human(&o);
+            if !human { return vec![]; }
+            if let Some(filter) = cwd_filter.as_mut() {
+                if !filter.matches(&cwd) { return vec![]; }
+            }
+            continue;
+        }
+
+        let (text_opt, is_event_msg) = if typ == Some("event_msg")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("user_message") {
+            (
+                payload.get("message").and_then(|m| m.as_str()).map(String::from)
+                    .or_else(|| codex_user_text(&payload)),
+                true,
+            )
+        } else if typ == Some("response_item")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("message")
+            && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
+            (codex_user_text(&payload), false)
+        } else { (None, false) };
+
+        let raw_text = match text_opt { Some(t) => t, None => continue };
+        let Some(message) = prepare_dump_text(&raw_text, clean) else { continue };
+        let ts = o.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        let record = dump_record("codex", &cwd, &session, (i + 1) as i64, ts, message, raw_path);
+        if is_event_msg { events.push(record); } else { responses.push(record); }
+    }
+
+    if !human { return vec![]; }
+
+    // Codex commonly stores the submitted prompt both as event_msg and response_item.
+    // Prefer event_msg for export, but keep response_item-only sessions.
+    let mut event_remaining: HashMap<String, usize> = HashMap::new();
+    for record in &events {
+        *event_remaining.entry(record.message.clone()).or_insert(0) += 1;
+    }
+
+    let mut records = events;
+    for response in responses {
+        let count = event_remaining.entry(response.message.clone()).or_insert(0);
+        if *count > 0 { *count -= 1; } else { records.push(response); }
+    }
+    records
+}
+
 // ── Drivers ──────────────────────────────────────────────────────────────────
 fn claude_files() -> Vec<PathBuf> {
     let root = dirs::home_dir().unwrap_or_default().join(".claude").join("projects");
@@ -249,12 +469,112 @@ fn claude_files() -> Vec<PathBuf> {
 }
 
 fn codex_files() -> Vec<PathBuf> {
+    codex_files_with_archived(false)
+}
+
+fn codex_files_with_archived(include_archived: bool) -> Vec<PathBuf> {
     let root = dirs::home_dir().unwrap_or_default().join(".codex").join("sessions");
-    walkdir::WalkDir::new(&root).into_iter().flatten()
-        .map(|e| e.into_path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str())
-            .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl")).unwrap_or(false))
-        .collect()
+    let mut roots = vec![root];
+    if include_archived {
+        roots.push(dirs::home_dir().unwrap_or_default().join(".codex").join("archived_sessions"));
+    }
+    let mut files = vec![];
+    for root in roots {
+        if !root.exists() { continue; }
+        files.extend(walkdir::WalkDir::new(&root).into_iter().flatten()
+            .map(|e| e.into_path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str())
+                .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl")).unwrap_or(false)));
+    }
+    files
+}
+
+fn pathish(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+struct CwdFilter {
+    target: PathBuf,
+    target_root_key: String,
+    target_abs: PathBuf,
+    include_subdirs: bool,
+    cache: HashMap<String, bool>,
+}
+
+impl CwdFilter {
+    fn new(target: &Path, include_subdirs: bool) -> Self {
+        Self {
+            target: target.to_path_buf(),
+            target_root_key: crate::config::normalize_path(
+                &crate::config::resolve_project_root(target)),
+            target_abs: pathish(target),
+            include_subdirs,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn matches(&mut self, cwd: &str) -> bool {
+        if cwd.is_empty() { return false; }
+        if let Some(hit) = self.cache.get(cwd) { return *hit; }
+
+        let cwd_path = PathBuf::from(cwd);
+        let cwd_root_key = crate::config::normalize_path(
+            &crate::config::resolve_project_root(&cwd_path));
+        let mut matches = cwd_root_key == self.target_root_key;
+
+        if !matches && self.include_subdirs {
+            matches = pathish(&cwd_path).starts_with(&self.target_abs);
+        }
+
+        if !matches {
+            matches = pathish(&cwd_path) == pathish(&self.target);
+        }
+
+        self.cache.insert(cwd.to_string(), matches);
+        matches
+    }
+}
+
+pub fn dump_records(options: &DumpOptions) -> Result<Vec<DumpRecord>> {
+    let mut records = vec![];
+    let mut cwd_filter = options.cwd.as_ref()
+        .map(|target| CwdFilter::new(target, options.include_subdirs));
+    match options.source {
+        DumpSource::Claude | DumpSource::Both => {
+            for f in claude_files() {
+                extract_claude_dump(
+                    &f,
+                    options.clean,
+                    &mut cwd_filter,
+                    &mut records,
+                );
+            }
+        }
+        DumpSource::Codex => {}
+    }
+
+    match options.source {
+        DumpSource::Codex | DumpSource::Both => {
+            for f in codex_files_with_archived(options.include_archived_codex) {
+                extract_codex_dump(
+                    &f,
+                    options.clean,
+                    &mut cwd_filter,
+                    &mut records,
+                );
+            }
+        }
+        DumpSource::Claude => {}
+    }
+
+    records.sort_by(|a, b| {
+        a.timestamp.cmp(&b.timestamp)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.transcript_path.cmp(&b.transcript_path))
+    });
+    Ok(records)
 }
 
 pub fn extract_all() -> Result<Vec<Turn>> {
@@ -351,5 +671,67 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"use 8px not 10px"}}"#,
         ]);
         assert_eq!(extract_codex_content(&c, SID, "/p").len(), 1);
+    }
+
+    #[test]
+    fn dump_codex_prefers_event_msg_over_duplicate_response_item() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"id":"full-session-id","originator":"codex-tui","cwd":"/a/proj"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"refactor the event bus to be push-based, not polling across the session runtime"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"refactor the event bus to be push-based, not polling across the session runtime"}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"use FlatBuffers not JSON across the FFI boundary"}]}}"#,
+        ]);
+
+        let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.iter().filter(|r| r.message.contains("event bus")).count(), 1);
+        assert_eq!(records[0].session_id, "full-session-id");
+        assert_eq!(records[0].cwd, "/a/proj");
+    }
+
+    #[test]
+    fn dump_codex_drops_automation_sessions() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","agent_role":"Reviewer","cwd":"/a/x"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"review every phase artifact and produce a structured implementation report"}}"#,
+        ]);
+
+        let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
+
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn dump_codex_keeps_short_human_commands() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","cwd":"/a/proj"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"commit"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"continue"}}"#,
+        ]);
+
+        let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].message, "commit");
+        assert_eq!(records[1].message, "continue");
+    }
+
+    #[test]
+    fn dump_claude_skips_sidechain_user_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session-1.jsonl");
+        std::fs::write(&path, jl(&[
+            r#"{"type":"user","isSidechain":true,"cwd":"/a/proj","timestamp":"2026-01-01T00:00:01Z","message":{"content":"summarize the implementation plan from the parent agent context"}}"#,
+            r#"{"type":"user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:02Z","message":{"content":"add transcript dump support to the recall command surface with cleanup enabled"}}"#,
+        ])).unwrap();
+
+        let mut records = vec![];
+        let mut cwd_filter = None;
+        extract_claude_dump(&path, true, &mut cwd_filter, &mut records);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].message.contains("transcript dump support"));
+        assert!(!records[0].message.contains("parent agent"));
     }
 }

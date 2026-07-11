@@ -8,6 +8,7 @@ pub mod store;
 pub mod extract;
 pub mod corpus;
 pub mod ask;
+pub mod dump;
 pub mod gate;
 pub mod chunked;
 mod picker;
@@ -62,6 +63,8 @@ pub enum RecallCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Dump human-authored Claude Code/Codex prompts for a project as JSONL, Markdown, or text.
+    Dump(dump::DumpArgs),
 }
 
 fn cfg_answer_model() -> String {
@@ -102,6 +105,7 @@ pub fn run(cmd: RecallCmd) -> Result<()> {
         }
         RecallCmd::Gate { model } => gate::build_gate(
             &ModelSpec::parse(model.as_deref().unwrap_or(gate::GATE_DEFAULT))),
+        RecallCmd::Dump(args) => dump::run(args),
     }
 }
 
