@@ -63,7 +63,7 @@ pub enum RecallCmd {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Dump human-authored Claude Code/Codex prompts for a project as JSONL, Markdown, or text.
+    /// Dump project-scoped Claude Code/Codex conversations as JSON, Markdown, or text.
     Dump(dump::DumpArgs),
 }
 

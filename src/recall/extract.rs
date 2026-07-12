@@ -1,6 +1,6 @@
-//! recall extract — pull human-authored utterances from Claude Code + Codex
-//! transcripts, strip harness/pasted/automation content. Ported from the validated
-//! Python prototype (experiments/recall/recall/extract.py).
+//! recall extract — index human-authored utterances and export visible conversations
+//! from Claude Code + Codex transcripts. Ported from the validated Python prototype
+//! (experiments/recall/recall/extract.py).
 
 use anyhow::Result;
 use serde::Serialize;
@@ -57,13 +57,17 @@ pub struct DumpOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DumpRecord {
     pub provider: String,
-    pub project: String,
     pub cwd: String,
     pub session_id: String,
     pub timestamp: String,
     pub line: i64,
     pub transcript_path: String,
-    pub message: String,
+    pub role: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 // Rust's regex crate has no backreferences, so we can't match "same tag name".
@@ -160,10 +164,43 @@ fn mk(source: &str, project: &str, session: &str, line: i64, ts: &str, text: Str
     }
 }
 
-fn prepare_dump_text(raw: &str, clean: bool) -> Option<String> {
-    let text = if clean { clean_text(raw) } else { raw.trim().to_string() };
-    if text.is_empty() || is_wrapper(&text) { return None; }
-    Some(text)
+fn message_text(message: &Value, content_types: &[&str]) -> Option<String> {
+    match message.get("content") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(arr)) => {
+            let text = arr.iter()
+                .filter(|block| block.get("type").and_then(|t| t.as_str())
+                    .map(|kind| content_types.contains(&kind)).unwrap_or(false))
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>();
+            if text.is_empty() { None } else { Some(text.join("\n")) }
+        }
+        _ => None,
+    }
+}
+
+fn prepare_user_dump_text(raw: &str, clean: bool) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+
+    let classified = clean_text(raw);
+    if classified.is_empty() || is_wrapper(&classified) { return None; }
+    if clean { Some(classified) } else { Some(raw.to_string()) }
+}
+
+fn prepare_assistant_dump_text(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if text.is_empty() { None } else { Some(text.to_string()) }
+}
+
+fn claude_is_agent_record(record: &Value) -> bool {
+    if record.get("isSidechain").and_then(|value| value.as_bool()) == Some(true) {
+        return true;
+    }
+    // Claude can embed teammate worktree records in the parent JSONL without isSidechain.
+    record.get("cwd").and_then(|cwd| cwd.as_str())
+        .map(|cwd| cwd.replace('\\', "/").contains("/.claude/worktrees/agent-"))
+        .unwrap_or(false)
 }
 
 fn dump_record(
@@ -172,18 +209,23 @@ fn dump_record(
     session_id: &str,
     line: i64,
     timestamp: &str,
-    message: String,
+    role: &str,
+    text: String,
+    phase: Option<String>,
+    stop_reason: Option<String>,
     transcript_path: &Path,
 ) -> DumpRecord {
     DumpRecord {
         provider: provider.to_string(),
-        project: project_of(cwd, provider),
         cwd: cwd.to_string(),
         session_id: session_id.to_string(),
         timestamp: timestamp.to_string(),
         line,
         transcript_path: transcript_path.to_string_lossy().to_string(),
-        message,
+        role: role.to_string(),
+        text,
+        phase,
+        stop_reason,
     }
 }
 
@@ -195,32 +237,97 @@ fn extract_claude_dump(
 ) {
     let session = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return };
+    let mut records: Vec<DumpRecord> = vec![];
+    let mut assistant_ids: HashMap<String, usize> = HashMap::new();
+    let mut lineage: HashMap<String, bool> = HashMap::new();
+    let mut current_included = true;
+
     for (i, raw) in content.lines().enumerate() {
         if !raw.contains("\"type\"") { continue; }
         let o: Value = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => continue };
-        if o.get("type").and_then(|t| t.as_str()) != Some("user") { continue; }
-        if o.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) { continue; }
-        match o.get("userType").and_then(|u| u.as_str()) {
-            None | Some("external") => {}
-            _ => continue,
-        }
+        let typ = o.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        let parent_included = o.get("parentUuid").and_then(|parent| parent.as_str())
+            .and_then(|parent| lineage.get(parent)).copied().unwrap_or(current_included);
+        let agent_record = claude_is_agent_record(&o);
+        let mut included = parent_included && !agent_record;
         let cwd = o.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
-        if let Some(filter) = cwd_filter.as_mut() {
-            if !filter.matches(cwd) { continue; }
-        }
-        let msg = match o.get("message") { Some(m) => m, None => continue };
-        let raw_text = match msg.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(arr)) => arr.iter()
-                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>().join("\n"),
-            _ => continue,
+        let cwd_matches = if let Some(filter) = cwd_filter.as_mut() {
+            filter.matches(cwd)
+        } else {
+            true
         };
-        let Some(message) = prepare_dump_text(&raw_text, clean) else { continue };
-        let ts = o.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-        out.push(dump_record("claude", cwd, &session, (i + 1) as i64, ts, message, path));
+        let message = o.get("message");
+
+        if typ == "user" {
+            if let Some(raw_text) = message.and_then(|message| message_text(message, &["text"])) {
+                let external = matches!(
+                    o.get("userType").and_then(|user_type| user_type.as_str()),
+                    None | Some("external")
+                );
+                let human_source = o.get("promptSource").and_then(|source| source.as_str())
+                    != Some("system");
+                let text = prepare_user_dump_text(&raw_text, clean);
+                included = external && human_source && !agent_record && text.is_some();
+                if included && cwd_matches {
+                    records.push(dump_record(
+                        "claude",
+                        cwd,
+                        &session,
+                        (i + 1) as i64,
+                        o.get("timestamp").and_then(|timestamp| timestamp.as_str()).unwrap_or(""),
+                        "user",
+                        text.unwrap(),
+                        None,
+                        None,
+                        path,
+                    ));
+                }
+            }
+        } else if typ == "assistant" && included && cwd_matches {
+            if let Some(message) = message {
+                if let Some(raw_text) = message_text(message, &["text"]) {
+                    if let Some(text) = prepare_assistant_dump_text(&raw_text) {
+                        let record = dump_record(
+                            "claude",
+                            cwd,
+                            &session,
+                            (i + 1) as i64,
+                            o.get("timestamp").and_then(|timestamp| timestamp.as_str()).unwrap_or(""),
+                            "assistant",
+                            text,
+                            None,
+                            message.get("stop_reason").and_then(|reason| reason.as_str())
+                                .map(String::from),
+                            path,
+                        );
+                        let native_id = message.get("id").and_then(|id| id.as_str())
+                            .filter(|id| !id.is_empty());
+                        if let Some(native_id) = native_id {
+                            if let Some(existing) = assistant_ids.get(native_id).copied() {
+                                records[existing].text.push('\n');
+                                records[existing].text.push_str(&record.text);
+                                if record.stop_reason.is_some() {
+                                    records[existing].stop_reason = record.stop_reason;
+                                }
+                            } else {
+                                assistant_ids.insert(native_id.to_string(), records.len());
+                                records.push(record);
+                            }
+                        } else {
+                            records.push(record);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(uuid) = o.get("uuid").and_then(|uuid| uuid.as_str()) {
+            lineage.insert(uuid.to_string(), included);
+        }
+        current_included = included;
     }
+
+    out.extend(records);
 }
 
 // ── Claude Code ────────────────────────────────────────────────────────────
@@ -322,14 +429,11 @@ fn extract_codex_content(content: &str, session: &str, raw_path: &str) -> Vec<Tu
 }
 
 fn codex_user_text(payload: &Value) -> Option<String> {
-    match payload.get("content") {
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Array(arr)) => Some(arr.iter()
-            .filter(|b| matches!(b.get("type").and_then(|t| t.as_str()), Some("input_text") | Some("text")))
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>().join("\n")),
-        _ => None,
-    }
+    message_text(payload, &["input_text", "text"])
+}
+
+fn codex_assistant_text(payload: &Value) -> Option<String> {
+    message_text(payload, &["output_text", "text"])
 }
 
 fn extract_codex_dump(
@@ -392,9 +496,9 @@ where
 {
     let mut cwd = String::new();
     let mut session = fallback_session.to_string();
-    let mut human = true;
-    let mut events: Vec<DumpRecord> = vec![];
-    let mut responses: Vec<DumpRecord> = vec![];
+    let mut user_events: Vec<DumpRecord> = vec![];
+    let mut user_responses: Vec<DumpRecord> = vec![];
+    let mut assistant_responses: Vec<DumpRecord> = vec![];
 
     for (i, raw) in lines.into_iter().enumerate() {
         let o: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
@@ -405,48 +509,81 @@ where
             if let Some(id) = payload.get("id").and_then(|id| id.as_str()) {
                 session = id.to_string();
             }
-            human = codex_is_human(&o);
-            if !human { return vec![]; }
+            if !codex_is_human(&o) { return vec![]; }
             if let Some(filter) = cwd_filter.as_mut() {
                 if !filter.matches(&cwd) { return vec![]; }
             }
             continue;
         }
 
-        let (text_opt, is_event_msg) = if typ == Some("event_msg")
+        let (role, text_opt, phase, is_event_user) = if typ == Some("event_msg")
             && payload.get("type").and_then(|t| t.as_str()) == Some("user_message") {
             (
+                "user",
                 payload.get("message").and_then(|m| m.as_str()).map(String::from)
                     .or_else(|| codex_user_text(&payload)),
+                None,
                 true,
             )
         } else if typ == Some("response_item")
             && payload.get("type").and_then(|t| t.as_str()) == Some("message")
             && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
-            (codex_user_text(&payload), false)
-        } else { (None, false) };
+            ("user", codex_user_text(&payload), None, false)
+        } else if typ == Some("response_item")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("message")
+            && payload.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            (
+                "assistant",
+                codex_assistant_text(&payload),
+                payload.get("phase").and_then(|phase| phase.as_str()).map(String::from),
+                false,
+            )
+        } else {
+            continue;
+        };
 
         let raw_text = match text_opt { Some(t) => t, None => continue };
-        let Some(message) = prepare_dump_text(&raw_text, clean) else { continue };
+        let text = match role {
+            "user" => prepare_user_dump_text(&raw_text, clean),
+            "assistant" => prepare_assistant_dump_text(&raw_text),
+            _ => None,
+        };
+        let Some(text) = text else { continue };
         let ts = o.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-        let record = dump_record("codex", &cwd, &session, (i + 1) as i64, ts, message, raw_path);
-        if is_event_msg { events.push(record); } else { responses.push(record); }
+        let record = dump_record(
+            "codex",
+            &cwd,
+            &session,
+            (i + 1) as i64,
+            ts,
+            role,
+            text,
+            phase,
+            None,
+            raw_path,
+        );
+        match (role, is_event_user) {
+            ("user", true) => user_events.push(record),
+            ("user", false) => user_responses.push(record),
+            ("assistant", _) => assistant_responses.push(record),
+            _ => {}
+        }
     }
-
-    if !human { return vec![]; }
 
     // Codex commonly stores the submitted prompt both as event_msg and response_item.
     // Prefer event_msg for export, but keep response_item-only sessions.
     let mut event_remaining: HashMap<String, usize> = HashMap::new();
-    for record in &events {
-        *event_remaining.entry(record.message.clone()).or_insert(0) += 1;
+    for record in &user_events {
+        *event_remaining.entry(record.text.clone()).or_insert(0) += 1;
     }
 
-    let mut records = events;
-    for response in responses {
-        let count = event_remaining.entry(response.message.clone()).or_insert(0);
+    let mut records = user_events;
+    for response in user_responses {
+        let count = event_remaining.entry(response.text.clone()).or_insert(0);
         if *count > 0 { *count -= 1; } else { records.push(response); }
     }
+    records.extend(assistant_responses);
+    records.sort_by_key(|record| record.line);
     records
 }
 
@@ -610,6 +747,25 @@ mod tests {
     const SID: &str = "abc12345-1111-2222";
 
     #[test]
+    fn dump_clean_and_raw_modes_classify_the_same_human_message() {
+        let raw = "<system-reminder>machine context</system-reminder>\nkeep this human request";
+
+        assert_eq!(
+            prepare_user_dump_text(raw, true).as_deref(),
+            Some("keep this human request")
+        );
+        assert_eq!(prepare_user_dump_text(raw, false).as_deref(), Some(raw));
+        assert!(prepare_user_dump_text(
+            "<environment_context><cwd>/tmp</cwd></environment_context>",
+            true
+        ).is_none());
+        assert!(prepare_user_dump_text(
+            "<environment_context><cwd>/tmp</cwd></environment_context>",
+            false
+        ).is_none());
+    }
+
+    #[test]
     fn event_msg_user_message_is_extracted() {
         // The case the original port missed: a human prompt logged ONLY as event_msg.
         let c = jl(&[
@@ -685,9 +841,10 @@ mod tests {
         let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records.iter().filter(|r| r.message.contains("event bus")).count(), 1);
+        assert_eq!(records.iter().filter(|r| r.text.contains("event bus")).count(), 1);
         assert_eq!(records[0].session_id, "full-session-id");
         assert_eq!(records[0].cwd, "/a/proj");
+        assert_eq!(records[0].role, "user");
     }
 
     #[test]
@@ -713,8 +870,8 @@ mod tests {
         let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].message, "commit");
-        assert_eq!(records[1].message, "continue");
+        assert_eq!(records[0].text, "commit");
+        assert_eq!(records[1].text, "continue");
     }
 
     #[test]
@@ -731,7 +888,116 @@ mod tests {
         extract_claude_dump(&path, true, &mut cwd_filter, &mut records);
 
         assert_eq!(records.len(), 1);
-        assert!(records[0].message.contains("transcript dump support"));
-        assert!(!records[0].message.contains("parent agent"));
+        assert!(records[0].text.contains("transcript dump support"));
+        assert!(!records[0].text.contains("parent agent"));
+    }
+
+    #[test]
+    fn dump_claude_skips_unflagged_agent_worktree_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session-1.jsonl");
+        std::fs::write(&path, jl(&[
+            r#"{"type":"user","cwd":"/a/proj/.claude/worktrees/agent-a1","timestamp":"2026-01-01T00:00:01Z","message":{"content":"subagent prompt"}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj/.claude/worktrees/agent-a1","timestamp":"2026-01-01T00:00:02Z","message":{"id":"msg-agent","content":[{"type":"text","text":"subagent response"}],"stop_reason":"end_turn"}}"#,
+            r#"{"type":"user","gitBranch":"worktree-agent-a2","cwd":"/a/proj","timestamp":"2026-01-01T00:00:03Z","message":{"content":"human message with stale branch metadata"}}"#,
+            r#"{"type":"assistant","gitBranch":"worktree-agent-a2","cwd":"/a/proj","timestamp":"2026-01-01T00:00:04Z","message":{"id":"msg-branch","content":[{"type":"text","text":"main response with stale branch metadata"}],"stop_reason":"end_turn"}}"#,
+            r#"{"type":"user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:05Z","message":{"content":"main prompt"}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:06Z","message":{"id":"msg-main","content":[{"type":"text","text":"main response"}],"stop_reason":"end_turn"}}"#,
+        ])).unwrap();
+
+        let mut records = vec![];
+        let mut cwd_filter = None;
+        extract_claude_dump(&path, true, &mut cwd_filter, &mut records);
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].text, "human message with stale branch metadata");
+        assert_eq!(records[1].text, "main response with stale branch metadata");
+        assert_eq!(records[2].text, "main prompt");
+        assert_eq!(records[3].text, "main response");
+    }
+
+    #[test]
+    fn dump_claude_suppresses_assistant_descendants_of_synthetic_users() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session-1.jsonl");
+        std::fs::write(&path, jl(&[
+            r#"{"type":"user","uuid":"auto-user","promptSource":"system","cwd":"/a/proj","timestamp":"2026-01-01T00:00:01Z","message":{"content":"Overnight goal continuation: keep the automation running"}}"#,
+            r#"{"type":"assistant","uuid":"auto-assistant","parentUuid":"auto-user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:02Z","message":{"id":"msg-auto","content":[{"type":"text","text":"Automation response"}],"stop_reason":"end_turn"}}"#,
+            r#"{"type":"user","uuid":"human-user","parentUuid":"auto-assistant","promptSource":"typed","cwd":"/a/proj","timestamp":"2026-01-01T00:00:03Z","message":{"content":"Explain the result more clearly"}}"#,
+            r#"{"type":"assistant","uuid":"human-assistant","parentUuid":"human-user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:04Z","message":{"id":"msg-human","content":[{"type":"text","text":"Clear explanation"}],"stop_reason":"end_turn"}}"#,
+            r#"{"type":"user","uuid":"shell-user","parentUuid":"human-assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:05Z","message":{"content":"<bash-input>status command</bash-input>"}}"#,
+            r#"{"type":"assistant","uuid":"shell-assistant","parentUuid":"shell-user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:06Z","message":{"id":"msg-shell","content":[{"type":"text","text":"Shell wrapper response"}],"stop_reason":"end_turn"}}"#,
+        ])).unwrap();
+
+        let mut records = vec![];
+        let mut cwd_filter = None;
+        extract_claude_dump(&path, true, &mut cwd_filter, &mut records);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text, "Explain the result more clearly");
+        assert_eq!(records[1].text, "Clear explanation");
+    }
+
+    #[test]
+    fn dump_codex_includes_canonical_assistant_text_without_event_duplicates() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"id":"full-session-id","originator":"codex-tui","cwd":"/a/proj"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"inspect the parser"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"I am inspecting it.","phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I am inspecting it."}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done."}]}}"#,
+        ]);
+
+        let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records.iter().filter(|record| record.role == "assistant").count(), 2);
+        assert_eq!(records.iter().filter(|record| record.text == "I am inspecting it.").count(), 1);
+        assert_eq!(records[1].phase.as_deref(), Some("commentary"));
+        assert_eq!(records[2].phase.as_deref(), Some("final_answer"));
+        assert_eq!(records[2].text, "Done.");
+    }
+
+    #[test]
+    fn dump_codex_does_not_clean_assistant_code_or_diffs() {
+        let c = jl(&[
+            r#"{"type":"session_meta","payload":{"originator":"codex-tui","cwd":"/a/proj"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Patch:\n\ndiff --git a/a b/a\n-old\n+new"}]}}"#,
+        ]);
+
+        let records = extract_codex_dump_content(&c, SID, Path::new("/p"), true);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].text.contains("diff --git"));
+        assert!(records[0].text.contains("+new"));
+    }
+
+    #[test]
+    fn dump_claude_includes_text_only_and_coalesces_shared_message_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session-1.jsonl");
+        std::fs::write(&path, jl(&[
+            r#"{"type":"user","cwd":"/a/proj","timestamp":"2026-01-01T00:00:01Z","message":{"content":"inspect the parser"}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:02Z","message":{"id":"msg-1","content":[{"type":"thinking","thinking":"hidden"}],"stop_reason":null}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:03Z","message":{"id":"msg-1","content":[{"type":"text","text":"First part."}],"stop_reason":null}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:04Z","message":{"id":"msg-1","content":[{"type":"tool_use","name":"Read"}],"stop_reason":"tool_use"}}"#,
+            r#"{"type":"assistant","cwd":"/a/proj","timestamp":"2026-01-01T00:00:05Z","message":{"id":"msg-1","content":[{"type":"text","text":"Second part."}],"stop_reason":"tool_use"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"cwd":"/a/proj","timestamp":"2026-01-01T00:00:06Z","message":{"id":"msg-side","content":[{"type":"text","text":"subagent text"}],"stop_reason":"end_turn"}}"#,
+        ])).unwrap();
+
+        let mut records = vec![];
+        let mut cwd_filter = None;
+        extract_claude_dump(&path, true, &mut cwd_filter, &mut records);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[1].role, "assistant");
+        assert_eq!(records[1].text, "First part.\nSecond part.");
+        assert_eq!(records[1].stop_reason.as_deref(), Some("tool_use"));
+        assert!(!records[1].text.contains("hidden"));
+        assert!(!records[1].text.contains("subagent"));
     }
 }
