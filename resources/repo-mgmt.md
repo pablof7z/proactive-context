@@ -71,6 +71,7 @@ Example `~/.pc/config.json` fragment:
 {
   "store_sync_enabled": true,
   "store_sync_poll_secs": 60,
+  "store_sync_jitter_secs": 5,
   "store_remote": "origin",
   "store_branch": "master",
   "reconciliation_command": ["codex", "exec", "-"],

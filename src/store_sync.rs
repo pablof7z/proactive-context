@@ -119,6 +119,20 @@ fn retry_delay(cfg: &Config, failures: u32) -> u64 {
         .min(cfg.store_retry_max_secs.max(1))
 }
 
+fn jitter_offset(store: &ProjectStore, cfg: &Config, now: u64, failures: u32) -> u64 {
+    let max = cfg.store_sync_jitter_secs;
+    if max == 0 {
+        return 0;
+    }
+    let mut digest = Sha256::new();
+    digest.update(store.manifest.project_uuid.as_bytes());
+    digest.update(now.to_le_bytes());
+    digest.update(failures.to_le_bytes());
+    let bytes = digest.finalize();
+    let value = u64::from_le_bytes(bytes[..8].try_into().expect("SHA-256 prefix"));
+    value % max.saturating_add(1)
+}
+
 fn persist_outcome(
     store: &ProjectStore,
     cfg: &Config,
@@ -141,10 +155,15 @@ fn persist_outcome(
         0
     };
     let now = now_secs();
+    let jitter = jitter_offset(store, cfg, now, failures);
     let next = if failed {
-        now.saturating_add(retry_delay(cfg, failures))
+        now.saturating_add(
+            retry_delay(cfg, failures)
+                .saturating_add(jitter)
+                .min(cfg.store_retry_max_secs.max(1)),
+        )
     } else {
-        now.saturating_add(cfg.store_sync_poll_secs)
+        now.saturating_add(cfg.store_sync_poll_secs.saturating_add(jitter))
     };
     atomic_json(
         &status_path(store),
@@ -976,6 +995,18 @@ mod tests {
         assert_eq!(retry_delay(&cfg, 1), 10);
         assert_eq!(retry_delay(&cfg, 2), 20);
         assert_eq!(retry_delay(&cfg, 10), 100);
+    }
+
+    #[test]
+    fn synchronization_jitter_is_configurable_bounded_and_stable() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut cfg) = fixture(&tmp);
+        cfg.store_sync_jitter_secs = 7;
+        let first = jitter_offset(&store, &cfg, 1234, 2);
+        assert!(first <= 7);
+        assert_eq!(jitter_offset(&store, &cfg, 1234, 2), first);
+        cfg.store_sync_jitter_secs = 0;
+        assert_eq!(jitter_offset(&store, &cfg, 1234, 2), 0);
     }
 
     #[test]

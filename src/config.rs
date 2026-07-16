@@ -261,6 +261,11 @@ pub struct Config {
     #[serde(default = "default_store_sync_poll_secs")]
     pub store_sync_poll_secs: u64,
 
+    /// Maximum deterministic jitter added to poll/retry deadlines so multiple
+    /// project stores do not fetch in lockstep.
+    #[serde(default = "default_store_sync_jitter_secs")]
+    pub store_sync_jitter_secs: u64,
+
     /// Remote used for portable project memory.
     #[serde(default = "default_store_remote")]
     pub store_remote: String,
@@ -360,7 +365,6 @@ fn default_capture_triage_model() -> String {
     "anthropic/claude-haiku-4-5".to_string()
 }
 
-
 fn default_logging_enabled() -> bool {
     true
 }
@@ -372,7 +376,6 @@ fn default_log_max_bytes() -> u64 {
 fn default_log_retention() -> usize {
     2
 }
-
 
 fn default_inject_context_turns() -> usize {
     6
@@ -457,16 +460,39 @@ fn default_capture_max_turns() -> usize {
     16
 }
 
-fn default_store_sync_enabled() -> bool { true }
-fn default_store_sync_poll_secs() -> u64 { 60 }
-fn default_store_remote() -> String { "origin".into() }
-fn default_store_branch() -> String { "master".into() }
-fn default_store_retry_initial_secs() -> u64 { 15 }
-fn default_store_retry_max_secs() -> u64 { 15 * 60 }
-fn default_reconciliation_prompt_transport() -> String { "stdin".into() }
-fn default_reconciliation_timeout_secs() -> u64 { 15 * 60 }
-fn default_reconciliation_log_max_bytes() -> u64 { 8 * 1024 * 1024 }
-fn default_reconciliation_log_retention() -> usize { 5 }
+fn default_store_sync_enabled() -> bool {
+    true
+}
+fn default_store_sync_poll_secs() -> u64 {
+    60
+}
+fn default_store_sync_jitter_secs() -> u64 {
+    5
+}
+fn default_store_remote() -> String {
+    "origin".into()
+}
+fn default_store_branch() -> String {
+    "master".into()
+}
+fn default_store_retry_initial_secs() -> u64 {
+    15
+}
+fn default_store_retry_max_secs() -> u64 {
+    15 * 60
+}
+fn default_reconciliation_prompt_transport() -> String {
+    "stdin".into()
+}
+fn default_reconciliation_timeout_secs() -> u64 {
+    15 * 60
+}
+fn default_reconciliation_log_max_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_reconciliation_log_retention() -> usize {
+    5
+}
 
 fn sanitize_inject(cfg: Config) -> Config {
     let mut c = cfg;
@@ -514,8 +540,6 @@ fn sanitize_inject(cfg: Config) -> Config {
         eprintln!("proactive-context: clamping inject_timeout_ms to 30000");
         c.inject_timeout_ms = 30000;
     }
-
-
 
     // Wiki navigation fields
     if c.inject_browse_timeout_ms < 1000 {
@@ -597,6 +621,7 @@ fn sanitize_store(cfg: Config) -> Config {
         c.store_branch = default_store_branch();
     }
     c.store_sync_poll_secs = c.store_sync_poll_secs.min(24 * 60 * 60);
+    c.store_sync_jitter_secs = c.store_sync_jitter_secs.min(60 * 60);
     c.store_retry_initial_secs = c.store_retry_initial_secs.max(1);
     c.store_retry_max_secs = c
         .store_retry_max_secs
@@ -661,6 +686,7 @@ impl Default for Config {
             // Portable project-store synchronization
             store_sync_enabled: default_store_sync_enabled(),
             store_sync_poll_secs: default_store_sync_poll_secs(),
+            store_sync_jitter_secs: default_store_sync_jitter_secs(),
             store_remote: default_store_remote(),
             store_branch: default_store_branch(),
             store_retry_initial_secs: default_store_retry_initial_secs(),
@@ -670,7 +696,6 @@ impl Default for Config {
             reconciliation_timeout_secs: default_reconciliation_timeout_secs(),
             reconciliation_log_max_bytes: default_reconciliation_log_max_bytes(),
             reconciliation_log_retention: default_reconciliation_log_retention(),
-
         }
     }
 }
@@ -743,8 +768,7 @@ pub fn resolve_project_root(path: &std::path::Path) -> PathBuf {
 /// Normalize a directory path into a safe filesystem name.
 /// e.g. "/Users/pablo/src/foo" → "Users_pablo_src_foo"
 pub fn normalize_path(root: &std::path::Path) -> String {
-    let abs = std::fs::canonicalize(root)
-        .unwrap_or_else(|_| root.to_path_buf());
+    let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let s = abs.to_string_lossy().to_string();
     // Remove leading / and replace separators
     s.trim_start_matches('/')
