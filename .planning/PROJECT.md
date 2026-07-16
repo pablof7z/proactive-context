@@ -43,7 +43,7 @@ Stress testing is part of the product story. The current planning baseline inclu
 
 ## Constraints
 
-- **Runtime**: Rust CLI (`pc` / `proactive-context`) with local project state under `~/.proactive-context` and per-project wiki artifacts.
+- **Runtime**: Rust CLI (`pc` / `proactive-context`) with canonical project memory in `~/.pc/projects/<id>` Git repositories and machine-local state under `~/.pc/state/<uuid>`.
 - **Privacy**: Embeddings and vector search stay local; LLM calls are explicit, bounded, and config-driven.
 - **Provenance**: Any captured assertion must have line-range evidence sliced by Rust, not quoted by the model.
 - **Hot path**: Injection and statusline work must be bounded, fail-soft, and must not block the agent prompt indefinitely.

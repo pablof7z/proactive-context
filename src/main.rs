@@ -10,6 +10,7 @@ mod tenex;
 mod codex;
 mod opencode;
 mod capture;
+mod capture_store;
 mod episode_capture;
 mod research_capture;
 mod claims;
@@ -42,17 +43,18 @@ mod claude_cli;
 mod claude_sidecar;
 mod embed_sidecar;
 mod events;
-mod git_autocommit;
 mod git_hooks;
 mod harness;
 mod inject;
 mod ledger;
 mod openrouter;
 mod provider;
+mod project_store;
 mod query;
 mod recall;
 mod route_recall;
 mod statusline;
+mod store_sync;
 mod tail;
 mod taxonomy_backfill;
 mod taxonomy_report;
@@ -149,7 +151,7 @@ enum Commands {
         action: ClaudeAction,
     },
 
-    /// Show or edit configuration (~/.proactive-context/config.json)
+    /// Show or edit configuration (~/.pc/config.json)
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -207,7 +209,7 @@ enum Commands {
         include_sidechains: bool,
 
         /// Write wiki output and capture markers to this directory instead of the default
-        /// ~/.proactive-context tree. All sessions are treated as new (isolated dedup).
+        /// ~/.pc tree. All sessions are treated as new (isolated dedup).
         /// Safe to delete afterwards.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<std::path::PathBuf>,
@@ -267,6 +269,12 @@ enum Commands {
     Wiki {
         #[command(subcommand)]
         action: WikiAction,
+    },
+
+    /// Inspect, attach, and synchronize this repository's external PC store.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
     },
 
     /// Capture-pipeline instrumentation. Inspect what the EXTRACT stage is fed and what
@@ -342,7 +350,7 @@ enum Commands {
         history_cap: usize,
 
         /// Root directory for all experiment artifacts (stores, results).
-        /// Default: ~/.proactive-context/experiments/claims-first-<timestamp>.
+        /// Default: ~/.pc/experiments/claims-first-<timestamp>.
         #[arg(long, value_name = "DIR")]
         experiment_dir: Option<PathBuf>,
 
@@ -556,7 +564,7 @@ enum DebugAction {
     /// (PC_PRIMER_LEVEL=def|facts|intent selects the content level).
     Nouns {
         /// Wiki directory to derive nouns from. Defaults to the discovered project wiki
-        /// (docs/wiki) for the current repo.
+        /// for the current repository's external PC memory workspace.
         #[arg(long, value_name = "DIR")]
         wiki_dir: Option<PathBuf>,
 
@@ -575,7 +583,7 @@ enum DebugAction {
     /// are currently injection-visible (SELECT catalog rows), and the taxonomy feature-flag
     /// state. Phase 0 audit tool — makes no changes.
     Taxonomy {
-        /// Wiki directory to audit. Defaults to the discovered project wiki (docs/wiki).
+        /// Wiki directory to audit. Defaults to the external project memory workspace.
         #[arg(long, value_name = "DIR")]
         wiki_dir: Option<PathBuf>,
     },
@@ -631,7 +639,7 @@ enum WikiAction {
     /// read-only and writes the proposed consolidated wiki to --output-dir.
     Doctor {
         /// Write the consolidated wiki here (dry-run). Defaults to a temp dir. NEVER touches
-        /// the real docs/wiki/ unless --apply.
+        /// the live external memory workspace unless --apply.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<PathBuf>,
 
@@ -678,7 +686,7 @@ enum WikiAction {
     /// citation markers (audit-preserved) and drop empty `## See Also` scaffolds.
     /// Idempotent; only touches parseable pc guides (a coexisting topic KB is skipped).
     Tidy {
-        /// Wiki directory of *.md guides (e.g. <repo>/docs/wiki)
+        /// Wiki directory of *.md guides (for example ~/.pc/state/<uuid>/wiki)
         #[arg(long)]
         dir: PathBuf,
         /// Apply changes in place (default is a dry-run summary only)
@@ -693,7 +701,7 @@ enum WikiAction {
     /// Use after a full-history replay that ran without the live linker.
     LinkEpisodes {
         /// Wiki directory whose `episodes/` subdir holds the cards. Defaults to the
-        /// discovered project wiki for the current repo (docs/wiki).
+        /// discovered external project memory workspace.
         #[arg(long, value_name = "DIR")]
         wiki_dir: Option<PathBuf>,
     },
@@ -724,7 +732,32 @@ enum ConfigAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Print the portable project-store checkout path.
+    Path,
+    /// Show project identity, storage, inbox, and synchronization state.
+    Status,
+    /// Synchronize now (publishes, pushes, fast-forwards, or reconciles).
+    Sync,
+    /// Explicitly bind this subject repository to an existing store checkout.
+    Attach {
+        /// Existing checkout under ~/.pc/projects/<project-id>.
+        store: PathBuf,
+    },
+    /// Validate identity, Git state, schema, and immutable objects.
+    Doctor,
+}
+
 fn main() -> Result<()> {
+    // Reconciliation agents inherit this flag. Hook descendants must become a
+    // true no-op before clap, Git discovery, config loading, or logging.
+    if crate::project_store::hooks_disabled()
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("hook"))
+    {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     let root = {
@@ -734,9 +767,6 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| std::env::current_dir().expect("could not get current directory"));
         resolve_project_root(&raw)
     };
-
-    // Ensure the per-project .proactive-context directory exists for lock/db
-    let _ = std::fs::create_dir_all(project_context_dir(&root));
 
     match cli.command {
         Commands::Init => {
@@ -863,7 +893,7 @@ fn main() -> Result<()> {
         Commands::Probe { prompt, model, with_generation } => {
             let cfg = load_config()?;
             let api_key = cfg.openrouter_api_key
-                .context("No openrouter_api_key in ~/.proactive-context/config.json")?;
+                .context("No openrouter_api_key in ~/.pc/config.json")?;
             probe_openrouter(&api_key, &model, &prompt, with_generation)?;
         }
 
@@ -1175,6 +1205,93 @@ fn main() -> Result<()> {
                 crate::taxonomy_backfill::run(&root, &wp, &project_context_dir(&root), write)?;
             }
         },
+
+        Commands::Project { action } => {
+            match action {
+                ProjectAction::Attach { store } => {
+                    let attached = crate::project_store::bind_existing_store(&root, &store)
+                        .map_err(anyhow::Error::from)?;
+                    let _lock = attached.acquire_lock().map_err(anyhow::Error::from)?;
+                    crate::capture_store::materialize_latest(&attached)?;
+                    println!("attached {} ({})", attached.manifest.project_id, attached.manifest.project_uuid);
+                    println!("{}", attached.repo_dir.display());
+                }
+                action => {
+                    let store = crate::project_store::ensure_project_store(&root)
+                        .map_err(anyhow::Error::from)?;
+                    match action {
+                        ProjectAction::Path => println!("{}", store.repo_dir.display()),
+                        ProjectAction::Status => {
+                            println!("project-id: {}", store.manifest.project_id);
+                            println!("project-uuid: {}", store.manifest.project_uuid);
+                            println!("subject-common-dir: {}", store.subject.common_dir.display());
+                            println!("store: {}", store.repo_dir.display());
+                            println!("state: {}", store.state_dir.display());
+                            let inbox = crate::capture_store::due_capture_ids(&store, u64::MAX).len();
+                            println!("capture-inbox: {}", inbox);
+                            if let Some(sync) = crate::store_sync::read_sync_record(&store) {
+                                println!("sync: {:?}", sync.outcome);
+                                if !sync.detail.is_empty() {
+                                    println!("sync-detail: {}", sync.detail);
+                                }
+                            } else {
+                                println!("sync: never attempted");
+                            }
+                            let reconciliation_root =
+                                store.logs_dir().join("reconciliation");
+                            let latest_reconciliation = std::fs::read_dir(&reconciliation_root)
+                                .ok()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry.path().is_dir())
+                                .max_by_key(|entry| entry.file_name());
+                            if let Some(attempt) = latest_reconciliation {
+                                let attempt_id = attempt.file_name().to_string_lossy().to_string();
+                                println!("reconciliation-latest: {}", attempt_id);
+                                if let Ok(result) = std::fs::read(attempt.path().join("result.json"))
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes)
+                                            .map_err(std::io::Error::other)
+                                    })
+                                {
+                                    println!(
+                                        "reconciliation-postconditions: {}",
+                                        result["postconditions_ok"].as_bool().unwrap_or(false)
+                                    );
+                                    if let Some(detail) = result["detail"].as_str() {
+                                        println!("reconciliation-detail: {}", detail);
+                                    }
+                                }
+                            } else {
+                                println!("reconciliation-latest: never attempted");
+                            }
+                        }
+                        ProjectAction::Sync => {
+                            let cfg = load_config()?;
+                            let outcome = crate::store_sync::synchronize(&store, &cfg)?;
+                            println!("{:?}", outcome);
+                        }
+                        ProjectAction::Doctor => {
+                            crate::capture_store::verify_immutable_objects(&store)?;
+                            let status = std::process::Command::new("git")
+                                .arg("-C")
+                                .arg(&store.repo_dir)
+                                .args(["status", "--porcelain"])
+                                .output()?;
+                            if !status.status.success() {
+                                anyhow::bail!("project-store Git status failed");
+                            }
+                            if !status.stdout.is_empty() {
+                                anyhow::bail!("project-store worktree is not clean");
+                            }
+                            println!("project store is healthy");
+                        }
+                        ProjectAction::Attach { .. } => unreachable!(),
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1360,7 +1477,7 @@ fn handle_config(action: Option<ConfigAction>) -> Result<()> {
             let mut cfg = load_config()?;
             cfg.openrouter_api_key = Some(key);
             save_config(&cfg)?;
-            println!("OpenRouter API key saved to ~/.proactive-context/config.json");
+            println!("OpenRouter API key saved to ~/.pc/config.json");
         }
     }
     Ok(())

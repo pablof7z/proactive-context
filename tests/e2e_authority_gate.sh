@@ -25,20 +25,21 @@ BIN="$WORKTREE/target/release/pc"
 cargo build --release 2>&1 | tail -2
 [ -x "$BIN" ] || { echo "FATAL: no binary"; exit 1; }
 
-REAL_CONFIG="$HOME/.proactive-context/config.json"
+REAL_CONFIG="$HOME/.pc/config.json"
 OLLAMA_KEY=$(python3 -c "import json;print(json.load(open('$REAL_CONFIG')).get('ollama_api_key',''))" 2>/dev/null)
 [ -n "$OLLAMA_KEY" ] || { echo "FATAL: no ollama_api_key"; exit 1; }
 MODEL="glm-5.1:cloud"; OLLAMA_URL="https://api.ollama.com"
 
 TMP=$(mktemp -d /tmp/pc-e2e-auth.XXXXXX); trap 'rm -rf "$TMP"' EXIT
-export HOME="$TMP/home"; mkdir -p "$HOME/.proactive-context"
-cat > "$HOME/.proactive-context/config.json" <<JSON
+export HOME="$TMP/home"; mkdir -p "$HOME/.pc"
+cat > "$HOME/.pc/config.json" <<JSON
 { "ollama_base_url": "$OLLAMA_URL", "ollama_api_key": "$OLLAMA_KEY",
   "capture_enabled": true, "capture_model": "ollama:$MODEL",
   "capture_triage_model": "", "capture_max_turns": 8, "logging_enabled": false }
 JSON
 
-PROJ="$TMP/proj"; mkdir -p "$PROJ"; WIKI="$PROJ/docs/wiki"
+PROJ="$TMP/proj"; mkdir -p "$PROJ"; git -C "$PROJ" init --quiet --initial-branch=master
+WIKI=""
 mkfix() { python3 -c "import json,sys;print(json.dumps({'type':sys.argv[1],'message':{'role':sys.argv[1],'content':sys.argv[2]}}))" "$1" "$2"; }
 
 SESS="$TMP/sess.jsonl"
@@ -55,14 +56,28 @@ SESS="$TMP/sess.jsonl"
   mkfix user "Sounds reasonable, let's move on to the next thing."
 } > "$SESS"
 
-run_capture() { python3 -c "import json,sys;print(json.dumps({'session_id':sys.argv[1],'cwd':sys.argv[2],'transcript_path':sys.argv[3]}))" "$1" "$PROJ" "$2" | "$BIN" capture; }
+run_capture() {
+  local before after
+  before=$(find "$HOME/.pc/projects" -path '*/captures/*/manifest.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  python3 -c "import json,sys;print(json.dumps({'session_id':sys.argv[1],'cwd':sys.argv[2],'transcript_path':sys.argv[3]}))" "$1" "$PROJ" "$2" | "$BIN" hook capture
+  for _ in $(seq 1 360); do
+    after=$(find "$HOME/.pc/projects" -path '*/captures/*/manifest.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$after" -gt "$before" ]; then
+      WIKI=$(find "$HOME/.pc/state" -mindepth 2 -maxdepth 2 -type d -name wiki -print -quit)
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: capture did not commit within 360 seconds"
+  return 1
+}
 
 echo "=== CAPTURE (mixed-authorship session) ==="
-run_capture "auth-gate-e2e-001" "$SESS"
+run_capture "auth-gate-e2e-001" "$SESS" || exit 1
 
 echo; echo "=========== RENDERED GUIDES ==========="
 shopt -s nullglob
-NONINDEX=(); for g in "$WIKI"/*.md; do [ "$(basename "$g")" = "_index.md" ] && continue; NONINDEX+=("$g"); echo "----- $(basename "$g") -----"; cat "$g"; echo; done
+NONINDEX=(); for g in "$WIKI/guides"/*.md; do NONINDEX+=("$g"); echo "----- $(basename "$g") -----"; cat "$g"; echo; done
 [ "${#NONINDEX[@]}" -gt 0 ] || { echo "FAIL: no guides produced"; exit 1; }
 ALL=$(cat "${NONINDEX[@]}")
 

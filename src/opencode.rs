@@ -18,9 +18,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::archeologist::{ProjectInfo, SessionInfo};
+use crate::archeologist::{project_group_key, ProjectInfo, SessionInfo};
 use crate::capture::archeologist_is_already_captured;
-use crate::config::{normalize_path, resolve_project_root};
 use crate::db::configure_sqlite_connection;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -54,7 +53,14 @@ pub fn scan_opencode_sessions(
     // Count how many need synthesis so we can show a progress counter.
     let new_count = sessions
         .iter()
-        .filter(|s| !archeologist_is_already_captured(&s.id, marker_dir.as_ref()))
+        .filter(|s| {
+            !archeologist_is_already_captured(
+                &s.id,
+                None,
+                Path::new(""),
+                marker_dir.as_ref(),
+            )
+        })
         .count();
     if new_count > 0 {
         eprintln!("opencode: synthesizing {new_count} new session(s)...");
@@ -69,7 +75,7 @@ pub fn scan_opencode_sessions(
             _ => continue,
         };
 
-        let routing_key = normalize_path(&resolve_project_root(&PathBuf::from(&directory)));
+        let routing_key = project_group_key(&PathBuf::from(&directory));
         if routing_key.is_empty() {
             continue;
         }
@@ -83,7 +89,9 @@ pub fn scan_opencode_sessions(
         // Skip synthesis for already-captured sessions — we still include them in the
         // project list so the picker can show accurate "new vs total" counts, but we
         // don't spend time writing JSONL files that will never be processed.
-        let already_captured = archeologist_is_already_captured(&session.id, marker_dir.as_ref());
+        let already_captured = marker_dir.as_ref().is_some_and(|dir| {
+            archeologist_is_already_captured(&session.id, None, Path::new(""), Some(dir))
+        });
 
         let (jsonl_path, size_bytes) = if already_captured {
             (PathBuf::new(), 0u64)
@@ -142,7 +150,14 @@ pub fn scan_opencode_sessions(
 
             let new_sessions = sessions
                 .iter()
-                .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
+                .filter(|s| {
+                    !archeologist_is_already_captured(
+                        &s.session_id,
+                        s.cwd.as_deref(),
+                        &s.path,
+                        marker_dir.as_ref(),
+                    )
+                })
                 .count();
 
             let total_bytes: u64 = sessions.iter().map(|s| s.size_bytes).sum();

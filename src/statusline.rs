@@ -1,6 +1,6 @@
 /// statusline.rs — Claude Code statusLine indicator for proactive-context
 ///
-/// Reads stdin JSON (Claude Code's status-line input), tails ~/.proactive-context/logs/events.jsonl
+/// Reads stdin JSON (Claude Code's status-line input), tails ~/.pc/state/events.jsonl
 /// (last ~128 KB, session-filtered), derives state, and prints one line to stdout.
 /// Always exits 0. No LLM, no network, no subprocess. Target: sub-10ms.
 ///
@@ -393,15 +393,18 @@ pub fn count_guides(wiki_dir: &std::path::Path) -> usize {
 // ─── Default log path ─────────────────────────────────────────────────────────
 
 pub fn default_log_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".proactive-context/logs/events.jsonl")
+    crate::config::config_dir()
+        .unwrap_or_else(|_| PathBuf::from("/tmp/.pc"))
+        .join("state/events.jsonl")
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 pub fn run_statusline(with_context: bool) -> ! {
     // Always exit 0; never panic; never hang.
+    if crate::project_store::hooks_disabled() {
+        std::process::exit(0);
+    }
     let output = run_statusline_inner(with_context);
     print!("{}", output);
     std::process::exit(0);
@@ -430,8 +433,16 @@ fn run_statusline_inner(with_context: bool) -> String {
         return String::new();
     }
 
-    // Resolve wiki dir
     let root = std::path::PathBuf::from(&cwd);
+    let eligible = crate::project_store::discover_hook_subject(&root)
+        .ok()
+        .flatten()
+        .is_some();
+    if !eligible || crate::project_store::ensure_project_store(&root).is_err() {
+        return String::new();
+    }
+
+    // Resolve wiki dir
     let wiki_dir = wiki::wiki_dir(&root);
 
     // Guide count — gates everything

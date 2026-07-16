@@ -3,7 +3,7 @@
 {"kind":"status","id":"settled-03","expected":"settled","text":"pc wiki doctor demotes stale guides rather than deleting them.","note":"shipped behavior"}
 {"kind":"status","id":"settled-04","expected":"settled","text":"The capture pipeline routes each claim to exactly one topic slug.","note":"in-force mechanism"}
 {"kind":"status","id":"settled-05","expected":"settled","text":"Inject compile synthesizes dense prose with mandatory inline (file:line) citations.","note":"adopted design"}
-{"kind":"status","id":"settled-06","expected":"settled","text":"Research capture writes immutable records under docs/wiki/research/.","note":"landed"}
+{"kind":"status","id":"settled-06","expected":"settled","text":"Research capture writes records into the external PC memory workspace and snapshots them as immutable project-store objects.","note":"landed"}
 {"kind":"status","id":"settled-07","expected":"settled","text":"capture_research is enabled by default.","note":"default on"}
 {"kind":"status","id":"settled-08","expected":"settled","text":"PC_INCLUDE_TASK_RESULTS is on by default so subagent task-results are captured.","note":"default on"}
 {"kind":"status","id":"settled-09","expected":"settled","text":"The EXTRACT granularity block is on by default in all capture arms.","note":"settled default"}

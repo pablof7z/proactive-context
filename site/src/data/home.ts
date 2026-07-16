@@ -60,7 +60,7 @@ export const artifacts: ArtifactItem[] = [
   {
     title: "Guides",
     label: "Current truth",
-    path: "docs/wiki/guides/",
+    path: "~/.pc/state/{uuid}/wiki/guides/",
     body: "Current truth, reconciled in place. Cited prose future agents can reuse.",
     glyph: "✓",
     badges: ["current", "cited", "mutable"],
@@ -69,7 +69,7 @@ export const artifacts: ArtifactItem[] = [
   {
     title: "Episode cards",
     label: "Direction changes",
-    path: "docs/wiki/episodes/",
+    path: "~/.pc/state/{uuid}/wiki/episodes/",
     body: "Immutable records for reversals, root causes, and product movement.",
     glyph: "◆",
     badges: ["historical", "supersession", "immutable"],
@@ -78,7 +78,7 @@ export const artifacts: ArtifactItem[] = [
   {
     title: "Research records",
     label: "Investigations",
-    path: "docs/wiki/research/",
+    path: "~/.pc/state/{uuid}/wiki/research/",
     body: "Experiment records with method, verdict, and evidence.",
     glyph: "⟜",
     badges: ["eval", "verdict", "preserved"],
@@ -260,9 +260,9 @@ export const messBefore = [
 ];
 
 export const messAfter = [
-  ["docs/wiki/guides", "current truth"],
-  ["docs/wiki/episodes", "reversals"],
-  ["docs/wiki/research", "investigations"],
+  ["~/.pc/state/{uuid}/wiki/guides", "current truth"],
+  ["~/.pc/state/{uuid}/wiki/episodes", "reversals"],
+  ["~/.pc/state/{uuid}/wiki/research", "investigations"],
   ["claims.jsonl", "cited substrate"],
   ["pc inject", "hot-path briefing"],
   ["pc tail", "audit stream"]

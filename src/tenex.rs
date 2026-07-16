@@ -14,9 +14,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::archeologist::{ProjectInfo, SessionInfo};
+use crate::archeologist::{project_group_key, ProjectInfo, SessionInfo};
 use crate::capture::archeologist_is_already_captured;
-use crate::config::normalize_path;
 use crate::db::configure_sqlite_connection;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -129,7 +128,7 @@ pub fn scan_tenex_projects(
             continue;
         }
 
-        let normalized_cwd = normalize_path(&crate::config::resolve_project_root(&local_cwd));
+        let normalized_cwd = project_group_key(&local_cwd);
         let marker_dir = output_dir.map(|d| d.join("captured-sessions"));
 
         let mut sessions: Vec<SessionInfo> = Vec::new();
@@ -137,8 +136,9 @@ pub fn scan_tenex_projects(
         let mut total_messages: usize = 0;
 
         for conv in conversations {
-            let already_captured =
-                archeologist_is_already_captured(&conv.id, marker_dir.as_ref());
+            let already_captured = marker_dir.as_ref().is_some_and(|dir| {
+                archeologist_is_already_captured(&conv.id, None, Path::new(""), Some(dir))
+            });
 
             let (jsonl_path, size_bytes) = if already_captured {
                 (PathBuf::new(), 0u64)
@@ -188,7 +188,14 @@ pub fn scan_tenex_projects(
 
         let new_sessions = sessions
             .iter()
-            .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
+            .filter(|s| {
+                !archeologist_is_already_captured(
+                    &s.session_id,
+                    s.cwd.as_deref(),
+                    &s.path,
+                    marker_dir.as_ref(),
+                )
+            })
             .count();
 
         let first_date = sessions

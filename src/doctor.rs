@@ -28,7 +28,7 @@
 //! Default is dry-run: it reads the LIVE wiki read-only and WRITES the proposed consolidated
 //! wiki to `--output-dir` (the complete wiki — every unmerged guide copied through, each
 //! cluster replaced by its merge — so counts and citation totals are meaningful). It NEVER
-//! touches the real `docs/wiki/` unless `--apply`. Mirrors the archeologist `--output-dir`
+//! touches the live external memory workspace unless `--apply`. Mirrors archeologist `--output-dir`
 //! safety pattern.
 //!
 //! TODO(cascade): orphan / cascade-gap detection is OUT of v1. It should reuse this same
@@ -62,7 +62,7 @@ pub struct DoctorArgs {
     /// dir is chosen and printed.
     pub output_dir: Option<PathBuf>,
     /// If true, write the consolidation in-place to the real wiki. v1: do NOT use on the
-    /// real wiki from a worktree (it writes the MAIN repo's docs/wiki).
+    /// live external memory workspace from a worktree.
     pub apply: bool,
     /// Skip the LLM confirm + merge steps; only detect + print clusters. For tau tuning.
     pub detect_only: bool,
@@ -839,7 +839,7 @@ fn run_retopic(
     }
 
     // APPLY: rewrite only the `topic` frontmatter field. Body/citations untouched.
-    let _ = root; // wiki writes target live_wiki (the real docs/wiki)
+    let _ = root; // wiki writes target the live external materialized workspace
     let mut changed = 0usize;
     for (topic, slugs) in &by_topic {
         for slug in slugs {

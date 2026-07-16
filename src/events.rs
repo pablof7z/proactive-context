@@ -82,9 +82,9 @@ fn log_cfg() -> &'static LogCfg {
 }
 
 fn default_log_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".proactive-context/logs/events.jsonl")
+    crate::config::config_dir()
+        .unwrap_or_else(|_| PathBuf::from("/tmp/.pc"))
+        .join("state/events.jsonl")
 }
 
 // ─── Event struct ─────────────────────────────────────────────────────────────

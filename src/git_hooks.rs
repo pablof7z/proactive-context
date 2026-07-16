@@ -40,7 +40,7 @@ pub fn run(opts: GitHooksOpts) -> Result<()> {
         path.display()
     );
     println!(
-        "  {} pc no longer installs hooks that commit generated docs/wiki changes automatically",
+        "  {} pc commits captures in the external ~/.pc/projects store; subject-repository auto-commit hooks are obsolete",
         "note:".yellow()
     );
     println!(

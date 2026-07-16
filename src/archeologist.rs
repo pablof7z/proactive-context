@@ -5,7 +5,7 @@
 /// retroactively populate the per-project wiki.
 ///
 /// Architecture:
-/// - Scans `~/.claude/projects/` and groups transcripts by `normalize_path(cwd)`.
+/// - Scans harness transcripts and groups local checkouts by absolute Git common-dir identity.
 /// - Presents an interactive multiselect picker (TTY only; bypassed by `--yes`/`--project`).
 /// - For each selected project, sorts sessions by first-message timestamp ascending,
 ///   filters already-captured sessions, and calls `run_capture_for_archeologist` serially.
@@ -21,12 +21,20 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::capture::{
-    archeologist_captured_sessions_dir, archeologist_is_already_captured, archeologist_project_dir,
+    archeologist_is_already_captured, archeologist_project_dir,
     run_capture_for_archeologist, run_structural_maintenance,
 };
 use crate::config::{normalize_path, resolve_project_root};
 use crate::transcript::{transcript_cwd, transcript_first_ts, transcript_message_count};
 use crate::wiki::wiki_dir;
+
+pub(crate) fn project_group_key(path: &Path) -> String {
+    crate::project_store::discover_git_repo(path)
+        .ok()
+        .flatten()
+        .map(|repo| normalize_path(&repo.common_dir))
+        .unwrap_or_else(|| normalize_path(&resolve_project_root(path)))
+}
 
 // ─── Public entry point (called from main.rs) ─────────────────────────────────
 
@@ -47,7 +55,7 @@ pub struct ArcheologistArgs {
     #[allow(dead_code)] // filtering is archeologist-side; plumbing exists, full use in v0.5+
     pub include_sidechains: bool,
     /// Redirect all wiki output and capture markers to this directory instead of the
-    /// default ~/.proactive-context tree. Useful for isolated test runs.
+    /// default ~/.pc tree. Useful for isolated test runs.
     pub output_dir: Option<std::path::PathBuf>,
     /// Forget capture markers so sessions count as new again, then exit. See `run_reset`.
     pub reset: bool,
@@ -66,12 +74,10 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
         anyhow::bail!("--project and --yes/--all are mutually exclusive (ambiguous scope)");
     }
 
-    // Select projects to process.
-    // routing_cwd: when Some, all selected sessions write to this project's wiki instead of
-    // their original per-session cwd. Set only for interactive picker so that the user can
-    // merge sessions from several source paths into the current project. --yes and --project
-    // keep their original per-session routing.
-    let mut routing_cwd: Option<String> = None;
+    // Select projects to process. Sessions always retain their proven subject
+    // repository identity; choosing multiple rows never silently merges them
+    // into the current checkout.
+    let routing_cwd: Option<String> = None;
     let mut source_tempdirs: Vec<tempfile::TempDir> = Vec::new();
     let selected: Vec<ProjectInfo> = if !args.yes
         && args.project.is_none()
@@ -83,7 +89,6 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
         let current_dir = std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().to_string());
-        routing_cwd = current_dir.clone();
         run_lazy_picker(&args, current_dir.as_deref())?
     } else {
         let projects = scan_all_projects(&args, &mut source_tempdirs)?;
@@ -97,7 +102,7 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
         if args.yes {
             projects
         } else if let Some(ref path_filter) = args.project {
-            let key = normalize_path(&PathBuf::from(path_filter));
+            let key = project_group_key(&PathBuf::from(path_filter));
             let filtered: Vec<ProjectInfo> = projects
                 .into_iter()
                 .filter(|p| {
@@ -163,18 +168,18 @@ pub fn run_archeologist(args: ArcheologistArgs) -> Result<()> {
 ///   `session-locks/` for a clean slate (global default tree only).
 ///
 /// `--output-dir DIR` targets that isolated ledger (`DIR/captured-sessions/`) instead of the
-/// default `~/.proactive-context/captured-sessions/`. Prompts for confirmation unless `--yes`.
+/// default per-project `~/.pc/state/<uuid>/captured-sessions/`. Prompts for confirmation unless `--yes`.
 fn run_reset(args: &ArcheologistArgs) -> Result<()> {
     let marker_dir = args
         .output_dir
         .as_ref()
         .map(|d| d.join("captured-sessions"))
-        .unwrap_or_else(archeologist_captured_sessions_dir);
+        .unwrap_or_else(|| crate::config::config_dir().unwrap_or_default().join("state"));
 
     if let Some(ref path_filter) = args.project {
         // Per-project reset: resolve the project's session IDs, delete just those markers.
         let projects = scan_claude_projects(&None)?;
-        let key = normalize_path(&PathBuf::from(path_filter));
+        let key = project_group_key(&PathBuf::from(path_filter));
         let matched: Vec<&ProjectInfo> = projects
             .iter()
             .filter(|p| p.normalized_cwd == key || p.display_name.contains(path_filter.as_str()))
@@ -203,13 +208,26 @@ fn run_reset(args: &ArcheologistArgs) -> Result<()> {
         }
 
         let mut removed = 0usize;
-        for sid in &session_ids {
-            let path = marker_dir.join(format!("{}.json", sid));
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("removing marker {}", path.display()))
+        for project in &matched {
+            for session in &project.sessions {
+                let target_dir = if let Some(output) = args.output_dir.as_ref() {
+                    output.join("captured-sessions")
+                } else if let Some(cwd) = session.cwd.as_deref() {
+                    match crate::project_store::bound_project_store(Path::new(cwd)) {
+                        Ok(Some(store)) => store.state_dir.join("captured-sessions"),
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                };
+                let path = target_dir.join(format!("{}.json", session.session_id));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("removing marker {}", path.display()))
+                    }
                 }
             }
         }
@@ -223,14 +241,18 @@ fn run_reset(args: &ArcheologistArgs) -> Result<()> {
     }
 
     // Full reset: wipe the whole marker dir (and, for the default tree, transient state).
-    let mut targets: Vec<PathBuf> = vec![marker_dir];
-    if args.output_dir.is_none() {
-        let base = dirs::home_dir()
-            .context("cannot determine home directory")?
-            .join(".proactive-context");
-        targets.push(base.join("pending-captures"));
-        targets.push(base.join("session-locks"));
-    }
+    let mut targets: Vec<PathBuf> = if args.output_dir.is_some() {
+        vec![marker_dir]
+    } else {
+        let state = crate::config::config_dir()?.join("state");
+        std::fs::read_dir(state)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path().join("captured-sessions")))
+            .collect()
+    };
+    targets.sort();
+    targets.dedup();
     let existing: Vec<&PathBuf> = targets.iter().filter(|p| p.exists()).collect();
 
     if existing.is_empty() {
@@ -363,7 +385,7 @@ pub struct SessionInfo {
 
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {
-    /// normalize_path(cwd) — the routing key
+    /// Absolute Git common-dir identity (normalized only for display/filter compatibility).
     pub normalized_cwd: String,
     /// Human-readable name (basename of cwd, or decoded dir name fallback)
     pub display_name: String,
@@ -489,7 +511,7 @@ fn collect_claude_project_dir(
         // Routing key: normalize_path(cwd) or fall back to encoded dir name
         let (routing_key, display_name) = match &cwd {
             Some(c) if !c.is_empty() => {
-                let key = normalize_path(&resolve_project_root(&PathBuf::from(c)));
+                let key = project_group_key(&PathBuf::from(c));
                 let name = PathBuf::from(c)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -548,7 +570,14 @@ fn build_project_infos_from_map(
 
             let new_sessions = sessions
                 .iter()
-                .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir))
+                .filter(|s| {
+                    !archeologist_is_already_captured(
+                        &s.session_id,
+                        s.cwd.as_deref(),
+                        &s.path,
+                        marker_dir,
+                    )
+                })
                 .count();
 
             let total_bytes: u64 = sessions.iter().map(|s| s.size_bytes).sum();
@@ -905,9 +934,8 @@ struct WorkItem {
 
 /// Build the flattened, ordered work-list across all selected projects.
 /// Filters already-captured sessions; computes checkpoint flags from `synth_every`.
-/// `routing_cwd`: when `Some`, all sessions write to that project's wiki instead of their
-/// own per-session cwd. Used by the interactive picker to merge multiple source paths into
-/// the current project.
+/// `routing_cwd` is retained for isolated evaluation callers; normal interactive
+/// selection passes `None` so repository identity is never implicitly rewritten.
 fn build_work_plan(
     projects: &[ProjectInfo],
     synth_every: usize,
@@ -920,7 +948,14 @@ fn build_work_plan(
         let work_list: Vec<&SessionInfo> = project
             .sessions
             .iter()
-            .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
+            .filter(|s| {
+                !archeologist_is_already_captured(
+                    &s.session_id,
+                    s.cwd.as_deref(),
+                    &s.path,
+                    marker_dir.as_ref(),
+                )
+            })
             .collect();
         let n_new = work_list.len();
         for (sess_idx, session) in work_list.iter().enumerate() {
@@ -991,7 +1026,7 @@ fn replay_worker(
             &item.cwd,
             &item.path,
             Some(item.date.clone()),
-            true, // skip_maint — worker owns all maintenance via checkpoints below
+            item.output_dir.is_some(), // canonical captures snapshot maintenance atomically
             filter_sidechains,
             item.output_dir.clone(),
         );
@@ -1024,9 +1059,21 @@ fn run_checkpoint(cwd: &str, output_dir: Option<&std::path::PathBuf>) {
     if cwd.is_empty() {
         return;
     }
+    // Canonical captures run maintenance inside their locked capture transaction
+    // so the immutable manifest includes it. Checkpoints remain only for isolated
+    // output-dir evaluation runs that intentionally bypass the project store.
+    if output_dir.is_none() {
+        return;
+    }
     let proj_dir = archeologist_project_dir(cwd, output_dir);
     let project_root = resolve_project_root(&std::path::PathBuf::from(cwd));
-    let project_key = normalize_path(&project_root);
+    let project_key = if output_dir.is_some() {
+        normalize_path(&project_root)
+    } else {
+        crate::project_store::ensure_project_store(&project_root)
+            .map(|store| store.manifest.project_uuid)
+            .unwrap_or_else(|_| normalize_path(&project_root))
+    };
     // Match run_capture_from_input: when output_dir is set, structural maintenance must
     // operate on the redirected wiki (proj_dir/docs/wiki), not the real repo's docs/wiki/.
     let wiki_path = if output_dir.is_some() {
@@ -1334,9 +1381,9 @@ fn events_log_path() -> PathBuf {
             }
         })
         .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".proactive-context/logs/events.jsonl")
+            crate::config::config_dir()
+                .unwrap_or_else(|_| PathBuf::from("/tmp/.pc"))
+                .join("state/events.jsonl")
         })
 }
 
@@ -3188,7 +3235,7 @@ pub fn run_picker(
     let _guard = TGuard;
 
     // Normalize the current cwd for matching against project keys.
-    let current_normalized = current_cwd.map(|c| normalize_path(&PathBuf::from(c)));
+    let current_normalized = current_cwd.map(|c| project_group_key(&PathBuf::from(c)));
 
     // Float matching projects to the top (stable within each group).
     if let Some(ref norm) = current_normalized {

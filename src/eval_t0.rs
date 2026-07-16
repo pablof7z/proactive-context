@@ -761,7 +761,7 @@ fn resolve_corpus(env_key: &str, prefix: &str, exp_dir: &Path) -> Option<PathBuf
     let experiments_root = exp_dir
         .parent()
         .map(|p| p.to_path_buf())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".proactive-context").join("experiments")))?;
+        .or_else(|| dirs::home_dir().map(|h| h.join(".pc").join("experiments")))?;
     let mut matches: Vec<PathBuf> = fs::read_dir(&experiments_root)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))

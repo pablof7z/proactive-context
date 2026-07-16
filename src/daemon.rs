@@ -266,20 +266,23 @@ fn get_process_uptime(pid: i32) -> String {
     }
 }
 
-/// Scan the centralized projects directory and return info for every live daemon.
+/// Scan machine-local project state and return info for every live daemon.
 pub fn list_daemons() -> Result<Vec<DaemonInfo>> {
     let mut daemons = Vec::new();
-    let projects_dir = match config_dir() {
-        Ok(d) => d.join("projects"),
+    let state_dir = match config_dir() {
+        Ok(d) => d.join("state"),
         Err(_) => return Ok(daemons),
     };
 
-    if !projects_dir.exists() {
+    if !state_dir.exists() {
         return Ok(daemons);
     }
 
-    for entry in fs::read_dir(&projects_dir)? {
+    for entry in fs::read_dir(&state_dir)? {
         let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
         let pid_file = entry.path().join("daemon.pid");
         if !pid_file.exists() {
             continue;
@@ -329,7 +332,7 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
         .git_exclude(true)
         .build();
 
-    let mut files = Vec::new();
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
 
     for entry in walker {
         let entry = match entry {
@@ -340,8 +343,27 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
         if path.is_file() {
             if let Some(ext) = path.extension() {
                 if ext == "md" || ext == "markdown" {
-                    files.push(path.to_path_buf());
+                    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+                    files.push((path.to_path_buf(), rel));
                 }
+            }
+        }
+    }
+
+    // Generated PC memory is external to the subject repository. Index it under
+    // a distinct logical prefix while continuing to index ordinary committed
+    // subject Markdown (including legacy docs/wiki) through the walker above.
+    let memory_root = crate::wiki::wiki_dir(root);
+    if memory_root.exists() {
+        for entry in walkdir::WalkDir::new(&memory_root).follow_links(false) {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if matches!(path.extension().and_then(|e| e.to_str()), Some("md" | "markdown")) {
+                let rel = path.strip_prefix(&memory_root).unwrap_or(path).to_string_lossy();
+                files.push((path.to_path_buf(), format!("pc-memory/{rel}")));
             }
         }
     }
@@ -349,7 +371,11 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
     // Sweep: remove DB entries for files that no longer exist on disk.
     if let Ok(db_paths) = indexed_paths(conn) {
         for rel in db_paths {
-            let abs = root.join(&rel);
+            let abs = if let Some(memory_rel) = rel.strip_prefix("pc-memory/") {
+                memory_root.join(memory_rel)
+            } else {
+                root.join(&rel)
+            };
             if !abs.exists() {
                 if let Err(e) = delete_chunks_for_path(conn, &rel) {
                     eprintln!("Warning: failed to remove stale entry {}: {}", rel, e);
@@ -361,14 +387,13 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
     let total = files.len();
     eprintln!("Found {} markdown files. Indexing...", total);
 
-    for (i, path) in files.iter().enumerate() {
-        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    for (i, (path, rel)) in files.iter().enumerate() {
         let pct = (i + 1) * 100 / total.max(1);
         let filled = pct / 5;
         let bar: String = format!("[{}>{}]", "#".repeat(filled), ".".repeat(20 - filled.min(20)));
         eprint!("\r{} {:>3}% ({}/{}) {}", bar, pct, i + 1, total, rel);
         let _ = std::io::Write::flush(&mut std::io::stderr());
-        if let Err(e) = index_single_file(root, conn, embedder, cfg, path, &rel) {
+        if let Err(e) = index_single_file(root, conn, embedder, cfg, path, rel) {
             eprintln!("\nWarning: failed to index {}: {}", rel, e);
         }
     }
@@ -438,7 +463,7 @@ pub fn index_single_file(
 /// already skips these via gitignore-aware walking, but the live `notify` watcher
 /// covers the root verbatim — without this filter it re-embeds e.g. every
 /// `node_modules/**/README.md` and fires on the `target/` build firehose.
-const WATCH_IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules", ".proactive-context"];
+const WATCH_IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules", ".pc", ".proactive-context"];
 
 /// Exit a daemon that has seen no indexable change for this long, so per-project
 /// watchers don't accumulate and idle forever. A new request re-spawns one on demand.
@@ -456,6 +481,11 @@ fn is_ignored_watch_path(path: &Path, root: &Path) -> bool {
 
 /// Start the daemon: acquire lock, do initial index, then watch for changes.
 pub fn run_daemon(root: &Path) -> Result<()> {
+    let store = crate::project_store::ensure_project_store(root).map_err(anyhow::Error::from)?;
+    {
+        let _store_lock = store.acquire_lock().map_err(anyhow::Error::from)?;
+        crate::capture_store::materialize_latest(&store)?;
+    }
     let cfg = crate::config::load_config()?;
     let mut embedder = build_sidecar_embedder(&cfg)?;
 
@@ -498,6 +528,7 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     )?;
 
     watcher.watch(root, RecursiveMode::Recursive)?;
+    watcher.watch(&store.wiki_dir(), RecursiveMode::Recursive)?;
 
     println!("Watching for changes in {} (press Ctrl-C to stop)", root.display());
 
@@ -505,12 +536,33 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     let mut pending: Vec<PathBuf> = Vec::new();
     let debounce = Duration::from_millis(300);
     let mut last_activity = Instant::now();
+    let mut last_store_maintenance = Instant::now() - Duration::from_secs(10);
 
     loop {
+        // Poll elapsed time independently of watcher idleness. A repository with
+        // a continuous stream of filesystem events must not starve remote fetch,
+        // retry, or durable-inbox work.
+        if last_store_maintenance.elapsed() >= Duration::from_secs(5) {
+            let _ = crate::capture::spawn_due_inbox_captures(&store);
+            let sync_outcome = crate::store_sync::synchronize_if_due(&store, &cfg)
+                .ok()
+                .flatten();
+            if matches!(
+                sync_outcome,
+                Some(crate::store_sync::SyncOutcome::FastForwarded)
+                    | Some(crate::store_sync::SyncOutcome::Reconciled)
+            ) {
+                // Materialization may have changed external memory without a
+                // portable filesystem notification (directory swap).
+                let _ = full_index(root, &conn, embedder.as_mut(), &cfg);
+            }
+            last_store_maintenance = Instant::now();
+        }
+
         match rx.recv_timeout(debounce) {
             Ok(Ok(event)) => {
                 for path in event.paths {
-                    if is_ignored_watch_path(&path, root) {
+                    if !path.starts_with(store.wiki_dir()) && is_ignored_watch_path(&path, root) {
                         continue;
                     }
                     if let Some(ext) = path.extension() {
@@ -543,7 +595,13 @@ pub fn run_daemon(root: &Path) -> Result<()> {
 
                     let mut updated_count = 0usize;
                     for abs_path in pending.drain(..) {
-                        let rel = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_string_lossy().to_string();
+                        let memory_root = store.wiki_dir();
+                        let (base, rel) = if abs_path.starts_with(&memory_root) {
+                            let rel = abs_path.strip_prefix(&memory_root).unwrap_or(&abs_path).to_string_lossy();
+                            (memory_root.clone(), format!("pc-memory/{rel}"))
+                        } else {
+                            (root.to_path_buf(), abs_path.strip_prefix(root).unwrap_or(&abs_path).to_string_lossy().to_string())
+                        };
 
                         if !abs_path.exists() {
                             // File deleted
@@ -556,7 +614,7 @@ pub fn run_daemon(root: &Path) -> Result<()> {
                             continue;
                         }
 
-                        match index_single_file(root, &conn, embedder.as_mut(), &cfg, &abs_path, &rel) {
+                        match index_single_file(&base, &conn, embedder.as_mut(), &cfg, &abs_path, &rel) {
                             Ok(_) => {
                                 println!("Updated: {}", rel);
                                 updated_count += 1;
@@ -645,9 +703,12 @@ fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod watch_filter_tests {
-    use super::{daemon_spawn_args, is_ignored_watch_path};
+    use super::{daemon_spawn_args, is_ignored_watch_path, list_daemons};
+    use crate::config::{ScopedPcHome, PC_HOME_TEST_LOCK};
     use std::ffi::OsString;
+    use std::fs;
     use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn daemon_spawn_args_use_internal_daemon_command() {
@@ -677,5 +738,27 @@ mod watch_filter_tests {
         // Kept: ordinary documentation paths.
         assert!(!is_ignored_watch_path(Path::new("/proj/docs/wiki/guide.md"), root));
         assert!(!is_ignored_watch_path(Path::new("/proj/README.md"), root));
+    }
+
+    #[test]
+    fn daemon_discovery_reads_machine_local_state_not_portable_projects() {
+        let _home_lock = PC_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedPcHome::set(tmp.path());
+        let subject = tmp.path().join("subject");
+        let state = tmp.path().join("state/project-uuid");
+        fs::create_dir_all(&subject).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("daemon.pid"),
+            format!("{}\n{}\n", std::process::id(), subject.display()),
+        )
+        .unwrap();
+
+        let daemons = list_daemons().unwrap();
+        assert_eq!(daemons.len(), 1);
+        assert_eq!(daemons[0].pid, std::process::id() as i32);
+        assert_eq!(daemons[0].root, subject);
+        assert!(!tmp.path().join("projects").exists());
     }
 }

@@ -63,12 +63,12 @@ cleanup() {
     wait "$INIT_PID" 2>/dev/null || true
   fi
 
-  # Remove the entire temporary corpus (includes its .proactive-context/ with db + pid)
+  # Remove the entire isolated subject repository and PC home.
   if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ]; then
     rm -rf "$TMP_ROOT" 2>/dev/null || true
   fi
 
-  # Do NOT touch the global ~/.proactive-context/config.json — it may contain the user's real key.
+  # PC_HOME is inside TMP_ROOT, so the user's ~/.pc/config.json is never touched.
 
   if [ $exit_code -ne 0 ]; then
     echo -e "${RED}❌ Smoke test failed (exit $exit_code). See logs above for details.${NC}"
@@ -101,6 +101,7 @@ log_step() {
 log_step "Starting proactive-context smoke test"
 
 require_cmd cargo
+require_cmd git
 require_cmd mktemp
 require_cmd grep
 
@@ -121,8 +122,10 @@ fi
 
 # Create hermetic temporary corpus
 TMP_ROOT="$(mktemp -d -t proactive-smoke-XXXXXX)"
+export PC_HOME="$TMP_ROOT/pc-home"
 CORPUS="$TMP_ROOT/$CORPUS_NAME"
 mkdir -p "$CORPUS/notes" "$CORPUS/projects"
+git -C "$CORPUS" init --quiet --initial-branch=master
 
 log_step "Creating temp corpus with conflicting facts at $CORPUS"
 
@@ -196,7 +199,7 @@ INIT_PID=""   # prevent double-kill in cleanup
 sleep "$SLEEP_AFTER_INIT"
 
 # Verify that indexing actually produced a database
-DB_PATH="$CORPUS/.proactive-context/index.db"
+DB_PATH=$(find "$PC_HOME/state" -mindepth 2 -maxdepth 2 -type f -name index.db -print -quit 2>/dev/null || true)
 if [ ! -f "$DB_PATH" ]; then
   echo "Init log tail:"; tail -n 30 "$INIT_LOG" || true
   fail "No index.db found after init. Indexing did not complete. See init.log above."

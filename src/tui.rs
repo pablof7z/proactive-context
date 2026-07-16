@@ -1957,9 +1957,14 @@ fn retrieve_hit_chunk_lines(ev: &EventLine, _state: &AppState) -> Vec<Line<'stat
         if p.is_absolute() {
             paths.push(p);
         } else {
-            if let Some(home) = dirs::home_dir() {
-                let project_root = home.join(".proactive-context/projects").join(&ev.project);
-                paths.push(project_root.join(path_str));
+            if let Ok(home) = crate::config::config_dir() {
+                let states = home.join("state");
+                if let Ok(entries) = std::fs::read_dir(states) {
+                    for entry in entries.flatten() {
+                        let rel = path_str.strip_prefix("pc-memory/").unwrap_or(path_str);
+                        paths.push(entry.path().join("wiki").join(rel));
+                    }
+                }
             }
             if let Ok(cwd) = std::env::current_dir() {
                 paths.push(cwd.join(path_str));

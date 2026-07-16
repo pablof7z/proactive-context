@@ -370,7 +370,7 @@ pub(crate) fn render_body(ev: &EventLine, _verbosity: Verbosity, body_budget: us
             trunc(&format!("[{}·{}]{} {}", cat, vol, global_hint, slug), budget)
         }
         "synth.write" => {
-            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("docs/wiki/_index.md");
+            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("pc-memory/_index.md");
             let bytes = p.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let lessons_in = p.get("lessons_in").and_then(|v| v.as_u64()).unwrap_or(0);
             trunc(
@@ -924,9 +924,9 @@ pub fn run_tail(
             }
         })
         .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".proactive-context/logs/events.jsonl")
+            crate::config::config_dir()
+                .unwrap_or_else(|_| PathBuf::from("/tmp/.pc"))
+                .join("state/events.jsonl")
         });
 
     // Parse --since cutoff

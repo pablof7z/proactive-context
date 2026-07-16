@@ -10,7 +10,7 @@
 //! <base_dir>/projects/<key>/claims.jsonl    ← append-only log (one JSON object per line)
 //! <base_dir>/projects/<key>/claims.db       ← sqlite-vec embeddings + cluster table
 //! ```
-//! where `<base_dir>` is either `~/.proactive-context` or the experiment home set via the
+//! where `<base_dir>` is either `~/.pc` or the experiment home set via the
 //! `PC_HOME` environment variable (isolation for the eval harness).
 //!
 //! ## Cluster semantics
@@ -22,7 +22,6 @@
 //! Call `claims_log_enabled()` before any write.  When OFF, every function in this module
 //! is a no-op (or returns an empty result for reads).
 
-use crate::config::project_context_dir;
 use crate::db::configure_sqlite_connection;
 use crate::embed::Embedder;
 use crate::route_recall::cosine;
@@ -124,11 +123,11 @@ pub fn pc_base_dir() -> PathBuf {
     } else {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".proactive-context")
+            .join(".pc")
     }
 }
 
-/// Project context dir under PC_HOME (or ~/.proactive-context).
+/// Project context dir under PC_HOME (or ~/.pc). Used only by isolated evaluations.
 pub fn experiment_project_dir(project_key: &str) -> PathBuf {
     pc_base_dir().join("projects").join(project_key)
 }

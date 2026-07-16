@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::archeologist::{ProjectInfo, SessionInfo};
+use crate::archeologist::{project_group_key, ProjectInfo, SessionInfo};
 use crate::capture::archeologist_is_already_captured;
-use crate::config::{normalize_path, resolve_project_root};
 use crate::transcript::{transcript_cwd, transcript_first_ts, transcript_message_count};
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -124,7 +123,7 @@ fn build_project_infos(
             _ => continue,
         };
 
-        let routing_key = normalize_path(&resolve_project_root(&PathBuf::from(&cwd_str)));
+        let routing_key = project_group_key(&PathBuf::from(&cwd_str));
         if routing_key.is_empty() {
             continue;
         }
@@ -174,7 +173,14 @@ fn build_project_infos(
 
             let new_sessions = sessions
                 .iter()
-                .filter(|s| !archeologist_is_already_captured(&s.session_id, marker_dir.as_ref()))
+                .filter(|s| {
+                    !archeologist_is_already_captured(
+                        &s.session_id,
+                        s.cwd.as_deref(),
+                        &s.path,
+                        marker_dir.as_ref(),
+                    )
+                })
                 .count();
 
             let total_bytes: u64 = sessions.iter().map(|s| s.size_bytes).sum();

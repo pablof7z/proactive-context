@@ -2,7 +2,60 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::default::Default;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+
+thread_local! {
+    static CONFIG_OVERRIDE: std::cell::RefCell<Option<Config>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// In-process configuration isolation for evaluation code. This does not add a
+/// runtime config path or copy credentials into experiment artifacts.
+pub(crate) struct ScopedConfigOverride(Option<Config>);
+
+impl ScopedConfigOverride {
+    pub(crate) fn set(config: Config) -> Self {
+        let previous = CONFIG_OVERRIDE.with(|slot| slot.replace(Some(config)));
+        Self(previous)
+    }
+}
+
+impl Drop for ScopedConfigOverride {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CONFIG_OVERRIDE.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(test)]
+pub static PC_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub struct ScopedPcHome(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl ScopedPcHome {
+    pub fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("PC_HOME");
+        std::env::set_var("PC_HOME", path);
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedPcHome {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var("PC_HOME", previous),
+            None => std::env::remove_var("PC_HOME"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -40,8 +93,8 @@ pub struct Config {
     #[serde(default = "default_capture_enabled")]
     pub capture_enabled: bool,
 
-    /// Commit generated docs/wiki changes after a successful live capture.
-    /// Default OFF because hidden background commits are a local workflow choice.
+    /// Deprecated compatibility field. Portable project-store capture commits
+    /// are always created after successful hooks; this value is ignored.
     #[serde(default = "default_capture_auto_commit_wiki")]
     pub capture_auto_commit_wiki: bool,
 
@@ -84,7 +137,7 @@ pub struct Config {
     #[serde(default = "default_logging_enabled")]
     pub logging_enabled: bool,
 
-    /// Absolute path to the event log. Empty -> ~/.proactive-context/logs/events.jsonl.
+    /// Absolute path to the event log. Empty -> ~/.pc/state/events.jsonl.
     #[serde(default)]
     pub log_path: String,
 
@@ -198,6 +251,52 @@ pub struct Config {
     /// Default: 16
     #[serde(default = "default_capture_max_turns")]
     pub capture_max_turns: usize,
+
+    // ---- Portable project-store synchronization ----
+    /// Periodically fetch and synchronize the portable project-store repository.
+    #[serde(default = "default_store_sync_enabled")]
+    pub store_sync_enabled: bool,
+
+    /// Poll interval for remote advancement. Zero disables daemon polling.
+    #[serde(default = "default_store_sync_poll_secs")]
+    pub store_sync_poll_secs: u64,
+
+    /// Remote used for portable project memory.
+    #[serde(default = "default_store_remote")]
+    pub store_remote: String,
+
+    /// Local branch used for portable project memory.
+    #[serde(default = "default_store_branch")]
+    pub store_branch: String,
+
+    /// Initial retry delay after a synchronization failure.
+    #[serde(default = "default_store_retry_initial_secs")]
+    pub store_retry_initial_secs: u64,
+
+    /// Maximum synchronization retry delay.
+    #[serde(default = "default_store_retry_max_secs")]
+    pub store_retry_max_secs: u64,
+
+    /// Trusted reconciliation command as typed argv. Empty disables automatic
+    /// semantic reconciliation while preserving pending work for retry.
+    #[serde(default)]
+    pub reconciliation_command: Vec<String>,
+
+    /// Prompt transport: `stdin` or `placeholder` (`{prompt}` in one argv item).
+    #[serde(default = "default_reconciliation_prompt_transport")]
+    pub reconciliation_prompt_transport: String,
+
+    /// Wall-clock limit for a reconciliation attempt.
+    #[serde(default = "default_reconciliation_timeout_secs")]
+    pub reconciliation_timeout_secs: u64,
+
+    /// Maximum bytes retained for each of stdout and stderr per attempt.
+    #[serde(default = "default_reconciliation_log_max_bytes")]
+    pub reconciliation_log_max_bytes: u64,
+
+    /// Number of reconciliation-attempt log directories retained.
+    #[serde(default = "default_reconciliation_log_retention")]
+    pub reconciliation_log_retention: usize,
 }
 
 fn default_ollama_base_url() -> String {
@@ -358,6 +457,17 @@ fn default_capture_max_turns() -> usize {
     16
 }
 
+fn default_store_sync_enabled() -> bool { true }
+fn default_store_sync_poll_secs() -> u64 { 60 }
+fn default_store_remote() -> String { "origin".into() }
+fn default_store_branch() -> String { "master".into() }
+fn default_store_retry_initial_secs() -> u64 { 15 }
+fn default_store_retry_max_secs() -> u64 { 15 * 60 }
+fn default_reconciliation_prompt_transport() -> String { "stdin".into() }
+fn default_reconciliation_timeout_secs() -> u64 { 15 * 60 }
+fn default_reconciliation_log_max_bytes() -> u64 { 8 * 1024 * 1024 }
+fn default_reconciliation_log_retention() -> usize { 5 }
+
 fn sanitize_inject(cfg: Config) -> Config {
     let mut c = cfg;
 
@@ -481,6 +591,25 @@ fn sanitize_logging(cfg: Config) -> Config {
     c
 }
 
+fn sanitize_store(cfg: Config) -> Config {
+    let mut c = cfg;
+    if c.store_branch.trim().is_empty() {
+        c.store_branch = default_store_branch();
+    }
+    c.store_sync_poll_secs = c.store_sync_poll_secs.min(24 * 60 * 60);
+    c.store_retry_initial_secs = c.store_retry_initial_secs.max(1);
+    c.store_retry_max_secs = c
+        .store_retry_max_secs
+        .max(c.store_retry_initial_secs)
+        .min(24 * 60 * 60);
+    c.reconciliation_timeout_secs = c.reconciliation_timeout_secs.clamp(1, 60 * 60);
+    c.reconciliation_log_max_bytes = c
+        .reconciliation_log_max_bytes
+        .clamp(1024 * 1024, 64 * 1024 * 1024);
+    c.reconciliation_log_retention = c.reconciliation_log_retention.clamp(1, 50);
+    c
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -529,18 +658,30 @@ impl Default for Config {
             // Citation-anchored capture (v0.4)
             capture_max_turns: default_capture_max_turns(), // usize
 
+            // Portable project-store synchronization
+            store_sync_enabled: default_store_sync_enabled(),
+            store_sync_poll_secs: default_store_sync_poll_secs(),
+            store_remote: default_store_remote(),
+            store_branch: default_store_branch(),
+            store_retry_initial_secs: default_store_retry_initial_secs(),
+            store_retry_max_secs: default_store_retry_max_secs(),
+            reconciliation_command: Vec::new(),
+            reconciliation_prompt_transport: default_reconciliation_prompt_transport(),
+            reconciliation_timeout_secs: default_reconciliation_timeout_secs(),
+            reconciliation_log_max_bytes: default_reconciliation_log_max_bytes(),
+            reconciliation_log_retention: default_reconciliation_log_retention(),
+
         }
     }
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    // PC_HOME lets the eval harness use an isolated base directory without touching
-    // the user's live ~/.proactive-context state.  Byte-identical behaviour when unset.
+    // PC_HOME lets tests and evaluation harnesses isolate all PC state.
     if let Ok(pc_home) = std::env::var("PC_HOME") {
         return Ok(PathBuf::from(pc_home));
     }
     let home = dirs::home_dir().context("Could not find home directory")?;
-    Ok(home.join(".proactive-context"))
+    Ok(home.join(".pc"))
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -548,24 +689,13 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub fn load_config() -> Result<Config> {
+    if let Some(config) = CONFIG_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Ok(sanitize_store(sanitize_logging(sanitize_inject(config))));
+    }
     let path = config_path()?;
     if !path.exists() {
-        // When PC_HOME is set (experiment mode) but no config exists there, fall back
-        // to the real ~/.proactive-context/config.json so API keys and models are
-        // available without having to copy the config into the experiment dir.
-        if std::env::var("PC_HOME").is_ok() {
-            let home = dirs::home_dir().context("Could not find home directory")?;
-            let real = home.join(".proactive-context/config.json");
-            if real.exists() {
-                let data = fs::read_to_string(&real)
-                    .with_context(|| format!("Failed to read config at {}", real.display()))?;
-                let cfg: Config = serde_json::from_str(&data)
-                    .with_context(|| format!("Failed to parse config at {}", real.display()))?;
-                return Ok(sanitize_logging(sanitize_inject(cfg)));
-            }
-        }
         // Create default config on first run
-        let cfg = sanitize_logging(sanitize_inject(Config::default()));
+        let cfg = sanitize_store(sanitize_logging(sanitize_inject(Config::default())));
         save_config(&cfg)?;
         return Ok(cfg);
     }
@@ -574,59 +704,40 @@ pub fn load_config() -> Result<Config> {
         .with_context(|| format!("Failed to read config at {}", path.display()))?;
     let cfg: Config = serde_json::from_str(&data)
         .with_context(|| format!("Failed to parse config at {}", path.display()))?;
-    Ok(sanitize_logging(sanitize_inject(cfg)))
+    Ok(sanitize_store(sanitize_logging(sanitize_inject(cfg))))
 }
 
 pub fn save_config(cfg: &Config) -> Result<()> {
     let dir = config_dir()?;
-    fs::create_dir_all(&dir).context("Failed to create ~/.proactive-context directory")?;
+    fs::create_dir_all(&dir).context("Failed to create ~/.pc directory")?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
 
     let path = dir.join("config.json");
     let data = serde_json::to_string_pretty(cfg)?;
-    fs::write(&path, data).context("Failed to write config.json")?;
+    let temp = dir.join(format!(".config.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temp)
+        .context("Failed to create config.json")?;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temp, &path).context("Failed to write config.json")?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     Ok(())
 }
 
-/// If `path` is inside a git worktree, return the main (primary) worktree root.
-/// Otherwise return `path` (canonicalized). Falls through unchanged for non-git directories.
-///
-/// Detection: `git rev-parse --git-common-dir` returns ".git" (relative) in the main
-/// worktree and an absolute path to `<main>/.git` in a linked worktree.
+/// If `path` is inside a Git worktree, return that worktree's root. Linked
+/// worktrees retain their own source root but share PC identity through the
+/// absolute Git common directory used by `project_store`.
 pub fn resolve_project_root(path: &std::path::Path) -> PathBuf {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-    let output = std::process::Command::new("git")
-        .args(["-C", &abs.to_string_lossy().as_ref(), "rev-parse", "--git-common-dir"])
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return abs,
-    };
-
-    let common_dir_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let common_dir = PathBuf::from(&common_dir_str);
-
-    // Absolute path → linked worktree; its parent is the main worktree root.
-    if common_dir.is_absolute() {
-        if let Some(main_root) = common_dir.parent() {
-            return main_root.to_path_buf();
-        }
-    }
-
-    // Relative path (e.g. ".git") → normal repo running from a subdirectory.
-    // Use --show-toplevel so we always land at the repo root, not the cwd.
-    if let Ok(o) = std::process::Command::new("git")
-        .args(["-C", &abs.to_string_lossy().as_ref(), "rev-parse", "--show-toplevel"])
-        .output()
-    {
-        if o.status.success() {
-            let toplevel = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            return PathBuf::from(toplevel);
-        }
-    }
-
-    abs
+    crate::project_store::discover_git_repo(&abs)
+        .ok()
+        .flatten()
+        .map(|repo| repo.worktree_root)
+        .unwrap_or(abs)
 }
 
 /// Normalize a directory path into a safe filesystem name.
@@ -641,12 +752,15 @@ pub fn normalize_path(root: &std::path::Path) -> String {
         .replace('\\', "_")
 }
 
-/// Returns the centralized project data directory under ~/.proactive-context/projects/
+/// Returns the machine-local operational directory for a subject repository.
+///
+/// New code that needs to surface an unavailable store should call
+/// `project_store::ensure_project_store` directly. This compatibility helper is
+/// retained for subsystems whose public path API is currently infallible.
 pub fn project_context_dir(root: &std::path::Path) -> PathBuf {
-    let projects_dir = config_dir()
-        .expect("could not find config dir")
-        .join("projects");
-    projects_dir.join(normalize_path(root))
+    crate::project_store::ensure_project_store(root)
+        .unwrap_or_else(|e| panic!("project store unavailable: {e}"))
+        .state_dir
 }
 
 pub fn project_db_path(root: &std::path::Path) -> PathBuf {

@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # The user-facing command is `pc`. The package keeps its descriptive name; only
-# the built binary is renamed. (Data dir is the hardcoded ~/.proactive-context,
-# independent of the binary name.)
+# the built binary is renamed. Data lives under the unified ~/.pc home.
 [[bin]]
 name = "pc"
 path = "src/main.rs"

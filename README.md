@@ -34,9 +34,9 @@ Because the spec exists, `pc` covers what people usually reach for "memory" tool
 
 ```
 Message delivery uses a transactional outbox; publishing directly from request
-handlers was explicitly rejected (docs/wiki/message-delivery.md:12-15). The
+handlers was explicitly rejected (~/.pc/state/&lt;uuid&gt;/wiki/guides/message-delivery.md:12-15). The
 drain worker batches by aggregate id — ordering across aggregates is not
-guaranteed and consumers must not assume it (docs/wiki/message-delivery.md:22-26).
+guaranteed and consumers must not assume it (~/.pc/state/&lt;uuid&gt;/wiki/guides/message-delivery.md:22-26).
 ```
 
 Every sentence carries a `(path:line)` citation into a guide you can open; every guide statement carries a receipt into the verbatim conversation behind it. This is the end of *"no — we use the outbox pattern, I told you this three weeks ago."*
@@ -68,7 +68,10 @@ pc install        # detect installed agent harnesses and wire the hooks
 pc archeologist   # optional, recommended: build the spec from your history
 ```
 
-That's it. Sessions update the spec when they end; prompts get cited briefings before the model answers. `pc install` is idempotent and reversible (`--uninstall` removes only what it added; `--dry-run` shows exactly what would be written).
+That's it. Hooks are silent no-ops outside a non-bare Git worktree. In a repository,
+sessions update the spec when they end and prompts get cited briefings before the
+model answers. `pc install` is idempotent and reversible (`--uninstall` removes
+only what it added; `--dry-run` shows exactly what would be written).
 
 Watch it work from any terminal:
 
@@ -76,22 +79,46 @@ Watch it work from any terminal:
 pc tail   # live event view: hits, guides read, per-stage latency
 ```
 
-## Local-first
+## Local-first, portable when you choose
 
-Local embeddings (fastembed/ONNX), a SQLite file, no account, no telemetry, no server. The spec itself is plain markdown on your disk. Nothing leaves your machine except the LLM calls capture and inject make through *your* configured provider — OpenRouter, or Ollama for fully local operation.
+Generated artifacts never enter the subject repository. PC uses one home:
+
+```text
+~/.pc/config.json
+~/.pc/projects/<project-id>/    # portable canonical Git history
+~/.pc/state/<project-uuid>/     # local inbox, materialized wiki, DB, locks, logs
+```
+
+Linked Git worktrees share a store; unrelated clones do not get conflated by a
+matching basename or origin. Every capture is durably queued, committed locally
+as create-only objects, and only then pushed. A missing or unavailable remote
+never blocks local capture.
+
+The project store is a normal Git repository. Add a private GitHub or other
+remote if memory should follow the project across computers or collaborators;
+see [repository management](resources/repo-mgmt.md). Treat it as sensitive:
+captured conversations and evidence may contain private project details.
+
+Local embeddings use fastembed/ONNX and SQLite; there is no PC account or
+telemetry service. Nothing leaves your machine unless you configure a Git remote
+or an LLM provider—OpenRouter, or Ollama for fully local model execution.
+
+This release does not migrate `~/.proactive-context` or repository `docs/wiki`
+artifacts. Recreate configuration and memory manually. Existing committed
+`docs/wiki` Markdown remains ordinary read-only project documentation: PC may
+index it, but never mutates it or treats it as canonical memory.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `pc install` | detect harnesses, wire/unwire hooks (`--status`, `--dry-run`, `--all`, `--uninstall`) |
-| `pc inject` / `pc capture` | the two hook entry points (you rarely run these by hand) |
+| `pc hook inject` / `pc hook capture` | hook adapters (normally invoked by harnesses) |
 | `pc query "..."` | semantic search over the captured knowledge |
 | `pc archeologist` | replay historical transcripts into the spec |
-| `pc tail` | follow the live event log (TUI) |
+| `pc debug tail` | follow the live event log (TUI) |
 | `pc wiki doctor` / `pc wiki tidy` | off-hot-path maintenance: consolidation, publish-ready cleanup |
-| `pc agents` | cross-agent standup board: what every concurrent agent in a repo is doing |
-| `pc statusline` | sub-10ms status bar indicator — no LLM, no network |
+| `pc project status/path/sync/doctor` | inspect and manage the external Git store |
 | `pc configure` | model and provider picker |
 
 ## Status

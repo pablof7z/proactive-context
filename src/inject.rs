@@ -601,6 +601,9 @@ fn scan_indexable_files(root: &Path) -> Vec<(PathBuf, usize)> {
 
 /// Always returns Ok(()). Every internal failure is swallowed and degrades gracefully.
 pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
+    if crate::project_store::hooks_disabled() {
+        return Ok(());
+    }
     let start = Instant::now();
 
     // Read stdin
@@ -611,6 +614,15 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     if raw.is_empty() {
         return Ok(());
     }
+    let raw_cwd = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.get("cwd").and_then(|v| v.as_str()).map(str::to_string));
+    let Some(raw_cwd) = raw_cwd else {
+        return Ok(());
+    };
+    if crate::project_store::discover_hook_subject(Path::new(&raw_cwd))?.is_none() {
+        return Ok(());
+    }
     // Normalize the harness's stdin/transcript into pc's canonical Claude shape,
     // and pick the output dialect for this harness.
     let spec = crate::harness::lookup(harness);
@@ -619,21 +631,13 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     let input: InjectInput = match serde_json::from_str(&normalized) {
         Ok(i) => i,
-        Err(e) => {
-            let err = e.to_string();
-            log_event("error", None, serde_json::json!({
-                "stage": "inject.stdin",
-                "error": truncate(&err, 200)
-            }));
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                "outcome": "empty",
-                "reason": "invalid_stdin"
-            }));
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
+    if crate::project_store::ensure_project_store(&root).is_err() {
+        return Ok(());
+    }
     // Seed event context as soon as stdin gives us cwd/session. Every later early-exit is
     // now session-visible instead of looking like pre-API silence.
     let project = normalize_path(&root);
@@ -1692,7 +1696,7 @@ async fn wiki_navigate_and_compile(
             return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
         }
         return Ok(NavigateResult::Briefing {
-            text: render_hits_librarian(hits),
+            text: render_hits_librarian(hits, root),
             guides_read: vec![],
         });
     }
@@ -2004,12 +2008,17 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
 /// Render raw vector hits verbatim as a librarian briefing (used when the wiki is empty
 /// but the index has hits). Chunks have no stable file-line mapping, so they are cited by
 /// path + chunk index rather than line range. No LLM — so no paraphrase.
-fn render_hits_librarian(hits: &[QueryResult]) -> String {
+fn render_hits_librarian(hits: &[QueryResult], root: &Path) -> String {
     let mut body = String::new();
     for h in hits {
+        let label = if let Some(memory_rel) = h.path.strip_prefix("pc-memory/") {
+            crate::wiki::wiki_dir(root).join(memory_rel).display().to_string()
+        } else {
+            h.path.clone()
+        };
         body.push_str(&format!(
             "{} (chunk {}, score {:.2})\n{}\n\n",
-            h.path, h.chunk_index, h.score, h.content
+            label, h.chunk_index, h.score, h.content
         ));
     }
     let body = body.trim_end();
@@ -2441,21 +2450,20 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
     #[test]
     fn raw_fallback_commit_records_briefing_and_primed_ledgers() {
         let _g = VARIANT_ENV_LOCK.lock().unwrap();
-        struct RestorePcHome(Option<std::ffi::OsString>);
-        impl Drop for RestorePcHome {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("PC_HOME", v),
-                    None => std::env::remove_var("PC_HOME"),
-                }
-            }
-        }
-        let _restore_pc_home = RestorePcHome(std::env::var_os("PC_HOME"));
+        let _pc_home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
         let pc_home = tempfile::tempdir().unwrap();
-        std::env::set_var("PC_HOME", pc_home.path());
+        let _pc_home = crate::config::ScopedPcHome::set(pc_home.path());
 
         let root_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg("--initial-branch=master")
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(init.success());
         let session = format!("fallback-ledger-{}", std::process::id());
         let hits = vec![crate::query::QueryResult {
             path: "docs/spec.md".to_string(),

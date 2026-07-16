@@ -323,6 +323,34 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    struct IsolatedProject {
+        _pc_home: crate::config::ScopedPcHome,
+        _home: tempfile::TempDir,
+        root: tempfile::TempDir,
+        _pc_home_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn isolated_project() -> IsolatedProject {
+        let pc_home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let pc_home = crate::config::ScopedPcHome::set(home.path());
+        let root = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg("--initial-branch=master")
+            .arg(root.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        IsolatedProject {
+            _pc_home: pc_home,
+            _home: home,
+            root,
+            _pc_home_lock: pc_home_lock,
+        }
+    }
+
     #[test]
     fn cap_tail_keeps_most_recent() {
         // Tail-cap retains the end of the block (most recently appended entries).
@@ -341,22 +369,22 @@ mod tests {
 
     #[test]
     fn append_then_read_roundtrips_and_dedups_block() {
-        // Use a unique session id so the test is isolated and self-cleaning.
-        let root = std::env::temp_dir();
+        let project = isolated_project();
+        let root = project.root.path();
         let sess = format!("pc-ledger-test-{}", std::process::id());
-        let path = ledger_path(&root, &sess);
+        let path = ledger_path(root, &sess);
         let _ = std::fs::remove_file(&path);
 
-        append(&root, &sess, Some("OAuth"), "Google is a supported provider (oauth.rs:42).");
-        append(&root, &sess, Some("Billing"), "Stripe is the billing backend (billing.rs:10).");
+        append(root, &sess, Some("OAuth"), "Google is a supported provider (oauth.rs:42).");
+        append(root, &sess, Some("Billing"), "Stripe is the billing backend (billing.rs:10).");
 
-        let block = read_recent(&root, &sess, 8, 3000);
+        let block = read_recent(root, &sess, 8, 3000);
         assert!(block.contains("[OAuth]"));
         assert!(block.contains("oauth.rs:42"));
         assert!(block.contains("[Billing]"));
 
         // max_entries=1 keeps only the most recent briefing.
-        let one = read_recent(&root, &sess, 1, 3000);
+        let one = read_recent(root, &sess, 1, 3000);
         assert!(one.contains("Billing"));
         assert!(!one.contains("OAuth"));
 
@@ -420,8 +448,8 @@ mod tests {
 
     #[test]
     fn read_visible_recent_empty_when_transcript_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let project = isolated_project();
+        let root = project.root.path();
         let sess = "sess-missing";
 
         append(root, sess, Some("OAuth"), "Google is supported.");
@@ -436,8 +464,8 @@ mod tests {
 
     #[test]
     fn read_visible_recent_keeps_only_entries_still_in_transcript_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let project = isolated_project();
+        let root = project.root.path();
         let sess = "sess-visible";
         let alpha = "Alpha reminder line one.\nAlpha reminder line two.";
         let beta = "Beta reminder survives compaction.";

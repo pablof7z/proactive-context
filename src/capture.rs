@@ -30,8 +30,9 @@ use crate::wiki::{
     rebuild_index, revise_section, save_guide, slugify, wiki_dir, Guide,
 };
 use state::{
-    acquire_project_wiki_lock, acquire_session_lock, captured_sessions_dir, is_already_captured_in,
-    mark_captured_in, pending_captures_dir, project_dir_from_cwd, project_wiki_lock_key_for_root,
+    acquire_project_wiki_lock, acquire_session_lock, captured_sessions_dir_for,
+    is_already_captured_in, mark_captured_in,
+    project_dir_from_cwd, project_wiki_lock_key_for_root,
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -60,23 +61,10 @@ struct CaptureInput {
     #[serde(default)]
     filter_sidechains: bool,
     /// Redirect wiki output and capture markers to this directory instead of the default
-    /// `~/.proactive-context` tree. `None` → standard paths (live hook default).
+    /// isolated output tree. `None` → standard `~/.pc` paths (live hook default).
     /// Set by archeologist `--output-dir` for isolated test runs.
     #[serde(default)]
     output_dir: Option<PathBuf>,
-    #[serde(default)]
-    auto_commit_wiki: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct PendingCapture {
-    session_id: String,
-    cwd: String,
-    transcript_path: String,
-    scheduled_at_secs: u64,
-    /// Debounce window (seconds) the deferred runner sleeps before capturing.
-    /// Always set from `--in <SECS>`; no config fallback.
-    debounce_secs: u64,
 }
 
 // ─── Unix timestamp helper ───────────────────────────────────────────────────
@@ -2423,7 +2411,37 @@ fn apply_reconcile_op(
 
 // ─── Core capture logic ───────────────────────────────────────────────────────
 
-fn run_capture_from_input(input: CaptureInput) -> Result<()> {
+fn finish_capture_snapshot_locked(
+    project_store: Option<&crate::project_store::ProjectStore>,
+    inbox_capture: Option<&crate::capture_store::InboxCapture>,
+    wiki_path: &Path,
+    marker_dir: &PathBuf,
+    session_id: &str,
+    exchanges: usize,
+) -> Result<Option<String>> {
+    if let (Some(store), Some(queued)) = (project_store, inbox_capture) {
+        let outcome = crate::capture_store::commit_workspace_capture_locked(
+            store,
+            &queued.request,
+            wiki_path,
+        )?;
+        let oid = match outcome {
+            crate::capture_store::SnapshotOutcome::Committed(oid)
+            | crate::capture_store::SnapshotOutcome::AlreadyCommitted(oid) => oid,
+        };
+        mark_captured_in(session_id, exchanges, marker_dir)?;
+        crate::capture_store::remove_completed(queued)?;
+        Ok(Some(oid))
+    } else {
+        mark_captured_in(session_id, exchanges, marker_dir)?;
+        Ok(None)
+    }
+}
+
+fn run_capture_from_input(
+    input: CaptureInput,
+    inbox_capture: Option<crate::capture_store::InboxCapture>,
+) -> Result<()> {
     if input.session_id.is_empty() {
         eprintln!("capture: no session_id — skipping");
         return Ok(());
@@ -2444,6 +2462,9 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     };
 
     if !cfg.capture_enabled {
+        if let Some(queued) = inbox_capture.as_ref() {
+            let _ = crate::capture_store::remove_completed(queued);
+        }
         return Ok(());
     }
 
@@ -2526,14 +2547,64 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     let exchanges = turns.iter().filter(|t| t.0 == "user").count();
 
     // Resolve output paths (output_dir override for isolated archeologist runs)
+    let project_root = resolve_project_root(&PathBuf::from(&input.cwd));
+    let project_store = if input.output_dir.is_none() {
+        match crate::project_store::ensure_project_store(&project_root) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                if let Some(queued) = inbox_capture.as_ref() {
+                    let _ = crate::capture_store::mark_attempt_failure(
+                        queued,
+                        &format!("project store unavailable: {e}"),
+                        60,
+                    );
+                }
+                eprintln!("capture: project store unavailable: {e}");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let marker_dir = input
         .output_dir
         .as_ref()
         .map(|d| d.join("captured-sessions"))
-        .unwrap_or_else(captured_sessions_dir);
+        .unwrap_or_else(|| captured_sessions_dir_for(&project_root));
+
+    // Serialize the full semantic mutation + immutable snapshot transaction.
+    // A capture has already been durably enqueued before it waits here, so a
+    // long reconciliation cannot make it disappear.
+    let mut store_transaction_lock = if let Some(store) = project_store.as_ref() {
+        match store.acquire_lock() {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                if let Some(queued) = inbox_capture.as_ref() {
+                    let _ = crate::capture_store::mark_attempt_failure(queued, &e.to_string(), 15);
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Canonical history, not a local marker, is the source of truth. This is
+    // the crash-recovery path for "commit succeeded, marker update did not".
+    if let (Some(store), Some(queued)) = (project_store.as_ref(), inbox_capture.as_ref()) {
+        if crate::capture_store::capture_commit_oid(store, &queued.request.capture_id)?
+            .is_some()
+        {
+            let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
+            let _ = crate::capture_store::remove_completed(queued);
+            return Ok(());
+        }
+    }
 
     // Fast dedup check
-    if is_already_captured_in(&input.session_id, exchanges, &marker_dir) {
+    if inbox_capture.is_none()
+        && is_already_captured_in(&input.session_id, exchanges, &marker_dir)
+    {
         eprintln!(
             "capture: already captured {} exchanges for session {} — skipping",
             exchanges, input.session_id
@@ -2573,11 +2644,33 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
             plain_ts.len(),
             exchanges
         );
+        let early_wiki = project_store
+            .as_ref()
+            .map(|store| store.wiki_dir())
+            .unwrap_or_default();
+        let committed = finish_capture_snapshot_locked(
+            project_store.as_ref(),
+            inbox_capture.as_ref(),
+            &early_wiki,
+            &marker_dir,
+            &input.session_id,
+            exchanges,
+        )?;
+        drop(store_transaction_lock.take());
+        if committed.is_some() {
+            if let Some(store) = project_store.as_ref() {
+                let _ = crate::store_sync::synchronize(store, &cfg);
+            }
+        }
         return Ok(());
     }
 
     // Acquire per-session lock
-    let _lock = match acquire_session_lock(&input.session_id) {
+    let project_key = project_store
+        .as_ref()
+        .map(|store| store.manifest.project_uuid.clone())
+        .unwrap_or_else(|| normalize_path(&project_root));
+    let _lock = match acquire_session_lock(&input.session_id, &project_key) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("capture: {}", e);
@@ -2586,7 +2679,9 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     };
 
     // Re-check after acquiring lock (TOCTOU guard)
-    if is_already_captured_in(&input.session_id, exchanges, &marker_dir) {
+    if inbox_capture.is_none()
+        && is_already_captured_in(&input.session_id, exchanges, &marker_dir)
+    {
         eprintln!("capture: already captured (post-lock check) — skipping");
         return Ok(());
     }
@@ -2597,7 +2692,6 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
     } else {
         project_dir_from_cwd(&input.cwd)
     };
-    let project_root = resolve_project_root(&PathBuf::from(&input.cwd));
     // When an output_dir override is set (archeologist isolated run), redirect ALL wiki
     // writes under it too — NOT just markers/index.db. Otherwise guides would clobber the
     // real repo's docs/wiki/. Mirror proj_dir's layout: <output_dir>/projects/<norm>/docs/wiki.
@@ -2646,6 +2740,20 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
                             "model": cfg.capture_triage_model
                         }),
                     );
+                    let committed = finish_capture_snapshot_locked(
+                        project_store.as_ref(),
+                        inbox_capture.as_ref(),
+                        &wiki_path,
+                        &marker_dir,
+                        &input.session_id,
+                        exchanges,
+                    )?;
+                    drop(store_transaction_lock.take());
+                    if committed.is_some() {
+                        if let Some(store) = project_store.as_ref() {
+                            let _ = crate::store_sync::synchronize(store, &cfg);
+                        }
+                    }
                     return Ok(());
                 }
                 log_event(
@@ -2775,12 +2883,6 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         }
     }
 
-    // Mark only after durable staged-capture success. Failed or timed-out runs must remain
-    // retryable because SessionEnd captures usually will not gain new exchanges.
-    if capture_completed {
-        let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
-    }
-
     // Research-capture stage (feature-flagged via `capture_research`, default ON
     // after validation). Runs AFTER the normal pass and is fully independent of it:
     // recognizes investigation artifacts and persists immutable research records under
@@ -2872,36 +2974,55 @@ fn run_capture_from_input(input: CaptureInput) -> Result<()> {
         run_structural_maintenance(&wiki_path, &proj_dir, &ctx.project_key, &today_str);
     }
 
-    if input.auto_commit_wiki && cfg.capture_auto_commit_wiki && input.output_dir.is_none() {
-        match acquire_project_wiki_lock(&project_key) {
-            Ok(_lock) => match crate::git_autocommit::commit_docs_wiki(&project_root) {
-                Ok(crate::git_autocommit::AutoCommitOutcome::Committed(commit)) => {
-                    eprintln!("capture: committed docs/wiki as {commit}");
+    let mut sync_after_commit = false;
+    if capture_completed {
+        if let (Some(store), Some(queued)) = (project_store.as_ref(), inbox_capture.as_ref()) {
+            match crate::capture_store::commit_workspace_capture_locked(
+                store,
+                &queued.request,
+                &wiki_path,
+            ) {
+                Ok(outcome) => {
+                    let commit = match outcome {
+                        crate::capture_store::SnapshotOutcome::Committed(oid)
+                        | crate::capture_store::SnapshotOutcome::AlreadyCommitted(oid) => oid,
+                    };
+                    let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
+                    let _ = crate::capture_store::remove_completed(queued);
                     log_event(
-                        "git.autocommit",
-                        None,
-                        serde_json::json!({ "path": "docs/wiki", "commit": commit }),
-                    );
-                }
-                Ok(crate::git_autocommit::AutoCommitOutcome::NoChanges) => {}
-                Ok(crate::git_autocommit::AutoCommitOutcome::Skipped(reason)) => {
-                    eprintln!("capture: docs/wiki auto-commit skipped: {reason}");
-                }
-                Err(e) => {
-                    eprintln!("capture: docs/wiki auto-commit failed: {e}");
-                    log_event(
-                        "error",
+                        "store.capture_commit",
                         None,
                         serde_json::json!({
-                            "stage": "git.autocommit",
-                            "message": truncate(&format!("{e}"), 300)
+                            "capture_id": queued.request.capture_id,
+                            "commit": commit
                         }),
                     );
+                    sync_after_commit = true;
                 }
-            },
-            Err(e) => {
-                eprintln!("capture: docs/wiki auto-commit lock failed: {e}");
+                Err(e) => {
+                    let _ = crate::capture_store::mark_attempt_failure(queued, &e.to_string(), 15);
+                    eprintln!("capture: local project-store commit failed: {e}");
+                }
             }
+        } else {
+            // Isolated evaluation output has no portable project store.
+            let _ = mark_captured_in(&input.session_id, exchanges, &marker_dir);
+        }
+    } else if let Some(queued) = inbox_capture.as_ref() {
+        let _ = crate::capture_store::mark_attempt_failure(
+            queued,
+            "semantic capture did not complete",
+            60,
+        );
+    }
+
+    // Network synchronization is deliberately after the local commit and after
+    // releasing the capture/reconciliation lock. Failures become retry state and
+    // never undo capture.
+    drop(store_transaction_lock.take());
+    if sync_after_commit {
+        if let Some(store) = project_store.as_ref() {
+            let _ = crate::store_sync::synchronize(store, &cfg);
         }
     }
 
@@ -3125,9 +3246,7 @@ pub(crate) fn run_structural_maintenance(
     }
 
     let db_path = proj_dir.join("index.db");
-    // The project cache dir (~/.proactive-context/projects/<slug>/) may not exist yet —
-    // the wiki lives under the repo (docs/wiki/), so nothing else creates this dir. Without
-    // it, opening index.db fails with ENOENT. Create it before indexing.
+    // The machine-local state directory may not exist yet. Create it before indexing.
     if let Err(e) = fs::create_dir_all(proj_dir) {
         eprintln!(
             "capture: could not create project dir {}: {}",
@@ -3163,7 +3282,7 @@ pub(crate) fn run_capture_for_archeologist(
     filter_sidechains: bool,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
-    run_capture_from_input(CaptureInput {
+    let input = CaptureInput {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         transcript_path: transcript_path.to_string(),
@@ -3171,8 +3290,23 @@ pub(crate) fn run_capture_for_archeologist(
         skip_structural_maintenance: skip_maint,
         filter_sidechains,
         output_dir,
-        auto_commit_wiki: false,
-    })
+    };
+    if input.output_dir.is_some() {
+        return run_capture_from_input(input, None);
+    }
+    let root = resolve_project_root(Path::new(cwd));
+    let store = crate::project_store::ensure_project_store(&root)
+        .map_err(anyhow::Error::from)?;
+    let queued = crate::capture_store::enqueue_capture(
+        &store,
+        "archeologist",
+        session_id,
+        Path::new(transcript_path),
+        0,
+    )?;
+    let mut durable_input = input;
+    durable_input.transcript_path = queued.transcript_path.to_string_lossy().to_string();
+    run_capture_from_input(durable_input, Some(queued))
 }
 
 /// Episode-only idempotency pass for the archeologist's already-captured sessions.
@@ -3225,20 +3359,37 @@ pub(crate) fn archeologist_project_dir(
     }
 }
 
-/// Expose the captured-sessions directory for the archeologist picker's "New" count.
-pub(crate) fn archeologist_captured_sessions_dir() -> PathBuf {
-    captured_sessions_dir()
-}
-
 /// Expose `is_already_captured` for archeologist's work-list filtering.
 /// A session is "new" when this returns false.
 /// Pass `marker_dir` to check against an isolated output dir; `None` uses the global default.
 pub(crate) fn archeologist_is_already_captured(
     session_id: &str,
+    cwd: Option<&str>,
+    transcript_path: &Path,
     marker_dir: Option<&PathBuf>,
 ) -> bool {
-    let dir = marker_dir.cloned().unwrap_or_else(captured_sessions_dir);
-    is_already_captured_in(session_id, 0, &dir)
+    if let Some(dir) = marker_dir {
+        return is_already_captured_in(session_id, 0, dir);
+    }
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return false;
+    };
+    let Ok(Some(store)) = crate::project_store::bound_project_store(Path::new(cwd)) else {
+        return false;
+    };
+    let Ok(transcript) = fs::read(transcript_path) else {
+        return false;
+    };
+    let capture_id = crate::project_store::stable_capture_id(
+        &store.manifest.project_uuid,
+        "archeologist",
+        session_id,
+        &transcript,
+    );
+    crate::capture_store::capture_commit_oid(&store, &capture_id)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 // ─── SessionEnd entry point ───────────────────────────────────────────────────
@@ -3256,12 +3407,26 @@ pub fn run_capture(harness: &str) -> Result<()> {
 // ─── Stop hook: `capture --in <secs>` ────────────────────────────────────────
 
 pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
+    if crate::project_store::hooks_disabled() {
+        return Ok(());
+    }
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(());
     }
+    // Eligibility is deliberately checked against the raw hook envelope before
+    // transcript normalization, config loading, logging, or filesystem writes.
+    let raw_cwd = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("cwd").and_then(|v| v.as_str()).map(str::to_string));
+    let Some(raw_cwd) = raw_cwd else {
+        return Ok(());
+    };
+    let Some(_) = crate::project_store::discover_hook_subject(Path::new(&raw_cwd))? else {
+        return Ok(());
+    };
     // Normalize now so the canonical (and, for non-Claude harnesses, converted)
     // transcript_path is what gets persisted into the pending-capture record and
     // read later by the detached deferred worker.
@@ -3275,8 +3440,7 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
         }
     };
 
-    if hook_input.session_id.is_empty() {
-        eprintln!("capture: no session_id — skipping");
+    if hook_input.session_id.is_empty() || hook_input.transcript_path.is_empty() {
         return Ok(());
     }
 
@@ -3292,32 +3456,25 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
         return Ok(());
     }
 
-    let pending = PendingCapture {
-        session_id: hook_input.session_id.clone(),
-        cwd: hook_input.cwd.clone(),
-        transcript_path: hook_input.transcript_path.clone(),
-        scheduled_at_secs: unix_now_secs(),
-        debounce_secs: delay_secs,
+    let root = resolve_project_root(Path::new(&hook_input.cwd));
+    let store = match crate::project_store::project_store_for_inbox(&root) {
+        Ok(store) => store,
+        Err(_) => return Ok(()),
     };
-
-    let dir = pending_captures_dir();
-    if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("capture: can't create pending dir: {}", e);
-        return Ok(());
-    }
-
-    let pid_path = dir.join(format!("{}.pid", &hook_input.session_id));
-    let pending_path = dir.join(format!("{}.json", &hook_input.session_id));
-
-    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
-
-    if let Err(e) = fs::write(&pending_path, serde_json::to_string(&pending)?) {
-        eprintln!("capture: can't write pending file: {}", e);
-        return Ok(());
+    // This copy is the capture's first durability boundary and happens before
+    // any project-store lock or network synchronization.
+    let queued = match crate::capture_store::enqueue_capture(
+        &store,
+        harness,
+        &hook_input.session_id,
+        Path::new(&hook_input.transcript_path),
+        delay_secs,
+    ) {
+        Ok(queued) => queued,
+        Err(_) => return Ok(()),
+    };
+    if crate::project_store::ensure_project_store(&store.subject.worktree_root).is_ok() {
+        let _ = crate::daemon::daemonize(&store.subject.worktree_root);
     }
 
     let exe = match std::env::current_exe() {
@@ -3328,12 +3485,13 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
         }
     };
 
-    let session_id = hook_input.session_id.clone();
+    let capture_id = queued.request.capture_id.clone();
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("hook")
         .arg("capture")
         .arg("--deferred")
-        .arg(&session_id)
+        .arg(&capture_id)
+        .current_dir(&store.subject.worktree_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -3346,17 +3504,9 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
     }
 
     match cmd.spawn() {
-        Ok(child) => {
-            let _ = fs::write(&pid_path, child.id().to_string());
-            eprintln!(
-                "capture: background capture started (pid={}, delay={}s, session={}…)",
-                child.id(),
-                delay_secs,
-                &session_id[..session_id.len().min(8)]
-            );
-        }
+        Ok(_) => {}
         Err(e) => {
-            eprintln!("capture: failed to spawn background process: {}", e);
+            let _ = crate::capture_store::mark_attempt_failure(&queued, &e.to_string(), 15);
         }
     }
 
@@ -3365,51 +3515,79 @@ pub fn run_capture_scheduled(delay_secs: u64, harness: &str) -> Result<()> {
 
 // ─── Background debounce runner (`capture --deferred <session_id>`) ───────────
 
-pub fn run_deferred_capture(session_id: &str) -> Result<()> {
-    let dir = pending_captures_dir();
-    let pending_path = dir.join(format!("{}.json", session_id));
-    let pid_path = dir.join(format!("{}.pid", session_id));
-
-    // Read the debounce window the scheduler resolved (`--in <SECS>` or config),
-    // along with the timestamp that marks us as the current winner.
-    let (launched_at, delay_secs) = {
-        let data = match fs::read_to_string(&pending_path) {
-            Ok(d) => d,
-            Err(_) => return Ok(()),
-        };
-        match serde_json::from_str::<PendingCapture>(&data) {
-            Ok(p) => (p.scheduled_at_secs, p.debounce_secs),
-            Err(_) => return Ok(()),
-        }
-    };
-
-    std::thread::sleep(std::time::Duration::from_secs(delay_secs));
-
-    let pending: PendingCapture = match fs::read_to_string(&pending_path)
-        .ok()
-        .and_then(|d| serde_json::from_str(&d).ok())
-    {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    if pending.scheduled_at_secs != launched_at {
+pub fn run_deferred_capture(capture_id: &str) -> Result<()> {
+    if crate::project_store::hooks_disabled() {
         return Ok(());
     }
-
-    let _ = fs::remove_file(&pending_path);
-    let _ = fs::remove_file(&pid_path);
-
+    let cwd = std::env::current_dir()?;
+    if crate::project_store::discover_hook_subject(&cwd)?.is_none() {
+        return Ok(());
+    }
+    let store = match crate::project_store::project_store_for_inbox(&cwd) {
+        Ok(store) => store,
+        Err(_) => return Ok(()),
+    };
+    let queued = match crate::capture_store::load_inbox_capture(&store, capture_id) {
+        Ok(queued) => queued,
+        Err(_) => return Ok(()),
+    };
+    if std::env::var_os("PC_CAPTURE_CLAIMED").as_deref() != Some(std::ffi::OsStr::new("1")) {
+      if let Some(schedule) = crate::capture_store::read_schedule(&queued.entry_dir) {
+        let now = unix_now_secs();
+        if schedule.not_before_unix_secs > now {
+            std::thread::sleep(std::time::Duration::from_secs(
+                schedule.not_before_unix_secs - now,
+            ));
+        }
+      }
+    }
     run_capture_from_input(CaptureInput {
-        session_id: pending.session_id,
-        cwd: pending.cwd,
-        transcript_path: pending.transcript_path,
+        session_id: queued.request.session_id.clone(),
+        cwd: store.subject.worktree_root.to_string_lossy().to_string(),
+        transcript_path: queued.transcript_path.to_string_lossy().to_string(),
         today_override: None,
         skip_structural_maintenance: false,
         filter_sidechains: false,
         output_dir: None,
-        auto_commit_wiki: true,
-    })
+    }, Some(queued))
+}
+
+/// Retry durable inbox entries whose debounce/backoff deadline has elapsed.
+/// The daemon calls this routinely; each worker is detached and the inbox entry
+/// remains until its immutable capture commit succeeds.
+pub fn spawn_due_inbox_captures(store: &crate::project_store::ProjectStore) -> Result<usize> {
+    let now = unix_now_secs();
+    let ids = crate::capture_store::due_capture_ids(store, now);
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let exe = std::env::current_exe()?;
+    let mut spawned = 0usize;
+    for capture_id in ids {
+        let entry = store.inbox_dir().join(&capture_id);
+        // A lease prevents the daemon's short poll loop from spawning a storm.
+        crate::capture_store::defer_capture(&entry, now.saturating_add(5 * 60))?;
+        let child = std::process::Command::new(&exe)
+            .arg("hook")
+            .arg("capture")
+            .arg("--deferred")
+            .arg(&capture_id)
+            .current_dir(&store.subject.worktree_root)
+            .env("PC_CAPTURE_CLAIMED", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(_) => spawned += 1,
+            Err(e) => {
+                if let Ok(queued) = crate::capture_store::load_inbox_capture(store, &capture_id) {
+                    let _ = crate::capture_store::mark_attempt_failure(&queued, &e.to_string(), 15);
+                }
+            }
+        }
+    }
+    Ok(spawned)
 }
 
 // ─── Debug commands (`pc debug …`) ─────────────────────────────────────────────
@@ -3960,6 +4138,9 @@ mod tests {
 
     #[test]
     fn project_wiki_lock_key_uses_resolved_project_root() {
+        let _pc_home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
+        let pc_home = tempfile::tempdir().unwrap();
+        let _pc_home = crate::config::ScopedPcHome::set(pc_home.path());
         let tmp = tempfile::tempdir().unwrap();
         let init = std::process::Command::new("git")
             .arg("init")
@@ -3976,7 +4157,10 @@ mod tests {
         fs::create_dir_all(&subdir).unwrap();
 
         let key = state::project_wiki_lock_key_for_cwd(subdir.to_str().unwrap());
-        let root_key = normalize_path(tmp.path());
+        let root_key = crate::project_store::ensure_project_store(tmp.path())
+            .unwrap()
+            .manifest
+            .project_uuid;
         let raw_subdir_key = normalize_path(&subdir);
 
         assert_eq!(key, root_key);

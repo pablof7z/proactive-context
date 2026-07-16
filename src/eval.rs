@@ -4,7 +4,7 @@
 //! FUTURE, and scores both stores against those labels.
 //!
 //! ## Safety invariants
-//! - NEVER touches the user's live `~/.proactive-context/projects/<key>` state.
+//! - NEVER touches the user's live `~/.pc/projects/<id>` state.
 //! - All output goes under `--experiment-dir` (defaulting to a timestamped temp dir).
 //! - The corpus project's repository is never written to.
 //! - The eval sets `PC_HOME=<experiment_dir>` so every pc sub-invocation writes
@@ -121,7 +121,7 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
             let ts = crate::capture::unix_now_secs();
             let base = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".proactive-context")
+                .join(".pc")
                 .join("experiments")
                 .join(format!("claims-first-{}", ts));
             base
@@ -472,6 +472,12 @@ pub(crate) fn build_store_direct(
     output_dir: &Path,
     claims_tap: bool,
 ) -> Result<()> {
+    // Isolated evaluation homes still use the caller's explicitly loaded model
+    // configuration. Keep it in-process so credentials are never copied into
+    // experiment artifacts; the old runtime fallback into another home is gone.
+    let evaluation_cfg = load_config()?;
+    let _config_override = crate::config::ScopedConfigOverride::set(evaluation_cfg);
+    let previous_pc_home = std::env::var_os("PC_HOME");
     let store_label = if claims_tap { "B (claim tap)" } else { "A (wiki)" };
     println!("eval: building Store {} under {}...", store_label, output_dir.display());
     let t0 = Instant::now();
@@ -540,7 +546,10 @@ pub(crate) fn build_store_direct(
     );
 
     // Restore env.
-    std::env::remove_var("PC_HOME");
+    match previous_pc_home {
+        Some(previous) => std::env::set_var("PC_HOME", previous),
+        None => std::env::remove_var("PC_HOME"),
+    }
     std::env::remove_var("PC_CLAIMS_LOG");
     Ok(())
 }

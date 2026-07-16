@@ -33,7 +33,7 @@ that flag is treated as a sentinel and can be filtered before the provider call)
    The plugin resolves the binary from `$PC_BIN`, then `~/.bin/pc`,
    `~/.local/bin/pc`, `/usr/local/bin/pc`, then `pc` on `PATH`.
 
-2. **Configure `pc`** (`~/.proactive-context/config.json`). Embeddings run locally
+2. **Configure `pc`** (`~/.pc/config.json`). Embeddings run locally
    (no key). The LLM roles default to OpenRouter; point them at a local Ollama model
    if you have no key:
    ```json
@@ -75,8 +75,8 @@ interactive sessions, exactly like the Claude Code `Stop`/`SessionEnd` hook.
 
 Set `PC_DEBUG=1` to log inject/capture activity to stderr (visible with
 `opencode … --print-logs`). The debounced capture worker is detached (`setsid`,
-null stdio), so its own logs don't surface — confirm it ran by the wiki it writes
-under `<project>/docs/wiki/`.
+null stdio), so its own logs don't surface — confirm it ran with `pc project status`
+or inspect the materialized wiki under `~/.pc/state/<project-uuid>/wiki/`.
 
 ## Stability caveat
 

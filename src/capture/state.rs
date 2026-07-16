@@ -4,35 +4,26 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use crate::config::{normalize_path, resolve_project_root};
+use crate::config::{config_dir, normalize_path, resolve_project_root};
 
 #[derive(Serialize, Deserialize, Default)]
 struct CaptureMarker {
     captured_at_exchanges: usize,
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().expect("cannot determine home directory")
-}
-
-pub(super) fn captured_sessions_dir() -> PathBuf {
-    home_dir()
-        .join(".proactive-context")
+pub(super) fn captured_sessions_dir_for(root: &Path) -> PathBuf {
+    crate::project_store::ensure_project_store(root)
+        .expect("project store unavailable")
+        .state_dir
         .join("captured-sessions")
 }
 
-fn session_lock_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("session-locks")
-}
-
-pub(super) fn pending_captures_dir() -> PathBuf {
-    home_dir()
-        .join(".proactive-context")
-        .join("pending-captures")
-}
-
-fn project_lock_dir() -> PathBuf {
-    home_dir().join(".proactive-context").join("project-locks")
+fn project_lock_dir(project_key: &str) -> PathBuf {
+    config_dir()
+        .expect("cannot determine PC home")
+        .join("state")
+        .join(project_key)
+        .join("locks")
 }
 
 pub(super) fn is_already_captured_in(
@@ -71,8 +62,8 @@ pub(super) fn mark_captured_in(
     Ok(())
 }
 
-pub(super) fn acquire_session_lock(session_id: &str) -> Result<fs::File> {
-    let dir = session_lock_dir();
+pub(super) fn acquire_session_lock(session_id: &str, project_key: &str) -> Result<fs::File> {
+    let dir = project_lock_dir(project_key);
     fs::create_dir_all(&dir)?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -86,7 +77,7 @@ pub(super) fn acquire_session_lock(session_id: &str) -> Result<fs::File> {
 }
 
 pub(super) fn acquire_project_wiki_lock(project_key: &str) -> Result<fs::File> {
-    let dir = project_lock_dir();
+    let dir = project_lock_dir(project_key);
     fs::create_dir_all(&dir)?;
     let safe_key: String = project_key
         .chars()
@@ -111,7 +102,9 @@ pub(super) fn acquire_project_wiki_lock(project_key: &str) -> Result<fs::File> {
 }
 
 pub(super) fn project_wiki_lock_key_for_root(root: &Path) -> String {
-    normalize_path(root)
+    crate::project_store::ensure_project_store(root)
+        .map(|store| store.manifest.project_uuid)
+        .unwrap_or_else(|_| normalize_path(root))
 }
 
 pub(super) fn project_wiki_lock_key_for_cwd(cwd: &str) -> String {
@@ -120,9 +113,7 @@ pub(super) fn project_wiki_lock_key_for_cwd(cwd: &str) -> String {
 }
 
 pub(super) fn project_dir_from_cwd(cwd: &str) -> PathBuf {
-    let normalized = project_wiki_lock_key_for_cwd(cwd);
-    home_dir()
-        .join(".proactive-context")
-        .join("projects")
-        .join(normalized)
+    crate::project_store::ensure_project_store(&resolve_project_root(&PathBuf::from(cwd)))
+        .expect("project store unavailable")
+        .state_dir
 }

@@ -944,7 +944,7 @@ fn resolve_cfv6(exp_dir: &Path) -> Option<PathBuf> {
     let root = exp_dir
         .parent()
         .map(|p| p.to_path_buf())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".proactive-context").join("experiments")))?;
+        .or_else(|| dirs::home_dir().map(|h| h.join(".pc").join("experiments")))?;
     let mut matches: Vec<PathBuf> = fs::read_dir(&root)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))

@@ -25,10 +25,9 @@ pub struct FileState {
 }
 
 pub fn db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".proactive-context")
-        .join("recall.db")
+    crate::config::config_dir()
+        .unwrap_or_else(|_| PathBuf::from(".pc"))
+        .join("state/recall.db")
 }
 
 pub struct Store {

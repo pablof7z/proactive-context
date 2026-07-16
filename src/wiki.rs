@@ -1,7 +1,7 @@
 /// wiki.rs — per-project knowledge wiki
 ///
 /// Storage layout:
-///   <project_root>/docs/wiki/
+///   ~/.pc/state/<project-uuid>/wiki/   (derived materialized workspace)
 ///     _index.md          derived cache: table of every guide (title, summary, tags, volatility, verified, slug)
 ///     <slug>.md          one guide per bounded concept
 ///
@@ -379,9 +379,15 @@ pub fn slugify(title: &str) -> String {
 
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
-/// Wiki directory for a project — always lives inside the project source tree.
+/// Materialized wiki workspace for a project.
+///
+/// Canonical portable history lives in the project's external Git store. The
+/// mutable tree used by the existing capture/indexing pipeline is machine-local
+/// derived state and is rebuilt from immutable capture manifests when needed.
 pub fn wiki_dir(project_root: &Path) -> PathBuf {
-    project_root.join("docs").join("wiki")
+    crate::project_store::ensure_project_store(project_root)
+        .unwrap_or_else(|e| panic!("project store unavailable: {e}"))
+        .wiki_dir()
 }
 
 /// Directory holding guide files. Guides used to live flat at the wiki root;
@@ -403,10 +409,9 @@ const ROOT_AGENTS: &str = r#"# Agent Notes
 This directory is proactive-context generated project memory. It is useful repo
 state, not scratch output.
 
-- Be proactive about committing generated `docs/wiki` changes with the code or
-  docs change they explain. If wiki changes accumulated during your work, include
-  them intentionally or call them out before handing off. Do not rely on pc to
-  create automatic follow-up commits for generated wiki changes.
+- Do not add this materialized workspace to the subject repository. PC snapshots
+  successful captures into immutable objects in ~/.pc/projects/<project-id>/,
+  commits them there, and synchronizes that repository independently.
 - Do not hand-edit `_index.md` or `_citations.log`; they are derived caches.
 - `_citations/` is the merge-friendly citation source of truth. Treat existing
   citation records as immutable evidence receipts.

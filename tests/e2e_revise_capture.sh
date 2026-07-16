@@ -9,7 +9,7 @@
 #               - RESTATES the topic with different wording (no shared keyword): the
 #                 throttling layer caps how many requests each client may issue
 #
-# Asserts on the resulting <proj>/docs/wiki/*.md:
+# Asserts on the resulting ~/.pc/state/<project-uuid>/wiki/*.md:
 #   (a) the rate-limiting / throttling topic lives in EXACTLY ONE guide (routing did
 #       not fragment one topic across two slugs)
 #   (b) Postgres is the CURRENT session-storage decision AND Redis is NOT presented as
@@ -30,7 +30,7 @@ BIN="$WORKTREE/target/release/pc"
 [ -x "$BIN" ] || { echo "FATAL: binary not built at $BIN"; exit 1; }
 
 # ── Pull ollama creds from the real config (key only; everything else is isolated) ──
-REAL_CONFIG="$HOME/.proactive-context/config.json"
+REAL_CONFIG="$HOME/.pc/config.json"
 OLLAMA_KEY=$(python3 -c "import json;print(json.load(open('$REAL_CONFIG')).get('ollama_api_key',''))" 2>/dev/null)
 if [ -z "$OLLAMA_KEY" ]; then echo "FATAL: no ollama_api_key in $REAL_CONFIG"; exit 1; fi
 
@@ -41,9 +41,9 @@ OLLAMA_URL="https://api.ollama.com"
 TMP=$(mktemp -d /tmp/pc-e2e.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
-mkdir -p "$HOME/.proactive-context"
+mkdir -p "$HOME/.pc"
 
-cat > "$HOME/.proactive-context/config.json" <<JSON
+cat > "$HOME/.pc/config.json" <<JSON
 {
   "ollama_base_url": "$OLLAMA_URL",
   "ollama_api_key": "$OLLAMA_KEY",
@@ -58,7 +58,8 @@ JSON
 # ── Temp project ──
 PROJ="$TMP/proj"
 mkdir -p "$PROJ"
-WIKI="$PROJ/docs/wiki"
+git -C "$PROJ" init --quiet --initial-branch=master
+WIKI=""
 
 # ── Fixtures: nested Claude Code JSONL. Content must NOT start with '<' (the parser
 #    drops user strings beginning with '<'). >=3 user/assistant exchanges, >500 chars. ──
@@ -86,24 +87,36 @@ SESS_B="$TMP/sessionB.jsonl"
 
 run_capture() {
   local sid="$1" tpath="$2"
+  local before after
+  before=$(find "$HOME/.pc/projects" -path '*/captures/*/manifest.json' -type f 2>/dev/null | wc -l | tr -d ' ')
   python3 -c "import json,sys;print(json.dumps({'session_id':sys.argv[1],'cwd':sys.argv[2],'transcript_path':sys.argv[3]}))" \
-    "$sid" "$PROJ" "$tpath" | "$BIN" capture
+    "$sid" "$PROJ" "$tpath" | "$BIN" hook capture
+  for _ in $(seq 1 360); do
+    after=$(find "$HOME/.pc/projects" -path '*/captures/*/manifest.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$after" -gt "$before" ]; then
+      WIKI=$(find "$HOME/.pc/state" -mindepth 2 -maxdepth 2 -type d -name wiki -print -quit)
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: capture did not commit within 360 seconds"
+  return 1
 }
 
 echo
 echo "=== SESSION A (establish: Redis sessions + token-bucket rate limiting) ==="
-run_capture "sessionA-e2e-001" "$SESS_A"
+run_capture "sessionA-e2e-001" "$SESS_A" || exit 1
 echo "--- wiki after A ---"
-ls -1 "$WIKI" 2>/dev/null | grep -v '^_' || echo "(no guides)"
+ls -1 "$WIKI/guides" 2>/dev/null || echo "(no guides)"
 
 echo
 echo "=== SESSION B (reverse: Postgres sessions + restated throttling topic) ==="
-run_capture "sessionB-e2e-002" "$SESS_B"
+run_capture "sessionB-e2e-002" "$SESS_B" || exit 1
 
 echo
 echo "=================== RENDERED GUIDES (final) ==================="
 shopt -s nullglob
-GUIDES=("$WIKI"/*.md)
+GUIDES=("$WIKI/guides"/*.md)
 NONINDEX=()
 for g in "${GUIDES[@]}"; do
   bn=$(basename "$g")
