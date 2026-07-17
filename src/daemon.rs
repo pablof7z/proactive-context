@@ -542,13 +542,19 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     let debounce = Duration::from_millis(300);
     let mut last_activity = Instant::now();
     let mut last_store_maintenance = Instant::now() - Duration::from_secs(10);
+    let mut capture_workers = Vec::new();
 
     loop {
+        // `Child` does not wait on drop. Poll on every watcher cycle so completed
+        // capture attempts remain zombies for at most one debounce interval.
+        reap_finished_capture_workers(&mut capture_workers);
+
         // Poll elapsed time independently of watcher idleness. A repository with
         // a continuous stream of filesystem events must not starve remote fetch,
         // retry, or durable-inbox work.
         if last_store_maintenance.elapsed() >= Duration::from_secs(5) {
-            let _ = crate::capture::spawn_due_inbox_captures(&store);
+            let _ =
+                crate::capture::spawn_due_inbox_captures(&store, &mut capture_workers);
             let sync_outcome = crate::store_sync::synchronize_if_due(&store, &cfg)
                 .ok()
                 .flatten();
@@ -648,6 +654,20 @@ pub fn run_daemon(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reap_finished_capture_workers(workers: &mut Vec<std::process::Child>) {
+    workers.retain_mut(|worker| match worker.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            eprintln!(
+                "capture: failed to reap deferred worker {}: {error}",
+                worker.id()
+            );
+            true
+        }
+    });
+}
+
 /// Index all .md files in `src_dir` (recursively) into the database at `db_path`.
 /// This is a one-shot, no-daemon function used by the `index-files` subcommand.
 pub fn index_files_into_db(src_dir: &Path, db_path: &Path) -> Result<()> {
@@ -707,11 +727,14 @@ fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod watch_filter_tests {
-    use super::{daemon_spawn_args, is_ignored_watch_path, list_daemons};
+    use super::{daemon_spawn_args, is_ignored_watch_path, list_daemons, reap_finished_capture_workers};
     use crate::config::{ScopedPcHome, PC_HOME_TEST_LOCK};
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[test]
@@ -728,6 +751,20 @@ mod watch_filter_tests {
         );
         assert!(!args.contains(&OsString::from("hook")));
         assert!(!args.contains(&OsString::from("inject")));
+    }
+
+    #[test]
+    fn reaps_finished_deferred_capture_workers() {
+        let mut workers = vec![Command::new("true").spawn().unwrap()];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !workers.is_empty() && Instant::now() < deadline {
+            reap_finished_capture_workers(&mut workers);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            workers.is_empty(),
+            "finished child must be waited and removed"
+        );
     }
 
     #[test]
