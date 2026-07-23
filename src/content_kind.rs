@@ -14,7 +14,7 @@
 #![allow(dead_code)] // Phases 2-7 wire these in; Phase 1 only lands the model + tests.
 
 /// What kind of memory an artifact is. The single source of truth for taxonomy classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContentKind {
     /// A flat wiki guide: present-tense current project truth. Has no `type:` frontmatter.
     CurrentGuide,
@@ -119,7 +119,7 @@ impl ContentKind {
 }
 
 /// How current an artifact's content is. Orthogonal to [`ContentKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Currentness {
     /// In force now.
     Current,
@@ -133,8 +133,20 @@ pub enum Currentness {
     Unknown,
 }
 
+impl Currentness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Currentness::Current => "current",
+            Currentness::Historical => "historical",
+            Currentness::Superseded => "superseded",
+            Currentness::Proposed => "proposed",
+            Currentness::Unknown => "unknown",
+        }
+    }
+}
+
 /// Who drove an assertion: the user explicitly, or inferred from agent/implementation context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Authority {
     Explicit,
     Implicit,
