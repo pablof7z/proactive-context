@@ -6,6 +6,8 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
+use crate::provider::{ModelSpec, Provider};
+
 thread_local! {
     static CONFIG_OVERRIDE: std::cell::RefCell<Option<Config>> = const {
         std::cell::RefCell::new(None)
@@ -196,7 +198,7 @@ pub struct Config {
     pub inject_compile_model: String,
 
     /// Timeout in ms for the wiki browse + compile step (default 8000).
-    /// On timeout, falls back to the cheap raw-hits <system-reminder>.
+    /// On timeout, injection fails closed and emits only structured diagnostics.
     #[serde(default = "default_inject_browse_timeout_ms")]
     pub inject_browse_timeout_ms: u64,
 
@@ -302,6 +304,136 @@ pub struct Config {
     /// Number of reconciliation-attempt log directories retained.
     #[serde(default = "default_reconciliation_log_retention")]
     pub reconciliation_log_retention: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    Inject,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigIssue {
+    pub code: &'static str,
+    pub field: &'static str,
+    pub message: String,
+}
+
+impl ConfigIssue {
+    fn new(code: &'static str, field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+fn configured_model_roles(cfg: &Config, scope: ConfigScope) -> Vec<(&'static str, &str, bool)> {
+    let mut roles = vec![
+        ("inject_select_model", cfg.inject_select_model.as_str(), false),
+        ("inject_compile_model", cfg.inject_compile_model.as_str(), false),
+    ];
+    if scope == ConfigScope::All {
+        roles.extend([
+            ("capture_model", cfg.capture_model.as_str(), false),
+            // An empty triage model intentionally disables triage.
+            ("capture_triage_model", cfg.capture_triage_model.as_str(), true),
+            ("recall_gate_model", cfg.recall_gate_model.as_str(), false),
+            ("recall_answer_model", cfg.recall_answer_model.as_str(), false),
+        ]);
+    }
+    roles
+}
+
+/// Validate provider/model/key combinations without making network calls.
+///
+/// Hook startup uses the narrow Inject scope so a broken optional recall role
+/// cannot disable injection. `pc doctor` and `pc configure` use All.
+pub fn validate_config(cfg: &Config, scope: ConfigScope) -> Vec<ConfigIssue> {
+    let mut issues = Vec::new();
+    let mut parsed = Vec::new();
+
+    for (field, raw, allow_empty) in configured_model_roles(cfg, scope) {
+        if allow_empty && raw.trim().is_empty() {
+            continue;
+        }
+        match ModelSpec::parse_checked(raw) {
+            Ok(spec) => parsed.push((field, spec)),
+            Err(error) => issues.push(ConfigIssue::new(error.code, field, error.message)),
+        }
+    }
+
+    if scope == ConfigScope::All {
+        match cfg.embed_provider.trim() {
+            "local" => {
+                if cfg.embed_model.trim().is_empty() {
+                    issues.push(ConfigIssue::new(
+                        "empty_model",
+                        "embed_model",
+                        "embedding model identifier is empty",
+                    ));
+                }
+            }
+            "openrouter" => {
+                if cfg.embed_model.trim().is_empty() {
+                    issues.push(ConfigIssue::new(
+                        "empty_model",
+                        "embed_model",
+                        "embedding model identifier is empty",
+                    ));
+                }
+                parsed.push((
+                    "embed_model",
+                    ModelSpec {
+                        provider: Provider::OpenRouter,
+                        model: cfg.embed_model.trim().to_string(),
+                    },
+                ));
+            }
+            other => issues.push(ConfigIssue::new(
+                "unsupported_provider",
+                "embed_provider",
+                format!("unsupported embedding provider `{other}`; use local or openrouter"),
+            )),
+        }
+    }
+
+    let needs_openrouter_key = parsed
+        .iter()
+        .any(|(_, spec)| spec.provider == Provider::OpenRouter);
+    if needs_openrouter_key
+        && cfg
+            .openrouter_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .is_none()
+    {
+        issues.push(ConfigIssue::new(
+            "missing_openrouter_key",
+            "openrouter_api_key",
+            "an OpenRouter model is configured but no OpenRouter API key is set",
+        ));
+    }
+
+    if parsed
+        .iter()
+        .any(|(_, spec)| spec.provider == Provider::Ollama)
+    {
+        match reqwest::Url::parse(cfg.ollama_base_url.trim()) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some() => {}
+            _ => issues.push(ConfigIssue::new(
+                "invalid_ollama_url",
+                "ollama_base_url",
+                "Ollama base URL must be an absolute http:// or https:// URL",
+            )),
+        }
+    }
+
+    issues
 }
 
 fn default_ollama_base_url() -> String {
@@ -561,14 +693,6 @@ fn sanitize_inject(cfg: Config) -> Config {
         c.inject_max_link_hops = 5;
     }
 
-    if c.inject_select_model.trim().is_empty() {
-        c.inject_select_model = default_inject_select_model();
-    }
-
-    if c.inject_compile_model.trim().is_empty() {
-        c.inject_compile_model = default_inject_compile_model();
-    }
-
     if c.inject_min_prompt_words == 0 {
         c.inject_min_prompt_words = 1;
     } else if c.inject_min_prompt_words > 20 {
@@ -793,4 +917,63 @@ pub fn project_db_path(root: &std::path::Path) -> PathBuf {
 
 pub fn project_pid_path(root: &std::path::Path) -> PathBuf {
     project_context_dir(root).join("daemon.pid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ConfigScope, validate_config};
+
+    fn codes(cfg: &Config, scope: ConfigScope) -> Vec<&'static str> {
+        validate_config(cfg, scope)
+            .into_iter()
+            .map(|issue| issue.code)
+            .collect()
+    }
+
+    #[test]
+    fn inject_validation_rejects_missing_openrouter_key() {
+        let cfg = Config::default();
+        assert!(codes(&cfg, ConfigScope::Inject).contains(&"missing_openrouter_key"));
+    }
+
+    #[test]
+    fn inject_validation_accepts_keyed_openrouter_roles() {
+        let mut cfg = Config::default();
+        cfg.openrouter_api_key = Some("test-key".to_string());
+        assert!(validate_config(&cfg, ConfigScope::Inject).is_empty());
+    }
+
+    #[test]
+    fn validation_rejects_bad_provider_and_ollama_url() {
+        let mut cfg = Config::default();
+        cfg.inject_select_model = "unknown:model".to_string();
+        cfg.inject_compile_model = "ollama:glm:cloud".to_string();
+        cfg.ollama_base_url = "localhost:11434".to_string();
+        let issues = validate_config(&cfg, ConfigScope::Inject);
+        assert!(issues.iter().any(|issue| issue.code == "unsupported_provider"));
+        assert!(issues.iter().any(|issue| issue.code == "invalid_ollama_url"));
+    }
+
+    #[test]
+    fn empty_capture_triage_is_an_intentional_disable() {
+        let mut cfg = Config::default();
+        cfg.openrouter_api_key = Some("test-key".to_string());
+        cfg.capture_triage_model.clear();
+        assert!(
+            validate_config(&cfg, ConfigScope::All)
+                .iter()
+                .all(|issue| issue.field != "capture_triage_model")
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_hide_empty_inject_model() {
+        let mut cfg = Config::default();
+        cfg.openrouter_api_key = Some("test-key".to_string());
+        cfg.inject_select_model.clear();
+        let issues = validate_config(&super::sanitize_inject(cfg), ConfigScope::Inject);
+        assert!(issues.iter().any(|issue| {
+            issue.field == "inject_select_model" && issue.code == "empty_model"
+        }));
+    }
 }

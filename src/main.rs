@@ -46,6 +46,7 @@ mod embed_sidecar;
 mod events;
 mod git_hooks;
 mod harness;
+mod health;
 mod inject;
 mod ledger;
 mod openrouter;
@@ -161,6 +162,14 @@ enum Commands {
     /// Interactive TUI for configuring LLM models for each role.
     /// Fetches available models from OpenRouter and/or Ollama automatically.
     Configure,
+
+    /// Validate configured providers, credentials, endpoints, and model availability.
+    /// Uses metadata-only checks; never performs a generation.
+    Doctor {
+        /// Emit one machine-readable health report.
+        #[arg(long)]
+        json: bool,
+    },
 
 
     /// Test OpenRouter connectivity and print the raw response (status + headers + body).
@@ -866,6 +875,10 @@ fn main() -> Result<()> {
 
         Commands::Configure => {
             crate::configure::run_configure()?;
+        }
+
+        Commands::Doctor { json } => {
+            crate::health::run_doctor(json)?;
         }
 
         Commands::Hook { action } => match action {

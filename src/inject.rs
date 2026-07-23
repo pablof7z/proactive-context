@@ -1,4 +1,7 @@
-use crate::config::{load_config, normalize_path, project_context_dir, project_db_path, resolve_project_root};
+use crate::config::{
+    ConfigScope, load_config, normalize_path, project_context_dir, project_db_path,
+    resolve_project_root, validate_config,
+};
 use crate::content_kind::{ContentKind, Currentness};
 use crate::events::{init_context, log_event, truncate};
 use crate::artifact_safety::{SourceDocument, escape_markup_text, render_untrusted_sources, validate_compiled_artifact};
@@ -7,7 +10,7 @@ use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::query::{run_query, QueryResult};
 use crate::transcript::parse_transcript;
 use crate::wiki::{self, guide_path, IndexRow};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rig_core::client::CompletionClient;
 use rig_core::completion::Prompt;
@@ -391,54 +394,13 @@ fn warn_missing_session_id(session_id: &str) {
     }
 }
 
-// ─── Fallback renderer ────────────────────────────────────────────────────────
+// ─── Context renderer ─────────────────────────────────────────────────────────
 
 fn wrap_context_reminder(project_name: &str, body: &str) -> String {
     format!(
         "<system-reminder>\nRelevant project context ({}):\n\n{}\n</system-reminder>",
         escape_markup_text(project_name), escape_markup_text(body)
     )
-}
-
-fn render_raw_body(hits: &[QueryResult], noun_block: Option<&str>) -> String {
-    let mut out = String::new();
-    // The noun primer is LLM-free, so it rides along even in the raw-fallback paths (no key / compile
-    // error / timeout) — placed first as the highest-signal context.
-    if let Some(block) = noun_block {
-        let block = block.trim();
-        if !block.is_empty() {
-            out.push_str(block);
-            out.push_str("\n\n");
-        }
-    }
-    for h in hits {
-        out.push_str(&format!(
-            "--- {} (chunk {}, score {:.2}) ---\n{}\n\n",
-            h.path, h.chunk_index, h.score, h.content
-        ));
-    }
-    out.trim_end().to_string()
-}
-
-fn commit_raw_fallback(
-    root: &Path,
-    session_id: &str,
-    project_basename: &str,
-    hits: &[QueryResult],
-    noun: &crate::nouns::NounResolution,
-) -> Option<(String, usize)> {
-    let body = render_raw_body(hits, noun.block.as_deref());
-    if body.trim().is_empty() {
-        return None;
-    }
-    crate::ledger::append(root, session_id, Some("Fallback context"), &body);
-    if !noun.primed_slugs.is_empty() {
-        crate::nouns::record_primed(&project_context_dir(root), session_id, &noun.primed_slugs);
-        log_noun_primer(noun, false);
-    }
-    let out = wrap_context_reminder(project_basename, &body);
-    let n = out.len();
-    Some((out, n))
 }
 
 // ─── Activation gate ─────────────────────────────────────────────────────────
@@ -547,8 +509,84 @@ fn config_error_payload(error: &str) -> serde_json::Value {
     serde_json::json!({
         "outcome": "empty",
         "reason": "config_error",
+        "out_chars": 0,
         "error": truncate(error, 200)
     })
+}
+
+fn config_validation_payload(issues: &[crate::config::ConfigIssue]) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "empty",
+        "reason": "invalid_config",
+        "out_chars": 0,
+        "issues": issues
+    })
+}
+
+fn generation_failure_payload(
+    reason: &str,
+    stage: &str,
+    error: &str,
+    hits: usize,
+    prompt_preview: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "empty",
+        "reason": reason,
+        "failure_stage": stage,
+        "error": truncate(error, 200),
+        "hits": hits,
+        "out_chars": 0,
+        "prompt_preview": prompt_preview
+    })
+}
+
+fn classify_generation_failure(error: &anyhow::Error) -> (&'static str, &'static str) {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    let stage = if message.contains("select") {
+        "select"
+    } else if message.contains("compile") {
+        "compile"
+    } else {
+        "provider"
+    };
+    let reason = if message.contains("malformed_selection_response")
+        || message.contains("malformed_compile_response")
+    {
+        "malformed_response"
+    } else if message.contains("401")
+        || message.contains("403")
+        || message.contains("unauthorized")
+        || message.contains("forbidden")
+        || message.contains("authentication")
+        || message.contains("api key")
+    {
+        "provider_auth"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "provider_timeout"
+    } else {
+        "provider_error"
+    };
+    (reason, stage)
+}
+
+fn fail_closed_generation(
+    out: &OutMode,
+    elapsed_ms: u64,
+    reason: &str,
+    stage: &str,
+    error: &str,
+    hits: usize,
+    prompt_preview: &str,
+) {
+    let payload = generation_failure_payload(reason, stage, error, hits, prompt_preview);
+    log_event("inject.failure", Some(elapsed_ms), payload.clone());
+    log_event("inject.done", Some(elapsed_ms), payload);
+    emit(
+        out,
+        None,
+        &format!("inject [{elapsed_ms}ms] | {stage} failed closed ({reason})"),
+    );
 }
 
 /// Called when no project DB exists. Starts the daemon if >5 indexable files exist.
@@ -679,6 +717,30 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
     };
 
+    let config_issues = validate_config(&cfg, ConfigScope::Inject);
+    if !config_issues.is_empty() {
+        let payload = config_validation_payload(&config_issues);
+        log_event("inject.failure", Some(start.elapsed().as_millis() as u64), serde_json::json!({
+            "failure_stage": "config",
+            "reason": "invalid_config",
+            "issues": config_issues
+        }));
+        log_event(
+            "inject.done",
+            Some(start.elapsed().as_millis() as u64),
+            payload,
+        );
+        emit(
+            &out_mode,
+            None,
+            &format!(
+                "inject [{}ms] | invalid provider configuration",
+                start.elapsed().as_millis()
+            ),
+        );
+        return Ok(());
+    }
+
     let context_turns_used = cfg.inject_context_turns;
 
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
@@ -791,57 +853,27 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
     };
 
-    // Prepare project label used by fallback/noun reminder rendering.
+    // Prepare project label used by noun and compiled reminder rendering.
     let project_basename = project_basename(&project);
 
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
     let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
     let needs_key = select_spec.needs_openrouter_key() || compile_spec.needs_openrouter_key();
 
-    // Guard: no API key when OpenRouter models are configured → emit fallback
+    // Defense in depth: startup validation above catches this before retrieval,
+    // but never raw-inject if configuration changes underneath a long-lived caller.
     let api_key = cfg.openrouter_api_key.clone().unwrap_or_default();
-    if needs_key && api_key.is_empty() {
-        if hits.is_empty() {
-            // The noun primer is LLM-free, so it still fires without an API key.
-            if let Some((out, out_chars)) =
-                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
-            {
-                log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                    "outcome": "noun_primer",
-                    "hits": 0,
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&out), &format!("inject [{}ms] | 0 hits | no API key → noun primer {}c",
-                    start.elapsed().as_millis(), out_chars));
-                return Ok(());
-            }
-            log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                "outcome": "empty",
-                "hits": 0,
-                "out_chars": 0,
-                "prompt_preview": &prompt_preview
-            }));
-            emit(&out_mode, None, &format!("inject [{}ms] | 0 hits | no API key — nothing injected",
-                start.elapsed().as_millis()));
-            return Ok(());
-        }
-        let elapsed_ms = start.elapsed().as_millis();
-        let Some((fallback_block, out_chars)) =
-            commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
-        else {
-            return Ok(());
-        };
-        log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-            "outcome": "fallback",
-            "reason": "no_api_key",
-            "hits": hits.len(),
-            "out_chars": out_chars,
-            "prompt_preview": &prompt_preview
-        }));
-        emit(&out_mode, Some(&fallback_block), &format!(
-            "inject [{}ms] | {} hits | fallback (no API key) | injected {}c",
-            elapsed_ms, hits.len(), out_chars));
+    if needs_key && api_key.trim().is_empty() {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        fail_closed_generation(
+            &out_mode,
+            elapsed_ms,
+            "provider_auth",
+            "config",
+            "OpenRouter key is missing",
+            hits.len(),
+            &prompt_preview,
+        );
         return Ok(());
     }
 
@@ -865,35 +897,16 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     let rt = match Runtime::new() {
         Ok(r) => r,
-        Err(_) => {
-            let elapsed_ms = start.elapsed().as_millis();
-            if !hits.is_empty() {
-                if let Some((fallback_block, out_chars)) =
-                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
-                {
-                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                        "outcome": "fallback",
-                        "reason": "runtime_unavailable",
-                        "hits": hits.len(),
-                        "out_chars": out_chars,
-                        "prompt_preview": &prompt_preview
-                    }));
-                    emit(&out_mode, Some(&fallback_block), &format!(
-                        "inject [{}ms] | {} hits | runtime unavailable → fallback {}c",
-                        elapsed_ms, hits.len(), out_chars));
-                }
-            } else if let Some((out, out_chars)) =
-                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
-            {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "noun_primer",
-                    "reason": "runtime_unavailable",
-                    "hits": 0,
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&out), "inject | runtime unavailable → noun primer");
-            }
+        Err(error) => {
+            fail_closed_generation(
+                &out_mode,
+                start.elapsed().as_millis() as u64,
+                "runtime_unavailable",
+                "runtime",
+                &error.to_string(),
+                hits.len(),
+                &prompt_preview,
+            );
             return Ok(());
         }
     };
@@ -1058,91 +1071,28 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
 
         Ok(Err(e)) => {
-            let elapsed_ms = start.elapsed().as_millis();
-            log_event("error", None, serde_json::json!({
-                "stage": "generate.briefing",
-                "message": truncate(&format!("{}", e), 300)
-            }));
-            if !hits.is_empty() {
-                let Some((fallback_block, out_chars)) =
-                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
-                else {
-                    return Ok(());
-                };
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "fallback",
-                    "reason": "compile_error",
-                    "hits": hits.len(),
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&fallback_block), &format!(
-                    "inject [{}ms] | {} hits | error: {} | fallback {}c",
-                    elapsed_ms, hits.len(), truncate(&format!("{}", e), 120),
-                    out_chars));
-            } else if let Some((out, out_chars)) =
-                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
-            {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "noun_primer",
-                    "hits": 0,
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&out), &format!(
-                    "inject [{}ms] | 0 hits | compile error → noun primer {}c", elapsed_ms, out_chars));
-            } else {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "empty",
-                    "hits": 0,
-                    "out_chars": 0,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, None, &format!(
-                    "inject [{}ms] | 0 hits | error: {}",
-                    elapsed_ms, truncate(&format!("{}", e), 120)));
-            }
+            let (reason, stage) = classify_generation_failure(&e);
+            fail_closed_generation(
+                &out_mode,
+                start.elapsed().as_millis() as u64,
+                reason,
+                stage,
+                &format!("{e:#}"),
+                hits.len(),
+                &prompt_preview,
+            );
         }
 
         Err(_timeout) => {
-            let elapsed_ms = start.elapsed().as_millis();
-            if !hits.is_empty() {
-                let Some((fallback_block, out_chars)) =
-                    commit_raw_fallback(&root, &input.session_id, &project_basename, &hits, &noun_resolution)
-                else {
-                    return Ok(());
-                };
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "fallback",
-                    "reason": "timeout",
-                    "hits": hits.len(),
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&fallback_block), &format!(
-                    "inject [{}ms] | {} hits | timeout → fallback {}c",
-                    elapsed_ms, hits.len(), out_chars));
-            } else if let Some((out, out_chars)) =
-                commit_noun_only(&root, &input.session_id, &project_basename, &noun_resolution)
-            {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "noun_primer",
-                    "hits": 0,
-                    "out_chars": out_chars,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, Some(&out), &format!(
-                    "inject [{}ms] | 0 hits | timeout → noun primer {}c", elapsed_ms, out_chars));
-            } else {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "empty",
-                    "hits": 0,
-                    "out_chars": 0,
-                    "prompt_preview": &prompt_preview
-                }));
-                emit(&out_mode, None, &format!(
-                    "inject [{}ms] | 0 hits | timeout — nothing injected", elapsed_ms));
-            }
+            fail_closed_generation(
+                &out_mode,
+                start.elapsed().as_millis() as u64,
+                "provider_timeout",
+                "generate",
+                "generation deadline exceeded",
+                hits.len(),
+                &prompt_preview,
+            );
         }
     }
 
@@ -1724,7 +1674,10 @@ async fn wiki_navigate_and_compile(
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &select_spec.model, &msgs, 300, 1).await?.content
+            chat_once(&client, api_key, &select_spec.model, &msgs, 300, 1)
+                .await
+                .context("select provider request failed")?
+                .content
         }
         Provider::Ollama => {
             let t0 = std::time::Instant::now();
@@ -1734,7 +1687,9 @@ async fn wiki_navigate_and_compile(
                 .max_tokens(300u64)
                 .additional_params(serde_json::json!({"max_tokens": 300}))
                 .build()
-                .prompt(current_prompt).await?;
+                .prompt(current_prompt)
+                .await
+                .context("select provider request failed")?;
             crate::openrouter::record_external_turn(
                 &select_spec.model, 1, &preamble, current_prompt, &resp,
                 t0.elapsed().as_millis() as u64,
@@ -1749,7 +1704,10 @@ async fn wiki_navigate_and_compile(
             let reply = tokio::task::spawn_blocking(move || {
                 crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
                     std::time::Duration::from_secs(25))
-            }).await??;
+            })
+            .await
+            .context("select provider task failed")?
+            .context("select provider request failed")?;
             crate::openrouter::record_external_turn(
                 &select_spec.model, 1, &preamble, current_prompt, &reply.content,
                 t0.elapsed().as_millis() as u64,
@@ -1774,7 +1732,7 @@ async fn wiki_navigate_and_compile(
 
     // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
     let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
-    let selected = parse_selected_keys(sel, &valid, max_guides);
+    let selected = parse_selection_decision(sel, &valid, max_guides)?;
 
     if selected.is_empty() {
         return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
@@ -1823,6 +1781,32 @@ fn parse_selected_keys(selection: &str, valid: &HashSet<&str>, max_guides: usize
         .take(max_guides)
         .map(|s| s.to_string())
         .collect()
+}
+
+fn is_nothing_relevant_line(line: &str) -> bool {
+    line.trim()
+        .trim_start_matches(['-', '*', '•', ' '])
+        .trim_matches('*')
+        .trim()
+        .eq_ignore_ascii_case("NOTHING_RELEVANT")
+}
+
+fn parse_selection_decision(
+    selection: &str,
+    valid: &HashSet<&str>,
+    max_guides: usize,
+) -> Result<Vec<String>> {
+    let selected = parse_selected_keys(selection, valid, max_guides);
+    if !selected.is_empty() {
+        return Ok(selected);
+    }
+    if selection.lines().any(is_nothing_relevant_line) {
+        return Ok(Vec::new());
+    }
+    anyhow::bail!(
+        "malformed_selection_response: expected at least one catalog key or NOTHING_RELEVANT; got `{}`",
+        truncate(selection, 160)
+    )
 }
 
 /// Eval-only entry point: run the FULL inject path (build_catalog + SELECT + compile) against a
@@ -1941,7 +1925,10 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
         Provider::OpenRouter => {
             let client = make_client();
             let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &spec.model, &msgs, max_tokens as u32, 2).await?.content
+            chat_once(&client, api_key, &spec.model, &msgs, max_tokens as u32, 2)
+                .await
+                .context("compile provider request failed")?
+                .content
         }
         Provider::Ollama => {
             let t0 = std::time::Instant::now();
@@ -1951,7 +1938,9 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
                 .max_tokens(max_tokens as u64)
                 .additional_params(serde_json::json!({"max_tokens": max_tokens}))
                 .build()
-                .prompt(current_prompt).await?;
+                .prompt(current_prompt)
+                .await
+                .context("compile provider request failed")?;
             crate::openrouter::record_external_turn(
                 &spec.model, 2, &preamble, current_prompt, &resp,
                 t0.elapsed().as_millis() as u64,
@@ -1966,7 +1955,10 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
             let reply = tokio::task::spawn_blocking(move || {
                 crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
                     std::time::Duration::from_secs(25))
-            }).await??;
+            })
+            .await
+            .context("compile provider task failed")?
+            .context("compile provider request failed")?;
             crate::openrouter::record_external_turn(
                 &spec.model, 2, &preamble, current_prompt, &reply.content,
                 t0.elapsed().as_millis() as u64,
@@ -1975,13 +1967,9 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
         }
     };
 
-    // The synthesized briefing is the output as-is. Its leading `TITLE:` line is stripped by the
-    // caller for the status bar; an empty body or `TITLE: none` degrades to a no-inject outcome.
-    let resp = response.trim();
-    if resp.is_empty() {
-        return Ok("TITLE: none".to_string());
-    }
-    validate_compiled_artifact(resp, &source_documents)?;
+    // The compiler response is a protocol artifact, not arbitrary prose. Reject
+    // malformed structure or provenance instead of injecting it.
+    let resp = validate_compile_response(&response, &source_documents)?;
 
     // If the synthesis carried any [^id] markers (copied from source prose), prepend the
     // citation-log preamble — but keep the leading TITLE: line first so the status bar reads it.
@@ -2000,6 +1988,19 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
     }
 
     Ok(resp.to_string())
+}
+
+fn validate_compile_response<'a>(
+    response: &'a str,
+    source_documents: &[SourceDocument<'_>],
+) -> Result<&'a str> {
+    let response = response.trim();
+    if response.is_empty() {
+        anyhow::bail!("malformed_compile_response: response was empty");
+    }
+    validate_compiled_artifact(response, source_documents)
+        .map_err(|error| anyhow::anyhow!("malformed_compile_response: {error}"))?;
+    Ok(response)
 }
 
 /// Render raw vector hits verbatim as a librarian briefing (used when the wiki is empty
@@ -2130,10 +2131,11 @@ fn format_guides(guides: &[String]) -> String {
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
     use super::{
-        build_catalog, commit_raw_fallback, config_error_payload, missing_session_id_warning_payload,
-        no_index_payload, read_catalog_content, source_label_for_key, EPISODE_KEY_PREFIX,
+        build_catalog, classify_generation_failure, config_error_payload,
+        generation_failure_payload, missing_session_id_warning_payload, no_index_payload,
+        parse_selection_decision, read_catalog_content, source_label_for_key,
+        validate_compile_response, EPISODE_KEY_PREFIX,
     };
-    use crate::config::project_context_dir;
     use std::collections::HashSet;
     use std::fs;
 
@@ -2410,6 +2412,61 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
     }
 
     #[test]
+    fn selection_requires_an_explicit_protocol_decision() {
+        let valid: HashSet<&str> = ["oauth-guide"].into_iter().collect();
+        assert_eq!(
+            parse_selection_decision("QUERY: OAuth?\nNOTHING_RELEVANT", &valid, 8).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_selection_decision("oauth-guide", &valid, 8).unwrap(),
+            vec!["oauth-guide"]
+        );
+        let error = parse_selection_decision("I cannot decide.", &valid, 8).unwrap_err();
+        assert!(error.to_string().contains("malformed_selection_response"));
+    }
+
+    #[test]
+    fn compile_response_requires_title_protocol_and_nonempty_body() {
+        let sources = [crate::artifact_safety::SourceDocument {
+            label: "./docs/guide.md",
+            content: "PKCE is required.",
+        }];
+        assert_eq!(
+            validate_compile_response(
+                "TITLE: OAuth Requirements\nUse PKCE. (./docs/guide.md:1)",
+                &sources,
+            )
+            .unwrap(),
+            "TITLE: OAuth Requirements\nUse PKCE. (./docs/guide.md:1)"
+        );
+        assert!(validate_compile_response("TITLE: none", &sources).is_ok());
+        assert!(validate_compile_response("Use PKCE.", &sources).is_err());
+        assert!(validate_compile_response("TITLE: OAuth Requirements", &sources).is_err());
+        assert!(validate_compile_response("", &sources).is_err());
+    }
+
+    #[test]
+    fn generation_failure_diagnostics_are_empty_and_classified() {
+        let malformed = anyhow::anyhow!(
+            "malformed_selection_response: expected catalog key"
+        );
+        assert_eq!(
+            classify_generation_failure(&malformed),
+            ("malformed_response", "select")
+        );
+        let auth = anyhow::anyhow!("compile provider request failed: OpenRouter 401");
+        assert_eq!(classify_generation_failure(&auth), ("provider_auth", "compile"));
+
+        let payload =
+            generation_failure_payload("provider_timeout", "generate", "deadline", 4, "prompt");
+        assert_eq!(payload["outcome"], "empty");
+        assert_eq!(payload["out_chars"], 0);
+        assert_eq!(payload["reason"], "provider_timeout");
+        assert_eq!(payload["hits"], 4);
+    }
+
+    #[test]
     fn no_index_payload_is_an_observable_empty_inject_outcome() {
         let payload = no_index_payload(7, true);
 
@@ -2442,56 +2499,6 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             .expect("warning should list disabled behaviors");
         assert!(disabled.iter().any(|v| v.as_str() == Some("session_ledger_dedup")));
         assert!(disabled.iter().any(|v| v.as_str() == Some("noun_priming_dedup")));
-    }
-
-    #[test]
-    fn raw_fallback_commit_records_briefing_and_primed_ledgers() {
-        let _g = VARIANT_ENV_LOCK.lock().unwrap();
-        let _pc_home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
-        let pc_home = tempfile::tempdir().unwrap();
-        let _pc_home = crate::config::ScopedPcHome::set(pc_home.path());
-
-        let root_dir = tempfile::tempdir().unwrap();
-        let root = root_dir.path();
-        let init = std::process::Command::new("git")
-            .arg("init")
-            .arg("--quiet")
-            .arg("--initial-branch=master")
-            .arg(root)
-            .status()
-            .unwrap();
-        assert!(init.success());
-        let session = format!("fallback-ledger-{}", std::process::id());
-        let hits = vec![crate::query::QueryResult {
-            path: "docs/spec.md".to_string(),
-            chunk_index: 2,
-            content: "Raw chunk body from fallback retrieval.".to_string(),
-            content_hash: "hash".to_string(),
-            score: 0.82,
-        }];
-        let noun = crate::nouns::NounResolution {
-            block: Some("Purple Pages is the local publish surface.".to_string()),
-            primed_slugs: vec!["purple-pages".to_string()],
-            matched: Vec::new(),
-            level: crate::nouns::PrimerLevel::Facts,
-            direct_query: true,
-        };
-
-        let (out, out_chars) =
-            commit_raw_fallback(root, &session, "demo", &hits, &noun).expect("fallback body");
-
-        assert_eq!(out_chars, out.len());
-        assert!(out.contains("<system-reminder>"));
-        assert!(out.contains("Purple Pages is the local publish surface."));
-        assert!(out.contains("Raw chunk body from fallback retrieval."));
-
-        let ledger = crate::ledger::read_recent(root, &session, 8, 3000);
-        assert!(ledger.contains("[Fallback context]"), "got: {ledger}");
-        assert!(ledger.contains("Purple Pages is the local publish surface."), "got: {ledger}");
-        assert!(ledger.contains("Raw chunk body from fallback retrieval."), "got: {ledger}");
-
-        let primed = crate::nouns::read_primed(&project_context_dir(root), &session);
-        assert!(primed.contains("purple-pages"), "got: {primed:?}");
     }
 
     // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────

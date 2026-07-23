@@ -11,8 +11,10 @@ use std::time::Duration;
 use anyhow::Result;
 use inquire::{InquireError, Select, Text};
 
-use crate::config::{load_config, save_config, Config};
-use crate::provider::Provider;
+use crate::config::{
+    Config, ConfigIssue, ConfigScope, load_config, save_config, validate_config,
+};
+use crate::provider::{ModelSpec, Provider, executable_in_path};
 
 // ─── Role descriptors ─────────────────────────────────────────────────────────
 
@@ -195,20 +197,22 @@ pub fn fetch_models_async(
     std::thread::spawn(move || {
         let mut all: Vec<ModelEntry> = Vec::new();
 
-        // ── Claude CLI (static entries — always available if `claude` is in PATH) ──
-        for (model, display, ctx_len) in [
-            ("opus", "Claude Opus (latest)", Some(1_000_000u64)),
-            ("sonnet", "Claude Sonnet (latest)", Some(1_000_000u64)),
-            ("haiku", "Claude Haiku (latest)", Some(1_000_000u64)),
-        ] {
-            all.push(ModelEntry {
-                spec: format!("claude-cli:{model}"),
-                display: format!("claude-cli · {display}"),
-                ctx_len,
-                price_prompt: None,
-                size_gb: None,
-                provider: Provider::ClaudeCli,
-            });
+        // ── Claude CLI (static aliases, only when the executable is usable) ──
+        if executable_in_path("claude").is_some() {
+            for (model, display, ctx_len) in [
+                ("opus", "Claude Opus (latest)", Some(1_000_000u64)),
+                ("sonnet", "Claude Sonnet (latest)", Some(1_000_000u64)),
+                ("haiku", "Claude Haiku (latest)", Some(1_000_000u64)),
+            ] {
+                all.push(ModelEntry {
+                    spec: format!("claude-cli:{model}"),
+                    display: format!("claude-cli · {display}"),
+                    ctx_len,
+                    price_prompt: None,
+                    size_gb: None,
+                    provider: Provider::ClaudeCli,
+                });
+            }
         }
 
         // ── OpenRouter ────────────────────────────────────────────────────────
@@ -240,11 +244,19 @@ fn fetch_openrouter_models(api_key: &str) -> Result<Vec<ModelEntry>> {
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp: serde_json::Value = client
+    let response = client
         .get("https://openrouter.ai/api/v1/models")
         .bearer_auth(api_key)
-        .send()?
-        .json()?;
+        .send()?;
+    let status = response.status();
+    let resp: serde_json::Value = response.json()?;
+    if !status.is_success() {
+        let detail = resp
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("request rejected");
+        anyhow::bail!("{} — {}", status, detail);
+    }
 
     let mut entries = Vec::new();
     if let Some(data) = resp["data"].as_array() {
@@ -375,7 +387,64 @@ fn fetch_ollama_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<Mode
     }
 
     entries.sort_by(|a, b| a.spec.cmp(&b.spec));
+    if entries.is_empty() {
+        anyhow::bail!("no models available at configured or local Ollama endpoint");
+    }
     Ok(entries)
+}
+
+fn configured_role_specs(cfg: &Config) -> Vec<(&'static str, &str, bool)> {
+    vec![
+        ("inject_select_model", cfg.inject_select_model.as_str(), false),
+        ("inject_compile_model", cfg.inject_compile_model.as_str(), false),
+        ("capture_model", cfg.capture_model.as_str(), false),
+        (
+            "capture_triage_model",
+            cfg.capture_triage_model.as_str(),
+            true,
+        ),
+        ("recall_gate_model", cfg.recall_gate_model.as_str(), false),
+        ("recall_answer_model", cfg.recall_answer_model.as_str(), false),
+    ]
+}
+
+fn canonical_spec(spec: &ModelSpec) -> String {
+    match spec.provider {
+        Provider::OpenRouter => format!("openrouter:{}", spec.model),
+        Provider::Ollama => format!("ollama:{}", spec.model),
+        Provider::ClaudeCli => format!("claude-cli:{}", spec.model),
+    }
+}
+
+fn validate_model_inventory(cfg: &Config, models: &[ModelEntry]) -> Vec<ConfigIssue> {
+    let available = models
+        .iter()
+        .map(|model| model.spec.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    configured_role_specs(cfg)
+        .into_iter()
+        .filter(|(_, raw, allow_empty)| !*allow_empty || !raw.trim().is_empty())
+        .filter_map(|(field, raw, _)| {
+            let spec = ModelSpec::parse_checked(raw).ok()?;
+            let canonical = canonical_spec(&spec);
+            (!available.contains(canonical.as_str())).then(|| ConfigIssue {
+                code: "model_unavailable",
+                field,
+                message: format!(
+                    "{} model `{}` is not available from the configured provider",
+                    spec.provider_name(),
+                    spec.model
+                ),
+            })
+        })
+        .collect()
+}
+
+fn print_validation_issues(issues: &[ConfigIssue]) {
+    eprintln!("Configuration was not saved:");
+    for issue in issues {
+        eprintln!("  - {} [{}]: {}", issue.field, issue.code, issue.message);
+    }
 }
 
 // ─── Interactive menus ────────────────────────────────────────────────────────
@@ -539,6 +608,12 @@ pub fn run_configure() -> Result<()> {
             2 => run_section("Recall", RECALL_ROLES, &mut cfg, &mut dirty, &models)?,
             3 => { /* divider — re-show the menu */ }
             4 => {
+                let mut issues = validate_config(&cfg, ConfigScope::All);
+                issues.extend(validate_model_inventory(&cfg, &models));
+                if !issues.is_empty() {
+                    print_validation_issues(&issues);
+                    continue;
+                }
                 save_config(&cfg)?;
                 println!("✓ Config saved.");
                 return Ok(());
@@ -549,5 +624,58 @@ pub fn run_configure() -> Result<()> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelEntry, validate_model_inventory};
+    use crate::config::Config;
+    use crate::provider::Provider;
+
+    fn entry(spec: &str, provider: Provider) -> ModelEntry {
+        ModelEntry {
+            spec: spec.to_string(),
+            display: spec.to_string(),
+            ctx_len: None,
+            price_prompt: None,
+            size_gb: None,
+            provider,
+        }
+    }
+
+    #[test]
+    fn inventory_validation_normalizes_legacy_openrouter_specs() {
+        let mut cfg = Config::default();
+        cfg.capture_triage_model.clear();
+        let models = vec![
+            entry(
+                "openrouter:anthropic/claude-haiku-4-5",
+                Provider::OpenRouter,
+            ),
+            entry(
+                "openrouter:anthropic/claude-sonnet-4-6",
+                Provider::OpenRouter,
+            ),
+            entry(
+                "openrouter:deepseek/deepseek-v4-flash",
+                Provider::OpenRouter,
+            ),
+            entry(
+                "openrouter:google/gemini-flash-1.5",
+                Provider::OpenRouter,
+            ),
+        ];
+        assert!(validate_model_inventory(&cfg, &models).is_empty());
+    }
+
+    #[test]
+    fn inventory_validation_reports_missing_selected_model() {
+        let mut cfg = Config::default();
+        cfg.inject_select_model = "ollama:not-installed".to_string();
+        let issues = validate_model_inventory(&cfg, &[]);
+        assert!(issues.iter().any(|issue| {
+            issue.field == "inject_select_model" && issue.code == "model_unavailable"
+        }));
     }
 }
