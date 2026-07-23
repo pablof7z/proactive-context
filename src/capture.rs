@@ -3554,9 +3554,13 @@ pub fn run_deferred_capture(capture_id: &str) -> Result<()> {
 }
 
 /// Retry durable inbox entries whose debounce/backoff deadline has elapsed.
-/// The daemon calls this routinely; each worker is detached and the inbox entry
-/// remains until its immutable capture commit succeeds.
-pub fn spawn_due_inbox_captures(store: &crate::project_store::ProjectStore) -> Result<usize> {
+/// The daemon calls this routinely and retains the returned child handles so
+/// completed workers can be waited instead of accumulating as zombies. The
+/// inbox entry remains until its immutable capture commit succeeds.
+pub fn spawn_due_inbox_captures(
+    store: &crate::project_store::ProjectStore,
+    workers: &mut Vec<std::process::Child>,
+) -> Result<usize> {
     let now = unix_now_secs();
     let ids = crate::capture_store::due_capture_ids(store, now);
     if ids.is_empty() {
@@ -3580,7 +3584,12 @@ pub fn spawn_due_inbox_captures(store: &crate::project_store::ProjectStore) -> R
             .stderr(std::process::Stdio::null())
             .spawn();
         match child {
-            Ok(_) => spawned += 1,
+            Ok(child) => {
+                // Transfer ownership immediately. If a later inbox entry fails,
+                // already-spawned workers must still remain available to wait.
+                workers.push(child);
+                spawned += 1;
+            }
             Err(e) => {
                 if let Ok(queued) = crate::capture_store::load_inbox_capture(store, &capture_id) {
                     let _ = crate::capture_store::mark_attempt_failure(&queued, &e.to_string(), 15);
