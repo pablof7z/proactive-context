@@ -346,12 +346,9 @@ fn required_authority_label(
         ArtifactContext::Standard => {}
     }
 
-    if sources.iter().any(|source| {
-        source.currentness == Currentness::Current
-            && (source.kind != ContentKind::Claim || source.authority == Authority::Explicit)
-    }) {
-        return None;
-    }
+    // A safe current citation must never launder a weaker citation on the same
+    // claim. Evaluate every cited source and return the strongest warning any
+    // one of them requires.
     if sources
         .iter()
         .any(|source| source.currentness == Currentness::Proposed)
@@ -371,13 +368,14 @@ fn required_authority_label(
         return Some("HISTORICAL:");
     }
     if sources.iter().any(|source| {
-        source.currentness == Currentness::Unknown || source.authority == Authority::Unknown
+        source.currentness == Currentness::Unknown
+            || (source.kind == ContentKind::Claim && source.authority == Authority::Unknown)
     }) {
         return Some("UNVERIFIED:");
     }
     if sources
         .iter()
-        .any(|source| source.authority == Authority::Implicit)
+        .any(|source| source.kind == ContentKind::Claim && source.authority == Authority::Implicit)
     {
         return Some("AGENT-INFERRED:");
     }
@@ -663,7 +661,7 @@ STORED BACKGROUND: The stored architecture document says Postgres. (./docs/archi
     }
 
     #[test]
-    fn current_sources_outrank_historical_conflicts() {
+    fn current_sources_do_not_mask_historical_citations() {
         let history = SourceDocument::new("./docs/history.md", "The service used port 3000.")
             .with_metadata(
                 ContentKind::EpisodeCard,
@@ -694,8 +692,76 @@ The service used port 3000. (./docs/history.md:1)",
 The service now uses port 8080. (./docs/current.md:1) (./docs/history.md:1)",
                 &[history, current]
             ),
-            Ok(())
+            Err(ArtifactError::MissingAuthorityLabel {
+                line: 2,
+                required: "HISTORICAL:",
+            })
         );
+    }
+
+    #[test]
+    fn unrelated_current_citations_cannot_mask_weaker_authority() {
+        let current = SourceDocument::new("./docs/current.md", "Current corroboration.")
+            .with_metadata(
+                ContentKind::CurrentGuide,
+                Currentness::Current,
+                Authority::Explicit,
+            );
+        let weaker = [
+            (
+                SourceDocument::new("./claims/proposed.md", "A proposed change.").with_metadata(
+                    ContentKind::Claim,
+                    Currentness::Proposed,
+                    Authority::Explicit,
+                ),
+                "PROPOSED:",
+            ),
+            (
+                SourceDocument::new("./docs/superseded.md", "A replaced design.").with_metadata(
+                    ContentKind::CommittedMarkdown,
+                    Currentness::Superseded,
+                    Authority::Explicit,
+                ),
+                "SUPERSEDED:",
+            ),
+            (
+                SourceDocument::new("./docs/historical.md", "A historical result.").with_metadata(
+                    ContentKind::EpisodeCard,
+                    Currentness::Historical,
+                    Authority::Explicit,
+                ),
+                "HISTORICAL:",
+            ),
+            (
+                SourceDocument::new("./claims/unknown.md", "An unverified claim.").with_metadata(
+                    ContentKind::Claim,
+                    Currentness::Current,
+                    Authority::Unknown,
+                ),
+                "UNVERIFIED:",
+            ),
+            (
+                SourceDocument::new("./claims/inferred.md", "An inferred claim.").with_metadata(
+                    ContentKind::Claim,
+                    Currentness::Current,
+                    Authority::Implicit,
+                ),
+                "AGENT-INFERRED:",
+            ),
+        ];
+
+        for (weak, required) in weaker {
+            let artifact = format!(
+                "TITLE: Mixed Authority Claim\n\
+Mixed claim. (./docs/current.md:1) ({}:1)",
+                weak.label
+            );
+            assert_eq!(
+                validate_compiled_artifact(&artifact, &[current, weak]),
+                Err(ArtifactError::MissingAuthorityLabel { line: 2, required }),
+                "current citation masked {required}"
+            );
+        }
     }
 
     #[test]

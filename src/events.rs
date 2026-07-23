@@ -133,6 +133,30 @@ struct LogCfg {
 
 static LOG_CFG: OnceLock<LogCfg> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static LOGGING_ENABLED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedLoggingEnabled(Option<bool>);
+
+#[cfg(test)]
+impl ScopedLoggingEnabled {
+    pub(crate) fn set(enabled: bool) -> Self {
+        let previous = LOGGING_ENABLED_OVERRIDE.with(|slot| slot.replace(Some(enabled)));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedLoggingEnabled {
+    fn drop(&mut self) {
+        LOGGING_ENABLED_OVERRIDE.with(|slot| slot.set(self.0));
+    }
+}
+
 fn log_cfg() -> &'static LogCfg {
     LOG_CFG.get_or_init(|| {
         // Try to load from config; fall back to defaults on any error.
@@ -155,6 +179,10 @@ fn log_cfg() -> &'static LogCfg {
 /// Injection traces share the event-log switch so disabling logging cannot
 /// leave a second, unexpectedly persistent observability surface behind.
 pub fn logging_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = LOGGING_ENABLED_OVERRIDE.with(|slot| slot.get()) {
+        return enabled;
+    }
     log_cfg().enabled
 }
 
@@ -182,10 +210,10 @@ struct Event {
 
 /// Best-effort, non-blocking, all failures swallowed. Never returns Err, never panics.
 pub fn log_event(event: &str, lat_ms: Option<u64>, payload: Value) {
-    let cfg = log_cfg();
-    if !cfg.enabled {
+    if !logging_enabled() {
         return;
     }
+    let cfg = log_cfg();
     crate::inject_trace::record_event(event, lat_ms, &payload);
 
     // Read ambient context

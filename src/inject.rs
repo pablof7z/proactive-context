@@ -394,7 +394,14 @@ fn artifact_context_for_prompt(prompt: &str) -> ArtifactContext {
     .any(|marker| normalized.contains(marker))
         || (asks_for_observation && (words.contains("logs") || words.contains("status")))
         || (words.contains("running")
-            && (words.contains("is") || words.contains("currently") || words.contains("now")));
+            && (words.contains("is") || words.contains("currently") || words.contains("now")))
+        || (words.contains("did")
+            && [
+                "succeed", "succeeded", "pass", "passed", "fail", "failed", "finish",
+                "finished", "complete", "completed",
+            ]
+            .iter()
+            .any(|word| words.contains(word)));
     if asks_live_state {
         return ArtifactContext::LiveState;
     }
@@ -410,7 +417,13 @@ fn artifact_context_for_prompt(prompt: &str) -> ArtifactContext {
         || normalized.contains("i said not ")
         || normalized.contains("use this instead")
         || normalized.contains("i meant ")
-        || normalized.contains("forget that ");
+        || normalized.contains("forget that ")
+        || ["don't use ", "do not use "].iter().any(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .map(|replacement| replacement.contains(" use "))
+                .unwrap_or(false)
+        });
     if correction {
         ArtifactContext::ExplicitUserCorrection
     } else {
@@ -517,10 +530,10 @@ struct CommittedContext {
     body: String,
 }
 
-enum NounCommit {
-    Absent,
+enum ContextCommit {
     Delivered(CommittedContext),
     Exhausted,
+    LedgerUnavailable,
 }
 
 /// Deduplicate and durably commit context before exposing it to the harness.
@@ -530,7 +543,7 @@ fn commit_context(
     session_id: &str,
     title: Option<&str>,
     body: &str,
-) -> Option<CommittedContext> {
+) -> ContextCommit {
     match crate::ledger::commit_unique(root, session_id, title, body) {
         Ok(body) if body.is_empty() => {
             log_event(
@@ -541,9 +554,9 @@ fn commit_context(
                     "out_chars": 0
                 }),
             );
-            None
+            ContextCommit::Exhausted
         }
-        Ok(body) => Some(CommittedContext {
+        Ok(body) => ContextCommit::Delivered(CommittedContext {
             output: wrap_context_reminder(&body),
             body,
         }),
@@ -558,54 +571,35 @@ fn commit_context(
                     "out_chars": 0
                 }),
             );
-            None
+            ContextCommit::LedgerUnavailable
         }
     }
 }
 
-/// Commit a standalone noun-primer injection (no guide briefing). Every
-/// terminal arm that would otherwise inject nothing calls this first.
-fn commit_noun_only(
-    root: &Path,
-    session_id: &str,
-    noun: &crate::nouns::NounResolution,
-) -> NounCommit {
-    let Some(block) = noun.block.as_ref() else {
-        return NounCommit::Absent;
-    };
-    let Some(committed) = commit_context(root, session_id, None, block) else {
-        return NounCommit::Exhausted;
-    };
-    if !noun.primed_slugs.is_empty() {
-        crate::nouns::record_primed(&project_context_dir(root), session_id, &noun.primed_slugs);
-    }
-    log_noun_primer(noun, true);
-    NounCommit::Delivered(committed)
+fn ledger_unavailable_done_payload(hits: usize, prompt_preview: &str) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "empty",
+        "failure_stage": "ledger",
+        "reason": "ledger_unavailable",
+        "hits": hits,
+        "out_chars": 0,
+        "prompt_preview": crate::events::truncate(prompt_preview, 150)
+    })
 }
 
-/// Log the `inject.noun_primer` event (shared by the standalone path and the guide-briefing
-/// prepend path). `standalone` distinguishes "noun primer WAS the injection" from "noun primer
-/// rode along with a guide briefing".
-fn log_noun_primer(noun: &crate::nouns::NounResolution, standalone: bool) {
-    if noun.primed_slugs.is_empty() {
-        return;
-    }
-    log_event("inject.noun_primer", None, serde_json::json!({
-        "level": noun.level.as_str(),
-        "direct_query": noun.direct_query,
-        "standalone": standalone,
-        "primed": noun.primed_slugs,
-        "matched": noun.matched.iter().map(|m| serde_json::json!({
-            "slug": m.slug, "name": m.name, "status": m.status, "via": m.via
-        })).collect::<Vec<_>>(),
-    }));
+fn log_ledger_unavailable_done(elapsed_ms: u64, hits: usize, prompt_preview: &str) {
+    log_event(
+        "inject.done",
+        Some(elapsed_ms),
+        ledger_unavailable_done_payload(hits, prompt_preview),
+    );
 }
 
 fn missing_session_id_warning_payload() -> serde_json::Value {
     serde_json::json!({
         "warning": "missing_session_id",
-        "disabled": ["session_ledger_dedup", "noun_priming_dedup"],
-        "impact": "already-injected and already-primed ledgers cannot be keyed without session_id"
+        "disabled": ["session_ledger_dedup"],
+        "impact": "the already-injected ledger cannot be keyed without session_id"
     })
 }
 
@@ -613,28 +607,6 @@ fn warn_missing_session_id(session_id: &str) {
     if session_id.trim().is_empty() {
         log_event("inject.warning", None, missing_session_id_warning_payload());
     }
-}
-
-fn suppress_repeated_noun_primer(
-    mut noun: crate::nouns::NounResolution,
-    overlap: &crate::context_overlap::ContextOverlap,
-) -> crate::nouns::NounResolution {
-    let repeated = noun
-        .block
-        .as_deref()
-        .map(|block| overlap.contains_text(block))
-        .unwrap_or(false);
-    if repeated {
-        log_event("inject.overlap_noun", None, serde_json::json!({
-            "outcome": "suppressed",
-            "reason": "exact_normalized_containment",
-            "nouns": noun.primed_slugs.len()
-        }));
-        noun.block = None;
-        noun.primed_slugs.clear();
-        noun.matched.clear();
-    }
-    noun
 }
 
 // ─── Context renderer ─────────────────────────────────────────────────────────
@@ -1017,49 +989,6 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
     if input.prompt.trim().len() < 3 || should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words) {
-        // A terse prompt the word-count gate rejects (e.g. "what is purplepag.es?" — 3 words) is
-        // still worth the noun layer if it NAMES a known entity. The resolver is LLM-free and never
-        // touches the guide pipeline, so we run it with empty recent (cheap) and inject noun-only on
-        // a hit. Only bother for substantive-length prompts so "ok"/"yes" stay free.
-        if input.prompt.trim().len() >= 8 {
-            let noun = suppress_repeated_noun_primer(
-                crate::nouns::resolve_noun_primer(
-                    &wiki::wiki_dir(&root),
-                    &project_context_dir(&root),
-                    &input.session_id,
-                    &input.prompt,
-                    "",
-                ),
-                &overlap,
-            );
-            match commit_noun_only(&root, &input.session_id, &noun) {
-                NounCommit::Delivered(committed) => {
-                    let out_chars = committed.output.len();
-                    log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                        "outcome": "noun_primer",
-                        "reason": "trivial_prompt_entity",
-                        "hits": 0,
-                        "out_chars": out_chars,
-                        "prompt_preview": &crate::events::truncate(&input.prompt, 150)
-                    }));
-                    emit(&out_mode, Some(&committed.output), &format!(
-                        "inject [{}ms] | trivial prompt named entity → noun primer {}c",
-                        start.elapsed().as_millis(), out_chars));
-                    return Ok(());
-                }
-                NounCommit::Exhausted => {
-                    log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                        "outcome": "none",
-                        "reason": "already_delivered",
-                        "hits": 0,
-                        "out_chars": 0,
-                        "prompt_preview": &crate::events::truncate(&input.prompt, 150)
-                    }));
-                    return Ok(());
-                }
-                NounCommit::Absent => {}
-            }
-        }
         log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
             "outcome": "skipped",
             "reason": "trivial_prompt",
@@ -1096,21 +1025,6 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         "char_cap": cfg.inject_query_char_cap
     }));
 
-    // ── Noun resolver (peer to the guide pipeline) ─────────────────────────
-    // LLM-free, runs independently of guide selection so a pure-entity prompt ("what is X?")
-    // injects the captured definition even when no guide is relevant (the short-circuit case
-    // that previously injected nothing). Computed up front; consumed by every terminal arm.
-    let noun_resolution = suppress_repeated_noun_primer(
-        crate::nouns::resolve_noun_primer(
-            &wiki::wiki_dir(&root),
-            &project_context_dir(&root),
-            &input.session_id,
-            &input.prompt,
-            &recent,
-        ),
-        &overlap,
-    );
-
     // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
     // Over-fetch using the same factor already used by the cross-encoder path,
     // then spend the configured top-k budget across distinct source paths.
@@ -1127,35 +1041,9 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 "stage": "query.start",
                 "message": truncate(&format!("retrieval failed: {}", e), 300)
             }));
-            // Retrieval is dead, but the noun layer is LLM-free and independent — still inject it.
-            match commit_noun_only(&root, &input.session_id, &noun_resolution) {
-                NounCommit::Delivered(committed) => {
-                    let out_chars = committed.output.len();
-                    log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                        "outcome": "noun_primer",
-                        "reason": "retrieval_failed",
-                        "hits": 0,
-                        "out_chars": out_chars,
-                        "prompt_preview": &prompt_preview
-                    }));
-                    emit(&out_mode, Some(&committed.output), &format!(
-                        "inject [{}ms] | retrieval failed → noun primer {}c", start.elapsed().as_millis(), out_chars));
-                    return Ok(());
-                }
-                NounCommit::Exhausted => {
-                    log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
-                        "outcome": "none",
-                        "reason": "already_delivered",
-                        "hits": 0,
-                        "out_chars": 0,
-                        "prompt_preview": &prompt_preview
-                    }));
-                    return Ok(());
-                }
-                NounCommit::Absent => {}
-            }
             log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
                 "outcome": "empty",
+                "reason": "retrieval_failed",
                 "hits": 0,
                 "out_chars": 0,
                 "prompt_preview": &prompt_preview
@@ -1301,33 +1189,6 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                     "briefing_chars": 0,
                     "summary": "NONE"
                 }));
-                // Guide briefing was empty — fall back to the noun primer if one resolved.
-                match commit_noun_only(&root, &input.session_id, &noun_resolution) {
-                    NounCommit::Delivered(committed) => {
-                        let out_chars = committed.output.len();
-                        log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                            "outcome": "noun_primer",
-                            "hits": hits.len(),
-                            "out_chars": out_chars,
-                            "prompt_preview": &prompt_preview
-                        }));
-                        emit(&out_mode, Some(&committed.output), &format!(
-                            "inject [{}ms] | {} hits | guides: {} | briefing: NONE → noun primer {}c",
-                            elapsed_ms, hits.len(), format_guides(&guides_read), out_chars));
-                        return Ok(());
-                    }
-                    NounCommit::Exhausted => {
-                        log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                            "outcome": "none",
-                            "reason": "already_delivered",
-                            "hits": hits.len(),
-                            "out_chars": 0,
-                            "prompt_preview": &prompt_preview
-                        }));
-                        return Ok(());
-                    }
-                    NounCommit::Absent => {}
-                }
                 log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
                     "outcome": "none",
                     "hits": hits.len(),
@@ -1340,37 +1201,32 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 return Ok(());
             }
 
-            // ── Noun first-mention primer (entity-layer) ──
-            // Additive: a SEPARATE block prepended to the briefing body, placement held
-            // constant, retrieval NOT blended (spec F16). The primer block was resolved up front
-            // (LLM-free, user-realness gate) so the same resolution serves both this guide-briefing
-            // path and the standalone short-circuit paths.
-            let body_with_primer = match &noun_resolution.block {
-                Some(block) => format!("{}\n\n{}", block, body),
-                None => body.to_string(),
-            };
-
-            let Some(committed) = commit_context(
+            let committed = match commit_context(
                 &root,
                 &input.session_id,
                 title_opt.as_deref(),
-                &body_with_primer,
-            ) else {
-                log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                    "outcome": "none",
-                    "reason": "already_delivered",
-                    "hits": hits.len(),
-                    "out_chars": 0,
-                    "prompt_preview": &prompt_preview
-                }));
-                return Ok(());
+                body,
+            ) {
+                ContextCommit::Delivered(committed) => committed,
+                ContextCommit::Exhausted => {
+                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                        "outcome": "none",
+                        "reason": "already_delivered",
+                        "hits": hits.len(),
+                        "out_chars": 0,
+                        "prompt_preview": &prompt_preview
+                    }));
+                    return Ok(());
+                }
+                ContextCommit::LedgerUnavailable => {
+                    log_ledger_unavailable_done(
+                        elapsed_ms as u64,
+                        hits.len(),
+                        &prompt_preview,
+                    );
+                    return Ok(());
+                }
             };
-
-            // Mark primed nouns once we've committed to injecting (so they prime once/session).
-            if !noun_resolution.primed_slugs.is_empty() {
-                crate::nouns::record_primed(&project_context_dir(&root), &input.session_id, &noun_resolution.primed_slugs);
-                log_noun_primer(&noun_resolution, false);
-            }
 
             log_event("generate.briefing", None, serde_json::json!({
                 "briefing_chars": body.len(),
@@ -1402,42 +1258,15 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             log_event("select.shortcircuit", None, serde_json::json!({
                 "reason": "no_relevant_guides"
             }));
-            // No relevant guide — but the noun layer is a PEER, not a garnish. If the prompt named
-            // a known entity, inject its captured definition standalone (the bug this fixes).
-            match commit_noun_only(&root, &input.session_id, &noun_resolution) {
-                NounCommit::Delivered(committed) => {
-                    let out_chars = committed.output.len();
-                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                        "outcome": "noun_primer",
-                        "hits": hits.len(),
-                        "out_chars": out_chars,
-                        "prompt_preview": &prompt_preview
-                    }));
-                    emit(&out_mode, Some(&committed.output), &format!(
-                        "inject [{}ms] | {} hits | no relevant guide → noun primer {}c",
-                        elapsed_ms, hits.len(), out_chars));
-                }
-                NounCommit::Exhausted => {
-                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                        "outcome": "none",
-                        "reason": "already_delivered",
-                        "hits": hits.len(),
-                        "out_chars": 0,
-                        "prompt_preview": &prompt_preview
-                    }));
-                }
-                NounCommit::Absent => {
-                    log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
-                        "outcome": "none",
-                        "hits": hits.len(),
-                        "out_chars": 0,
-                        "prompt_preview": &prompt_preview
-                    }));
-                    emit(&out_mode, None, &format!(
-                        "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
-                        elapsed_ms, hits.len(), format_guides(&guides_read)));
-                }
-            }
+            log_event("inject.done", Some(elapsed_ms as u64), serde_json::json!({
+                "outcome": "none",
+                "hits": hits.len(),
+                "out_chars": 0,
+                "prompt_preview": &prompt_preview
+            }));
+            emit(&out_mode, None, &format!(
+                "inject [{}ms] | {} hits | guides read: {} | nothing relevant — skipped",
+                elapsed_ms, hits.len(), format_guides(&guides_read)));
         }
 
         Ok(Err(e)) => {
@@ -3209,22 +3038,136 @@ fn format_guides(guides: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_query_line, parse_selected_keys};
     use super::{
         artifact_context_for_prompt, authority_rules, build_catalog, classify_generation_failure,
-        contextualized_query, diversify_hits, generation_failure_payload,
-        missing_session_id_warning_payload, no_index_payload, parse_selection_decision,
-        no_generation_config_payload,
-        read_catalog_content, read_guides_with_budget, relevance_evidenced_catalog,
-        rerank_selected_catalog, source_char_budget, source_label_for_key,
-        validate_compile_response, wrap_context_reminder, CatalogItem, EPISODE_KEY_PREFIX,
+        commit_context, contextualized_query, diversify_hits, generation_failure_payload,
+        ledger_unavailable_done_payload,
+        missing_session_id_warning_payload, no_generation_config_payload, no_index_payload,
+        parse_selection_decision, read_catalog_content, read_guides_with_budget,
+        relevance_evidenced_catalog, rerank_selected_catalog, source_char_budget,
+        source_label_for_key, validate_compile_response, wrap_context_reminder, CatalogItem,
+        ContextCommit, EPISODE_KEY_PREFIX,
     };
+    use super::{parse_query_line, parse_selected_keys};
     use std::collections::HashSet;
-    use std::fs;
     use std::collections::VecDeque;
+    use std::fs;
 
     // Serialize the env-mutating prompt-variant tests (env vars are process-global).
     static VARIANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn hook_cannot_deliver_noun_facts_on_retrieval_failure_or_short_circuit() {
+        // Noun capture/indexing remains available elsewhere, but proposed,
+        // implicit, superseded, or zero-overlap noun facts must not have a
+        // direct hook path around SELECT+COMPILE and artifact validation.
+        let source = include_str!("inject.rs");
+        let hook = source
+            .split_once("pub fn run_inject")
+            .expect("inject entrypoint")
+            .1
+            .split_once("// ─── Navigation result")
+            .expect("end of inject entrypoint")
+            .0;
+        assert!(!hook.contains("resolve_noun_primer"));
+        assert!(!hook.contains("noun_resolution"));
+        assert!(!hook.contains("NounCommit"));
+        assert_eq!(
+            hook.matches("commit_context(").count(),
+            1,
+            "only the validated compiled-artifact arm may commit hook context"
+        );
+
+        let retrieval_failure = hook
+            .split_once("let retrieved_hits = match")
+            .expect("retrieval arm")
+            .1
+            .split_once("let retrieved_hit_count")
+            .expect("end retrieval arm")
+            .0;
+        assert!(!retrieval_failure.contains("commit_context("));
+        assert!(!retrieval_failure.contains("Some(&"));
+
+        let short_circuit = hook
+            .split_once("Ok(Ok(NavigateResult::ShortCircuit")
+            .expect("short-circuit arm")
+            .1
+            .split_once("Ok(Err(e))")
+            .expect("end short-circuit arm")
+            .0;
+        assert!(!short_circuit.contains("commit_context("));
+        assert!(!short_circuit.contains("Some(&"));
+        assert!(short_circuit.contains("emit(&out_mode, None"));
+    }
+
+    #[test]
+    fn compiled_context_commit_keeps_exhaustion_distinct_from_ledger_failure() {
+        let _home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _pc_home = crate::config::ScopedPcHome::set(home.path());
+
+        let healthy_root = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg("--initial-branch=master")
+            .arg(healthy_root.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        assert!(matches!(
+            commit_context(
+                healthy_root.path(),
+                "healthy-session",
+                Some("Compiled"),
+                "A compiled fact."
+            ),
+            ContextCommit::Delivered(_)
+        ));
+        assert!(matches!(
+            commit_context(
+                healthy_root.path(),
+                "healthy-session",
+                Some("Compiled"),
+                "A compiled fact."
+            ),
+            ContextCommit::Exhausted
+        ));
+
+        let broken_root = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg("--initial-branch=master")
+            .arg(broken_root.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let ledger_path = crate::config::project_context_dir(broken_root.path()).join("ledger");
+        std::fs::write(&ledger_path, "not a directory").unwrap();
+
+        assert!(matches!(
+            commit_context(
+                broken_root.path(),
+                "broken-compiled-session",
+                Some("Compiled"),
+                "A compiled fact."
+            ),
+            ContextCommit::LedgerUnavailable
+        ));
+
+        let long_prompt = "x".repeat(200);
+        let done = ledger_unavailable_done_payload(2, &long_prompt);
+        assert_eq!(done["outcome"], "empty");
+        assert_eq!(done["failure_stage"], "ledger");
+        assert_eq!(done["reason"], "ledger_unavailable");
+        assert_ne!(done["reason"], "already_delivered");
+        assert_eq!(
+            done["prompt_preview"],
+            crate::events::truncate(&long_prompt, 150)
+        );
+    }
 
     #[test]
     fn compile_preamble_default_is_byte_identical() {
@@ -3516,14 +3459,78 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             artifact_context_for_prompt("What's the status of the relay?"),
             crate::artifact_safety::ArtifactContext::LiveState
         );
+        for prompt in [
+            "Did the deploy succeed?",
+            "Did the tests pass?",
+            "Did the build fail?",
+            "Did the migration finish?",
+            "Did the rollout complete?",
+        ] {
+            assert_eq!(
+                artifact_context_for_prompt(prompt),
+                crate::artifact_safety::ArtifactContext::LiveState,
+                "{prompt}"
+            );
+        }
         assert_eq!(
             artifact_context_for_prompt("No, that is wrong; use SQLite instead"),
             crate::artifact_safety::ArtifactContext::ExplicitUserCorrection
         );
+        for prompt in [
+            "Don't use Redis; use Postgres",
+            "do not use Redis; use Postgres",
+        ] {
+            assert_eq!(
+                artifact_context_for_prompt(prompt),
+                crate::artifact_safety::ArtifactContext::ExplicitUserCorrection,
+                "{prompt}"
+            );
+        }
         assert_eq!(
             artifact_context_for_prompt("Explain the storage architecture"),
             crate::artifact_safety::ArtifactContext::Standard
         );
+    }
+
+    #[test]
+    fn live_results_and_negative_replacements_require_authority_labels() {
+        let source = [crate::artifact_safety::SourceDocument::new(
+            "./docs/runbook.md",
+            "The deploy normally succeeds and the application uses Redis.",
+        )];
+        let artifact =
+            "TITLE: Stored Project Context\nStored fact. (./docs/runbook.md:1)";
+
+        for prompt in ["Did the deploy succeed?", "Did the tests pass?"] {
+            assert_eq!(
+                crate::artifact_safety::validate_compiled_artifact_for_context(
+                    artifact,
+                    &source,
+                    artifact_context_for_prompt(prompt),
+                ),
+                Err(crate::artifact_safety::ArtifactError::MissingAuthorityLabel {
+                    line: 2,
+                    required: "STATIC BACKGROUND:",
+                })
+            );
+        }
+
+        for prompt in [
+            "Don't use Redis; use Postgres",
+            "do not use Redis; use Postgres",
+        ] {
+            assert_eq!(
+                crate::artifact_safety::validate_compiled_artifact_for_context(
+                    artifact,
+                    &source,
+                    artifact_context_for_prompt(prompt),
+                ),
+                Err(crate::artifact_safety::ArtifactError::MissingAuthorityLabel {
+                    line: 2,
+                    required: "STORED BACKGROUND:",
+                })
+            );
+        }
     }
 
     #[test]
@@ -3836,8 +3843,8 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             .get("disabled")
             .and_then(|v| v.as_array())
             .expect("warning should list disabled behaviors");
+        assert_eq!(disabled.len(), 1);
         assert!(disabled.iter().any(|v| v.as_str() == Some("session_ledger_dedup")));
-        assert!(disabled.iter().any(|v| v.as_str() == Some("noun_priming_dedup")));
     }
 
     // ── Phase 2: typed-catalog taxonomy ─────────────────────────────────────────

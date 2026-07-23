@@ -11,8 +11,8 @@ Replace the TypeScript injection hook with a Rust `inject` subcommand that compi
 
 This spec designs three coupled things:
 
-1. **`inject` subcommand** — a Rust replacement for `claude/hooks/ProactiveContext.hook.ts` (which is deleted). It reads the `UserPromptSubmit` hook stdin JSON and writes a `<system-reminder>` block to stdout.
-2. **Inject-as-generate** — injection runs the fan-out → retrieval → (optional) rerank → (optional) read_file → LLM-compile pipeline to produce a briefing, with a strict latency/token budget and a free, non-blocking fallback.
+1. **`inject` subcommand** — a Rust replacement for `claude/hooks/ProactiveContext.hook.ts` (which is deleted). It reads the `UserPromptSubmit` hook stdin JSON and writes a `<relevant-context from="pc skill">` block to stdout.
+2. **Inject-as-generate** — injection runs retrieval → typed catalog → SELECT → COMPILE to produce a cited briefing under strict latency/token budgets. Any generation, validation, or ledger failure emits no context.
 3. **Observability log + `tail`** — a structured JSON event log written best-effort by all proactive-context processes, and a `tail` command that renders a live, cross-project stream.
 
 Locked (do not re-litigate): no TypeScript; inject compiles a briefing (does not dump); inject is on the hot path and must never block; `PRODUCT_MODEL.md` is an input to inject, never injected verbatim; logging must not measurably slow the hot path.
@@ -28,7 +28,7 @@ Add to `Commands` in `src/main.rs`:
 ```rust
 /// Compile a relevance-filtered briefing for the current prompt (invoked via UserPromptSubmit hook).
 /// Reads { prompt, cwd, session_id, transcript_path } JSON from stdin.
-/// Writes a <system-reminder> block to stdout. Never blocks or errors out the prompt.
+/// Writes a <relevant-context from="pc skill"> block to stdout. Never blocks or errors out the prompt.
 Inject,
 ```
 
@@ -40,7 +40,7 @@ Commands::Inject => {
 }
 ```
 
-`run_inject()` always returns `Ok(())`. Every internal failure is swallowed and degrades to fallback or silence — exactly like `run_capture()`.
+`run_inject()` always returns `Ok(())`. Every internal failure is recorded when observability is enabled and fails closed to silence.
 
 ### 1.2 stdin contract
 
@@ -61,7 +61,7 @@ Guard clauses (each → emit nothing, exit 0):
 
 ### 1.3 The inject pipeline (budget-aware)
 
-The pipeline is deliberately a **leaner variant** of `generate`, reusing its internals. The ordering is load-bearing: **the cheap fallback context is produced first and held**, then the expensive LLM compile is attempted under a hard timeout. If the compile times out or fails, the already-computed cheap context is emitted. This makes the fallback free.
+The pipeline is deliberately a **leaner variant** of `generate`, reusing its internals. The ordering is load-bearing: retrieval supplies relevance hints, SELECT chooses typed sources, and COMPILE produces a cited artifact that Rust validates before delivery. Raw retrieval hits and noun primers are never alternate delivery paths.
 
 ```
 run_inject:
@@ -72,23 +72,16 @@ run_inject:
                         rerank = inject_rerank /*default false*/, global = true)
        -- enriched_query = current prompt + last N turns (§1.4), bounded.
        -- Emit query.start, retrieve.subquery (the enriched query), retrieve.hit* events.
-       Hold `fallback_block` = render_raw_reminder(hits)  // the old TS behavior
-  4. If hits empty -> emit inject.done (empty) and exit 0 (emit nothing).
-  5. If no openrouter_api_key -> skip compile; emit fallback_block; inject.done; exit.
-  6. EXPENSIVE COMPILE under tokio::time::timeout(inject_timeout_ms):
-       a. optional fan-out: if inject_max_fanout > 0, decompose with inject_model
-          and run inject_max_fanout extra parallel run_query calls (rerank=false),
-          merge+dedup into hits. Default inject_max_fanout = 0 (skip decompose call).
-       b. optional prefetch: up to inject_max_prefetch full docs (default low, e.g. 2).
-          PRODUCT_MODEL.md is read here as an INPUT document (never emitted verbatim).
-       c. compile: single LLM call with inject_model + the COMPILE PREAMBLE (§1.5).
-          Equip read_file tool ONLY if inject_allow_read_file (default false) to bound turns.
-          Emit generate.tool_call (if any), generate.briefing (summary+len, NOT full text).
-  7. On compile success: emit the briefing as <system-reminder>; inject.done{ok}.
-     On timeout/error: emit fallback_block; inject.done{fallback, reason}; exit 0.
+  4. Build the typed catalog and run SELECT. If SELECT finds nothing relevant, emit nothing.
+  5. Read only selected sources and run COMPILE under the generation timeout.
+  6. Validate every output claim against supplied source labels, line ranges, currentness,
+     and authority; atomically commit session dedup before exposing the result.
+  7. On success, emit the cited briefing as <relevant-context from="pc skill">.
+     On missing config, timeout, provider error, malformed output, relevance rejection,
+     or ledger failure: emit no context and record an explicit empty outcome.
 ```
 
-**Why a new subcommand, not repurposing `generate`:** `generate` prints a human-facing answer to stdout, takes a single positional `query`, has no transcript/timeout/fallback machinery, and always tries the full (slow) pipeline. `inject` reads hook JSON, bounds a transcript, uses a faster model, emits a `<system-reminder>`, and must degrade gracefully. They share *internals* (`run_query`, `generate_sub_queries`, `prefetch_files_parallel`) but not the entry point. The shared helpers in `src/generate.rs` are made `pub(crate)` so `inject.rs` can call them; no duplication.
+**Why a new subcommand, not repurposing `generate`:** `generate` prints a human-facing answer to stdout and takes a positional query. `inject` reads hook JSON, bounds transcript context, runs the safety pipeline, emits a semantic relevant-context block, and must fail closed without blocking the harness.
 
 ### 1.4 Conversation context (bounded)
 
@@ -112,14 +105,12 @@ Token cap: `.max_tokens(inject_max_tokens)` (default 700) — briefings are shor
 ### 1.6 Output format
 
 ```
-<system-reminder>
-Relevant project context (proactive-context):
-
-<compiled briefing OR raw hits fallback>
-</system-reminder>
+<relevant-context from="pc skill">
+<validated cited briefing>
+</relevant-context>
 ```
 
-The fallback renderer (`render_raw_reminder`) reproduces the current TS behavior: the reranked/scored top-K chunks, lightly formatted. It carries the same `[CONTRADICTION]` TODO the TS file had — out of scope here, tracked in lessons-capture.md.
+The wrapper identifies provenance without pretending to system authority. There is no raw-hit or noun-primer fallback.
 
 ---
 
@@ -153,15 +144,15 @@ All events are single-line JSON objects (JSONL). One canonical struct, serialize
 | `retrieve.hit` | `path`, `chunk_index`, `score`, `snippet` (≤200 chars) | per returned hit, post-merge |
 | `retrieve.rerank` | `candidates`, `kept`, `model` | `query::rerank_hits` |
 | `generate.tool_call` | `tool`("read_file"), `arg` (path), `bytes` | inject/generate agent tool use |
-| `generate.briefing` | `briefing_chars`, `summary` (first ≤200 chars), `tokens`? | after compile call |
-| `inject.done` | `outcome`("compiled"\|"fallback"\|"empty"\|"none"\|"skipped"), `reason`?, `hits`, `out_chars` | `run_inject` exit (carries `lat_ms`) |
+| `generate.briefing` | `briefing_chars`, `summary` (first ≤200 chars), `briefing_text` (bounded by the event-line cap) | after validated compile |
+| `inject.done` | `outcome`("compiled"\|"empty"\|"none"\|"skipped"), `reason`?, `failure_stage`?, `hits`, `out_chars` | `run_inject` exit (carries `lat_ms`) |
 | `capture.start` | `transcript_chars`, `exchanges`, `model` | `capture::run_capture` |
 | `capture.lesson` | `slug`, `category`, `scope`, `volatility` | per distilled lesson |
 | `synth.write` | `path`, `bytes`, `lessons_in` | `capture::synthesize_product_model` |
 | `daemon.index` | `phase`("full"\|"incremental"), `files`, `chunks`, `path`? | `daemon::full_index` / `index_single_file` |
 | `error` | `stage`, `message` (≤300 chars) | any swallowed error worth surfacing |
 
-**Hard payload caps (the atomicity guarantee — §3.2):** every string field that could be large (`snippet`, `summary`, `text`, `message`, `arg`) is truncated at emit time (200–300 chars). `generate.briefing` stores **length + a short summary, never the full briefing text**. This keeps each serialized line comfortably under `PIPE_BUF` (~4 KB) so a single `write()` is atomic with no locking.
+**Hard payload caps:** event serialization applies one canonical maximum line size and truncates oversized strings before append. `generate.briefing` includes the validated text for observability when it fits that bound; sidecars and event lines obey the same `logging_enabled` switch.
 
 ---
 
@@ -495,12 +486,12 @@ The binary is installed at `~/.bin/proactive-context` (per the `justfile`). Both
 
 Notes:
 - `inject` reads `{ prompt, cwd, session_id, transcript_path }` from stdin (Claude Code provides all four on `UserPromptSubmit`). `cwd` selects the project index; `inject` does **not** need a `-d` flag because it derives `root` from stdin `cwd` (the old TS passed `-d cwd`; the Rust subcommand reads it from stdin directly).
-- The hook-level `timeout: 10` (seconds) is an outer safety net; the *inner* `inject_timeout_ms` (default 4s) governs the compile and guarantees the fallback fires well before the harness timeout. inject still emits the fallback/empty `<system-reminder>` and exits 0 in all paths.
+- The hook-level timeout is an outer safety net; the inner generation deadline governs SELECT+COMPILE. On expiry, inject records an empty failure outcome, emits no context, and exits 0.
 - `capture` wiring is unchanged in shape from v0.2 (SessionEnd, reads `{ session_id, cwd, transcript_path }`); restated here for completeness. Its timeout is generous (off hot path).
 - **Out of scope (do not add):** SessionStart / PRODUCT_MODEL.md verbatim injection. PRODUCT_MODEL.md is consumed as an *input* by `inject`'s compile step, never injected verbatim.
 
 ### Deletion
-- Delete `claude/hooks/ProactiveContext.hook.ts`. Its behavior (raw query dump in a `<system-reminder>`) survives as `inject`'s fallback path, so no capability is lost.
+- Delete `claude/hooks/ProactiveContext.hook.ts`. Its raw-query-dump behavior is intentionally retired.
 
 ---
 
@@ -508,7 +499,7 @@ Notes:
 
 | File | Change |
 |---|---|
-| `src/inject.rs` | **new** — `run_inject`, the budget-aware pipeline, fallback renderer |
+| `src/inject.rs` | **new** — `run_inject`, the budget-aware fail-closed SELECT+COMPILE pipeline |
 | `src/events.rs` | **new** — `Event`, `log_event` (best-effort), request-id management, rotation |
 | `src/transcript.rs` | **new** — `parse_transcript`/`extract_text`/`build_transcript_string` lifted from `capture.rs` (pure refactor) |
 | `src/tail.rs` | **new** — `run_tail`, follow/rotation/filter logic |
@@ -526,7 +517,7 @@ Notes:
 
 ## 11. Latency / Budget Summary (the hot-path contract)
 
-1. Cheap retrieval (local embed + sqlite-vec KNN, **rerank off by default**) runs first and is the held fallback. This is the only mandatory work and is the same order of magnitude as the old TS `query` call. (Note: the per-process fastembed model load is the dominant fixed cost; keeping rerank off avoids the *second* model load that `rerank_hits` triggers via `TextRerank::try_new` on every call.)
-2. The LLM compile is attempted under `tokio::time::timeout(inject_timeout_ms)` (default 4s). Fan-out (default 0 → no decompose call) and prefetch (default 2) are bounded.
-3. On timeout/error/no-key → emit the already-computed fallback (or nothing). The prompt is **never** blocked beyond the outer hook timeout, and the inner budget guarantees the fallback fires first.
+1. Cheap retrieval (local embed + sqlite-vec KNN, **rerank off by default**) supplies relevance hints only; it is never directly injected.
+2. SELECT+COMPILE run under the configured generation deadline with bounded source and token budgets.
+3. On timeout/error/no-key/invalid artifact/ledger error → emit nothing. The prompt is **never** blocked beyond the outer hook timeout.
 4. Logging adds one sub-`PIPE_BUF` `write(2)` per event and is gate-checked off in a single branch when disabled — no measurable hot-path cost; all failures swallowed.

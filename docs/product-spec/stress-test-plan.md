@@ -57,7 +57,7 @@ echo '{"session_id":"'$SID'","cwd":"'$CWD'","transcript_path":"'$TP'"}' | $BIN c
 # statusline:
 echo '{"session_id":"'$SID'","cwd":"'$CWD'","context_window":{"used_percentage":42}}' | $BIN statusline --with-context
 ```
-Almost everything is drivable this way. **Only E2E-04 needs real `claude -p`** (to prove Claude *uses* injected knowledge); all other behaviors are provable by inspecting the emitted `<system-reminder>`, the wiki dir, `_citations.log`, and the event log.
+Almost everything is drivable this way. **Only E2E-04 needs real `claude -p`** (to prove Claude *uses* injected knowledge); all other behaviors are provable by inspecting the emitted `<relevant-context from="pc skill">`, the wiki dir, `_citations.log`, and the event log.
 
 ### 0.6 UNIVERSAL INTEGRITY AUDIT (run after EVERY capture scenario) — CRITICAL
 This converts hard-to-force bugs into "caught if they ever occur." After any capture, for the project's `wiki/` dir:
@@ -74,7 +74,7 @@ Provide this audit as a small python script the executor reuses.
 
 ### 0.8 Config knobs for forcing edge states
 Edit `~/.proactive-context/config.json` (back it up first; restore after). Useful forces:
-- `inject_browse_timeout_ms` → set very low (clamped to min 1000) to force inject timeout→fallback.
+- `inject_browse_timeout_ms` → set very low (clamped to min 1000) to force a fail-closed generation timeout.
 - `inject_min_prompt_words` → raise to force skip; lower to force activation.
 - `capture_triage_model` → set `""` to disable triage (always proceed).
 - `capture_debounce_secs` → set 1 to make the Stop-hook path testable quickly.
@@ -89,7 +89,7 @@ Edit `~/.proactive-context/config.json` (back it up first; restore after). Usefu
 Setup: any project WITH an index db present (else `handle_no_index` runs instead — see INJ-12). Quick way to get a db: run a capture first, or `$BIN -d $CWD init` and wait for index. Unique SID.
 Action: pipe each prompt separately:
 `yes` · `ok` · `thanks` · `continue` · `Hi` (case) · `   no  ` (whitespace) · `nope`.
-Expected: each → no LLM call, no `inject.start`, single `inject.done` with `outcome:"skipped"`, `reason:"trivial_prompt"`. `--verbose` stdout contains `inject | skipped trivial prompt`. No `<system-reminder>` emitted.
+Expected: each → no LLM call, no `inject.start`, single `inject.done` with `outcome:"skipped"`, `reason:"trivial_prompt"`. `--verbose` stdout contains `inject | skipped trivial prompt`. No relevant-context block is emitted.
 Verify: `tail --json --grep <SID>` shows exactly one `inject.done` per prompt, `outcome=skipped`, and **zero** `inject.start`/`select.*`/`guide.read`/`generate.briefing`. Confirm `lat_ms` is tiny (<50ms typical).
 Adversarial twist: `"yes."` and `"yes please do it now"` are NOT in the stoplist and have ≥? words — confirm `"yes please do it now"` (5 words) does NOT skip on the phrase test (it skips only if word-count < min_words=4; 5 words → proceeds). `"yes."` (1 word, 4 chars) skips via word-count + len<8.
 
@@ -100,15 +100,15 @@ Expected: all → `outcome:"skipped"`. Verify as INJ-01. Note the three independ
 ### INJ-03 — Substantive-but-irrelevant short-circuit: ZERO guide.read — CRITICAL (the key latency proof)
 Setup: project with a **populated wiki of clearly-irrelevant guides** (this is essential — with an empty catalog the selector is skipped and the proof fails). Build the wiki by running a capture on a transcript about, say, "avatar hovercards & optimistic locking." Confirm `wiki/` has ≥2 guides + `_index.md`. Unique SID.
 Action: `echo '{"prompt":"How do I configure the Kubernetes ingress controller TLS certificates for our staging cluster?","cwd":...,"session_id":...}' | $BIN inject --verbose`
-Expected: Haiku selector returns `NOTHING_RELEVANT` → `NavigateResult::ShortCircuit`. Events: `inject.start` → `wiki.index_read` → `select.shortcircuit` → `inject.done(outcome:none, out_chars:0)`. **ZERO `guide.read` events. NO `generate.briefing`. No Sonnet compile call.** No `<system-reminder>` on stdout.
+Expected: the selector returns `NOTHING_RELEVANT` → `NavigateResult::ShortCircuit`. Events: `inject.start` → `wiki.index_read` → `select.shortcircuit` → `inject.done(outcome:none, out_chars:0)`. **ZERO `guide.read` events. NO `generate.briefing`. No compile call.** No relevant-context block on stdout. A captured noun, including proposed/implicit/superseded facts, must not create a standalone fallback.
 Verify: assert `guide.read` count == 0 and `generate.briefing` absent in the SID's events; `select.shortcircuit` present. Record `lat_ms` (should be ~1 Haiku round-trip, not 2).
 Bug to watch: if `guide.read` > 0 here, the short-circuit is broken (wasted Sonnet latency on every irrelevant prompt).
 
 ### INJ-04 — Relevant prompt → compiled briefing with citations — CRITICAL
 Setup: same populated wiki as INJ-03. Unique SID.
 Action: prompt directly on-topic, e.g. `"What is the expected behavior when a user taps an avatar on the feed?"`
-Expected: selector picks the avatar guide → `guide.read` for it → Sonnet compile returns JSON selections → Rust slices verbatim → `<system-reminder>` on stdout containing `Relevant project context (<projname>):`, an excerpt headed by `<abs-path>:<start>-<end> (updated <date> · <relative>)`. Event `inject.done(outcome:compiled)` with `title`, `out_words`. If guide prose has `[^id]` markers, the body is preceded by the `_citations.log` preamble line.
-Verify: the excerpt text between the citation header and the next blank-line block is **verbatim** a line-range slice of the guide file (open the guide, slice those lines, compare). The path resolves (file exists at that abs path). `out_words` in event == word count of injected body.
+Expected: SELECT picks the avatar guide and COMPILE returns one claim per line with supplied source citations. Rust validates every source label/range and authority requirement before stdout contains `<relevant-context from="pc skill">`. Event `inject.done(outcome:compiled)` carries `title` and `out_words`.
+Verify: every terminal citation names a source supplied to COMPILE and an in-range source line; malformed, uncited, mixed-authority-unlabeled, or irrelevant output is rejected with no context. `out_words` equals the validated injected body word count.
 
 ### INJ-05 — Mixed wiki + committed-md selection; non-wiki citation path resolves to repo root — CRITICAL
 Setup: populated wiki **plus** a committed markdown file in the git repo at `$CWD`, e.g. `docs/deploy.md` containing distinctive on-topic content; `git add` + `git commit` it (catalog uses `git ls-files`). Index db present. Unique SID.
@@ -118,14 +118,14 @@ Verify: the committed-file citation header is an absolute path **under the repo 
 
 ### INJ-06 — Hallucinated / out-of-catalog key rejection — CRITICAL (code-path guarantee)
 Note: you cannot reliably *force* a live model to hallucinate a key. Instead verify the **validation path** holds across real runs. Setup: populated wiki, run INJ-04-style relevant prompts ~5 times with distinct SIDs.
-Expected: every key the compile step cites resolves to a real catalog source; no `<system-reminder>` ever contains a citation header for a path that doesn't exist on disk.
+Expected: every key the compile step cites resolves to a real catalog source; no relevant-context block ever contains a citation for a path that doesn't exist on disk.
 Verify: for each compiled run, extract every `<path>:<a>-<b>` header and assert the file exists. (Code: `selected` is filtered by `valid.contains(*l)`; `render_selection` skips selections whose slug isn't in `guides`.) Mark as a guarantee-audit, not an elicitation.
 
 ### INJ-07 — Verbose mode JSON shape — NTH
 Setup: indexed project, relevant prompt (compiled) and an irrelevant prompt (short-circuit). Unique SIDs.
 Action: run with `--verbose`.
-Expected (compiled): stdout is a single JSON object with `systemMessage` (human string with `inject [..ms] | .. hits | guides: .. | compiled ..c`) AND `hookSpecificOutput.additionalContext` == the `<system-reminder>` block. (Short-circuit/skip): JSON with only `systemMessage`, no `hookSpecificOutput`.
-Verify: `python3 -c "import json,sys;json.load(sys.stdin)"` parses; assert keys present/absent per case. Non-verbose run of the same compiled prompt prints the **raw `<system-reminder>`** (not JSON) to stdout.
+Expected (compiled): stdout is a single JSON object with `systemMessage` AND `hookSpecificOutput.additionalContext` equal to the `<relevant-context from="pc skill">` block. (Short-circuit/skip): JSON with only `systemMessage`, no `hookSpecificOutput`.
+Verify: `python3 -c "import json,sys;json.load(sys.stdin)"` parses; assert keys present/absent per case. Non-verbose compiled output is the raw semantic relevant-context block, not JSON.
 
 ### INJ-08 — Bootstrap on unindexed project (no db) — CRITICAL
 Setup: fresh temp dir, NO index db. Three sub-cases by file count/LOC:
@@ -134,27 +134,27 @@ Setup: fresh temp dir, NO index db. Three sub-cases by file count/LOC:
 - (c) >5 files, >5000 LOC (pad files) → expected: emits a `[proactive-context] No index found...` block listing up to 100 candidate files + the "Ask the user...run: proactive-context init" suffix; `--verbose` systemMessage `inject | no-index | N files ~L LOC`.
 Verify: stdout content per case; for (b) `$BIN -d $CWD ps`/pid file. Bug to watch: case (a)/(c) accidentally spawning a daemon; case (b) failing silently.
 
-### INJ-09 — Timeout → fallback (can you force it?) — CRITICAL
-Setup: indexed project with **vector hits available** (so fallback block is non-empty) and a populated wiki. Set `inject_browse_timeout_ms` to its clamp-min `1000` (1s) — Haiku+Sonnet rarely finish in 1s → timeout. Unique SID.
+### INJ-09 — Timeout fails closed — CRITICAL
+Setup: indexed project with vector hits and a populated wiki. Set `inject_browse_timeout_ms` to its clamp-min `1000` (1s) to force a timeout. Unique SID.
 Action: relevant prompt.
-Expected: `Err(_timeout)` arm → if hits non-empty, emit `fallback_block` (`<system-reminder>` of raw chunks `--- path (chunk N, score S) ---`), event `inject.done(outcome:fallback, reason:"timeout")`. If somehow zero hits, `outcome:empty`, nothing injected.
-Verify: event `outcome=fallback`, `reason=timeout`; stdout fallback block format. Restore config. Bug to watch: a partial/garbled briefing emitted on timeout instead of the clean fallback.
+Expected: `Err(_timeout)` → `inject.failure` plus `inject.done(outcome:empty, reason:"provider_timeout", failure_stage:"generate", out_chars:0)`. Stdout contains no context even when vector hits or noun artifacts exist.
+Verify: no raw chunks, noun primer, partial briefing, or relevant-context wrapper is emitted. Restore config.
 
 ### INJ-10 — Empty wiki but committed md present — CRITICAL
 Setup: indexed project, **no wiki dir** (delete it), but committed `.md` files in the repo. Unique SID, relevant prompt.
 Expected: `wiki_index_rows` empty, but `build_catalog` still includes committed md → selector runs over them → may compile a briefing citing repo files, or short-circuit. Either way it must NOT crash and the cited paths resolve to repo root.
-Verify: no panic, exit 0; any citation header path exists. Also test the **catalog-empty** sub-case (no wiki, no committed md, but vector hits exist): expect `render_hits_librarian` path → `<system-reminder>` titled `relevant project files` citing `path (chunk N, score S)`.
+Verify: no panic, exit 0; every citation path exists. Also test the **catalog-empty** sub-case (no wiki, no committed md, but vector hits exist): expect SELECT to short-circuit and emit no context; retrieval hits are hints, never a raw fallback.
 
 ### INJ-11 — `[^id]` preamble appears ONLY when markers present — CRITICAL
 Setup: two wikis. Wiki-A: a guide whose body contains `[^abc12-1]` markers (produce via a real capture). Wiki-B: a guide with NO `[^` markers (hand-write a clean guide file, rebuild index via a capture or `IndexFiles`).
 Action: relevant compiled inject against each.
-Expected: A's `<system-reminder>` body begins with `Inline [^id] markers cite verbatim source-conversation evidence in <wiki>/_citations.log; read it...`. B's body has NO such preamble line.
+Expected: A's relevant-context body begins with `Inline [^id] markers cite verbatim source-conversation evidence in <wiki>/_citations.log; read it...`. B's body has NO such preamble line.
 Verify: grep the injected block for the preamble sentence; present for A, absent for B. (Code: `render_selection` adds preamble iff `body.contains("[^")`.)
 
-### INJ-12 — No-API-key fallback path — NTH
+### INJ-12 — No-API-key fails closed — NTH
 Setup: indexed project with vector hits + populated wiki; temporarily blank `openrouter_api_key`. Unique SID, relevant prompt.
-Expected: with hits → `inject.done(outcome:fallback, reason:"no_api_key")` + fallback block. With zero hits → `outcome:empty`, nothing injected, verbose says `no API key — nothing injected`.
-Verify: event reason; stdout. **RESTORE the key immediately after.**
+Expected: validation reports `no_generation_config`, the first hook in the session may emit the short setup warning, and no context is injected regardless of hits or noun artifacts.
+Verify: `inject.done(outcome:empty, reason:"no_generation_config", out_chars:0)` and no relevant-context block. **RESTORE the key immediately after.**
 
 ### INJ-13 — Recent-context enrichment from transcript — NTH
 Setup: indexed project, a transcript_path with prior turns; `inject_context_turns` default 6. Unique SID.
@@ -245,7 +245,7 @@ Transcript <500 chars OR <3 exchanges. Expect: "too short ... skipping", no tria
 
 ### E2E-01 — Teach in session A → fresh session B inject surfaces it — CRITICAL
 A: capture the sentinel transcript (knowledge that is NOT in any committed doc) → guide created. B: a **fresh SID**, inject a relevant prompt.
-Expected: B's `<system-reminder>` contains the distilled spec fact, sliced verbatim from A's guide, with a citation header. Knowledge that was never in the repo docs now reaches a new session.
+Expected: B's `<relevant-context from="pc skill">` contains the distilled spec fact with validated source citations. Knowledge that was never in the repo docs now reaches a new session.
 Verify: confirm the fact does not exist in any committed `.md` (grep repo), but appears in B's injection.
 
 ### E2E-02 — Enrichment across two sessions creates+links guides — CRITICAL
@@ -259,7 +259,7 @@ Expected: the *current* spec (hovercard) is what's injected. Prior `[^id]`s pres
 Verify: injected briefing reflects hovercard (not the stale "navigate"); old marker still in `_citations.log`. The `[CONTRADICTION]` flag is model-driven — report whether it appears; absence is not necessarily a bug, but a *retrieved stale-and-current pair without the flag* is a quality concern.
 
 ### E2E-04 — Claude actually USES the injected knowledge (real headless) — CRITICAL (only scenario needing `claude -p`)
-Setup: E2E-01 state. Use a real `claude -p --model haiku` session in `$CWD` with the inject hook wired (or manually prepend the emitted `<system-reminder>` to the prompt). Ask a question answerable ONLY from the captured guide.
+Setup: E2E-01 state. Use a real `claude -p --model haiku` session in `$CWD` with the inject hook wired (or manually prepend the emitted semantic relevant-context block to the prompt). Ask a question answerable ONLY from the captured guide.
 Expected: Claude's answer reflects the captured fact (hovercard), proving the loop end-to-end.
 Verify: answer content. If a full hook wiring is impractical, approximate by feeding the injected block + question to `claude -p` directly and checking the answer.
 
@@ -280,10 +280,10 @@ Setup: session whose latest `inject.done` is `outcome:none` (from INJ-03) or `sk
 Expected: `⬡ idle · Project Wiki: G guides`, dim. (Code collapses none/empty/skipped to `idle` — DIVERGENCE from spec's distinct `⊘ skip`.)
 Verify: substring `idle`; dim ANSI `\x1b[2m`.
 
-### SL-03 — fallback — CRITICAL
-Setup: session with `inject.done(outcome:fallback, hits:N)` (from INJ-09).
-Expected: `⬡ Nh hits · <lat>s · Project Wiki: G guides`, yellow.
-Verify: `Nh hits`, yellow `\x1b[33m`.
+### SL-03 — fail-closed empty — CRITICAL
+Setup: session with `inject.done(outcome:empty, reason:provider_timeout, hits:N)` (from INJ-09).
+Expected: the statusline shows an empty/error state, never a delivered-hit fallback.
+Verify: it does not present `Nh hits` as injected context.
 
 ### SL-04 — in-flight — CRITICAL
 This needs an unmatched `inject.start` < staleness cap. Hard to catch live (inject is fast). Force it: append a synthetic `inject.start` for the SID to the log with `ts` ~6s ago and NO matching `inject.done` (write a JSONL line matching `EventLine` shape: `ts,project,session_id,req,event,payload`). 
@@ -380,7 +380,7 @@ Verify: `outcome` per prompt; document surprising pass/skip decisions.
 ### ADV-05 — Malformed stdin JSON → graceful exit 0, never blocks — CRITICAL
 For BOTH `inject` and `capture` and `statusline`, pipe: empty string; whitespace only; `not json`; `{}` (all fields default); `{"prompt":123}` (wrong type); truncated `{"prompt":"hi"`; a 1MB garbage blob; valid JSON with `cwd` pointing to a nonexistent dir; `null`.
 Expected: every case exits 0, emits nothing harmful, never panics, never hangs. inject must NEVER block the user's prompt (a hook that errors could break Claude Code).
-Verify: `$?`==0 for all; no stderr panic/backtrace; inject emits no spurious `<system-reminder>`. Bug to watch: a wrong-type field causing serde to error (handled → Ok) vs a panic.
+Verify: `$?`==0 for all; no stderr panic/backtrace; inject emits no spurious relevant-context block. Bug to watch: a wrong-type field causing serde to error (handled → Ok) vs a panic.
 
 ### ADV-06 — Huge transcript char-boundary panic in capture — CRITICAL (suspected crash bug)
 inject sub-case (safe baseline): a 1MB prompt. Expected: `cap_tail` (inject.rs:1166) walks `is_char_boundary` before slicing → caps the enriched query at `inject_query_char_cap` (≤8000); no OOM; **exit 0 even with multibyte content at the cut**.
@@ -443,7 +443,7 @@ Verify (behavioral proxy): inject compile output never balloons (out_words bound
 Verify: do NOT assert the staged pipeline retries (it doesn't). For the triage path, if you can inject a transient failure (e.g. point at a proxy returning 503 twice then 200), confirm it retries and succeeds; else code-confirm. Report the asymmetry (staged capture has no retry, only a 300s timeout) as a robustness note.
 
 ### REG-03 — inject `verbose` flag preserved end-to-end — CRITICAL
-Confirm `--verbose` reaches `run_inject(verbose)` and changes output shape (JSON vs raw) in every arm: skipped, short-circuit, compiled, fallback, error, timeout, no-index. 
+Confirm `--verbose` reaches `run_inject(verbose)` and changes output shape (JSON vs raw) in every arm: skipped, short-circuit, compiled, error, timeout, no-index.
 Verify: run each arm with and without `--verbose`; non-verbose emits only the context block (or nothing); verbose always emits a JSON `systemMessage` (+ `additionalContext` when a block exists). (Covered partly by INJ-07; REG-03 ensures ALL arms honor it.)
 
 ### REG-04 — statusline reads inject.done title/out_words — CRITICAL

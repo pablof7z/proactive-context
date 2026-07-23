@@ -50,10 +50,11 @@ prompt ──> trivial-prompt gate
            present-tense questions to guides; resolves the prompt into a standalone query
        ──> COMPILE (strong model): dense cited briefing; cards labeled as historical
            provenance unless corroborated; per-session ledger = only NEW facts each turn
-       ──> <system-reminder> pushed into the agent's context
+       ──> <relevant-context from="pc skill"> pushed into the agent's context
 ```
 
 Composition happens at SELECT (the model picks per-prompt among typed sources) — never by blending retrieval budgets, which measurably dilutes.
+Captured noun artifacts remain available to the typed catalog, but direct noun-primer delivery is disabled: hook context must pass the same SELECT, COMPILE, citation, relevance, and authority checks as every other source.
 
 ## Cold start
 

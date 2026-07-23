@@ -169,6 +169,10 @@ fn write_sidecar(
     generation_id: &Option<String>,
     lat_ms: u64,
 ) -> Option<PathBuf> {
+    if !crate::events::logging_enabled() {
+        return None;
+    }
+
     let (req_id, dir) = {
         let cfg = crate::events::log_cfg_path_and_req();
         cfg
@@ -280,5 +284,33 @@ mod tests {
         assert!(value.get("tool_calls").is_none());
         assert!(value.get("tool_call_id").is_none());
         assert!(value.get("name").is_none());
+    }
+
+    #[test]
+    fn disabled_logging_suppresses_external_provider_sidecars() {
+        let _home_lock = crate::config::PC_HOME_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pc_home = temp.path().join("pc-home");
+        let _home = crate::config::ScopedPcHome::set(&pc_home);
+        let _logging = crate::events::ScopedLoggingEnabled::set(false);
+        crate::events::init_context_with_request("project", "session", "provider-run".to_string());
+
+        record_external_turn(
+            "ollama:test-model",
+            2,
+            "system prompt",
+            "user prompt",
+            "provider response",
+            12,
+        );
+
+        assert!(
+            !pc_home.join("state/events.jsonl").exists(),
+            "disabled logging must not write provider events"
+        );
+        assert!(
+            !pc_home.join("state/llm_turns").exists(),
+            "disabled logging must not create request/response sidecars"
+        );
     }
 }
