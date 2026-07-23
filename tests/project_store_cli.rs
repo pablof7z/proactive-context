@@ -140,6 +140,57 @@ fn non_git_hooks_are_exact_silent_noops_before_config_or_logging() {
 }
 
 #[test]
+fn missing_generation_config_warns_once_per_session_without_context() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("pc-home");
+    let subject = tmp.path().join("subject");
+    init_subject(&subject);
+
+    let input_for = |session: &str| {
+        format!(
+            "{{\"cwd\":{},\"session_id\":{},\"prompt\":\"explain the project architecture\"}}",
+            serde_json::to_string(subject.to_str().unwrap()).unwrap(),
+            serde_json::to_string(session).unwrap()
+        )
+    };
+
+    let first = run_hook(
+        &home,
+        &subject,
+        &["hook", "inject"],
+        &input_for("session-a"),
+        false,
+    );
+    assert!(first.status.success());
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["systemMessage"], "pc: no generation config.");
+    assert!(first_json.get("hookSpecificOutput").is_none());
+    assert!(first_json.get("context").is_none());
+
+    let repeated = run_hook(
+        &home,
+        &subject,
+        &["hook", "inject"],
+        &input_for("session-a"),
+        false,
+    );
+    assert!(repeated.status.success());
+    assert!(repeated.stdout.is_empty());
+
+    let next_session = run_hook(
+        &home,
+        &subject,
+        &["hook", "inject"],
+        &input_for("session-b"),
+        false,
+    );
+    assert!(next_session.status.success());
+    let next_json: serde_json::Value = serde_json::from_slice(&next_session.stdout).unwrap();
+    assert_eq!(next_json["systemMessage"], "pc: no generation config.");
+    assert!(next_json.get("hookSpecificOutput").is_none());
+}
+
+#[test]
 fn worktrees_share_a_store_and_same_named_repositories_do_not() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("pc-home");

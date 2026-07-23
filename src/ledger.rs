@@ -1,11 +1,8 @@
 //! Per-session injection ledger.
 //!
-//! Every briefing the inject hook surfaces on a turn is written as a
-//! `<system-reminder>` and mirrored here. The ledger is only an optimization:
-//! before a later turn uses it for dedup, the current transcript window must
-//! still contain the injected reminder body. If visibility cannot be proven
-//! (missing transcript, harness compaction, rewritten transcript), we return an
-//! empty block and let inject resurface the context.
+//! Every briefing the inject hook surfaces on a turn is mirrored here. Delivery
+//! is session-absolute: once a line has been committed for a session it is
+//! suppressed on later turns, even after transcript compaction.
 //!
 //! Storage is a JSONL file per `session_id` under the project's data dir. Each
 //! inject process is a short-lived hook, so state must round-trip through disk;
@@ -15,7 +12,10 @@ use crate::config::project_context_dir;
 use crate::events::now_rfc3339;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,36 @@ fn ledger_path(root: &Path, session_id: &str) -> PathBuf {
     project_context_dir(root)
         .join("ledger")
         .join(format!("{}.jsonl", sanitize_session(session_id)))
+}
+
+fn session_flag_path(root: &Path, session_id: &str, flag: &str) -> PathBuf {
+    project_context_dir(root)
+        .join("session-flags")
+        .join(format!(
+            "{}.{}",
+            sanitize_session(session_id),
+            sanitize_session(flag)
+        ))
+}
+
+/// Atomically mark a session-scoped flag. Returns true only for the process
+/// that creates the marker, so concurrent first hooks cannot repeat a warning.
+pub fn mark_session_flag_once(root: &Path, session_id: &str, flag: &str) -> bool {
+    if session_id.trim().is_empty() || flag.trim().is_empty() {
+        return false;
+    }
+    let path = session_flag_path(root, session_id, flag);
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .is_ok()
 }
 
 pub(crate) fn prune_old_session_files(dir: &Path, suffix: &str, keep: usize) -> usize {
@@ -151,20 +181,21 @@ fn cap_tail(s: &str, char_cap: usize) -> String {
     s[boundary..].to_string()
 }
 
+fn parse_entries(raw: &str) -> Vec<LedgerEntry> {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<LedgerEntry>(l).ok())
+        .collect()
+}
+
 fn read_entries(root: &Path, session_id: &str) -> Vec<LedgerEntry> {
     if session_id.is_empty() {
         return Vec::new();
     }
     let path = ledger_path(root, session_id);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<LedgerEntry>(l).ok())
-        .collect()
+    std::fs::read_to_string(path)
+        .map(|raw| parse_entries(&raw))
+        .unwrap_or_default()
 }
 
 fn render_recent(entries: &[LedgerEntry], max_entries: usize, char_cap: usize) -> String {
@@ -194,8 +225,8 @@ fn render_recent(entries: &[LedgerEntry], max_entries: usize, char_cap: usize) -
 /// Build the raw "already injected this session" block without checking whether
 /// the current assistant context can still see it.
 ///
-/// Kept for tests and diagnostics. Production inject should use
-/// `read_visible_recent` so compaction cannot turn dedup into under-injection.
+/// Used by production inject as a model hint. Deterministic suppression happens
+/// again atomically at commit time.
 pub fn read_recent(
     root: &Path,
     session_id: &str,
@@ -288,33 +319,141 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Append one injected briefing to the session ledger. Best-effort: any error
-/// (no dir, bad permissions) is swallowed — the ledger is an optimization, not
-/// a correctness dependency.
+struct LockedLedger {
+    file: File,
+}
+
+impl LockedLedger {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        // SAFETY: flock only borrows this valid descriptor. LockedLedger owns
+        // the File and unlocks it before the descriptor is closed.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { file })
+    }
+
+    fn entries(&mut self) -> std::io::Result<Vec<LedgerEntry>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut raw = String::new();
+        self.file.read_to_string(&mut raw)?;
+        Ok(parse_entries(&raw))
+    }
+
+    fn append(&mut self, entry: &LedgerEntry) -> std::io::Result<()> {
+        let mut line = serde_json::to_string(entry)
+            .map_err(std::io::Error::other)?;
+        line.push('\n');
+        self.file.write_all(line.as_bytes())?;
+        self.file.flush()
+    }
+}
+
+impl Drop for LockedLedger {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid for the duration of this call.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn normalize_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn delivered_lines(entries: &[LedgerEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .flat_map(|entry| entry.body.lines())
+        .map(normalize_line)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn suppress_delivered_lines(entries: &[LedgerEntry], body: &str) -> String {
+    let mut seen = delivered_lines(entries);
+    let mut kept = Vec::new();
+    let mut pending_blank = false;
+
+    for line in body.trim().lines() {
+        let normalized = normalize_line(line);
+        if normalized.is_empty() {
+            pending_blank = !kept.is_empty();
+            continue;
+        }
+        if !seen.insert(normalized) {
+            continue;
+        }
+        if pending_blank {
+            kept.push(String::new());
+        }
+        kept.push(line.trim_end().to_string());
+        pending_blank = false;
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
+/// Atomically suppress content already delivered in this session and commit
+/// exactly the remainder. The read/dedup/write transaction is protected by an
+/// advisory file lock so concurrent hook processes cannot both emit a line.
+///
+/// An empty result means the proposed context was fully exhausted.
+pub fn commit_unique(
+    root: &Path,
+    session_id: &str,
+    title: Option<&str>,
+    body: &str,
+) -> std::io::Result<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(String::new());
+    }
+    if session_id.trim().is_empty() {
+        return Ok(body.to_string());
+    }
+
+    let path = ledger_path(root, session_id);
+    let mut ledger = LockedLedger::open(&path)?;
+    let unique = suppress_delivered_lines(&ledger.entries()?, body);
+    if unique.is_empty() {
+        return Ok(String::new());
+    }
+    ledger.append(&LedgerEntry {
+        ts: now_rfc3339(),
+        title: title.unwrap_or("").to_string(),
+        body: unique.clone(),
+    })?;
+    drop(ledger);
+    prune_project_ledgers(root, &path);
+    Ok(unique)
+}
+
+/// Append one injected briefing to the session ledger. Best-effort diagnostic
+/// helper; production context delivery should use `commit_unique`.
 pub fn append(root: &Path, session_id: &str, title: Option<&str>, body: &str) {
     if session_id.is_empty() || body.trim().is_empty() {
         return;
     }
     let path = ledger_path(root, session_id);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
     let entry = LedgerEntry {
         ts: now_rfc3339(),
         title: title.unwrap_or("").to_string(),
         body: body.trim().to_string(),
     };
-    let mut line = match serde_json::to_string(&entry) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    line.push('\n');
-
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
-        drop(f);
-        prune_project_ledgers(root, &path);
+    if let Ok(mut ledger) = LockedLedger::open(&path) {
+        if ledger.append(&entry).is_ok() {
+            drop(ledger);
+            prune_project_ledgers(root, &path);
+        }
     }
 }
 
@@ -389,6 +528,91 @@ mod tests {
         assert!(!one.contains("OAuth"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_flag_is_marked_only_once() {
+        let project = isolated_project();
+        let root = project.root.path();
+
+        assert!(mark_session_flag_once(root, "sess-once", "no-config-warning"));
+        assert!(!mark_session_flag_once(root, "sess-once", "no-config-warning"));
+        assert!(mark_session_flag_once(root, "sess-other", "no-config-warning"));
+        assert!(!mark_session_flag_once(root, "", "no-config-warning"));
+    }
+
+    #[test]
+    fn commit_unique_suppresses_prior_and_same_payload_lines() {
+        let project = isolated_project();
+        let root = project.root.path();
+        let session = "sess-unique";
+
+        let first = commit_unique(
+            root,
+            session,
+            Some("First"),
+            "Entity primer.\n\nShared fact (guide.md:1).\nShared fact (guide.md:1).",
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            "Entity primer.\n\nShared fact (guide.md:1).",
+            "duplicates inside the first payload must also be removed"
+        );
+
+        let second = commit_unique(
+            root,
+            session,
+            Some("Second"),
+            " Entity   primer. \n\nShared fact (guide.md:1).\nNew fact (guide.md:2).",
+        )
+        .unwrap();
+        assert_eq!(second, "New fact (guide.md:2).");
+
+        let exhausted = commit_unique(
+            root,
+            session,
+            Some("Third"),
+            "Entity primer.\nShared fact (guide.md:1).\nNew fact (guide.md:2).",
+        )
+        .unwrap();
+        assert_eq!(exhausted, "");
+
+        let recorded = read_recent(root, session, 8, 3000);
+        assert_eq!(recorded.matches("Entity primer.").count(), 1);
+        assert_eq!(recorded.matches("Shared fact (guide.md:1).").count(), 1);
+        assert_eq!(recorded.matches("New fact (guide.md:2).").count(), 1);
+    }
+
+    #[test]
+    fn commit_unique_serializes_concurrent_delivery() {
+        let project = isolated_project();
+        let root = project.root.path().to_path_buf();
+        let _ = project_context_dir(&root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                commit_unique(
+                    &root,
+                    "sess-concurrent",
+                    Some("Concurrent"),
+                    "Only once (guide.md:1).",
+                )
+                .unwrap()
+            }));
+        }
+
+        let delivered = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|body| !body.is_empty())
+            .count();
+        assert_eq!(delivered, 1);
     }
 
     #[test]
