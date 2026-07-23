@@ -9,7 +9,7 @@ use crate::content_kind::{ContentKind, Currentness};
 use crate::events::{init_context, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
-use crate::query::{run_query, QueryResult};
+use crate::query::{run_query, QueryResult, MINIMUM_RELEVANCE_SCORE};
 use crate::transcript::parse_transcript;
 use crate::wiki::{self, guide_path, IndexRow};
 use anyhow::{Context, Result};
@@ -35,6 +35,10 @@ const TRIVIAL_PHRASES: &[&str] = &[
 
 const NO_GENERATION_CONFIG_WARNING: &str = "pc: no generation config.";
 const NO_GENERATION_CONFIG_FLAG: &str = "no-generation-config-warning";
+/// The project already estimates tokens as four characters in recall/capture
+/// accounting. Reuse that convention to turn the configured compile output and
+/// source-count budgets into a bounded source-input budget.
+const ESTIMATED_CHARS_PER_TOKEN: usize = 4;
 
 // ─── stdin contract ───────────────────────────────────────────────────────────
 
@@ -296,6 +300,57 @@ fn parse_query_line(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ─── Relevance safety ─────────────────────────────────────────────────────────
+
+fn contextualized_query(current_prompt: &str, recent: &str, char_cap: usize) -> String {
+    if recent.is_empty() {
+        cap_tail(current_prompt, char_cap)
+    } else {
+        cap_tail(&format!("{}\n\n{}", recent, current_prompt), char_cap)
+    }
+}
+
+/// Prefer distinct source paths before taking additional chunks from a source,
+/// while preserving the retrieval/reranker order within both passes.
+fn diversify_hits(hits: &[QueryResult], top_k: usize) -> Vec<QueryResult> {
+    let mut seen_paths = HashSet::new();
+    let mut primary = Vec::new();
+    let mut overflow = Vec::new();
+
+    for hit in hits {
+        if seen_paths.insert(hit.path.as_str()) {
+            primary.push(hit.clone());
+        } else {
+            overflow.push(hit.clone());
+        }
+    }
+    primary.extend(overflow);
+    primary.truncate(top_k);
+    primary
+}
+
+fn source_char_budget(max_tokens: usize, max_guides: usize) -> usize {
+    max_tokens
+        .saturating_mul(ESTIMATED_CHARS_PER_TOKEN)
+        .saturating_mul(max_guides)
+}
+
+fn truncate_head_to_chars(text: &str, char_budget: usize) -> String {
+    if char_budget == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= char_budget {
+        return text.to_string();
+    }
+
+    let byte_end = text
+        .char_indices()
+        .nth(char_budget)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    text[..byte_end].trim_end().to_string()
 }
 
 // ─── Output helper ───────────────────────────────────────────────────────────
@@ -931,7 +986,13 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         cfg.inject_query_char_cap,
     );
     let enriched_query =
-        build_enriched_query(&input.prompt, &recent, cfg.inject_query_char_cap);
+        contextualized_query(&input.prompt, &recent, cfg.inject_query_char_cap);
+    log_event("inject.query", None, serde_json::json!({
+        "current_chars": input.prompt.chars().count(),
+        "recent_chars": recent.chars().count(),
+        "contextualized_chars": enriched_query.chars().count(),
+        "char_cap": cfg.inject_query_char_cap
+    }));
 
     // ── Noun resolver (peer to the guide pipeline) ─────────────────────────
     // LLM-free, runs independently of guide selection so a pure-entity prompt ("what is X?")
@@ -949,10 +1010,13 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     );
 
     // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
+    // Over-fetch using the same factor already used by the cross-encoder path,
+    // then spend the configured top-k budget across distinct source paths.
+    let retrieval_candidates = cfg.inject_top_k.saturating_mul(4);
     let retrieved_hits = match run_query(
         &root,
         &enriched_query,
-        cfg.inject_top_k,
+        retrieval_candidates,
         cfg.inject_rerank,
     ) {
         Ok(h) => h,
@@ -998,16 +1062,25 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         }
     };
     let retrieved_hit_count = retrieved_hits.len();
-    let (hits, overlap_stats) = overlap.suppress_hits(retrieved_hits);
+    let (overlap_hits, overlap_stats) = overlap.suppress_hits(retrieved_hits);
     log_event("inject.overlap_filter", None, serde_json::json!({
         "retrieved_hits": retrieved_hit_count,
-        "kept_hits": hits.len(),
+        "kept_hits": overlap_hits.len(),
         "dropped_hits": overlap_stats.dropped_hits,
         "fingerprint_matches": overlap_stats.fingerprint_matches,
         "source_identity_matches": overlap_stats.source_identity_matches,
         "containment_matches": overlap_stats.containment_matches,
         "partially_masked_hits": overlap_stats.partially_masked_hits,
         "removed_lines": overlap_stats.removed_lines
+    }));
+    let hits = diversify_hits(&overlap_hits, cfg.inject_top_k);
+    log_event("inject.relevance", None, serde_json::json!({
+        "stage": "retrieval",
+        "candidates": retrieval_candidates,
+        "kept": hits.len(),
+        "distinct_sources": hits.iter().map(|hit| hit.path.as_str()).collect::<HashSet<_>>().len(),
+        "minimum_score": MINIMUM_RELEVANCE_SCORE,
+        "rerank": cfg.inject_rerank
     }));
 
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
@@ -1096,6 +1169,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 cfg.inject_resolve_query,
                 &already_injected,
                 &overlap,
+                true,
             )
         ).await
     });
@@ -1632,19 +1706,22 @@ fn build_catalog(
     current_prompt: &str,
     mut embedder: Option<Box<dyn crate::embed::Embedder>>,
 ) -> Vec<CatalogItem> {
-    // RAG hit → best score, keyed by filename stem for loose matching across path schemes.
+    // RAG hit → best score by its exact logical index path. Avoid stem-only
+    // matching: two unrelated documents named README.md must not share
+    // relevance evidence.
     let mut hit_score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for h in hits {
-        let stem = Path::new(&h.path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&h.path)
-            .to_string();
-        let e = hit_score.entry(stem).or_insert(h.score);
+        let e = hit_score.entry(h.path.clone()).or_insert(h.score);
         if h.score > *e {
             *e = h.score;
         }
     }
+    let best_path_score = |paths: &[String]| {
+        paths
+            .iter()
+            .filter_map(|path| hit_score.get(path).copied())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    };
 
     let mut items: Vec<CatalogItem> = Vec::new();
 
@@ -1656,7 +1733,10 @@ fn build_catalog(
             key: r.slug.clone(),
             title: r.title.clone(),
             summary: r.summary.clone(),
-            score: hit_score.get(&r.slug).copied(),
+            score: best_path_score(&[
+                format!("pc-memory/guides/{}.md", r.slug),
+                format!("pc-memory/{}.md", r.slug),
+            ]),
             kind: ContentKind::CurrentGuide,
             currentness: Currentness::Current,
         });
@@ -1673,23 +1753,20 @@ fn build_catalog(
             key: format!("{}{}", EPISODE_KEY_PREFIX, stem),
             title,
             summary: ep.summary,
-            score: hit_score.get(&stem).copied(),
+            score: hit_score
+                .get(&format!("pc-memory/episodes/{}.md", stem))
+                .copied(),
             kind: ContentKind::EpisodeCard,
             currentness: Currentness::Historical,
         });
     }
 
     for path in list_committed_markdown(root) {
-        let stem = Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&path)
-            .to_string();
         items.push(CatalogItem {
-            key: path,
+            key: path.clone(),
             title: String::new(),
             summary: String::new(),
-            score: hit_score.get(&stem).copied(),
+            score: hit_score.get(&path).copied(),
             kind: ContentKind::CommittedMarkdown,
             currentness: Currentness::Unknown,
         });
@@ -1716,7 +1793,9 @@ fn build_catalog(
                 key: ContentKind::ResearchRecord.render_key(&stem),
                 title,
                 summary,
-                score: hit_score.get(&stem).copied(),
+                score: hit_score
+                    .get(&format!("pc-memory/research/{}.md", stem))
+                    .copied(),
                 kind: ContentKind::ResearchRecord,
                 currentness: Currentness::Historical,
             });
@@ -1734,7 +1813,9 @@ fn build_catalog(
                 key: ContentKind::NounEntry.render_key(&nr.slug),
                 title: nr.name,
                 summary: truncate(&nr.definition, 100),
-                score: hit_score.get(&nr.slug).copied(),
+                score: hit_score
+                    .get(&format!("pc-memory/nouns/{}.md", nr.slug))
+                    .copied(),
                 kind: ContentKind::NounEntry,
                 currentness: Currentness::Current,
             });
@@ -1775,7 +1856,9 @@ fn build_catalog(
                             key: ContentKind::Claim.render_key(&cluster.cluster_id),
                             title,
                             summary,
-                            score: None, // cosine score from retrieval is not a RAG hit score
+                            // Use raw semantic similarity for the relevance
+                            // gate; the authority-boosted score is rank-only.
+                            score: Some(cluster.similarity_score as f64),
                             kind: ContentKind::Claim,
                             currentness: Currentness::Current,
                         });
@@ -1815,6 +1898,101 @@ fn build_catalog(
     }
 
     items
+}
+
+fn relevance_evidenced_catalog(items: Vec<CatalogItem>) -> Vec<CatalogItem> {
+    items
+        .into_iter()
+        .filter(|item| {
+            item.score
+                .is_some_and(|score| score >= MINIMUM_RELEVANCE_SCORE)
+        })
+        .collect()
+}
+
+/// Re-rank selected sources by the retrieval score, then spend the configured
+/// guide budget across distinct source kinds before admitting same-kind
+/// overflow. Existing catalog order remains the tie-breaker.
+fn rerank_selected_catalog<'a>(
+    catalog: &'a [CatalogItem],
+    selected: &[String],
+    max_guides: usize,
+) -> Vec<&'a CatalogItem> {
+    let selected_keys = selected
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut ranked = catalog
+        .iter()
+        .filter(|item| selected_keys.contains(item.key.as_str()))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut seen_keys = HashSet::new();
+    let mut seen_kinds = HashSet::new();
+    let mut primary = Vec::new();
+    let mut overflow = Vec::new();
+    for item in ranked {
+        if !seen_keys.insert(item.key.as_str()) {
+            continue;
+        }
+        if seen_kinds.insert(item.kind.label()) {
+            primary.push(item);
+        } else {
+            overflow.push(item);
+        }
+    }
+    primary.extend(overflow);
+    primary.truncate(max_guides);
+    primary
+}
+
+fn read_guides_with_budget(
+    root: &Path,
+    wiki_dir: &Path,
+    project_dir: &Path,
+    items: &[&CatalogItem],
+    char_budget: usize,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut guides = Vec::new();
+    let mut guides_read = Vec::new();
+    let mut remaining_chars = char_budget;
+
+    for (index, item) in items.iter().enumerate() {
+        if remaining_chars == 0 {
+            break;
+        }
+        let Some(content) = read_catalog_content(root, wiki_dir, project_dir, &item.key) else {
+            continue;
+        };
+        let sources_left = items.len().saturating_sub(index).max(1);
+        let fair_share = remaining_chars.div_ceil(sources_left);
+        let clipped = truncate_head_to_chars(&content, fair_share);
+        if clipped.trim().is_empty() {
+            continue;
+        }
+        let used_chars = clipped.chars().count();
+        remaining_chars = remaining_chars.saturating_sub(used_chars);
+        log_event("guide.read", None, serde_json::json!({
+            "slug": item.key,
+            "chars": used_chars,
+            "truncated": used_chars < content.chars().count()
+        }));
+        guides.push((item.key.clone(), clipped));
+        guides_read.push(item.key.clone());
+    }
+
+    log_event("inject.context_budget", None, serde_json::json!({
+        "stage": "compile_sources",
+        "budget_chars": char_budget,
+        "used_chars": char_budget.saturating_sub(remaining_chars),
+        "sources": guides_read
+    }));
+    (guides, guides_read)
 }
 
 /// Render the catalog for the selector preamble: one compact line per source.
@@ -1898,6 +2076,7 @@ async fn wiki_navigate_and_compile(
     resolve_query: bool,
     already_injected: &str,
     overlap: &crate::context_overlap::ContextOverlap,
+    require_relevance_evidence: bool,
 ) -> Result<NavigateResult> {
     let mut backend = LivePipelineModelBackend {
         api_key,
@@ -1919,6 +2098,7 @@ async fn wiki_navigate_and_compile(
         max_tokens,
         resolve_query,
         already_injected,
+        require_relevance_evidence,
         overlap,
         false,
     )
@@ -1940,6 +2120,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     max_tokens: usize,
     resolve_query: bool,
     already_injected: &str,
+    require_relevance_evidence: bool,
     overlap: &crate::context_overlap::ContextOverlap,
     capture_trace: bool,
 ) -> Result<(NavigateResult, Option<PipelineNavigationTrace>)> {
@@ -1957,7 +2138,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     } else {
         None
     };
-    let catalog = build_catalog(
+    let mut catalog = build_catalog(
         root,
         wiki_dir,
         project_dir,
@@ -1967,6 +2148,17 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         current_prompt,
         claim_embedder,
     );
+    let catalog_candidates = catalog.len();
+    if require_relevance_evidence {
+        catalog = relevance_evidenced_catalog(catalog);
+    }
+    log_event("inject.relevance", None, serde_json::json!({
+        "stage": "catalog",
+        "candidates": catalog_candidates,
+        "kept": catalog.len(),
+        "minimum_score": MINIMUM_RELEVANCE_SCORE,
+        "evidence_required": require_relevance_evidence
+    }));
     log_event("wiki.index_read", None, serde_json::json!({ "guide_count": catalog.len() }));
     let candidates = if capture_trace {
         catalog
@@ -1991,6 +2183,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         Vec::new()
     };
 
+    let source_budget = source_char_budget(max_tokens, max_guides);
     if catalog.is_empty() {
         // Nothing enumerable. If the vector index still surfaced raw chunks, cite them verbatim.
         if hits.is_empty() {
@@ -2011,10 +2204,8 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
                 }),
             ));
         }
-        let artifact = render_hits_librarian(hits, root);
         return Ok((
-            NavigateResult::Briefing {
-                text: artifact.clone(),
+            NavigateResult::ShortCircuit {
                 guides_read: vec![],
             },
             capture_trace.then(|| PipelineNavigationTrace {
@@ -2025,8 +2216,8 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
                 select_latency_ms: None,
                 compile_latency_ms: None,
                 provider_call_count: 0,
-                outcome: "raw_retrieval_artifact".to_string(),
-                compiled_artifact: Some(artifact),
+                outcome: "no_catalog_candidates".to_string(),
+                compiled_artifact: None,
             }),
         ));
     }
@@ -2072,7 +2263,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
 
     // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
     let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
-    let selected = parse_selection_decision(sel, &valid, max_guides)?;
+    let selected = parse_selection_decision(sel, &valid, catalog.len())?;
 
     if selected.is_empty() {
         return Ok((
@@ -2093,13 +2284,47 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         ));
     }
 
+    let selected_items = rerank_selected_catalog(&catalog, &selected, max_guides);
+    if selected_items.is_empty() {
+        return Ok((
+            NavigateResult::ShortCircuit {
+                guides_read: vec![],
+            },
+            capture_trace.then(|| PipelineNavigationTrace {
+                candidates,
+                selection_response: Some(selection),
+                selected_keys: selected,
+                selected_sources: vec![],
+                select_latency_ms: Some(select_latency_ms),
+                compile_latency_ms: None,
+                provider_call_count: 1,
+                outcome: "selected_sources_below_relevance_floor".to_string(),
+                compiled_artifact: None,
+            }),
+        ));
+    }
+    log_event("inject.relevance", None, serde_json::json!({
+        "stage": "selected_sources",
+        "selected": selected.len(),
+        "kept": selected_items.len(),
+        "sources": selected_items.iter().map(|item| serde_json::json!({
+            "key": item.key,
+            "kind": item.kind.label(),
+            "score": item.score
+        })).collect::<Vec<_>>()
+    }));
+
     // ── Deterministic read of the selected sources (no tool round-trips) ───────
-    let mut guides: Vec<(String, String)> = Vec::new();
-    let mut guides_read: Vec<String> = Vec::new();
-    for key in &selected {
-        if let Some(content) = read_catalog_content(root, wiki_dir, project_dir, key) {
-            log_event("guide.read", None, serde_json::json!({ "slug": key }));
-            guides_read.push(key.clone());
+    let (budgeted_guides, guides_read) = read_guides_with_budget(
+        root,
+        wiki_dir,
+        project_dir,
+        &selected_items,
+        source_budget,
+    );
+    let guides = budgeted_guides
+        .into_iter()
+        .filter_map(|(key, content)| {
             let masked = overlap.mask_source_preserving_lines(&content);
             if masked.removed_lines > 0 {
                 log_event("inject.overlap_source", None, serde_json::json!({
@@ -2108,11 +2333,9 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
                     "fully_suppressed": masked.fully_suppressed
                 }));
             }
-            if !masked.fully_suppressed {
-                guides.push((key.clone(), masked.text));
-            }
-        }
-    }
+            (!masked.fully_suppressed).then_some((key, masked.text))
+        })
+        .collect::<Vec<_>>();
     if guides.is_empty() {
         return Ok((
             NavigateResult::ShortCircuit {
@@ -2258,6 +2481,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
         false,     // no query resolution
         "",        // no already-injected ledger
         &overlap,
+        false,     // eval corpus intentionally enumerates without live retrieval evidence
     )
     .await
 }
@@ -2312,6 +2536,7 @@ pub(crate) async fn navigate_and_compile_for_replay(
         max_tokens,
         resolve_query,
         already_injected,
+        true,
         &overlap,
         true,
     )
@@ -2611,29 +2836,6 @@ fn validate_compile_response<'a>(
     Ok(response)
 }
 
-/// Render raw vector hits verbatim as a librarian briefing (used when the wiki is empty
-/// but the index has hits). Chunks have no stable file-line mapping, so they are cited by
-/// path + chunk index rather than line range. No LLM — so no paraphrase.
-fn render_hits_librarian(hits: &[QueryResult], root: &Path) -> String {
-    let mut body = String::new();
-    for h in hits {
-        let label = if let Some(memory_rel) = h.path.strip_prefix("pc-memory/") {
-            crate::wiki::wiki_dir(root).join(memory_rel).display().to_string()
-        } else {
-            h.path.clone()
-        };
-        body.push_str(&format!(
-            "{} (chunk {}, score {:.2})\n{}\n\n",
-            label, h.chunk_index, h.score, h.content
-        ));
-    }
-    let body = body.trim_end();
-    if body.is_empty() {
-        return "NONE".to_string();
-    }
-    format!("TITLE: relevant project files\n{}", body)
-}
-
 // ─── Eval harness public wrappers ────────────────────────────────────────────
 
 /// Public async wrapper for `compile_briefing`, callable from the eval runner.
@@ -2711,22 +2913,19 @@ pub(crate) fn build_enriched_query(
     recent: &str,
     char_cap: usize,
 ) -> String {
-    if recent.is_empty() {
-        current_prompt.to_string()
-    } else {
-        cap_tail(&format!("{}\n\n{}", recent, current_prompt), char_cap)
-    }
+    contextualized_query(current_prompt, recent, char_cap)
 }
 
 fn cap_tail(s: &str, char_cap: usize) -> String {
-    if s.len() <= char_cap {
+    let char_count = s.chars().count();
+    if char_count <= char_cap {
         return s.to_string();
     }
-    let start = s.len() - char_cap;
-    let mut boundary = start;
-    while boundary < s.len() && !s.is_char_boundary(boundary) {
-        boundary += 1;
-    }
+    let boundary = s
+        .char_indices()
+        .nth(char_count - char_cap)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
     s[boundary..].to_string()
 }
 
@@ -2742,10 +2941,13 @@ fn format_guides(guides: &[String]) -> String {
 mod tests {
     use super::{parse_query_line, parse_selected_keys};
     use super::{
-        build_catalog, classify_generation_failure, generation_failure_payload,
-        missing_session_id_warning_payload, no_generation_config_payload, no_index_payload,
-        parse_selection_decision, read_catalog_content, source_label_for_key,
-        validate_compile_response, wrap_context_reminder, EPISODE_KEY_PREFIX,
+        build_catalog, classify_generation_failure, contextualized_query, diversify_hits,
+        generation_failure_payload,
+        missing_session_id_warning_payload, no_index_payload, parse_selection_decision,
+        no_generation_config_payload,
+        read_catalog_content, read_guides_with_budget, relevance_evidenced_catalog,
+        rerank_selected_catalog, source_char_budget, source_label_for_key,
+        validate_compile_response, wrap_context_reminder, CatalogItem, EPISODE_KEY_PREFIX,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -3007,6 +3209,177 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         assert_eq!(parse_query_line("inject-subcommand"), None);
         assert_eq!(parse_query_line("QUERY:"), None);
         assert_eq!(parse_query_line("NOTHING_RELEVANT"), None);
+    }
+
+    fn query_hit(path: &str, chunk_index: i64, score: f64) -> crate::query::QueryResult {
+        crate::query::QueryResult {
+            path: path.to_string(),
+            chunk_index,
+            content: format!("{path} chunk {chunk_index}"),
+            content_hash: format!("{path}-{chunk_index}"),
+            score,
+        }
+    }
+
+    #[test]
+    fn contextualized_query_keeps_recent_context_and_current_prompt_under_cap() {
+        let query = contextualized_query(
+            "Does it support Google?",
+            "User: We are discussing OAuth.",
+            200,
+        );
+        assert!(query.contains("discussing OAuth"));
+        assert!(query.ends_with("Does it support Google?"));
+
+        let capped = contextualized_query("CURRENT", &"x".repeat(300), 40);
+        assert!(capped.len() <= 40);
+        assert!(capped.ends_with("CURRENT"));
+    }
+
+    #[test]
+    fn retrieval_diversity_prefers_distinct_paths_without_losing_rank_order() {
+        let hits = vec![
+            query_hit("a.md", 0, 0.9),
+            query_hit("a.md", 1, 0.8),
+            query_hit("b.md", 0, 0.7),
+            query_hit("c.md", 0, 0.6),
+        ];
+        let kept = diversify_hits(&hits, 3);
+        let identities = kept
+            .iter()
+            .map(|hit| (hit.path.as_str(), hit.chunk_index))
+            .collect::<Vec<_>>();
+        assert_eq!(identities, vec![("a.md", 0), ("b.md", 0), ("c.md", 0)]);
+    }
+
+    #[test]
+    fn catalog_requires_existing_semantic_relevance_evidence() {
+        use crate::content_kind::{ContentKind, Currentness};
+        use crate::query::MINIMUM_RELEVANCE_SCORE;
+
+        let item = |key: &str, score| CatalogItem {
+            key: key.to_string(),
+            title: key.to_string(),
+            summary: String::new(),
+            score,
+            kind: ContentKind::CurrentGuide,
+            currentness: Currentness::Current,
+        };
+        let kept = relevance_evidenced_catalog(vec![
+            item("at-floor", Some(MINIMUM_RELEVANCE_SCORE)),
+            item("below", Some(MINIMUM_RELEVANCE_SCORE - 0.001)),
+            item("unscored", None),
+        ]);
+        assert_eq!(
+            kept.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+            vec!["at-floor"]
+        );
+    }
+
+    #[test]
+    fn catalog_relevance_evidence_does_not_cross_same_stem_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::create_dir_all(&wiki).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(root.join("docs/readme.md"), "# Relevant\n\nOAuth details.").unwrap();
+        fs::write(root.join("other/readme.md"), "# Unrelated\n\nGardening details.").unwrap();
+
+        let hits = vec![query_hit("docs/readme.md", 0, 0.8)];
+        let catalog = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &[],
+            &hits,
+            150,
+            "OAuth",
+            None,
+        );
+        let kept = relevance_evidenced_catalog(catalog);
+
+        assert_eq!(
+            kept.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+            vec!["docs/readme.md"]
+        );
+    }
+
+    #[test]
+    fn selected_catalog_rerank_spends_budget_across_source_kinds() {
+        use crate::content_kind::{ContentKind, Currentness};
+
+        let item = |key: &str, score: f64, kind| CatalogItem {
+            key: key.to_string(),
+            title: key.to_string(),
+            summary: String::new(),
+            score: Some(score),
+            kind,
+            currentness: Currentness::Current,
+        };
+        let catalog = vec![
+            item("guide-a", 0.9, ContentKind::CurrentGuide),
+            item("guide-b", 0.8, ContentKind::CurrentGuide),
+            item("claim:c", 0.7, ContentKind::Claim),
+        ];
+        let selected = vec![
+            "guide-b".to_string(),
+            "claim:c".to_string(),
+            "guide-a".to_string(),
+        ];
+        let kept = rerank_selected_catalog(&catalog, &selected, 2);
+        assert_eq!(
+            kept.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+            vec!["guide-a", "claim:c"]
+        );
+    }
+
+    #[test]
+    fn selected_source_input_obeys_derived_hard_context_budget() {
+        use crate::content_kind::{ContentKind, Currentness};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(wiki.join("guides")).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(wiki.join("guides/first.md"), "a".repeat(100)).unwrap();
+        fs::write(wiki.join("guides/second.md"), "b".repeat(100)).unwrap();
+
+        let items = vec![
+            CatalogItem {
+                key: "first".to_string(),
+                title: "First".to_string(),
+                summary: String::new(),
+                score: Some(0.9),
+                kind: ContentKind::CurrentGuide,
+                currentness: Currentness::Current,
+            },
+            CatalogItem {
+                key: "second".to_string(),
+                title: "Second".to_string(),
+                summary: String::new(),
+                score: Some(0.8),
+                kind: ContentKind::Claim,
+                currentness: Currentness::Current,
+            },
+        ];
+        let refs = items.iter().collect::<Vec<_>>();
+        let budget = 20;
+        let (guides, read) =
+            read_guides_with_budget(root, &wiki, &project_dir, &refs, budget);
+        let used = guides
+            .iter()
+            .map(|(_, content)| content.chars().count())
+            .sum::<usize>();
+
+        assert_eq!(read, vec!["first", "second"]);
+        assert!(used <= budget, "used {used} chars with budget {budget}");
+        assert_eq!(source_char_budget(700, 8), 22_400);
     }
 
     #[test]
@@ -3426,6 +3799,7 @@ The live route is POST /v2/session.\n",
                 300,
                 false,
                 "",
+                false,
                 &overlap,
                 true,
             ))

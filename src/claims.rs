@@ -110,8 +110,12 @@ pub struct ClaimCluster {
     pub cluster_id: String,
     /// All claims in the cluster, most-recent first.
     pub claims: Vec<ClaimRecord>,
-    /// Cosine similarity to the query (set at retrieval time).
+    /// Rank score after the existing explicit-authority boost.
     pub score: f32,
+    /// Raw cosine similarity to the query, before authority affects ordering.
+    /// Relevance gates must use this value so authority cannot make an
+    /// unrelated claim look semantically relevant.
+    pub similarity_score: f32,
 }
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
@@ -767,7 +771,12 @@ pub fn load_cluster(project_dir: &Path, cluster_id: &str) -> Option<ClaimCluster
     }
     // Most-recent first (mirrors retrieve_top_clusters ordering).
     claims.sort_by(|a, b| b.ts.cmp(&a.ts));
-    Some(ClaimCluster { cluster_id: cluster_id.to_string(), claims, score: 0.0 })
+    Some(ClaimCluster {
+        cluster_id: cluster_id.to_string(),
+        claims,
+        score: 0.0,
+        similarity_score: 0.0,
+    })
 }
 
 /// Retrieve the top-K most relevant claim clusters for `query`, ranked by:
@@ -842,7 +851,12 @@ pub fn retrieve_top_clusters(
             } else {
                 base_score
             };
-            Some(ClaimCluster { cluster_id: cid, claims, score })
+            Some(ClaimCluster {
+                cluster_id: cid,
+                claims,
+                score,
+                similarity_score: base_score,
+            })
         })
         .collect();
 

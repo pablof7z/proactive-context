@@ -11,6 +11,16 @@ use std::path::Path;
 ///   0.0 = identical, 0.5 = somewhat related, 1.0 = orthogonal, >1.0 = unrelated/negative.
 const DEFAULT_MAX_DISTANCE: f64 = 0.75;
 
+/// Minimum semantic similarity accepted by retrieval.
+///
+/// This is the score form of the long-standing `DEFAULT_MAX_DISTANCE` cutoff,
+/// not a second independently tuned threshold.
+pub(crate) const MINIMUM_RELEVANCE_SCORE: f64 = 1.0 - DEFAULT_MAX_DISTANCE;
+
+fn meets_relevance_floor(score: f64) -> bool {
+    score >= MINIMUM_RELEVANCE_SCORE
+}
+
 /// Result of a query, optionally reranked.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -73,6 +83,9 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool) -> Result
     // Emit retrieve.hit for each returned result
     let results: Vec<QueryResult> = final_hits
         .into_iter()
+        // Keep the SQL distance predicate as the primary gate, but defend the
+        // injection boundary if a different search implementation is wired in.
+        .filter(|h| meets_relevance_floor(1.0 - h.distance))
         .map(|h| {
             let score = 1.0 - h.distance;
             log_event("retrieve.hit", None, serde_json::json!({
@@ -90,6 +103,13 @@ pub fn run_query(root: &Path, query: &str, top_k: usize, rerank: bool) -> Result
             }
         })
         .collect();
+
+    if results.is_empty() {
+        log_event("retrieve.abstain", None, serde_json::json!({
+            "reason": "below_relevance_floor",
+            "minimum_score": MINIMUM_RELEVANCE_SCORE
+        }));
+    }
 
     Ok(results)
 }
@@ -159,5 +179,17 @@ pub fn print_results(results: &[QueryResult], root: &Path) {
             r.score * 100.0,
             &truncate(&r.content, 280)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{meets_relevance_floor, MINIMUM_RELEVANCE_SCORE};
+
+    #[test]
+    fn relevance_floor_is_the_existing_distance_cutoff_in_score_form() {
+        assert_eq!(MINIMUM_RELEVANCE_SCORE, 0.25);
+        assert!(meets_relevance_floor(0.25));
+        assert!(!meets_relevance_floor(0.249_999));
     }
 }
