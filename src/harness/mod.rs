@@ -17,7 +17,7 @@ pub mod install;
 mod selector;
 
 use crate::transcript::parse_codex_rollout;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ─── Orthogonal axes ──────────────────────────────────────────────────────────
 
@@ -245,6 +245,16 @@ fn normalize_inner(spec: &HarnessSpec, raw: &str) -> Option<String> {
     };
 
     // Resolve the transcript into a canonical flat-JSONL temp file when needed.
+    //
+    // Keep the least-lossy host transcript separately for overlap suppression. In particular,
+    // Codex's canonical copy deliberately contains only user/assistant prose, while its original
+    // rollout also exposes developer instructions and XML-wrapped PC context that the model can
+    // already see. Inject uses `model_context_path` only for deterministic exact-match suppression;
+    // capture/recent-conversation parsing keeps its existing filtered transcript behavior.
+    let model_context_path: Option<String> = match spec.transcript {
+        TranscriptDialect::ClaudeJsonl | TranscriptDialect::CodexRollout => transcript_src.clone(),
+        TranscriptDialect::InlineOpenAi => None,
+    };
     let transcript_path: Option<String> = match spec.transcript {
         TranscriptDialect::ClaudeJsonl => transcript_src,
         TranscriptDialect::CodexRollout => transcript_src
@@ -262,7 +272,7 @@ fn normalize_inner(spec: &HarnessSpec, raw: &str) -> Option<String> {
                             let role = m.get("role")?.as_str()?.to_string();
                             let content = match m.get("content")? {
                                 serde_json::Value::String(s) => s.clone(),
-                                other => crate::transcript::extract_text(other),
+                                other => crate::context_overlap::context_text(other),
                             };
                             Some((role, content))
                         })
@@ -280,6 +290,19 @@ fn normalize_inner(spec: &HarnessSpec, raw: &str) -> Option<String> {
     });
     if let Some(tp) = transcript_path {
         out["transcript_path"] = serde_json::Value::String(tp);
+    }
+    // Inline history exists only in the canonical temp file produced above.
+    let model_context_path = model_context_path.or_else(|| {
+        if matches!(spec.transcript, TranscriptDialect::InlineOpenAi) {
+            out.get("transcript_path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    });
+    if let Some(path) = model_context_path {
+        out["model_context_path"] = serde_json::Value::String(path);
     }
     Some(out.to_string())
 }
@@ -302,4 +325,79 @@ fn write_canonical_transcript(session_id: &str, turns: &[(String, String)]) -> O
         .join("\n");
     std::fs::write(&path, body).ok()?;
     Some(path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn codex_normalization_keeps_original_rollout_for_overlap_context() {
+        let mut rollout = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            rollout,
+            "{}",
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Harness instruction."}]}})
+        )
+        .unwrap();
+        writeln!(
+            rollout,
+            "{}",
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Current user message."}]}})
+        )
+        .unwrap();
+
+        let raw = serde_json::json!({
+            "prompt": "Current user message.",
+            "cwd": "/tmp/project",
+            "session_id": "codex-overlap-test",
+            "transcript_path": rollout.path()
+        })
+        .to_string();
+        let normalized = normalize_stdin(&lookup("codex"), &raw);
+        let value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            value["model_context_path"].as_str(),
+            rollout.path().to_str()
+        );
+        assert_ne!(
+            value["transcript_path"].as_str(),
+            value["model_context_path"].as_str()
+        );
+        let recent =
+            crate::transcript::parse_transcript(value["transcript_path"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            recent,
+            vec![("user".to_string(), "Current user message.".to_string())]
+        );
+    }
+
+    #[test]
+    fn hermes_inline_history_preserves_instruction_text_for_overlap_context() {
+        let raw = serde_json::json!({
+            "cwd": "/tmp/project",
+            "session_id": "hermes-overlap-test",
+            "extra": {
+                "user_message": "Do the work.",
+                "conversation_history": [
+                    {"role":"system","content":[{"type":"text","text":"Harness instruction."}]},
+                    {"role":"user","content":"Do the work."}
+                ]
+            }
+        })
+        .to_string();
+        let normalized = normalize_stdin(&lookup("hermes"), &raw);
+        let value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            value["model_context_path"].as_str(),
+            value["transcript_path"].as_str()
+        );
+        let context =
+            std::fs::read_to_string(value["model_context_path"].as_str().unwrap()).unwrap();
+        assert!(context.contains("\"role\":\"system\""));
+        assert!(context.contains("Harness instruction."));
+    }
 }

@@ -41,6 +41,11 @@ struct InjectInput {
     session_id: String,
     #[serde(default)]
     transcript_path: Option<String>,
+    /// Least-lossy host transcript used only for exact overlap suppression. Codex normalization,
+    /// for example, keeps recent conversation in `transcript_path` but points this at the original
+    /// rollout so developer instructions and prior PC payloads remain observable.
+    #[serde(default)]
+    model_context_path: Option<String>,
 }
 
 // ─── Compile preamble (briefing step) ────────────────────────────────────────
@@ -394,6 +399,28 @@ fn warn_missing_session_id(session_id: &str) {
     }
 }
 
+fn suppress_repeated_noun_primer(
+    mut noun: crate::nouns::NounResolution,
+    overlap: &crate::context_overlap::ContextOverlap,
+) -> crate::nouns::NounResolution {
+    let repeated = noun
+        .block
+        .as_deref()
+        .map(|block| overlap.contains_text(block))
+        .unwrap_or(false);
+    if repeated {
+        log_event("inject.overlap_noun", None, serde_json::json!({
+            "outcome": "suppressed",
+            "reason": "exact_normalized_containment",
+            "nouns": noun.primed_slugs.len()
+        }));
+        noun.block = None;
+        noun.primed_slugs.clear();
+        noun.matched.clear();
+    }
+    noun
+}
+
 // ─── Context renderer ─────────────────────────────────────────────────────────
 
 fn wrap_context_reminder(project_name: &str, body: &str) -> String {
@@ -742,6 +769,25 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     }
 
     let context_turns_used = cfg.inject_context_turns;
+    // An on-disk transcript can outlive the model's visible context after compaction. Reuse the
+    // established ledger visibility window: ordinary conversation/PC payloads are suppressive only
+    // inside this tail, while model-persistent system/developer instructions remain available.
+    let context_visibility_messages = cfg.inject_context_turns.saturating_mul(2).saturating_add(8);
+    let model_context_path = input
+        .model_context_path
+        .as_deref()
+        .or(input.transcript_path.as_deref());
+    let overlap = crate::context_overlap::ContextOverlap::from_hook(
+        &input.prompt,
+        model_context_path,
+        harness,
+        context_visibility_messages,
+    );
+    log_event(
+        "inject.overlap_context",
+        None,
+        overlap.coverage().telemetry(),
+    );
 
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
     if input.prompt.trim().len() < 3 || should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words) {
@@ -750,12 +796,15 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         // touches the guide pipeline, so we run it with empty recent (cheap) and inject noun-only on
         // a hit. Only bother for substantive-length prompts so "ok"/"yes" stay free.
         if input.prompt.trim().len() >= 8 {
-            let noun = crate::nouns::resolve_noun_primer(
-                &wiki::wiki_dir(&root),
-                &project_context_dir(&root),
-                &input.session_id,
-                &input.prompt,
-                "",
+            let noun = suppress_repeated_noun_primer(
+                crate::nouns::resolve_noun_primer(
+                    &wiki::wiki_dir(&root),
+                    &project_context_dir(&root),
+                    &input.session_id,
+                    &input.prompt,
+                    "",
+                ),
+                &overlap,
             );
             let project_basename = project_basename(&project);
             if let Some((out, out_chars)) =
@@ -811,16 +860,24 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     // LLM-free, runs independently of guide selection so a pure-entity prompt ("what is X?")
     // injects the captured definition even when no guide is relevant (the short-circuit case
     // that previously injected nothing). Computed up front; consumed by every terminal arm.
-    let noun_resolution = crate::nouns::resolve_noun_primer(
-        &wiki::wiki_dir(&root),
-        &project_context_dir(&root),
-        &input.session_id,
-        &input.prompt,
-        &recent,
+    let noun_resolution = suppress_repeated_noun_primer(
+        crate::nouns::resolve_noun_primer(
+            &wiki::wiki_dir(&root),
+            &project_context_dir(&root),
+            &input.session_id,
+            &input.prompt,
+            &recent,
+        ),
+        &overlap,
     );
 
     // ── 2. Cheap retrieval (synchronous, seed hints) ───────────────────────
-    let hits = match run_query(&root, &enriched_query, cfg.inject_top_k, cfg.inject_rerank) {
+    let retrieved_hits = match run_query(
+        &root,
+        &enriched_query,
+        cfg.inject_top_k,
+        cfg.inject_rerank,
+    ) {
         Ok(h) => h,
         Err(e) => {
             log_event("error", None, serde_json::json!({
@@ -852,6 +909,18 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
             return Ok(());
         }
     };
+    let retrieved_hit_count = retrieved_hits.len();
+    let (hits, overlap_stats) = overlap.suppress_hits(retrieved_hits);
+    log_event("inject.overlap_filter", None, serde_json::json!({
+        "retrieved_hits": retrieved_hit_count,
+        "kept_hits": hits.len(),
+        "dropped_hits": overlap_stats.dropped_hits,
+        "fingerprint_matches": overlap_stats.fingerprint_matches,
+        "source_identity_matches": overlap_stats.source_identity_matches,
+        "containment_matches": overlap_stats.containment_matches,
+        "partially_masked_hits": overlap_stats.partially_masked_hits,
+        "removed_lines": overlap_stats.removed_lines
+    }));
 
     // Prepare project label used by noun and compiled reminder rendering.
     let project_basename = project_basename(&project);
@@ -914,12 +983,11 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     // Prior briefings injected this session are only suppressive when the
     // current transcript window still proves the reminder body is visible.
     // After harness compaction, resurfacing context is safer than under-injecting.
-    let ledger_visibility_turns = cfg.inject_context_turns.saturating_mul(2).saturating_add(8);
     let already_injected = crate::ledger::read_visible_recent(
         &root,
         &input.session_id,
         input.transcript_path.as_deref(),
-        ledger_visibility_turns,
+        context_visibility_messages,
         cfg.inject_ledger_entries,
         cfg.inject_ledger_char_cap,
     );
@@ -945,6 +1013,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
                 cfg.inject_max_tokens,
                 cfg.inject_resolve_query,
                 &already_injected,
+                &overlap,
             )
         ).await
     });
@@ -957,7 +1026,14 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
 
     match browse_result {
         Ok(Ok(NavigateResult::Briefing { text: briefing, guides_read })) => {
-            let trimmed = briefing.trim();
+            let compiled_suppression = overlap.suppress_compiled(&briefing);
+            if compiled_suppression.removed_lines > 0 {
+                log_event("inject.overlap_compiled", None, serde_json::json!({
+                    "removed_lines": compiled_suppression.removed_lines,
+                    "fully_suppressed": compiled_suppression.fully_suppressed
+                }));
+            }
+            let trimmed = compiled_suppression.text.trim();
             let elapsed_ms = start.elapsed().as_millis();
             // Strip the leading `TITLE:` line — it's metadata for the status bar, not for Claude.
             let (title_opt, body) = strip_title_line(trimmed);
@@ -1618,6 +1694,7 @@ async fn wiki_navigate_and_compile(
     max_tokens: usize,
     resolve_query: bool,
     already_injected: &str,
+    overlap: &crate::context_overlap::ContextOverlap,
 ) -> Result<NavigateResult> {
     // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
     // PC_CLAIM_CATALOG: when on, build_catalog needs an embedder for cluster retrieval. We build
@@ -1744,8 +1821,18 @@ async fn wiki_navigate_and_compile(
     for key in &selected {
         if let Some(content) = read_catalog_content(root, wiki_dir, project_dir, key) {
             log_event("guide.read", None, serde_json::json!({ "slug": key }));
-            guides.push((key.clone(), content));
             guides_read.push(key.clone());
+            let masked = overlap.mask_source_preserving_lines(&content);
+            if masked.removed_lines > 0 {
+                log_event("inject.overlap_source", None, serde_json::json!({
+                    "source": key,
+                    "removed_lines": masked.removed_lines,
+                    "fully_suppressed": masked.fully_suppressed
+                }));
+            }
+            if !masked.fully_suppressed {
+                guides.push((key.clone(), masked.text));
+            }
         }
     }
     if guides.is_empty() {
@@ -1833,6 +1920,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
     // corpus has no claims store, so even if the flag were on, retrieve_top_clusters returns []).
     // Pass a temp dir as project_dir — it will never be read unless the flag is set.
     let dummy_project_dir = std::env::temp_dir();
+    let overlap = crate::context_overlap::ContextOverlap::from_hook(prompt, None, "eval", 0);
     wiki_navigate_and_compile(
         api_key,
         ollama_api_key,
@@ -1850,6 +1938,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
         max_tokens,
         false,     // no query resolution
         "",        // no already-injected ledger
+        &overlap,
     )
     .await
 }

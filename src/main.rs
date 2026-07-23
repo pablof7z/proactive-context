@@ -34,6 +34,7 @@ mod session_start;
 mod chunker;
 mod config;
 mod configure;
+mod context_overlap;
 mod content_kind;
 mod daemon;
 mod db;
