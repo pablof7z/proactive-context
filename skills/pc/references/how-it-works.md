@@ -22,9 +22,9 @@ The user, repository sources, and live systems retain their original authority. 
 
 ## Deduplication and overlap
 
-PC records delivered briefing bodies in a per-session ledger. A prior body is suppressive only while the current transcript window proves that exact context is still visible; missing history or compaction favors resurfacing over silent omission.
+PC atomically records delivered briefing bodies in a per-session ledger. Suppression is session-absolute, including after compaction: normalized exact lines are not delivered twice, and cited lines use the cited path plus line or range as a deterministic fact identity, so paraphrasing the same citation does not reintroduce it.
 
-Before delivery, compare the compiled facts with context already visible in the session and remove redundant overlap. Preserve distinct constraints, corrections, provenance, and changed state. Never suppress a fact merely because it is topically similar, and never repeat the same context block when it is already visible.
+Separately, PC removes context that the hook can prove is already available to the model. It uses exact source identity, content fingerprints, and whitespace-normalized containment to drop or line-mask overlapping retrieval, source, noun, and compiled text while preserving citation line positions. It does not make a semantic same-fact judgment from topical similarity.
 
 ## Inspecting one run
 

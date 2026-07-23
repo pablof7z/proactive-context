@@ -899,9 +899,8 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     }
 
     let context_turns_used = cfg.inject_context_turns;
-    // An on-disk transcript can outlive the model's visible context after compaction. Reuse the
-    // established ledger visibility window: ordinary conversation/PC payloads are suppressive only
-    // inside this tail, while model-persistent system/developer instructions remain available.
+    // Bound the current-context overlap surface: ordinary conversation/PC payloads come from this
+    // recent tail, while model-persistent system/developer instructions remain available.
     let context_visibility_messages = cfg.inject_context_turns.saturating_mul(2).saturating_add(8);
     let model_context_path = input
         .model_context_path

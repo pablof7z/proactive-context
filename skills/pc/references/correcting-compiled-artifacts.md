@@ -24,7 +24,7 @@ Treat compiled PC context as a fallible, cited hypothesis about what matters now
 - If good evidence was never considered, correct indexing, retrieval, catalog construction, or source eligibility.
 - If candidates were present but the wrong sources were chosen, correct SELECT relevance or source-type handling.
 - If selected sources were right but the briefing was wrong, correct COMPILE instructions, citation validation, artifact safety, or fail-closed handling.
-- If output was correct but missing, duplicated, or repeated, correct delivery, session identity, ledger visibility, or overlap suppression.
+- If output was correct but missing, duplicated, or repeated, correct delivery, session identity, session-absolute ledger/citation identity, or deterministic overlap suppression.
 - If the source itself is genuinely outdated, update it through the authoritative capture/reconciliation workflow with new cited evidence and explicit supersession.
 
 Rerun the affected pipeline and inspect a fresh trace. Confirm the corrected payload against the user intent, live state, and cited sources, and add a regression test at the stage that failed.
