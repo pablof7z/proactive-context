@@ -19,7 +19,7 @@ mod state;
 
 use crate::config::{load_config, normalize_path, resolve_project_root};
 use crate::daemon::index_files_into_db;
-use crate::events::{init_context, log_event, truncate};
+use crate::events::{init_project_context, log_event, truncate};
 use crate::provider::{build_ollama_client, ModelSpec, Provider};
 use crate::transcript::{
     build_transcript_string, parse_transcript, parse_transcript_meta, reduce_turns_to_fit,
@@ -2447,9 +2447,10 @@ fn run_capture_from_input(
         return Ok(());
     }
 
-    // Seed event context
-    let project = normalize_path(&PathBuf::from(&input.cwd));
-    init_context(&project, &input.session_id);
+    // Seed event context from the canonical PC binding when this is a live
+    // project, or from an explicit unbound identity for isolated replay runs.
+    init_project_context(Path::new(&input.cwd), &input.session_id)
+        .map_err(anyhow::Error::from)?;
 
     let capture_start = std::time::Instant::now();
 

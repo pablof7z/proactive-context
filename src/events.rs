@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -46,6 +47,69 @@ pub fn new_pass(project: &str) {
         c.project = project.to_string();
         c.req = new_request_id();
     }
+}
+
+const UNBOUND_PROJECT_PREFIX: &str = "unbound-path:";
+
+/// Resolve the project identity used only by observability records.
+///
+/// Existing PC bindings always win. Operations that intentionally run before
+/// a project is bound retain a path-derived identity, explicitly namespaced so
+/// it cannot be confused with a canonical project-store ID.
+pub fn project_event_id(
+    path: &Path,
+) -> Result<String, crate::project_store::UnavailableReason> {
+    match crate::project_store::bound_project_store(path) {
+        Ok(Some(store)) => Ok(store.manifest.project_id),
+        Ok(None) | Err(crate::project_store::UnavailableReason::NotGitWorktree) => {
+            let root = crate::config::resolve_project_root(path);
+            Ok(format!(
+                "{UNBOUND_PROJECT_PREFIX}{}",
+                crate::config::normalize_path(&root)
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Seed a command or capture operation from an existing binding when present.
+/// The returned value is the exact project ID written to subsequent events.
+pub fn init_project_context(
+    path: &Path,
+    session_id: &str,
+) -> Result<String, crate::project_store::UnavailableReason> {
+    let project = project_event_id(path)?;
+    init_context(&project, session_id);
+    Ok(project)
+}
+
+/// Seed a store-backed command with its already-proven canonical identity.
+pub fn init_store_context(
+    store: &crate::project_store::ProjectStore,
+    session_id: &str,
+) -> String {
+    let project = store.manifest.project_id.clone();
+    init_context(&project, session_id);
+    project
+}
+
+/// Seed a store-backed operation with its already-proven canonical identity.
+pub fn init_store_context_with_request(
+    store: &crate::project_store::ProjectStore,
+    session_id: &str,
+    request_id: String,
+) -> String {
+    let project = store.manifest.project_id.clone();
+    init_context_with_request(&project, session_id, request_id);
+    project
+}
+
+/// Rotate the request ID for a store-backed daemon pass without changing its
+/// canonical project identity.
+pub fn new_store_pass(store: &crate::project_store::ProjectStore) -> String {
+    let project = store.manifest.project_id.clone();
+    new_pass(&project);
+    project
 }
 
 /// Generate a cheap, collision-resistant request ID: `<pid-hex>-<unix_millis>`.
@@ -384,6 +448,42 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ScopedPcHome, PC_HOME_TEST_LOCK};
+    use std::fs;
+    use std::process::Command;
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_subject(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "--initial-branch", "master"]);
+        fs::write(path.join("README.md"), "subject\n").unwrap();
+        git(path, &["add", "README.md"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initialize",
+            ],
+        );
+    }
 
     fn event(payload: Value) -> Event {
         Event {
@@ -431,6 +531,66 @@ mod tests {
         assert_eq!(payload.get("small").and_then(|v| v.as_str()), Some("kept"));
         assert!(payload.get("system").and_then(|v| v.as_str()).unwrap().len() < 6000);
         assert!(payload.get("user").and_then(|v| v.as_str()).unwrap().len() < 6000);
+    }
+
+    #[test]
+    fn bound_store_identity_is_shared_by_injection_query_capture_and_daemon() {
+        let _home_lock = PC_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedPcHome::set(&tmp.path().join("pc-home"));
+        let subject = tmp.path().join("subject");
+        let linked = tmp.path().join("linked");
+        init_subject(&subject);
+
+        let unbound = project_event_id(&subject).unwrap();
+        assert!(
+            unbound.starts_with(UNBOUND_PROJECT_PREFIX),
+            "an unbound operation must be visibly distinct from a store ID: {unbound}"
+        );
+
+        let store = crate::project_store::ensure_project_store(&subject).unwrap();
+        git(
+            &subject,
+            &["worktree", "add", linked.to_str().unwrap(), "-b", "linked"],
+        );
+        let expected = store.manifest.project_id.clone();
+
+        // These are the exact context-seeding surfaces used by injection,
+        // query, capture (from a linked worktree), and daemon indexing.
+        let injection =
+            init_store_context_with_request(&store, "session", "inject-run".to_string());
+        let query = init_store_context(&store, "");
+        let capture = init_project_context(&linked, "session").unwrap();
+        let daemon = new_store_pass(&store);
+
+        assert_eq!(injection, expected);
+        assert_eq!(query, expected);
+        assert_eq!(capture, expected);
+        assert_eq!(daemon, expected);
+    }
+
+    #[test]
+    fn truly_unbound_event_identity_is_explicit_and_path_stable() {
+        let _home_lock = PC_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedPcHome::set(&tmp.path().join("pc-home"));
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+
+        let root_id = project_event_id(&plain).unwrap();
+        let repeated_id = project_event_id(&plain).unwrap();
+
+        assert_eq!(
+            root_id, repeated_id,
+            "repeated unbound operations must retain the same fallback identity"
+        );
+        assert_eq!(
+            root_id,
+            format!(
+                "{UNBOUND_PROJECT_PREFIX}{}",
+                crate::config::normalize_path(&plain)
+            )
+        );
     }
 
     #[cfg(unix)]

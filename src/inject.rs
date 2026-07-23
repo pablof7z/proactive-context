@@ -7,7 +7,7 @@ use crate::config::{
     validate_config,
 };
 use crate::content_kind::{Authority, ContentKind, Currentness};
-use crate::events::{init_context_with_request, log_event, truncate};
+use crate::events::{init_store_context_with_request, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::query::{run_query, QueryResult, MINIMUM_RELEVANCE_SCORE};
@@ -952,7 +952,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         &input.prompt,
         input.transcript_path.is_some(),
     );
-    init_context_with_request(&store.manifest.project_id, &input.session_id, run_id);
+    init_store_context_with_request(&store, &input.session_id, run_id);
     warn_missing_session_id(&input.session_id);
 
     let cfg = match load_config() {

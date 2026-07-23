@@ -67,11 +67,11 @@ mod transcript;
 mod tui;
 mod wiki;
 
-use crate::config::{load_config, normalize_path, project_context_dir, resolve_project_root, save_config};
+use crate::config::{load_config, project_context_dir, resolve_project_root, save_config};
 use crate::daemon::{
     daemonize, index_files_into_db, list_daemons, run_daemon_foreground, stop_daemon,
 };
-use crate::events::init_context;
+use crate::events::init_store_context;
 use crate::query::{print_results, run_query};
 
 #[derive(Parser)]
@@ -832,8 +832,9 @@ fn main() -> Result<()> {
 
         Commands::Query { query, top_k, rerank } => {
             // Seed event context so run_query emits with correct project/req
-            let project = normalize_path(&root);
-            init_context(&project, "");
+            let store = crate::project_store::ensure_project_store(&root)
+                .map_err(anyhow::Error::from)?;
+            init_store_context(&store, "");
             let results = run_query(&root, &query, top_k, rerank)?;
             print_results(&results, &root);
         }

@@ -1,8 +1,8 @@
-use crate::config::{config_dir, normalize_path, project_context_dir, project_db_path, project_pid_path, Config};
+use crate::config::{config_dir, project_context_dir, project_db_path, project_pid_path, Config};
 use crate::db::{chunk_hashes_for_path, content_hash, delete_chunks_for_path, index_stats, indexed_paths, open_db, open_db_at, replace_chunks_for_path};
 use crate::embed::{build_embedder, build_sidecar_embedder, Embedder};
 use crate::chunker::chunk_markdown;
-use crate::events::{log_event, new_pass};
+use crate::events::{log_event, new_store_pass};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -324,7 +324,13 @@ pub fn list_daemons() -> Result<Vec<DaemonInfo>> {
 }
 
 /// Perform a full (re)index of all .md files under root, respecting .gitignore.
-pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, cfg: &Config) -> Result<()> {
+pub fn full_index(
+    root: &Path,
+    store: &crate::project_store::ProjectStore,
+    conn: &Connection,
+    embedder: &mut dyn Embedder,
+    cfg: &Config,
+) -> Result<()> {
     let walker = WalkBuilder::new(root)
         .hidden(true)           // skip .git etc.
         .git_ignore(true)
@@ -403,8 +409,7 @@ pub fn full_index(root: &Path, conn: &Connection, embedder: &mut dyn Embedder, c
     println!("Index complete: {} files, {} chunks", file_count, chunk_count);
 
     // Emit daemon.index event (full phase)
-    let project = normalize_path(root);
-    new_pass(&project);
+    new_store_pass(store);
     log_event("daemon.index", None, serde_json::json!({
         "phase": "full",
         "files": file_count,
@@ -516,7 +521,7 @@ pub fn run_daemon(root: &Path) -> Result<()> {
 
     // Initial full index (idempotent) — guard against concurrent index-files runs
     let _index_lock = IndexLock::acquire(&project_db_path(root))?;
-    full_index(root, &conn, embedder.as_mut(), &cfg)?;
+    full_index(root, &store, &conn, embedder.as_mut(), &cfg)?;
     drop(_index_lock);
 
     // --- File watcher ---
@@ -554,7 +559,7 @@ pub fn run_daemon(root: &Path) -> Result<()> {
             ) {
                 // Materialization may have changed external memory without a
                 // portable filesystem notification (directory swap).
-                let _ = full_index(root, &conn, embedder.as_mut(), &cfg);
+                let _ = full_index(root, &store, &conn, embedder.as_mut(), &cfg);
             }
             last_store_maintenance = Instant::now();
         }
@@ -590,8 +595,7 @@ pub fn run_daemon(root: &Path) -> Result<()> {
                     pending.retain(|p| unique.insert(p.clone()));
 
                     // Set a fresh req for this incremental pass
-                    let project = normalize_path(root);
-                    new_pass(&project);
+                    new_store_pass(&store);
 
                     let mut updated_count = 0usize;
                     for abs_path in pending.drain(..) {
