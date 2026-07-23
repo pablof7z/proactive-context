@@ -100,7 +100,7 @@ Expected: all → `outcome:"skipped"`. Verify as INJ-01. Note the three independ
 ### INJ-03 — Substantive-but-irrelevant short-circuit: ZERO guide.read — CRITICAL (the key latency proof)
 Setup: project with a **populated wiki of clearly-irrelevant guides** (this is essential — with an empty catalog the selector is skipped and the proof fails). Build the wiki by running a capture on a transcript about, say, "avatar hovercards & optimistic locking." Confirm `wiki/` has ≥2 guides + `_index.md`. Unique SID.
 Action: `echo '{"prompt":"How do I configure the Kubernetes ingress controller TLS certificates for our staging cluster?","cwd":...,"session_id":...}' | $BIN inject --verbose`
-Expected: the selector returns `NOTHING_RELEVANT` → `NavigateResult::ShortCircuit`. Events: `inject.start` → `wiki.index_read` → `select.shortcircuit` → `inject.done(outcome:none, out_chars:0)`. **ZERO `guide.read` events. NO `generate.briefing`. No compile call.** No relevant-context block on stdout. A captured noun, including proposed/implicit/superseded facts, must not create a standalone fallback.
+Expected: the selector returns `NOTHING_RELEVANT` → `NavigateResult::ShortCircuit`. Events: `inject.start` → `wiki.index_read` → `select.shortcircuit` → `inject.done(outcome:none, out_chars:0)`. **ZERO `guide.read` events. NO `generate.briefing`. No compile call.** No relevant-context block on stdout. A captured noun, including proposed/implicit/superseded facts, must not create a standalone fallback. A promoted noun may enter SELECT only as a prompt-matched alias to exactly one current guide whose semantic score meets the ordinary relevance floor; abstention still emits nothing.
 Verify: assert `guide.read` count == 0 and `generate.briefing` absent in the SID's events; `select.shortcircuit` present. Record `lat_ms` (should be ~1 Haiku round-trip, not 2).
 Bug to watch: if `guide.read` > 0 here, the short-circuit is broken (wasted Sonnet latency on every irrelevant prompt).
 
@@ -139,6 +139,11 @@ Setup: indexed project with vector hits and a populated wiki. Set `inject_browse
 Action: relevant prompt.
 Expected: `Err(_timeout)` → `inject.failure` plus `inject.done(outcome:empty, reason:"provider_timeout", failure_stage:"generate", out_chars:0)`. Stdout contains no context even when vector hits or noun artifacts exist.
 Verify: no raw chunks, noun primer, partial briefing, or relevant-context wrapper is emitted. Restore config.
+
+### INJ-09A — Safe noun alias provenance — CRITICAL
+Setup: create promoted, provisional, rejected, topic-only, claim-only, ambiguous-guide, and promoted-single-guide nouns. Give only the promoted single-guide noun a prompt match and an exact backing-guide retrieval score at or above `0.25`.
+Expected: only that noun appears as `noun:<slug>` in SELECT, and the durable `noun_source_map` records its concrete guide key, score, and currentness before model selection. If selected, PC reads the guide, COMPILE sees a current-guide source, and the artifact cites only the guide path; the noun record and realness registry are never source documents.
+Verify: repeat below `0.25`, with no prompt match, after recent-context repetition, with multiple/no direct guide refs, and with `PC_NOUN_CATALOG=0`; each must exclude the alias. A direct three-word entity question may bypass only the trivial-prompt gate, then must still pass retrieval, SELECT, COMPILE, citation validation, overlap, and ledger deduplication.
 
 ### INJ-10 — Empty wiki but committed md present — CRITICAL
 Setup: indexed project, **no wiki dir** (delete it), but committed `.md` files in the repo. Unique SID, relevant prompt.

@@ -109,11 +109,11 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
 
     // ── Injection visibility: which kinds currently become SELECT catalog rows. ──────────────
     // Reflects inject::build_catalog: guides + episode cards + committed markdown are catalog rows;
-    // promoted user-realness nouns can be exposed behind PC_NOUN_CATALOG; raw noun-entry files are
-    // inventory/debug records, not the noun population.
+    // promoted user-realness nouns are default-on SELECT aliases to exactly one scored backing
+    // current guide; raw noun-entry files are inventory/debug records, not injection sources.
     let typed_catalog = flag_default_on("PC_TYPED_CATALOG");
     let research_catalog = flag_enabled("PC_RESEARCH_CATALOG");
-    let noun_catalog = flag_enabled("PC_NOUN_CATALOG");
+    let noun_catalog = flag_default_on("PC_NOUN_CATALOG");
     let claim_catalog = flag_enabled("PC_CLAIM_CATALOG");
 
     println!("── injection visibility (current build_catalog) ───────────");
@@ -124,7 +124,7 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
     print_vis(
         ContentKind::NounEntry,
         noun_catalog,
-        "promoted realness nouns only behind PC_NOUN_CATALOG",
+        "prompt-matched realness aliases to exact scored current guides",
     );
     print_vis(
         ContentKind::ResearchRecord,
@@ -144,7 +144,7 @@ pub fn run(root: &Path, wiki: &Path, project_dir: &Path) -> anyhow::Result<()> {
         FlagState { name: "PC_TYPED_CATALOG", enabled: typed_catalog, note: "carry ContentKind into the catalog (DEFAULT ON 2026-06-18)" },
         FlagState { name: "PC_SELECT_SOURCE_TYPES", enabled: flag_default_on("PC_SELECT_SOURCE_TYPES"), note: "type-aware SELECT instructions (DEFAULT ON 2026-06-18)" },
         FlagState { name: "PC_RESEARCH_CATALOG", enabled: research_catalog, note: "research records selectable" },
-        FlagState { name: "PC_NOUN_CATALOG", enabled: noun_catalog, note: "promoted realness nouns selectable" },
+        FlagState { name: "PC_NOUN_CATALOG", enabled: noun_catalog, note: "safe noun aliases selectable (DEFAULT ON; disable with 0)" },
         FlagState { name: "PC_CLAIM_STATUS", enabled: flag_enabled("PC_CLAIM_STATUS"), note: "persist settled|proposed on claims" },
         FlagState { name: "PC_CLAIM_CATALOG", enabled: claim_catalog, note: "claim clusters selectable" },
         FlagState { name: "PC_TYPED_TRANSCRIPT", enabled: flag_enabled("PC_TYPED_TRANSCRIPT"), note: "canonical transcript substrate" },

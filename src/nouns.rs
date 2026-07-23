@@ -1646,8 +1646,8 @@ pub fn read_noun_entry_files(wiki_dir: &Path) -> Vec<NounFileEntry> {
 }
 
 /// True when the prompt is a DIRECT entity question ("what is X?", "you know what X is?", "explain
-/// X") rather than an incidental task mention. The asking is itself a strong relevance signal, so
-/// the surfacing gate relaxes for thin/unscored nouns on a direct query. Heuristic, LLM-free.
+/// X") rather than an incidental task mention. The asking is a strong activation signal, but it
+/// never replaces the inject pipeline's semantic-relevance requirement.
 fn is_direct_entity_query(prompt: &str) -> bool {
     let p = prompt.to_lowercase();
     const PATTERNS: &[&str] = &[
@@ -1739,6 +1739,64 @@ pub struct MatchedNoun {
     pub name: String,
     pub status: String,
     pub via: String,
+}
+
+/// A side-effect-free production candidate for the typed SELECT catalog.
+///
+/// This deliberately carries only the promoted realness entry and match telemetry. It composes no
+/// primer prose, reads or writes no primed-noun ledger, and grants no delivery authority. The
+/// inject catalog must still resolve it to one exact scored backing source before SELECT can see it.
+#[derive(Debug, Clone)]
+pub struct NounCatalogCandidate {
+    pub entry: NounEntry,
+    pub direct_query: bool,
+}
+
+/// Find promoted user-realness nouns named by this prompt for possible catalog admission.
+///
+/// Ordinary prompts keep first-mention behavior by suppressing nouns already present in recent
+/// conversation. A direct high-confidence entity question may still ask for grounding after the
+/// noun was mentioned. This is selection only: no generated noun content, session ledger, or
+/// delivery side effect is involved.
+pub fn noun_catalog_candidates(
+    wiki_dir: &Path,
+    project_dir: &Path,
+    prompt: &str,
+    recent: &str,
+) -> Vec<NounCatalogCandidate> {
+    let direct_query = is_direct_entity_query(prompt);
+    let prompt_l = prompt.to_lowercase();
+    let recent_l = recent.to_lowercase();
+    let mut candidates = Vec::new();
+
+    for entry in primeable_noun_registry(wiki_dir, project_dir) {
+        let Some(strength) = match_noun_in_prompt(&prompt_l, &entry.name, &entry.slug) else {
+            continue;
+        };
+        let recent_match = match_noun_in_prompt(&recent_l, &entry.name, &entry.slug);
+        if recent_match.is_some() && !(direct_query && strength.is_high_confidence()) {
+            continue;
+        }
+        candidates.push((
+            NounCatalogCandidate {
+                entry,
+                direct_query,
+            },
+            strength,
+        ));
+    }
+
+    candidates.sort_by(|(left, left_strength), (right, right_strength)| {
+        right_strength
+            .rank()
+            .cmp(&left_strength.rank())
+            .then_with(|| left.entry.slug.cmp(&right.entry.slug))
+    });
+    candidates.truncate(MAX_PRIME_PER_TURN);
+    candidates
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .collect()
 }
 
 /// The result of the user-realness noun resolver: the composed primer block (if any), the slugs to

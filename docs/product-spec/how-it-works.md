@@ -54,7 +54,7 @@ prompt ──> trivial-prompt gate
 ```
 
 Composition happens at SELECT (the model picks per-prompt among typed sources) — never by blending retrieval budgets, which measurably dilutes.
-Captured noun artifacts remain available to the typed catalog, but direct noun-primer delivery is disabled: hook context must pass the same SELECT, COMPILE, citation, relevance, and authority checks as every other source.
+Promoted user-realness nouns are default-on SELECT aliases only when prompt-matched and backed by exactly one current guide with semantic score at or above the ordinary relevance floor. Selecting a noun reads and cites that real guide; it never injects a noun record or bypasses SELECT, COMPILE, citation, relevance, authority, overlap, or ledger checks.
 
 ## Cold start
 

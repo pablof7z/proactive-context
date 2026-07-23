@@ -24,7 +24,7 @@ The user, repository sources, and live systems retain their original authority. 
 
 PC atomically records delivered briefing bodies in a per-session ledger. Suppression is session-absolute, including after compaction: normalized exact lines are not delivered twice, and cited lines use the cited path plus line or range as a deterministic fact identity, so paraphrasing the same citation does not reintroduce it.
 
-Separately, PC removes context that the hook can prove is already available to the model. It uses exact source identity, content fingerprints, and whitespace-normalized containment to drop or line-mask overlapping retrieval, source, noun, and compiled text while preserving citation line positions. It does not make a semantic same-fact judgment from topical similarity.
+Separately, PC removes context that the hook can prove is already available to the model. It uses exact source identity, content fingerprints, and whitespace-normalized containment to drop or line-mask overlapping retrieval, source, and compiled text while preserving citation line positions. A noun catalog key is only an alias: overlap and deduplication use its concrete backing guide identity. PC does not make a semantic same-fact judgment from topical similarity.
 
 ## Inspecting one run
 

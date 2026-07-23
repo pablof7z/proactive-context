@@ -987,8 +987,30 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         return handle_no_index(&root, &out_mode, start.elapsed().as_millis() as u64);
     }
 
+    let recent = recent_context_text(
+        input.transcript_path.as_deref(),
+        cfg.inject_context_turns,
+        cfg.inject_query_char_cap,
+    );
+    let wiki_path = wiki::wiki_dir(&root);
+    let wiki_index_rows = if wiki_path.exists() {
+        wiki::read_index(&wiki_path)
+    } else {
+        vec![]
+    };
+
     // ── Activation gate (runs AFTER init_context so events are attributed) ─
-    if input.prompt.trim().len() < 3 || should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words) {
+    let ordinarily_skipped =
+        should_skip_prompt(&input.prompt, cfg.inject_min_prompt_words);
+    let noun_activation = ordinarily_skipped
+        && noun_direct_activation(
+            &wiki_path,
+            &project_context_dir(&root),
+            &wiki_index_rows,
+            &input.prompt,
+            &recent,
+        );
+    if input.prompt.trim().len() < 3 || (ordinarily_skipped && !noun_activation) {
         log_event("inject.done", Some(start.elapsed().as_millis() as u64), serde_json::json!({
             "outcome": "skipped",
             "reason": "trivial_prompt",
@@ -1011,11 +1033,6 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     }));
 
     // ── 1. Recent context + enriched query ─────────────────────────────────
-    let recent = recent_context_text(
-        input.transcript_path.as_deref(),
-        cfg.inject_context_turns,
-        cfg.inject_query_char_cap,
-    );
     let enriched_query =
         contextualized_query(&input.prompt, &recent, cfg.inject_query_char_cap);
     log_event("inject.query", None, serde_json::json!({
@@ -1099,15 +1116,6 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     let ollama_api_key = cfg.ollama_api_key.clone();
 
     // ── 3. Wiki-based navigation under timeout ─────────────────────────────
-    let wiki_path = wiki::wiki_dir(&root);
-
-    // Check if wiki exists and has guides
-    let wiki_index_rows = if wiki_path.exists() {
-        wiki::read_index(&wiki_path)
-    } else {
-        vec![]
-    };
-
     // Emit wiki.index_read
     log_event("wiki.index_read", None, serde_json::json!({
         "guide_count": wiki_index_rows.len()
@@ -1310,6 +1318,7 @@ pub(crate) enum NavigateResult {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PipelineCandidateTrace {
     pub key: String,
+    pub source_key: String,
     pub title: String,
     pub summary: String,
     pub score: Option<f64>,
@@ -1320,7 +1329,8 @@ pub(crate) struct PipelineCandidateTrace {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PipelineSourceTrace {
-    pub key: String,
+    pub catalog_key: String,
+    pub source_key: String,
     pub content: String,
 }
 
@@ -1402,7 +1412,11 @@ const CATALOG_MAX: usize = 150;
 /// A selectable context source: a wiki guide (keyed by bare slug) or a committed
 /// project markdown file (keyed by its repo-relative path — contains '/' or ends ".md").
 struct CatalogItem {
+    /// Key shown to and returned by SELECT.
     key: String,
+    /// Concrete source key read for COMPILE. Noun rows are selection aliases whose source key is
+    /// one exact backing current guide; all ordinary rows map to themselves.
+    source_key: String,
     title: String,
     summary: String,
     score: Option<f64>,
@@ -1527,7 +1541,7 @@ fn read_head(path: &Path, cap: usize) -> String {
 
 /// Full content of a catalog source by key. Resolution by key shape:
 ///   - `episode:<stem>`  → `<wiki_dir>/episodes/<stem>.md` (historical episode card)
-///   - `noun:<slug>` → rendered from the promoted user-realness noun registry
+///   - `noun:<slug>` → never directly readable; noun catalog rows must resolve to a backing guide
 ///   - `claim:<cluster_id>` → rendered from claims.jsonl records for that cluster (no .md file)
 ///   - `<path>` containing '/' or ending '.md' → `<root>/<path>` (committed project doc)
 ///   - bare slug → `<wiki_dir>/<slug>.md` (wiki guide)
@@ -1543,12 +1557,9 @@ fn read_catalog_content(root: &Path, wiki_dir: &Path, project_dir: &Path, key: &
             let path = wiki_dir.join("research").join(format!("{}.md", stem));
             return std::fs::read_to_string(path).ok();
         }
-        (ContentKind::NounEntry, slug) => {
-            return crate::nouns::primeable_noun_registry(wiki_dir, project_dir)
-                .into_iter()
-                .find(|entry| entry.slug == slug)
-                .map(|entry| crate::nouns::render_noun_record(&entry));
-        }
+        // A noun key is a SELECT-only alias. Treating a synthetic rendered noun as if it were the
+        // contents of realness.jsonl would create citations to lines that do not exist.
+        (ContentKind::NounEntry, _) => return None,
         // Phase 5: claim rows have no backing .md file — content is rendered from ClaimRecords.
         // load_cluster resolves by cluster_id directly from claims.jsonl (no embedder needed,
         // no re-retrieval inconsistency risk). Returns None gracefully on a missing cluster.
@@ -1587,13 +1598,9 @@ fn source_label_for_key(
         (ContentKind::ResearchRecord, stem) => {
             label_for_path(root, &wiki_dir.join("research").join(format!("{}.md", stem)))
         }
-        (ContentKind::NounEntry, slug) => {
-            format!(
-                "{}#{}",
-                label_for_path(root, &wiki_dir.join("nouns").join("realness.jsonl")),
-                slug
-            )
-        }
+        // Noun keys are SELECT-only aliases and must never reach source labeling. Keep the
+        // defensive label visibly unresolved rather than fabricating a realness.jsonl citation.
+        (ContentKind::NounEntry, slug) => format!("unresolved-noun-alias:{}", slug),
         (ContentKind::Claim, cluster_id) => {
             if let Some(project_dir) = project_dir {
                 let claim_store = crate::claims::claims_jsonl_path(project_dir);
@@ -1693,6 +1700,82 @@ const EPISODE_KEY_PREFIX: &str = "episode:";
 /// catalog cap (CATALOG_MAX) and subsequent SELECT pruning keep the window manageable.
 const CATALOG_CLAIMS_TOP_K: usize = 20;
 
+#[derive(Debug, Clone)]
+struct NounCatalogSeed {
+    key: String,
+    source_key: String,
+    title: String,
+    summary: String,
+    direct_query: bool,
+}
+
+/// Resolve prompt-matched, promoted realness nouns to exactly one concrete current guide.
+///
+/// Topic-only and claim-only entries are deliberately excluded: their legacy source references do
+/// not identify one line-addressable compile source. Multiple direct guide refs are also ambiguous.
+/// This function grants activation/catalog eligibility only; semantic retrieval evidence is added
+/// separately from the exact guide path in `build_catalog`.
+fn noun_catalog_seeds(
+    wiki_dir: &Path,
+    project_dir: &Path,
+    index_rows: &[IndexRow],
+    current_prompt: &str,
+    recent: &str,
+) -> Vec<NounCatalogSeed> {
+    crate::nouns::noun_catalog_candidates(wiki_dir, project_dir, current_prompt, recent)
+        .into_iter()
+        .filter_map(|candidate| {
+            if !candidate.entry.has_definition() {
+                return None;
+            }
+            let guide_refs = candidate
+                .entry
+                .source_refs
+                .iter()
+                .filter_map(|source_ref| source_ref.strip_prefix("guide:"))
+                .collect::<HashSet<_>>();
+            if guide_refs.len() != 1 {
+                return None;
+            }
+            let source_key = (*guide_refs.iter().next()?).to_string();
+            let row = index_rows.iter().find(|row| row.slug == source_key)?;
+            if !guide_path(wiki_dir, &source_key).is_file() {
+                return None;
+            }
+            Some(NounCatalogSeed {
+                key: ContentKind::NounEntry.render_key(&candidate.entry.slug),
+                source_key,
+                title: candidate.entry.name,
+                summary: if candidate.entry.definition.trim().is_empty() {
+                    row.summary.clone()
+                } else {
+                    truncate(&candidate.entry.definition, 100)
+                },
+                direct_query: candidate.direct_query,
+            })
+        })
+        .collect()
+}
+
+fn noun_direct_activation(
+    wiki_dir: &Path,
+    project_dir: &Path,
+    index_rows: &[IndexRow],
+    current_prompt: &str,
+    recent: &str,
+) -> bool {
+    taxonomy_flag_default_on("PC_NOUN_CATALOG")
+        && noun_catalog_seeds(
+            wiki_dir,
+            project_dir,
+            index_rows,
+            current_prompt,
+            recent,
+        )
+        .iter()
+        .any(|seed| seed.direct_query)
+}
+
 /// Build the candidate catalog: wiki guides (free title/summary from the index) ∪ committed
 /// project markdown, annotated with vector-preselect scores, capped at CATALOG_MAX. File
 /// heads are read ONLY for post-cap survivors so a big repo never pays hundreds of opens.
@@ -1708,6 +1791,7 @@ fn build_catalog(
     hits: &[QueryResult],
     max: usize,
     current_prompt: &str,
+    recent: &str,
     mut embedder: Option<Box<dyn crate::embed::Embedder>>,
 ) -> Vec<CatalogItem> {
     // RAG hit → best score by its exact logical index path. Avoid stem-only
@@ -1735,6 +1819,7 @@ fn build_catalog(
         }
         items.push(CatalogItem {
             key: r.slug.clone(),
+            source_key: r.slug.clone(),
             title: r.title.clone(),
             summary: r.summary.clone(),
             score: best_path_score(&[
@@ -1756,6 +1841,7 @@ fn build_catalog(
         let title = format!("[episode {} · {}] {}", ep.date, ep.salience, ep.title);
         items.push(CatalogItem {
             key: format!("{}{}", EPISODE_KEY_PREFIX, stem),
+            source_key: format!("{}{}", EPISODE_KEY_PREFIX, stem),
             title,
             summary: ep.summary,
             score: hit_score
@@ -1774,6 +1860,7 @@ fn build_catalog(
     for path in list_committed_markdown(root) {
         items.push(CatalogItem {
             key: path.clone(),
+            source_key: path.clone(),
             title: String::new(),
             summary: String::new(),
             score: hit_score.get(&path).copied(),
@@ -1802,6 +1889,7 @@ fn build_catalog(
             };
             items.push(CatalogItem {
                 key: ContentKind::ResearchRecord.render_key(&stem),
+                source_key: ContentKind::ResearchRecord.render_key(&stem),
                 title,
                 summary,
                 score: hit_score
@@ -1814,20 +1902,30 @@ fn build_catalog(
         }
     }
 
-    // Noun entries (`noun:<slug>`): off by default; gated by PC_NOUN_CATALOG.
-    // Enumerates promoted user-realness nouns only; generated noun-entry files are not population.
-    if taxonomy_flag("PC_NOUN_CATALOG") {
-        for nr in crate::nouns::primeable_noun_registry(wiki_dir, project_dir)
-            .into_iter()
-            .filter(|entry| entry.has_definition())
-        {
+    // Noun entries (`noun:<slug>`): production-on, explicit opt-out with PC_NOUN_CATALOG=0.
+    // A noun is a SELECT-only alias to one exact backing current guide. It is admitted only when
+    // that guide already carries live semantic-retrieval evidence at the ordinary relevance floor.
+    if taxonomy_flag_default_on("PC_NOUN_CATALOG") {
+        for seed in noun_catalog_seeds(
+            wiki_dir,
+            project_dir,
+            index_rows,
+            current_prompt,
+            recent,
+        ) {
+            let score = best_path_score(&[
+                format!("pc-memory/guides/{}.md", seed.source_key),
+                format!("pc-memory/{}.md", seed.source_key),
+            ]);
+            if !score.is_some_and(|score| score >= MINIMUM_RELEVANCE_SCORE) {
+                continue;
+            }
             items.push(CatalogItem {
-                key: ContentKind::NounEntry.render_key(&nr.slug),
-                title: nr.name,
-                summary: truncate(&nr.definition, 100),
-                score: hit_score
-                    .get(&format!("pc-memory/nouns/{}.md", nr.slug))
-                    .copied(),
+                key: seed.key,
+                source_key: seed.source_key,
+                title: seed.title,
+                summary: seed.summary,
+                score,
                 kind: ContentKind::NounEntry,
                 currentness: Currentness::Current,
                 authority: Authority::Unknown,
@@ -1873,6 +1971,7 @@ fn build_catalog(
                         let summary = crate::events::truncate(summary_raw, 100);
                         items.push(CatalogItem {
                             key: ContentKind::Claim.render_key(&cluster.cluster_id),
+                            source_key: ContentKind::Claim.render_key(&cluster.cluster_id),
                             title,
                             summary,
                             // Use raw semantic similarity for the relevance
@@ -1960,7 +2059,7 @@ fn rerank_selected_catalog<'a>(
             })
     });
 
-    let mut seen_keys = HashSet::new();
+    let mut seen_source_keys = HashSet::new();
     let mut output = Vec::new();
     let mut start = 0;
     while start < ranked.len() {
@@ -1983,7 +2082,9 @@ fn rerank_selected_catalog<'a>(
         let mut primary = Vec::new();
         let mut overflow = Vec::new();
         for item in &ranked[start..end] {
-            if !seen_keys.insert(item.key.as_str()) {
+            // A noun alias and its ordinary guide row represent one compile source and therefore
+            // consume one source-budget slot even when SELECT returns both keys.
+            if !seen_source_keys.insert(item.source_key.as_str()) {
                 continue;
             }
             if seen_kinds.insert(item.kind.label()) {
@@ -2032,7 +2133,9 @@ fn read_guides_with_budget(
         if remaining_chars == 0 {
             break;
         }
-        let Some(content) = read_catalog_content(root, wiki_dir, project_dir, &item.key) else {
+        let Some(content) =
+            read_catalog_content(root, wiki_dir, project_dir, &item.source_key)
+        else {
             continue;
         };
         let sources_left = items.len().saturating_sub(index).max(1);
@@ -2044,12 +2147,14 @@ fn read_guides_with_budget(
         let used_chars = clipped.chars().count();
         remaining_chars = remaining_chars.saturating_sub(used_chars);
         log_event("guide.read", None, serde_json::json!({
-            "slug": item.key,
+            "slug": item.source_key,
+            "catalog_key": item.key,
+            "source_key": item.source_key,
             "chars": used_chars,
             "truncated": used_chars < content.chars().count()
         }));
-        guides.push((item.key.clone(), clipped));
-        guides_read.push(item.key.clone());
+        guides.push((item.source_key.clone(), clipped));
+        guides_read.push(item.source_key.clone());
     }
 
     log_event("inject.context_budget", None, serde_json::json!({
@@ -2221,6 +2326,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         hits,
         CATALOG_MAX,
         current_prompt,
+        recent,
         claim_embedder,
     );
     let catalog_candidates = catalog.len();
@@ -2234,12 +2340,33 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         "minimum_score": MINIMUM_RELEVANCE_SCORE,
         "evidence_required": require_relevance_evidence
     }));
+    let noun_source_map = catalog
+        .iter()
+        .filter(|item| item.kind == ContentKind::NounEntry)
+        .map(|item| serde_json::json!({
+            "catalog_key": item.key,
+            "source_key": item.source_key,
+            "score": item.score,
+            "currentness": match item.currentness {
+                Currentness::Current => "current",
+                Currentness::Historical => "historical",
+                Currentness::Superseded => "superseded",
+                Currentness::Proposed => "proposed",
+                Currentness::Unknown => "unknown",
+            }
+        }))
+        .collect::<Vec<_>>();
+    crate::inject_trace::record_decision(
+        "noun_source_map",
+        serde_json::json!({"sources": noun_source_map}),
+    );
     log_event("wiki.index_read", None, serde_json::json!({ "guide_count": catalog.len() }));
     let candidates = if capture_trace {
         catalog
             .iter()
             .map(|item| PipelineCandidateTrace {
                 key: item.key.clone(),
+                source_key: item.source_key.clone(),
                 title: item.title.clone(),
                 summary: item.summary.clone(),
                 score: item.score,
@@ -2333,6 +2460,20 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     crate::inject_trace::record_decision(
         "selected_sources",
         serde_json::json!({"sources": selected}),
+    );
+    let selected_source_map = catalog
+        .iter()
+        .filter(|item| selected.iter().any(|key| key == &item.key))
+        .map(|item| serde_json::json!({
+            "catalog_key": item.key,
+            "source_key": item.source_key,
+            "kind": item.kind.label(),
+            "score": item.score
+        }))
+        .collect::<Vec<_>>();
+    crate::inject_trace::record_decision(
+        "selected_source_map",
+        serde_json::json!({"sources": selected_source_map}),
     );
 
     if selected.is_empty() {
@@ -2429,9 +2570,17 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     let selected_sources = if capture_trace {
         guides
             .iter()
-            .map(|(key, content)| PipelineSourceTrace {
-                key: key.clone(),
-                content: content.clone(),
+            .map(|(source_key, content)| {
+                let catalog_key = selected_items
+                    .iter()
+                    .find(|item| item.source_key.as_str() == source_key.as_str())
+                    .map(|item| item.key.clone())
+                    .unwrap_or_else(|| source_key.clone());
+                PipelineSourceTrace {
+                    catalog_key,
+                    source_key: source_key.clone(),
+                    content: content.clone(),
+                }
             })
             .collect()
     } else {
@@ -3043,10 +3192,11 @@ mod tests {
         commit_context, contextualized_query, diversify_hits, generation_failure_payload,
         ledger_unavailable_done_payload,
         missing_session_id_warning_payload, no_generation_config_payload, no_index_payload,
-        parse_selection_decision, read_catalog_content, read_guides_with_budget,
+        noun_direct_activation, parse_selection_decision, read_catalog_content,
+        read_guides_with_budget,
         relevance_evidenced_catalog, rerank_selected_catalog, source_char_budget,
-        source_label_for_key, validate_compile_response, wrap_context_reminder, CatalogItem,
-        ContextCommit, EPISODE_KEY_PREFIX,
+        source_label_for_key, should_skip_prompt, validate_compile_response,
+        wrap_context_reminder, CatalogItem, ContextCommit, EPISODE_KEY_PREFIX,
     };
     use super::{parse_query_line, parse_selected_keys};
     use std::collections::HashSet;
@@ -3285,6 +3435,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         let dummy_project_dir = std::env::temp_dir();
         let catalog = build_catalog(
             root, &wiki, &dummy_project_dir, &[], &[], 150, "",
+            "",
             None::<Box<dyn crate::embed::Embedder>>,
         );
         let episode_rows: Vec<_> = catalog
@@ -3320,28 +3471,270 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             "---\ntype: noun-entry\nslug: junk-file\nname: \"Junk File\"\norigin: extracted\nsource_refs:\n  []\n---\n\n# Junk File\n\nShould not be cataloged.\n",
         )
         .unwrap();
+        let guide = crate::wiki::guide_path(&wiki, "real-thing");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
         fs::write(
-            wiki.join("real-thing.md"),
+            &guide,
             "---\ntitle: Real Thing\nsummary: Definition from guide.\n---\n\n# Real Thing\n\nDefinition from guide.\n",
         )
         .unwrap();
         crate::nouns::write_realness_registry(&wiki, &[crate::nouns::RealnessNoun::new("Real Thing", 3)]).unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let hits = vec![query_hit("pc-memory/guides/real-thing.md", 0, 0.91)];
 
-        let catalog = build_catalog(root, &wiki, &project_dir, &[], &[], 150, "what is real thing?", None);
-        let noun_keys: Vec<_> = catalog
+        let catalog = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &hits,
+            150,
+            "what is real thing?",
+            "",
+            None,
+        );
+        let noun_rows: Vec<_> = catalog
             .iter()
             .filter(|item| item.key.starts_with("noun:"))
-            .map(|item| item.key.as_str())
             .collect();
-        assert_eq!(noun_keys, vec!["noun:real-thing"]);
-        assert!(!noun_keys.contains(&"noun:junk-file"));
+        assert_eq!(noun_rows.len(), 1);
+        assert_eq!(noun_rows[0].key, "noun:real-thing");
+        assert_eq!(noun_rows[0].source_key, "real-thing");
+        assert_eq!(noun_rows[0].kind, crate::content_kind::ContentKind::NounEntry);
 
-        let content = read_catalog_content(root, &wiki, &project_dir, "noun:real-thing")
-            .expect("realness-promoted noun should resolve");
+        // The noun key itself is never a compile source. Only its resolved real guide is readable.
+        assert!(read_catalog_content(root, &wiki, &project_dir, "noun:real-thing").is_none());
+        let content = read_catalog_content(root, &wiki, &project_dir, &noun_rows[0].source_key)
+            .expect("resolved guide source should be readable");
         assert!(content.contains("Definition from guide."));
         assert!(read_catalog_content(root, &wiki, &project_dir, "noun:junk-file").is_none());
 
         std::env::remove_var("PC_NOUN_CATALOG");
+    }
+
+    #[test]
+    fn noun_catalog_requires_realness_prompt_match_and_scored_exact_guide() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for (slug, title) in [
+            ("realthing", "RealThing"),
+            ("maybething", "MaybeThing"),
+            ("rejectedthing", "RejectedThing"),
+        ] {
+            let path = crate::wiki::guide_path(&wiki, slug);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!(
+                    "---\ntitle: {title}\nslug: {slug}\ntopic: entities\nsummary: {title} has a project-specific definition.\n---\n\n# {title}\n\n{title} has a project-specific definition.\n"
+                ),
+            )
+            .unwrap();
+        }
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[
+                crate::nouns::RealnessNoun::new("RealThing", 3),
+                crate::nouns::RealnessNoun::new("MaybeThing", 1),
+                crate::nouns::RealnessNoun::new("RejectedThing", -2),
+            ],
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let prompt = "what is RealThing MaybeThing RejectedThing?";
+
+        let unscored = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &[],
+            150,
+            prompt,
+            "",
+            None,
+        );
+        assert!(!unscored.iter().any(|item| item.key.starts_with("noun:")));
+
+        let below_floor = vec![query_hit(
+            "pc-memory/guides/realthing.md",
+            0,
+            crate::query::MINIMUM_RELEVANCE_SCORE - 0.001,
+        )];
+        let below = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &below_floor,
+            150,
+            prompt,
+            "",
+            None,
+        );
+        assert!(!below.iter().any(|item| item.key.starts_with("noun:")));
+
+        let at_floor = vec![
+            query_hit(
+                "pc-memory/guides/realthing.md",
+                0,
+                crate::query::MINIMUM_RELEVANCE_SCORE,
+            ),
+            query_hit("pc-memory/guides/maybething.md", 0, 0.99),
+            query_hit("pc-memory/guides/rejectedthing.md", 0, 0.99),
+        ];
+        let admitted = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &at_floor,
+            150,
+            prompt,
+            "",
+            None,
+        );
+        let noun_rows = admitted
+            .iter()
+            .filter(|item| item.key.starts_with("noun:"))
+            .collect::<Vec<_>>();
+        assert_eq!(noun_rows.len(), 1);
+        assert_eq!(noun_rows[0].key, "noun:realthing");
+        assert_eq!(noun_rows[0].source_key, "realthing");
+
+        let ordinary_recent = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &at_floor,
+            150,
+            "please update RealThing now",
+            "User: We already discussed RealThing.",
+            None,
+        );
+        assert!(!ordinary_recent
+            .iter()
+            .any(|item| item.key == "noun:realthing"));
+
+        let direct_recent = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &at_floor,
+            150,
+            "what is RealThing?",
+            "User: We mentioned RealThing.",
+            None,
+        );
+        assert!(direct_recent
+            .iter()
+            .any(|item| item.key == "noun:realthing"));
+
+        assert!(should_skip_prompt("what is RealThing?", 4));
+        assert!(noun_direct_activation(
+            &wiki,
+            &project_dir,
+            &index_rows,
+            "what is RealThing?",
+            "",
+        ));
+        assert!(!noun_direct_activation(
+            &wiki,
+            &project_dir,
+            &index_rows,
+            "what is UnknownThing?",
+            "",
+        ));
+
+        std::env::set_var("PC_NOUN_CATALOG", "0");
+        assert!(!noun_direct_activation(
+            &wiki,
+            &project_dir,
+            &index_rows,
+            "what is RealThing?",
+            "",
+        ));
+        std::env::remove_var("PC_NOUN_CATALOG");
+    }
+
+    #[test]
+    fn noun_catalog_excludes_topic_only_and_claim_only_provenance() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let guide = crate::wiki::guide_path(&wiki, "routing-details");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
+        fs::write(
+            &guide,
+            "---\ntitle: Routing Details\nslug: routing-details\ntopic: Routing\nsummary: Routes requests through the relay.\n---\n\n# Routing Details\n\nRoutes requests through the relay.\n",
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+
+        let claim = crate::claims::ClaimRecord {
+            id: "claim-only".to_string(),
+            ts: "2026-07-23".to_string(),
+            session: "test".to_string(),
+            assertion: "ClaimWidget uses a local queue.".to_string(),
+            authority: "explicit".to_string(),
+            subject: "ClaimWidget".to_string(),
+            evidence_text: "test evidence".to_string(),
+            evidence: vec![],
+            cluster_id: "cl-claim-only".to_string(),
+            supersedes: vec![],
+            confirmed_ts: String::new(),
+            status: crate::claims::ClaimStatus::Settled,
+        };
+        fs::write(
+            crate::claims::claims_jsonl_path(&project_dir),
+            format!("{}\n", serde_json::to_string(&claim).unwrap()),
+        )
+        .unwrap();
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[
+                crate::nouns::RealnessNoun::new("Routing", 3),
+                crate::nouns::RealnessNoun::new("ClaimWidget", 3),
+            ],
+        )
+        .unwrap();
+
+        let hits = vec![query_hit(
+            "pc-memory/guides/routing-details.md",
+            0,
+            0.95,
+        )];
+        let catalog = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &hits,
+            150,
+            "what is Routing and ClaimWidget?",
+            "",
+            None,
+        );
+        assert!(!catalog.iter().any(|item| item.key == "noun:routing"));
+        assert!(!catalog.iter().any(|item| item.key == "noun:claimwidget"));
     }
 
     #[test]
@@ -3379,8 +3772,10 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         );
         assert_eq!(
             source_label_for_key(root, &wiki, Some(&project_dir), "noun:mint"),
-            "./docs/wiki/nouns/realness.jsonl#mint"
+            "unresolved-noun-alias:mint"
         );
+        assert!(!source_label_for_key(root, &wiki, Some(&project_dir), "noun:mint")
+            .contains("realness.jsonl"));
         assert_eq!(
             source_label_for_key(root, &wiki, Some(&project_dir), "claim:cl-abc123"),
             "./pc-project/claims.jsonl#claim-cl-abc123"
@@ -3567,6 +3962,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
 
         let item = |key: &str, score| CatalogItem {
             key: key.to_string(),
+            source_key: key.to_string(),
             title: key.to_string(),
             summary: String::new(),
             score,
@@ -3607,6 +4003,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             &hits,
             150,
             "OAuth",
+            "",
             None,
         );
         let kept = relevance_evidenced_catalog(catalog);
@@ -3623,6 +4020,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
 
         let item = |key: &str, score: f64, kind| CatalogItem {
             key: key.to_string(),
+            source_key: key.to_string(),
             title: key.to_string(),
             summary: String::new(),
             score: Some(score),
@@ -3648,12 +4046,46 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
     }
 
     #[test]
+    fn noun_and_guide_aliases_consume_one_source_budget_slot() {
+        use crate::content_kind::{Authority, ContentKind, Currentness};
+
+        let catalog = vec![
+            CatalogItem {
+                key: "real-thing".to_string(),
+                source_key: "real-thing".to_string(),
+                title: "Real Thing".to_string(),
+                summary: String::new(),
+                score: Some(0.92),
+                kind: ContentKind::CurrentGuide,
+                currentness: Currentness::Current,
+                authority: Authority::Unknown,
+            },
+            CatalogItem {
+                key: "noun:real-thing".to_string(),
+                source_key: "real-thing".to_string(),
+                title: "Real Thing".to_string(),
+                summary: String::new(),
+                score: Some(0.92),
+                kind: ContentKind::NounEntry,
+                currentness: Currentness::Current,
+                authority: Authority::Unknown,
+            },
+        ];
+        let selected = vec!["real-thing".to_string(), "noun:real-thing".to_string()];
+        let kept = rerank_selected_catalog(&catalog, &selected, 8);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].source_key, "real-thing");
+    }
+
+    #[test]
     fn selected_catalog_never_lets_proposed_material_outrank_current_truth() {
         use crate::content_kind::{Authority, ContentKind, Currentness};
 
         let catalog = vec![
             CatalogItem {
                 key: "claim:proposal".to_string(),
+                source_key: "claim:proposal".to_string(),
                 title: "Proposal".to_string(),
                 summary: String::new(),
                 score: Some(0.99),
@@ -3663,6 +4095,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             },
             CatalogItem {
                 key: "docs/current.md".to_string(),
+                source_key: "docs/current.md".to_string(),
                 title: "Current".to_string(),
                 summary: String::new(),
                 score: Some(0.30),
@@ -3699,6 +4132,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         let items = vec![
             CatalogItem {
                 key: "first".to_string(),
+                source_key: "first".to_string(),
                 title: "First".to_string(),
                 summary: String::new(),
                 score: Some(0.9),
@@ -3708,6 +4142,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
             },
             CatalogItem {
                 key: "second".to_string(),
+                source_key: "second".to_string(),
                 title: "Second".to_string(),
                 summary: String::new(),
                 score: Some(0.8),
@@ -3870,6 +4305,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         // A sample item exercising the summary + score branch.
         let items = vec![CatalogItem {
             key: "token-model".to_string(),
+            source_key: "token-model".to_string(),
             title: "Token model".to_string(),
             summary: "How tokens flow".to_string(),
             score: Some(0.42),
@@ -3949,7 +4385,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         let emb: Box<dyn crate::embed::Embedder> = Box::new(ConstEmbedder { dim: 4 });
         let catalog = build_catalog(
             root, &wiki, &project_dir, &[], &[], 150,
-            "token model", Some(emb),
+            "token model", "", Some(emb),
         );
         std::env::remove_var("PC_CLAIM_CATALOG");
 
@@ -3984,6 +4420,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         std::env::remove_var("PC_CLAIM_CATALOG");
         let catalog = build_catalog(
             root, &wiki, &project_dir, &[], &[], 150, "some query",
+            "",
             None::<Box<dyn crate::embed::Embedder>>,
         );
 
@@ -4035,7 +4472,7 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         let emb: Box<dyn crate::embed::Embedder> = Box::new(ConstEmbedder { dim: 4 });
         let catalog = build_catalog(
             root, &wiki, &project_dir, &[], &[], 150,
-            "deploy", Some(emb),
+            "deploy", "", Some(emb),
         );
         std::env::remove_var("PC_CLAIM_CATALOG");
 
@@ -4076,6 +4513,22 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
                 .pop_front()
                 .expect("scripted pipeline reply");
             Box::pin(async move { Ok(reply) })
+        }
+    }
+
+    struct FailingPipelineBackend {
+        calls: usize,
+    }
+
+    impl super::PipelineModelBackend for FailingPipelineBackend {
+        fn complete<'a>(
+            &'a mut self,
+            _request: super::PipelineModelRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<String>> + 'a>,
+        > {
+            self.calls += 1;
+            Box::pin(async { anyhow::bail!("scripted provider failure") })
         }
     }
 
@@ -4182,5 +4635,226 @@ The live route is POST /v2/session.\n",
             .contains("POST /v2/session"));
         assert!(trace.select_latency_ms.is_some());
         assert!(trace.compile_latency_ms.is_some());
+    }
+
+    #[test]
+    fn noun_alias_runs_select_compile_and_cites_only_its_backing_guide() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("subject");
+        let wiki = tmp.path().join("wiki");
+        let project_dir = tmp.path().join("project-state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let guide = crate::wiki::guide_path(&wiki, "purplepages");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
+        fs::write(
+            &guide,
+            "---\ntitle: PurplePages\nslug: purplepages\ntopic: product\nsummary: PurplePages is the project's public directory.\n---\n\n# PurplePages\n\nPurplePages is the project's public directory.\n",
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[crate::nouns::RealnessNoun::new("PurplePages", 3)],
+        )
+        .unwrap();
+        let source_label =
+            super::source_label_for_key(&root, &wiki, Some(&project_dir), "purplepages");
+        let hits = vec![query_hit(
+            "pc-memory/guides/purplepages.md",
+            0,
+            0.94,
+        )];
+        let mut backend = ScriptedPipelineBackend {
+            replies: VecDeque::from([
+                "noun:purplepages".to_string(),
+                format!(
+                    "TITLE: PurplePages grounding\nPurplePages is the project's public directory. ({source_label}:10)"
+                ),
+            ]),
+            calls: vec![],
+        };
+        let overlap = crate::context_overlap::ContextOverlap::from_hook(
+            "what is PurplePages?",
+            None,
+            "eval",
+            0,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (outcome, trace) = runtime
+            .block_on(super::wiki_navigate_and_compile_with_backend(
+                &mut backend,
+                "what is PurplePages?",
+                "",
+                &hits,
+                &wiki,
+                &index_rows,
+                &root,
+                &project_dir,
+                4,
+                300,
+                false,
+                "",
+                true,
+                &overlap,
+                true,
+            ))
+            .unwrap();
+        let trace = trace.expect("trace requested");
+
+        match outcome {
+            super::NavigateResult::Briefing { text, guides_read } => {
+                assert!(text.contains("PurplePages is the project's public directory."));
+                assert_eq!(guides_read, vec!["purplepages"]);
+            }
+            super::NavigateResult::ShortCircuit { .. } => panic!("expected noun-backed briefing"),
+        }
+        assert_eq!(backend.calls.len(), 2);
+        assert!(backend.calls[0].0.contains("noun:purplepages"));
+        assert!(backend.calls[1].0.contains("kind=\"current-guide\""));
+        assert!(!backend.calls[1].0.contains("realness.jsonl"));
+        assert!(!backend.calls[1].0.contains("unresolved-noun-alias"));
+
+        let noun_candidate = trace
+            .candidates
+            .iter()
+            .find(|candidate| candidate.key == "noun:purplepages")
+            .expect("noun candidate");
+        assert_eq!(noun_candidate.source_key, "purplepages");
+        assert_eq!(trace.selected_keys, vec!["noun:purplepages"]);
+        assert_eq!(trace.selected_sources.len(), 1);
+        assert_eq!(trace.selected_sources[0].catalog_key, "noun:purplepages");
+        assert_eq!(trace.selected_sources[0].source_key, "purplepages");
+        assert!(
+            !project_dir.join("noun-ledger").exists(),
+            "safe noun aliases must not create the retired primed-noun ledger"
+        );
+    }
+
+    #[test]
+    fn noun_selector_abstention_and_invalid_compile_never_produce_a_briefing() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("subject");
+        let wiki = tmp.path().join("wiki");
+        let project_dir = tmp.path().join("project-state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let guide = crate::wiki::guide_path(&wiki, "purplepages");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
+        fs::write(
+            &guide,
+            "---\ntitle: PurplePages\nslug: purplepages\ntopic: product\nsummary: PurplePages is the public directory.\n---\n\n# PurplePages\n\nPurplePages is the public directory.\n",
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[crate::nouns::RealnessNoun::new("PurplePages", 3)],
+        )
+        .unwrap();
+        let hits = vec![query_hit(
+            "pc-memory/guides/purplepages.md",
+            0,
+            0.94,
+        )];
+        let overlap = crate::context_overlap::ContextOverlap::from_hook(
+            "what is PurplePages?",
+            None,
+            "eval",
+            0,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let mut abstaining = ScriptedPipelineBackend {
+            replies: VecDeque::from(["NOTHING_RELEVANT".to_string()]),
+            calls: vec![],
+        };
+        let (outcome, _) = runtime
+            .block_on(super::wiki_navigate_and_compile_with_backend(
+                &mut abstaining,
+                "what is PurplePages?",
+                "",
+                &hits,
+                &wiki,
+                &index_rows,
+                &root,
+                &project_dir,
+                4,
+                300,
+                false,
+                "",
+                true,
+                &overlap,
+                true,
+            ))
+            .unwrap();
+        assert!(matches!(outcome, super::NavigateResult::ShortCircuit { .. }));
+        assert_eq!(abstaining.calls.len(), 1, "COMPILE must not run after abstention");
+
+        let mut invalid_compile = ScriptedPipelineBackend {
+            replies: VecDeque::from([
+                "noun:purplepages".to_string(),
+                "TITLE: PurplePages grounding\nUncited model prose.".to_string(),
+            ]),
+            calls: vec![],
+        };
+        let result = runtime.block_on(super::wiki_navigate_and_compile_with_backend(
+                &mut invalid_compile,
+                "what is PurplePages?",
+                "",
+                &hits,
+                &wiki,
+                &index_rows,
+                &root,
+                &project_dir,
+                4,
+                300,
+                false,
+                "",
+                true,
+                &overlap,
+                true,
+            ));
+        let error = match result {
+            Ok(_) => panic!("invalid uncited compile must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("malformed_compile_response"));
+        assert_eq!(invalid_compile.calls.len(), 2);
+
+        let mut failing = FailingPipelineBackend { calls: 0 };
+        let failure = runtime.block_on(super::wiki_navigate_and_compile_with_backend(
+            &mut failing,
+            "what is PurplePages?",
+            "",
+            &hits,
+            &wiki,
+            &index_rows,
+            &root,
+            &project_dir,
+            4,
+            300,
+            false,
+            "",
+            true,
+            &overlap,
+            true,
+        ));
+        let failure = match failure {
+            Ok(_) => panic!("provider failure must not produce a navigation result"),
+            Err(error) => error,
+        };
+        assert!(failure.to_string().contains("scripted provider failure"));
+        assert_eq!(failing.calls, 1, "failure must not invoke a fallback model path");
     }
 }
