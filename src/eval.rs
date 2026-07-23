@@ -23,7 +23,7 @@ use crate::transcript::transcript_first_ts;
 // ─── Public args ──────────────────────────────────────────────────────────────
 
 pub struct EvalArgs {
-    pub project: String,
+    pub project: Option<String>,
     pub history_sessions: Option<usize>,
     pub history_cap: usize,
     pub experiment_dir: Option<PathBuf>,
@@ -48,6 +48,14 @@ pub struct EvalArgs {
     pub arms_label_cap: Option<usize>,
     /// Number of judge calls per briefing in --select-arms (majority-voted). Default 3.
     pub judge_k: usize,
+    /// Deterministic paired recipient-value evaluation over frozen canaries or a JSONL replay.
+    pub recipient_value: bool,
+    /// Replace the frozen responses with live paired model calls.
+    pub recipient_value_live: bool,
+    /// Explicit model for the live recipient-value replay.
+    pub recipient_value_model: Option<String>,
+    /// Optional external recipient-value JSONL corpus.
+    pub recipient_value_fixture: Option<PathBuf>,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -108,8 +116,23 @@ struct Probe2Result {
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run_eval(args: EvalArgs) -> Result<()> {
+    if args.recipient_value {
+        return crate::eval_recipient_value::run_recipient_value(
+            crate::eval_recipient_value::RecipientValueArgs {
+                experiment_dir: args.experiment_dir,
+                fixture_path: args.recipient_value_fixture,
+                live: args.recipient_value_live,
+                model: args.recipient_value_model,
+            },
+        );
+    }
+
     // Resolve corpus project root.
-    let corpus_root = resolve_project_root(&PathBuf::from(&args.project));
+    let project = args
+        .project
+        .as_deref()
+        .context("--project is required unless --recipient-value is used")?;
+    let corpus_root = resolve_project_root(&PathBuf::from(project));
     let project_key = normalize_path(&corpus_root);
     println!("eval: corpus project = {}", corpus_root.display());
     println!("eval: project key    = {}", project_key);

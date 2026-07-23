@@ -16,6 +16,7 @@ mod episode_capture;
 mod research_capture;
 mod claims;
 mod eval;
+mod eval_recipient_value;
 mod eval_run7;
 mod eval_run8;
 mod eval_run9;
@@ -192,7 +193,7 @@ enum Commands {
     /// Without flags, opens an interactive project picker.
     Archeologist {
         /// Scope to exactly one project (real cwd path or normalized key). Bypasses picker.
-        #[arg(long)]
+        #[arg(long, required_unless_present = "recipient_value")]
         project: Option<String>,
 
         /// Only replay sessions whose first timestamp is >= DATE (YYYY-MM-DD or RFC3339).
@@ -348,8 +349,9 @@ enum Commands {
     /// the experiment dir (--experiment-dir) and the user's live state is never touched.
     Eval {
         /// Corpus project path (real cwd of the target project).
+        /// Not required for --recipient-value, whose default canaries are embedded.
         #[arg(long)]
-        project: String,
+        project: Option<String>,
 
         /// Chronological session split: first N sessions go to HISTORY, remainder to FUTURE.
         /// Default: use the first 80% for HISTORY.
@@ -459,6 +461,25 @@ enum Commands {
         /// are majority-voted across the K calls to kill single-judge variance (default 3).
         #[arg(long, value_name = "N", default_value_t = 3)]
         judge_k: usize,
+
+        /// Run the deterministic paired recipient-value canaries: the same prompt without
+        /// injection versus with a frozen compiled injection. Reports metrics and deltas only.
+        #[arg(long)]
+        recipient_value: bool,
+
+        /// Regenerate both recipient-value response arms with a configured live model.
+        /// The compiled artifacts remain frozen so the comparison stays paired.
+        #[arg(long, requires = "recipient_value")]
+        recipient_value_live: bool,
+
+        /// Model for --recipient-value-live. Can instead be set with
+        /// PC_RECIPIENT_VALUE_MODEL.
+        #[arg(long, value_name = "MODEL", requires = "recipient_value_live")]
+        recipient_value_model: Option<String>,
+
+        /// Optional JSONL canary/replay corpus. Defaults to the embedded regression canaries.
+        #[arg(long, value_name = "FILE", requires = "recipient_value")]
+        recipient_value_fixture: Option<PathBuf>,
     },
 }
 
@@ -1093,6 +1114,10 @@ fn main() -> Result<()> {
             select_arms,
             arms_label_cap,
             judge_k,
+            recipient_value,
+            recipient_value_live,
+            recipient_value_model,
+            recipient_value_fixture,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
                 project,
@@ -1115,6 +1140,10 @@ fn main() -> Result<()> {
                 select_arms,
                 arms_label_cap,
                 judge_k,
+                recipient_value,
+                recipient_value_live,
+                recipient_value_model,
+                recipient_value_fixture,
             })?;
         }
 
