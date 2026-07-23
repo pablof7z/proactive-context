@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{bail, Context, Result};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as DeserializeError};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -28,11 +28,17 @@ Return JSON only.";
 #[derive(Debug, Deserialize)]
 struct ArtifactWire {
     verdict: ArtifactVerdict,
+    #[serde(deserialize_with = "deserialize_u8_or_string")]
     relevance: u8,
+    #[serde(deserialize_with = "deserialize_u8_or_string")]
     correctness: u8,
+    #[serde(deserialize_with = "deserialize_u8_or_string")]
     novelty: u8,
+    #[serde(deserialize_with = "deserialize_u8_or_string")]
     actionability: u8,
+    #[serde(deserialize_with = "deserialize_u8_or_string")]
     distraction: u8,
+    #[serde(deserialize_with = "deserialize_f64_or_string")]
     confidence: f64,
     reason: String,
 }
@@ -48,8 +54,44 @@ enum PairChoice {
 #[derive(Debug, Deserialize)]
 struct PairWire {
     preferred: PairChoice,
+    #[serde(deserialize_with = "deserialize_f64_or_string")]
     confidence: f64,
     reason: String,
+}
+
+fn deserialize_u8_or_string<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|number| u8::try_from(number).ok())
+            .ok_or_else(|| D::Error::custom("expected an integer in the u8 range")),
+        serde_json::Value::String(number) => number
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| D::Error::custom("expected an integer or numeric string")),
+        _ => Err(D::Error::custom("expected an integer or numeric string")),
+    }
+}
+
+fn deserialize_f64_or_string<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .ok_or_else(|| D::Error::custom("expected a finite number")),
+        serde_json::Value::String(number) => number
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| D::Error::custom("expected a number or numeric string")),
+        _ => Err(D::Error::custom("expected a number or numeric string")),
+    }
 }
 
 pub(super) fn generate_semantic_judgments(
@@ -314,6 +356,20 @@ mod tests {
         .unwrap();
         assert!(matches!(parsed.preferred, PairChoice::Tie));
         assert!(parse_json::<PairWire>("not json").is_err());
+    }
+
+    #[test]
+    fn accepts_numeric_strings_from_repaired_judge_output() {
+        let pair: PairWire =
+            parse_json(r#"{"preferred":"a","confidence":"0.85","reason":"more useful"}"#).unwrap();
+        assert_eq!(pair.confidence, 0.85);
+
+        let artifact: ArtifactWire = parse_json(
+            r#"{"verdict":"useful","relevance":"4","correctness":"3","novelty":"2","actionability":"4","distraction":"0","confidence":"0.9","reason":"useful"}"#,
+        )
+        .unwrap();
+        assert_eq!(artifact.relevance, 4);
+        assert_eq!(artifact.confidence, 0.9);
     }
 
     #[test]
