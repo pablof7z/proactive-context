@@ -8,3 +8,9 @@ install:
     # backward-compat: legacy `proactive-context` name points at the same binary
     ln -sf pc ~/.bin/proactive-context
     @echo "Installed to ~/.bin/pc (~/.local/bin/pc and proactive-context link to it)"
+
+loc:
+    scripts/check-rust-loc.sh
+
+check: loc
+    cargo test --locked
