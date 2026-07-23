@@ -1,0 +1,4 @@
+interface:
+  display_name: "PC"
+  short_description: "PC orientation and compiled artifact repair"
+  default_prompt: "Use $pc to understand proactive-context and fix incomplete or incorrect compiled PC artifacts."
