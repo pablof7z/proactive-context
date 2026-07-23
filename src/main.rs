@@ -480,6 +480,15 @@ enum Commands {
         /// Optional JSONL canary/replay corpus. Defaults to the embedded regression canaries.
         #[arg(long, value_name = "FILE", requires = "recipient_value")]
         recipient_value_fixture: Option<PathBuf>,
+
+        /// Replay each recipient-value case through the production retrieval, SELECT, and
+        /// COMPILE path before generating the paired recipient responses. This makes real
+        /// provider calls and therefore requires --project and --recipient-value-live.
+        #[arg(
+            long,
+            requires_all = ["recipient_value", "recipient_value_live", "project"]
+        )]
+        recipient_value_pipeline_live: bool,
     },
 }
 
@@ -1118,6 +1127,7 @@ fn main() -> Result<()> {
             recipient_value_live,
             recipient_value_model,
             recipient_value_fixture,
+            recipient_value_pipeline_live,
         } => {
             crate::eval::run_eval(crate::eval::EvalArgs {
                 project,
@@ -1144,6 +1154,7 @@ fn main() -> Result<()> {
                 recipient_value_live,
                 recipient_value_model,
                 recipient_value_fixture,
+                recipient_value_pipeline_live,
             })?;
         }
 

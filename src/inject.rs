@@ -14,10 +14,12 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rig_core::client::CompletionClient;
 use rig_core::completion::Prompt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Instant;
 use tokio::runtime::Runtime;
 
@@ -256,7 +258,7 @@ pub(crate) fn select_preamble() -> std::borrow::Cow<'static, str> {
 /// If the model output begins with `TITLE: <text>`, strip that line and return
 /// (Some(title), rest_of_body). Otherwise returns (None, original_text). The title
 /// is metadata for the status bar; the body is what gets injected into Claude.
-fn strip_title_line(text: &str) -> (Option<String>, &str) {
+pub(crate) fn strip_title_line(text: &str) -> (Option<String>, &str) {
     // Try to find a leading "TITLE:" line (case-insensitive)
     let upper = text.to_uppercase();
     if upper.starts_with("TITLE:") {
@@ -850,11 +852,8 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         cfg.inject_context_turns,
         cfg.inject_query_char_cap,
     );
-    let enriched_query = if recent.is_empty() {
-        input.prompt.clone()
-    } else {
-        cap_tail(&format!("{}\n\n{}", recent, input.prompt), cfg.inject_query_char_cap)
-    };
+    let enriched_query =
+        build_enriched_query(&input.prompt, &recent, cfg.inject_query_char_cap);
 
     // ── Noun resolver (peer to the guide pipeline) ─────────────────────────
     // LLM-free, runs independently of guide selection so a pure-entity prompt ("what is X?")
@@ -1182,6 +1181,92 @@ pub(crate) enum NavigateResult {
     Briefing { text: String, guides_read: Vec<String> },
     /// The fast model determined nothing is relevant — short-circuit, emit nothing.
     ShortCircuit { guides_read: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PipelineCandidateTrace {
+    pub key: String,
+    pub title: String,
+    pub summary: String,
+    pub score: Option<f64>,
+    pub kind: String,
+    pub currentness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PipelineSourceTrace {
+    pub key: String,
+    pub content: String,
+}
+
+/// Exact, credential-free trace of the candidate, selection, read, and compile stages.
+///
+/// The trace intentionally records model outputs and source content but never provider
+/// configuration, request headers, or API keys.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PipelineNavigationTrace {
+    pub candidates: Vec<PipelineCandidateTrace>,
+    pub selection_response: Option<String>,
+    pub selected_keys: Vec<String>,
+    pub selected_sources: Vec<PipelineSourceTrace>,
+    pub select_latency_ms: Option<u64>,
+    pub compile_latency_ms: Option<u64>,
+    pub provider_call_count: usize,
+    pub outcome: String,
+    pub compiled_artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PipelineModelStage {
+    Select,
+    Compile,
+}
+
+struct PipelineModelRequest {
+    stage: PipelineModelStage,
+    system: String,
+    user: String,
+    max_tokens: usize,
+}
+
+trait PipelineModelBackend {
+    fn complete<'a>(
+        &'a mut self,
+        request: PipelineModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+}
+
+struct LivePipelineModelBackend<'a> {
+    api_key: &'a str,
+    ollama_api_key: Option<&'a str>,
+    ollama_base_url: &'a str,
+    select_spec: &'a ModelSpec,
+    compile_spec: &'a ModelSpec,
+}
+
+impl PipelineModelBackend for LivePipelineModelBackend<'_> {
+    fn complete<'a>(
+        &'a mut self,
+        request: PipelineModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move {
+            let (spec, phase) = match request.stage {
+                PipelineModelStage::Select => (self.select_spec, 1),
+                PipelineModelStage::Compile => (self.compile_spec, 2),
+            };
+            call_pipeline_model(
+                self.api_key,
+                self.ollama_api_key,
+                self.ollama_base_url,
+                spec,
+                phase,
+                &request.system,
+                &request.user,
+                request.max_tokens,
+            )
+            .await
+        })
+    }
 }
 
 // ─── Catalog (selection front-end) ────────────────────────────────────────────
@@ -1696,6 +1781,50 @@ async fn wiki_navigate_and_compile(
     already_injected: &str,
     overlap: &crate::context_overlap::ContextOverlap,
 ) -> Result<NavigateResult> {
+    let mut backend = LivePipelineModelBackend {
+        api_key,
+        ollama_api_key,
+        ollama_base_url,
+        select_spec,
+        compile_spec,
+    };
+    wiki_navigate_and_compile_with_backend(
+        &mut backend,
+        current_prompt,
+        recent,
+        hits,
+        wiki_dir,
+        index_rows,
+        root,
+        project_dir,
+        max_guides,
+        max_tokens,
+        resolve_query,
+        already_injected,
+        overlap,
+        false,
+    )
+    .await
+    .map(|(result, _trace)| result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
+    backend: &mut B,
+    current_prompt: &str,
+    recent: &str,
+    hits: &[QueryResult],
+    wiki_dir: &Path,
+    index_rows: &[IndexRow],
+    root: &Path,
+    project_dir: &Path,
+    max_guides: usize,
+    max_tokens: usize,
+    resolve_query: bool,
+    already_injected: &str,
+    overlap: &crate::context_overlap::ContextOverlap,
+    capture_trace: bool,
+) -> Result<(NavigateResult, Option<PipelineNavigationTrace>)> {
     // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
     // PC_CLAIM_CATALOG: when on, build_catalog needs an embedder for cluster retrieval. We build
     // it lazily here (only when the flag is set) to avoid the ONNX model-load cost on every
@@ -1721,16 +1850,67 @@ async fn wiki_navigate_and_compile(
         claim_embedder,
     );
     log_event("wiki.index_read", None, serde_json::json!({ "guide_count": catalog.len() }));
+    let candidates = if capture_trace {
+        catalog
+            .iter()
+            .map(|item| PipelineCandidateTrace {
+                key: item.key.clone(),
+                title: item.title.clone(),
+                summary: item.summary.clone(),
+                score: item.score,
+                kind: item.kind.label().to_string(),
+                currentness: match item.currentness {
+                    Currentness::Current => "current",
+                    Currentness::Historical => "historical",
+                    Currentness::Superseded => "superseded",
+                    Currentness::Proposed => "proposed",
+                    Currentness::Unknown => "unknown",
+                }
+                .to_string(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     if catalog.is_empty() {
         // Nothing enumerable. If the vector index still surfaced raw chunks, cite them verbatim.
         if hits.is_empty() {
-            return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
+            return Ok((
+                NavigateResult::ShortCircuit {
+                    guides_read: vec![],
+                },
+                capture_trace.then(|| PipelineNavigationTrace {
+                    candidates,
+                    selection_response: None,
+                    selected_keys: vec![],
+                    selected_sources: vec![],
+                    select_latency_ms: None,
+                    compile_latency_ms: None,
+                    provider_call_count: 0,
+                    outcome: "no_candidates".to_string(),
+                    compiled_artifact: None,
+                }),
+            ));
         }
-        return Ok(NavigateResult::Briefing {
-            text: render_hits_librarian(hits, root),
-            guides_read: vec![],
-        });
+        let artifact = render_hits_librarian(hits, root);
+        return Ok((
+            NavigateResult::Briefing {
+                text: artifact.clone(),
+                guides_read: vec![],
+            },
+            capture_trace.then(|| PipelineNavigationTrace {
+                candidates,
+                selection_response: None,
+                selected_keys: vec![],
+                selected_sources: vec![],
+                select_latency_ms: None,
+                compile_latency_ms: None,
+                provider_call_count: 0,
+                outcome: "raw_retrieval_artifact".to_string(),
+                compiled_artifact: Some(artifact),
+            }),
+        ));
     }
 
     // ── TURN 1 (fast model, NO TOOLS): resolve the query + select keys, or bail ─
@@ -1747,51 +1927,16 @@ async fn wiki_navigate_and_compile(
         preamble.push_str("\n\n");
     }
 
-    let selection: String = match select_spec.provider {
-        Provider::OpenRouter => {
-            let client = make_client();
-            let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &select_spec.model, &msgs, 300, 1)
-                .await
-                .context("select provider request failed")?
-                .content
-        }
-        Provider::Ollama => {
-            let t0 = std::time::Instant::now();
-            let resp = build_ollama_client(ollama_base_url, ollama_api_key)?
-                .agent(&select_spec.model)
-                .preamble(&preamble)
-                .max_tokens(300u64)
-                .additional_params(serde_json::json!({"max_tokens": 300}))
-                .build()
-                .prompt(current_prompt)
-                .await
-                .context("select provider request failed")?;
-            crate::openrouter::record_external_turn(
-                &select_spec.model, 1, &preamble, current_prompt, &resp,
-                t0.elapsed().as_millis() as u64,
-            );
-            resp
-        }
-        Provider::ClaudeCli => {
-            let model = select_spec.model.clone();
-            let preamble2 = preamble.clone();
-            let prompt2 = current_prompt.to_string();
-            let t0 = std::time::Instant::now();
-            let reply = tokio::task::spawn_blocking(move || {
-                crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
-                    std::time::Duration::from_secs(25))
-            })
-            .await
-            .context("select provider task failed")?
-            .context("select provider request failed")?;
-            crate::openrouter::record_external_turn(
-                &select_spec.model, 1, &preamble, current_prompt, &reply.content,
-                t0.elapsed().as_millis() as u64,
-            );
-            reply.content
-        }
-    };
+    let select_started = Instant::now();
+    let selection = backend
+        .complete(PipelineModelRequest {
+            stage: PipelineModelStage::Select,
+            system: preamble,
+            user: current_prompt.to_string(),
+            max_tokens: 300,
+        })
+        .await?;
+    let select_latency_ms = select_started.elapsed().as_millis() as u64;
 
     let sel = selection.trim();
 
@@ -1812,7 +1957,22 @@ async fn wiki_navigate_and_compile(
     let selected = parse_selection_decision(sel, &valid, max_guides)?;
 
     if selected.is_empty() {
-        return Ok(NavigateResult::ShortCircuit { guides_read: vec![] });
+        return Ok((
+            NavigateResult::ShortCircuit {
+                guides_read: vec![],
+            },
+            capture_trace.then(|| PipelineNavigationTrace {
+                candidates,
+                selection_response: Some(selection),
+                selected_keys: vec![],
+                selected_sources: vec![],
+                select_latency_ms: Some(select_latency_ms),
+                compile_latency_ms: None,
+                provider_call_count: 1,
+                outcome: "selector_abstained".to_string(),
+                compiled_artifact: None,
+            }),
+        ));
     }
 
     // ── Deterministic read of the selected sources (no tool round-trips) ───────
@@ -1836,15 +1996,39 @@ async fn wiki_navigate_and_compile(
         }
     }
     if guides.is_empty() {
-        return Ok(NavigateResult::ShortCircuit { guides_read });
+        return Ok((
+            NavigateResult::ShortCircuit {
+                guides_read: guides_read.clone(),
+            },
+            capture_trace.then(|| PipelineNavigationTrace {
+                candidates,
+                selection_response: Some(selection),
+                selected_keys: selected,
+                selected_sources: vec![],
+                select_latency_ms: Some(select_latency_ms),
+                compile_latency_ms: None,
+                provider_call_count: 1,
+                outcome: "selected_sources_unreadable".to_string(),
+                compiled_artifact: None,
+            }),
+        ));
     }
 
     // ── STRONG MODEL (compiler): synthesize a cited briefing from the sources ──
-    compile_briefing(
-        api_key,
-        ollama_api_key,
-        ollama_base_url,
-        compile_spec,
+    let selected_sources = if capture_trace {
+        guides
+            .iter()
+            .map(|(key, content)| PipelineSourceTrace {
+                key: key.clone(),
+                content: content.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let compile_started = Instant::now();
+    let artifact = compile_briefing_with_backend(
+        backend,
         focal,
         recent,
         already_injected,
@@ -1854,8 +2038,25 @@ async fn wiki_navigate_and_compile(
         Some(project_dir),
         max_tokens,
     )
-    .await
-    .map(|text| NavigateResult::Briefing { text, guides_read })
+    .await?;
+    let compile_latency_ms = compile_started.elapsed().as_millis() as u64;
+    Ok((
+        NavigateResult::Briefing {
+            text: artifact.clone(),
+            guides_read,
+        },
+        capture_trace.then(|| PipelineNavigationTrace {
+            candidates,
+            selection_response: Some(selection),
+            selected_keys: selected,
+            selected_sources,
+            select_latency_ms: Some(select_latency_ms),
+            compile_latency_ms: Some(compile_latency_ms),
+            provider_call_count: 2,
+            outcome: "compiled".to_string(),
+            compiled_artifact: Some(artifact),
+        }),
+    ))
 }
 
 fn parse_selected_keys(selection: &str, valid: &HashSet<&str>, max_guides: usize) -> Vec<String> {
@@ -1943,17 +2144,144 @@ pub(crate) async fn navigate_and_compile_for_eval(
     .await
 }
 
+/// Recipient-value replay entry point for the production compiled path.
+///
+/// Retrieval happens in the caller through `query::run_query`; this function consumes those exact
+/// hits and then runs the same catalog construction, selector, source reads, and compiler used by
+/// `hook inject`, returning a credential-free trace alongside the artifact.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn navigate_and_compile_for_replay(
+    api_key: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    select_spec: &ModelSpec,
+    compile_spec: &ModelSpec,
+    prompt: &str,
+    recent: &str,
+    hits: &[QueryResult],
+    root: &Path,
+    project_dir: &Path,
+    max_guides: usize,
+    max_tokens: usize,
+    resolve_query: bool,
+    already_injected: &str,
+) -> Result<(NavigateResult, PipelineNavigationTrace)> {
+    let wiki_dir = crate::wiki::wiki_dir(root);
+    let index_rows = crate::wiki::read_index(&wiki_dir);
+    let mut backend = LivePipelineModelBackend {
+        api_key,
+        ollama_api_key,
+        ollama_base_url,
+        select_spec,
+        compile_spec,
+    };
+    let overlap = crate::context_overlap::ContextOverlap::from_hook(
+        prompt,
+        None,
+        "recipient-value-replay",
+        0,
+    );
+    wiki_navigate_and_compile_with_backend(
+        &mut backend,
+        prompt,
+        recent,
+        hits,
+        &wiki_dir,
+        &index_rows,
+        root,
+        project_dir,
+        max_guides,
+        max_tokens,
+        resolve_query,
+        already_injected,
+        &overlap,
+        true,
+    )
+    .await
+    .and_then(|(result, trace)| {
+        trace
+            .map(|trace| (result, trace))
+            .context("compiled-pipeline replay trace was not captured")
+    })
+}
+
 // ─── Source rendering (compile model input) ───────────────────────────────────
 
-/// Ask the compile model to synthesize a dense, relevant briefing from the selected sources,
-/// requiring an inline `(path:line)` citation after every claim (enforced by prompt, then
-/// surfaced verbatim to Claude Code). The model's prose IS the output — sources are presented
-/// line-numbered under their absolute path so its citations point back at openable locations.
-async fn compile_briefing(
+async fn call_pipeline_model(
     api_key: &str,
     ollama_api_key: Option<&str>,
     ollama_base_url: &str,
     spec: &ModelSpec,
+    phase: usize,
+    system: &str,
+    user: &str,
+    max_tokens: usize,
+) -> Result<String> {
+    match spec.provider {
+        Provider::OpenRouter => {
+            let client = make_client();
+            let msgs = vec![system_msg(system), user_msg(user)];
+            Ok(
+                chat_once(
+                    &client,
+                    api_key,
+                    &spec.model,
+                    &msgs,
+                    max_tokens as u32,
+                    phase,
+                )
+                .await?
+                .content,
+            )
+        }
+        Provider::Ollama => {
+            let t0 = std::time::Instant::now();
+            let response = build_ollama_client(ollama_base_url, ollama_api_key)?
+                .agent(&spec.model)
+                .preamble(system)
+                .max_tokens(max_tokens as u64)
+                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
+                .build()
+                .prompt(user)
+                .await?;
+            crate::openrouter::record_external_turn(
+                &spec.model,
+                phase,
+                system,
+                user,
+                &response,
+                t0.elapsed().as_millis() as u64,
+            );
+            Ok(response)
+        }
+        Provider::ClaudeCli => {
+            let model = spec.model.clone();
+            let system_owned = system.to_string();
+            let user_owned = user.to_string();
+            let t0 = std::time::Instant::now();
+            let reply = tokio::task::spawn_blocking(move || {
+                crate::claude_sidecar::chat_blocking(
+                    &model,
+                    &system_owned,
+                    &user_owned,
+                    std::time::Duration::from_secs(25),
+                )
+            })
+            .await??;
+            crate::openrouter::record_external_turn(
+                &spec.model,
+                phase,
+                system,
+                user,
+                &reply.content,
+                t0.elapsed().as_millis() as u64,
+            );
+            Ok(reply.content)
+        }
+    }
+}
+
+fn build_compile_preamble(
     current_prompt: &str,
     recent: &str,
     already_injected: &str,
@@ -1961,8 +2289,7 @@ async fn compile_briefing(
     wiki_dir: &Path,
     root: &Path,
     project_dir: Option<&Path>,
-    max_tokens: usize,
-) -> Result<String> {
+) -> Result<(String, String)> {
     // Label each source by a cwd-relative path the model must cite.
     let sources: Vec<(String, String)> = guides
         .iter()
@@ -2006,59 +2333,24 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
         );
     }
 
-    let preamble = format!(
-        "{}\n\n{}\n\n{}",
-        compile_preamble(), UNTRUSTED_SOURCE_RULES, context
-    );
-    let response: String = match spec.provider {
-        Provider::OpenRouter => {
-            let client = make_client();
-            let msgs = vec![system_msg(&preamble), user_msg(current_prompt)];
-            chat_once(&client, api_key, &spec.model, &msgs, max_tokens as u32, 2)
-                .await
-                .context("compile provider request failed")?
-                .content
-        }
-        Provider::Ollama => {
-            let t0 = std::time::Instant::now();
-            let resp = build_ollama_client(ollama_base_url, ollama_api_key)?
-                .agent(&spec.model)
-                .preamble(&preamble)
-                .max_tokens(max_tokens as u64)
-                .additional_params(serde_json::json!({"max_tokens": max_tokens}))
-                .build()
-                .prompt(current_prompt)
-                .await
-                .context("compile provider request failed")?;
-            crate::openrouter::record_external_turn(
-                &spec.model, 2, &preamble, current_prompt, &resp,
-                t0.elapsed().as_millis() as u64,
-            );
-            resp
-        }
-        Provider::ClaudeCli => {
-            let model = spec.model.clone();
-            let preamble2 = preamble.clone();
-            let prompt2 = current_prompt.to_string();
-            let t0 = std::time::Instant::now();
-            let reply = tokio::task::spawn_blocking(move || {
-                crate::claude_sidecar::chat_blocking(&model, &preamble2, &prompt2,
-                    std::time::Duration::from_secs(25))
-            })
-            .await
-            .context("compile provider task failed")?
-            .context("compile provider request failed")?;
-            crate::openrouter::record_external_turn(
-                &spec.model, 2, &preamble, current_prompt, &reply.content,
-                t0.elapsed().as_millis() as u64,
-            );
-            reply.content
-        }
-    };
+    Ok((
+        format!(
+            "{}\n\n{}\n\n{}",
+            compile_preamble(),
+            UNTRUSTED_SOURCE_RULES,
+            context
+        ),
+        current_prompt.to_string(),
+    ))
+}
 
-    // The compiler response is a protocol artifact, not arbitrary prose. Reject
-    // malformed structure or provenance instead of injecting it.
-    let resp = validate_compile_response(&response, &source_documents)?;
+fn finalize_compiled_response(response: &str, wiki_dir: &Path) -> String {
+    // The synthesized briefing is the output as-is. Its leading `TITLE:` line is stripped by the
+    // caller for the status bar; an empty body or `TITLE: none` degrades to a no-inject outcome.
+    let resp = response.trim();
+    if resp.is_empty() {
+        return "NONE".to_string();
+    }
 
     // If the synthesis carried any [^id] markers (copied from source prose), prepend the
     // citation-log preamble — but keep the leading TITLE: line first so the status bar reads it.
@@ -2072,11 +2364,120 @@ covered there. Emit only what remains. If nothing remains, output exactly: TITLE
             citations_log.display()
         );
         if let Some(nl) = resp.find('\n') {
-            return Ok(format!("{}\n{}{}", &resp[..nl], pre, resp[nl + 1..].trim_start()));
+            return format!("{}\n{}{}", &resp[..nl], pre, resp[nl + 1..].trim_start());
         }
     }
 
-    Ok(resp.to_string())
+    resp.to_string()
+}
+
+fn validate_and_finalize_compiled_response(
+    response: &str,
+    guides: &[(String, String)],
+    wiki_dir: &Path,
+    root: &Path,
+    project_dir: Option<&Path>,
+) -> Result<String> {
+    let sources = guides
+        .iter()
+        .map(|(slug, content)| {
+            (
+                source_label_for_key(root, wiki_dir, project_dir, slug),
+                content.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_documents = sources
+        .iter()
+        .map(|(label, content)| SourceDocument { label, content })
+        .collect::<Vec<_>>();
+    let validated = validate_compile_response(response, &source_documents)?;
+    Ok(finalize_compiled_response(validated, wiki_dir))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_briefing_with_backend<B: PipelineModelBackend>(
+    backend: &mut B,
+    current_prompt: &str,
+    recent: &str,
+    already_injected: &str,
+    guides: &[(String, String)],
+    wiki_dir: &Path,
+    root: &Path,
+    project_dir: Option<&Path>,
+    max_tokens: usize,
+) -> Result<String> {
+    let (system, user) = build_compile_preamble(
+        current_prompt,
+        recent,
+        already_injected,
+        guides,
+        wiki_dir,
+        root,
+        project_dir,
+    )?;
+    let response = backend
+        .complete(PipelineModelRequest {
+            stage: PipelineModelStage::Compile,
+            system,
+            user,
+            max_tokens,
+        })
+        .await?;
+    validate_and_finalize_compiled_response(
+        &response,
+        guides,
+        wiki_dir,
+        root,
+        project_dir,
+    )
+}
+
+/// Ask the compile model to synthesize a dense, relevant briefing from the selected sources,
+/// requiring an inline `(path:line)` citation after every claim (enforced by prompt, then
+/// surfaced verbatim to Claude Code). The model's prose IS the output — sources are presented
+/// line-numbered under their absolute path so its citations point back at openable locations.
+async fn compile_briefing(
+    api_key: &str,
+    ollama_api_key: Option<&str>,
+    ollama_base_url: &str,
+    spec: &ModelSpec,
+    current_prompt: &str,
+    recent: &str,
+    already_injected: &str,
+    guides: &[(String, String)],
+    wiki_dir: &Path,
+    root: &Path,
+    project_dir: Option<&Path>,
+    max_tokens: usize,
+) -> Result<String> {
+    let (system, user) = build_compile_preamble(
+        current_prompt,
+        recent,
+        already_injected,
+        guides,
+        wiki_dir,
+        root,
+        project_dir,
+    )?;
+    let response = call_pipeline_model(
+        api_key,
+        ollama_api_key,
+        ollama_base_url,
+        spec,
+        2,
+        &system,
+        &user,
+        max_tokens,
+    )
+    .await?;
+    validate_and_finalize_compiled_response(
+        &response,
+        guides,
+        wiki_dir,
+        root,
+        project_dir,
+    )
 }
 
 fn validate_compile_response<'a>(
@@ -2187,6 +2588,18 @@ fn recent_context_text(
     cap_tail(&text, char_cap)
 }
 
+pub(crate) fn build_enriched_query(
+    current_prompt: &str,
+    recent: &str,
+    char_cap: usize,
+) -> String {
+    if recent.is_empty() {
+        current_prompt.to_string()
+    } else {
+        cap_tail(&format!("{}\n\n{}", recent, current_prompt), char_cap)
+    }
+}
+
 fn cap_tail(s: &str, char_cap: usize) -> String {
     if s.len() <= char_cap {
         return s.to_string();
@@ -2227,6 +2640,7 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::fs;
+    use std::collections::VecDeque;
 
     // Serialize the env-mutating prompt-variant tests (env vars are process-global).
     static VARIANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2794,5 +3208,128 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         // Summary must be the evidence text (truncated).
         assert_eq!(row.summary, crate::events::truncate(evidence, 100),
             "summary must be the evidence text, got: {}", row.summary);
+    }
+
+    struct ScriptedPipelineBackend {
+        replies: VecDeque<String>,
+        calls: Vec<(String, String, usize)>,
+    }
+
+    impl super::PipelineModelBackend for ScriptedPipelineBackend {
+        fn complete<'a>(
+            &'a mut self,
+            request: super::PipelineModelRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<String>> + 'a>,
+        > {
+            self.calls
+                .push((request.system, request.user, request.max_tokens));
+            let reply = self
+                .replies
+                .pop_front()
+                .expect("scripted pipeline reply");
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+
+    #[test]
+    fn compiled_pipeline_trace_uses_scripted_provider_and_records_exact_stages() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_CLAIM_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_NOUN_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("subject");
+        let wiki = tmp.path().join("wiki");
+        let project_dir = tmp.path().join("project-state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&wiki).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let guide = crate::wiki::guide_path(&wiki, "auth-flow");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
+        fs::write(
+            &guide,
+            "---\n\
+title: Auth flow\n\
+slug: auth-flow\n\
+topic: auth\n\
+summary: Current authentication route\n\
+tags: [auth]\n\
+volatility: warm\n\
+confidence: high\n\
+created: 2026-07-23\n\
+updated: 2026-07-23\n\
+verified: 2026-07-23\n\
+compiled_from: test\n\
+sources: [session:test]\n\
+---\n\n\
+The live route is POST /v2/session.\n",
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let hits = vec![crate::query::QueryResult {
+            path: "auth-flow.md".to_string(),
+            chunk_index: 0,
+            content: "The live route is POST /v2/session.".to_string(),
+            content_hash: "hash-auth".to_string(),
+            score: 0.93,
+        }];
+        let mut backend = ScriptedPipelineBackend {
+            replies: VecDeque::from([
+                "auth-flow".to_string(),
+                "TITLE: current auth route\nUse POST /v2/session. (./auth-flow.md:14)"
+                    .to_string(),
+            ]),
+            calls: vec![],
+        };
+        let overlap = crate::context_overlap::ContextOverlap::from_hook(
+            "Which endpoint creates a session?",
+            None,
+            "eval",
+            0,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (outcome, trace) = runtime
+            .block_on(super::wiki_navigate_and_compile_with_backend(
+                &mut backend,
+                "Which endpoint creates a session?",
+                "",
+                &hits,
+                &wiki,
+                &index_rows,
+                &root,
+                &project_dir,
+                4,
+                300,
+                false,
+                "",
+                &overlap,
+                true,
+            ))
+            .unwrap();
+        let trace = trace.expect("test requested a pipeline trace");
+
+        match outcome {
+            super::NavigateResult::Briefing { text, guides_read } => {
+                assert!(text.contains("POST /v2/session"));
+                assert_eq!(guides_read, vec!["auth-flow"]);
+            }
+            super::NavigateResult::ShortCircuit { .. } => panic!("expected compiled artifact"),
+        }
+        assert_eq!(backend.calls.len(), 2);
+        assert!(backend.calls[0].0.contains("CATALOG:"));
+        assert!(backend.calls[1].0.contains("SOURCE DOCUMENTS"));
+        assert_eq!(trace.provider_call_count, 2);
+        assert_eq!(trace.selected_keys, vec!["auth-flow"]);
+        assert_eq!(trace.selected_sources.len(), 1);
+        assert!(trace.selected_sources[0].content.contains("POST /v2/session"));
+        assert!(trace
+            .compiled_artifact
+            .as_deref()
+            .unwrap()
+            .contains("POST /v2/session"));
+        assert!(trace.select_latency_ms.is_some());
+        assert!(trace.compile_latency_ms.is_some());
     }
 }

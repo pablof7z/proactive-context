@@ -56,6 +56,8 @@ pub struct EvalArgs {
     pub recipient_value_model: Option<String>,
     /// Optional external recipient-value JSONL corpus.
     pub recipient_value_fixture: Option<PathBuf>,
+    /// Run the real retrieval, SELECT, and COMPILE pipeline before the paired live replay.
+    pub recipient_value_pipeline_live: bool,
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -123,6 +125,8 @@ pub fn run_eval(args: EvalArgs) -> Result<()> {
                 fixture_path: args.recipient_value_fixture,
                 live: args.recipient_value_live,
                 model: args.recipient_value_model,
+                pipeline_live: args.recipient_value_pipeline_live,
+                project: args.project.map(PathBuf::from),
             },
         );
     }

@@ -8,9 +8,9 @@
 //! cost. It reports paired deltas but applies no product pass threshold.
 //!
 //! `--recipient-value-live` replaces the frozen responses by replaying both arms through an
-//! explicitly configured model. It does not regenerate the compiled artifact: the embedded or
-//! caller-provided fixture remains the frozen intervention, which keeps the comparison paired and
-//! lets real compiled artifacts be exported into JSONL and replayed later.
+//! explicitly configured model. `--recipient-value-pipeline-live` additionally replaces each
+//! frozen artifact by running the production retrieval, SELECT, source-read, and COMPILE path
+//! first. Both live modes are explicit; the default evaluator makes no provider calls.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::config::{load_config, Config};
+use crate::config::{load_config, resolve_project_root, Config};
 use crate::provider::{ModelSpec, Provider};
+use crate::query::QueryResult;
 
 const DEFAULT_FIXTURES: &str = include_str!("fixtures/recipient_value_canaries.jsonl");
 const LIVE_SYSTEM: &str = "You are evaluating a coding assistant. Answer the current user request \
@@ -43,6 +44,8 @@ pub struct RecipientValueArgs {
     pub fixture_path: Option<PathBuf>,
     pub live: bool,
     pub model: Option<String>,
+    pub pipeline_live: bool,
+    pub project: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -143,6 +146,58 @@ struct CaseReport {
     compiled_injection: ArmMetrics,
     injection: InjectionMetrics,
     delta_compiled_minus_no_injection: PairedDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline: Option<CasePipelineTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetrievalCandidateTrace {
+    path: String,
+    chunk_index: i64,
+    content: String,
+    content_hash: String,
+    score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PipelineFailureTrace {
+    stage: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PipelineTelemetry {
+    retrieval_latency_ms: u64,
+    navigation_latency_ms: Option<u64>,
+    select_latency_ms: Option<u64>,
+    compile_latency_ms: Option<u64>,
+    total_latency_ms: u64,
+    provider_call_count: Option<usize>,
+    retrieval_candidates: usize,
+    selection_candidates: Option<usize>,
+    selected_sources: Option<usize>,
+    delivered_chars: usize,
+    estimated_delivered_tokens: usize,
+    abstained: bool,
+    failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CasePipelineTrace {
+    retrieval_query: String,
+    retrieval_candidates: Vec<RetrievalCandidateTrace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigation: Option<crate::inject::PipelineNavigationTrace>,
+    telemetry: PipelineTelemetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<PipelineFailureTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PipelineModels {
+    project: String,
+    select: String,
+    compile: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -177,6 +232,8 @@ struct RecipientValueReport {
     mode: &'static str,
     fixture_source: String,
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline_models: Option<PipelineModels>,
     threshold_policy: &'static str,
     categories: BTreeMap<String, usize>,
     canary_roles: BTreeMap<String, usize>,
@@ -185,7 +242,10 @@ struct RecipientValueReport {
 }
 
 pub fn run_recipient_value(args: RecipientValueArgs) -> Result<()> {
-    let (fixtures, fixture_source) = load_fixtures(args.fixture_path.as_deref())?;
+    if args.pipeline_live && !args.live {
+        bail!("--recipient-value-pipeline-live requires --recipient-value-live");
+    }
+    let (mut fixtures, fixture_source) = load_fixtures(args.fixture_path.as_deref())?;
     validate_fixtures(&fixtures)?;
     if args.fixture_path.is_none() {
         validate_default_category_coverage(&fixtures)?;
@@ -204,10 +264,30 @@ pub fn run_recipient_value(args: RecipientValueArgs) -> Result<()> {
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("create recipient-value output {}", output_dir.display()))?;
 
+    let cfg = if args.live || args.pipeline_live {
+        Some(load_config().context("load config for live recipient-value replay")?)
+    } else {
+        None
+    };
+
+    let (pipeline_traces, pipeline_models) = if args.pipeline_live {
+        let project = args
+            .project
+            .as_deref()
+            .context("--recipient-value-pipeline-live requires --project")?;
+        let cfg = cfg
+            .as_ref()
+            .expect("live pipeline always loads configuration");
+        let (traces, models) = generate_live_pipeline(&mut fixtures, project, cfg)?;
+        (Some(traces), Some(models))
+    } else {
+        (None, None)
+    };
+
     let (responses, model) = if args.live {
-        let cfg = load_config().context("load config for live recipient-value replay")?;
+        let cfg = cfg.as_ref().expect("live replay always loads configuration");
         let model = resolve_live_model(args.model.as_deref())?;
-        let responses = generate_live_responses(&fixtures, &model, &cfg)?;
+        let responses = generate_live_responses(&fixtures, &model, cfg)?;
         (responses, Some(model))
     } else {
         (
@@ -228,8 +308,16 @@ pub fn run_recipient_value(args: RecipientValueArgs) -> Result<()> {
         &fixtures,
         &responses,
         &fixture_source,
-        if args.live { "live" } else { "frozen" },
+        if args.pipeline_live {
+            "live_pipeline"
+        } else if args.live {
+            "live"
+        } else {
+            "frozen"
+        },
         model,
+        pipeline_models,
+        pipeline_traces.as_deref(),
     );
     let json_path = output_dir.join("recipient-value-results.json");
     let markdown_path = output_dir.join("recipient-value-results.md");
@@ -426,6 +514,192 @@ fn generate_live_responses(
     Ok(responses)
 }
 
+fn generate_live_pipeline(
+    fixtures: &mut [CaseFixture],
+    project: &Path,
+    cfg: &Config,
+) -> Result<(Vec<CasePipelineTrace>, PipelineModels)> {
+    let root = resolve_project_root(&project.to_path_buf());
+    let store = crate::project_store::ensure_project_store(&root)
+        .map_err(|error| anyhow::anyhow!("resolve project store for replay: {error}"))?;
+    let project_dir = store.state_dir;
+    let select_spec = ModelSpec::parse(&cfg.inject_select_model);
+    let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
+    let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
+    if (select_spec.needs_openrouter_key() || compile_spec.needs_openrouter_key())
+        && openrouter_key.trim().is_empty()
+    {
+        bail!(
+            "live compiled-pipeline replay needs an OpenRouter key for configured SELECT/COMPILE models"
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new()
+        .context("create runtime for live compiled-pipeline replay")?;
+    let fixture_count = fixtures.len();
+    let mut traces = Vec::with_capacity(fixture_count);
+    for (idx, fixture) in fixtures.iter_mut().enumerate() {
+        println!(
+            "eval: compiled pipeline live {}/{} — {}",
+            idx + 1,
+            fixture_count,
+            fixture.id
+        );
+        let total_started = Instant::now();
+        let retrieval_query = crate::inject::build_enriched_query(
+            &fixture.prompt,
+            &fixture.recent_context,
+            cfg.inject_query_char_cap,
+        );
+        let retrieval_started = Instant::now();
+        let hits = match crate::query::run_query(
+            &root,
+            &retrieval_query,
+            cfg.inject_top_k,
+            cfg.inject_rerank,
+        ) {
+            Ok(hits) => hits,
+            Err(error) => {
+                fixture.compiled_context.clear();
+                let retrieval_latency_ms = retrieval_started.elapsed().as_millis() as u64;
+                traces.push(CasePipelineTrace {
+                    retrieval_query,
+                    retrieval_candidates: vec![],
+                    navigation: None,
+                    telemetry: PipelineTelemetry {
+                        retrieval_latency_ms,
+                        navigation_latency_ms: None,
+                        select_latency_ms: None,
+                        compile_latency_ms: None,
+                        total_latency_ms: total_started.elapsed().as_millis() as u64,
+                        provider_call_count: Some(0),
+                        retrieval_candidates: 0,
+                        selection_candidates: None,
+                        selected_sources: None,
+                        delivered_chars: 0,
+                        estimated_delivered_tokens: 0,
+                        abstained: false,
+                        failed: true,
+                    },
+                    failure: Some(PipelineFailureTrace {
+                        stage: "retrieval".to_string(),
+                        error: crate::events::truncate(&error.to_string(), 300),
+                    }),
+                });
+                continue;
+            }
+        };
+        let retrieval_latency_ms = retrieval_started.elapsed().as_millis() as u64;
+        let retrieval_candidates = hits.iter().map(trace_hit).collect::<Vec<_>>();
+        let navigation_started = Instant::now();
+        let navigated = runtime.block_on(crate::inject::navigate_and_compile_for_replay(
+            openrouter_key,
+            cfg.ollama_api_key.as_deref(),
+            &cfg.ollama_base_url,
+            &select_spec,
+            &compile_spec,
+            &fixture.prompt,
+            &fixture.recent_context,
+            &hits,
+            &root,
+            &project_dir,
+            cfg.inject_max_guides,
+            cfg.inject_max_tokens,
+            cfg.inject_resolve_query,
+            "",
+        ));
+        let navigation_latency_ms = navigation_started.elapsed().as_millis() as u64;
+        match navigated {
+            Ok((outcome, navigation)) => {
+                let compiled_context = match outcome {
+                    crate::inject::NavigateResult::Briefing { text, .. } => {
+                        let (_, body) = crate::inject::strip_title_line(text.trim());
+                        let body = body.trim();
+                        if body.is_empty() || body.eq_ignore_ascii_case("none") {
+                            String::new()
+                        } else {
+                            body.to_string()
+                        }
+                    }
+                    crate::inject::NavigateResult::ShortCircuit { .. } => String::new(),
+                };
+                let delivered_chars = compiled_context.chars().count();
+                let estimated_delivered_tokens = estimate_tokens(&compiled_context);
+                let abstained = compiled_context.is_empty();
+                let telemetry = PipelineTelemetry {
+                    retrieval_latency_ms,
+                    navigation_latency_ms: Some(navigation_latency_ms),
+                    select_latency_ms: navigation.select_latency_ms,
+                    compile_latency_ms: navigation.compile_latency_ms,
+                    total_latency_ms: total_started.elapsed().as_millis() as u64,
+                    provider_call_count: Some(navigation.provider_call_count),
+                    retrieval_candidates: retrieval_candidates.len(),
+                    selection_candidates: Some(navigation.candidates.len()),
+                    selected_sources: Some(navigation.selected_sources.len()),
+                    delivered_chars,
+                    estimated_delivered_tokens,
+                    abstained,
+                    failed: false,
+                };
+                fixture.compiled_context = compiled_context;
+                traces.push(CasePipelineTrace {
+                    retrieval_query,
+                    retrieval_candidates,
+                    navigation: Some(navigation),
+                    telemetry,
+                    failure: None,
+                });
+            }
+            Err(error) => {
+                fixture.compiled_context.clear();
+                traces.push(CasePipelineTrace {
+                    retrieval_query,
+                    retrieval_candidates: retrieval_candidates.clone(),
+                    navigation: None,
+                    telemetry: PipelineTelemetry {
+                        retrieval_latency_ms,
+                        navigation_latency_ms: Some(navigation_latency_ms),
+                        select_latency_ms: None,
+                        compile_latency_ms: None,
+                        total_latency_ms: total_started.elapsed().as_millis() as u64,
+                        provider_call_count: None,
+                        retrieval_candidates: retrieval_candidates.len(),
+                        selection_candidates: None,
+                        selected_sources: None,
+                        delivered_chars: 0,
+                        estimated_delivered_tokens: 0,
+                        abstained: false,
+                        failed: true,
+                    },
+                    failure: Some(PipelineFailureTrace {
+                        stage: "selection_or_compilation".to_string(),
+                        error: crate::events::truncate(&error.to_string(), 300),
+                    }),
+                });
+            }
+        }
+    }
+
+    Ok((
+        traces,
+        PipelineModels {
+            project: root.display().to_string(),
+            select: cfg.inject_select_model.clone(),
+            compile: cfg.inject_compile_model.clone(),
+        },
+    ))
+}
+
+fn trace_hit(hit: &QueryResult) -> RetrievalCandidateTrace {
+    RetrievalCandidateTrace {
+        path: hit.path.clone(),
+        chunk_index: hit.chunk_index,
+        content: hit.content.clone(),
+        content_hash: hit.content_hash.clone(),
+        score: hit.score,
+    }
+}
+
 fn build_live_user_message(fixture: &CaseFixture, with_injection: bool) -> String {
     let mut message = String::new();
     if !fixture.recent_context.trim().is_empty() {
@@ -449,11 +723,20 @@ fn build_report(
     fixture_source: &str,
     mode: &'static str,
     model: Option<String>,
+    pipeline_models: Option<PipelineModels>,
+    pipeline_traces: Option<&[CasePipelineTrace]>,
 ) -> RecipientValueReport {
     let cases: Vec<CaseReport> = fixtures
         .iter()
         .zip(responses)
-        .map(|(fixture, responses)| score_case(fixture, responses))
+        .enumerate()
+        .map(|(idx, (fixture, responses))| {
+            score_case(
+                fixture,
+                responses,
+                pipeline_traces.and_then(|traces| traces.get(idx)).cloned(),
+            )
+        })
         .collect();
     let aggregate = aggregate_cases(&cases);
     let mut categories = BTreeMap::new();
@@ -463,10 +746,11 @@ fn build_report(
         *canary_roles.entry(case.canary_role.clone()).or_insert(0) += 1;
     }
     RecipientValueReport {
-        schema_version: 1,
+        schema_version: 2,
         mode,
         fixture_source: fixture_source.to_string(),
         model,
+        pipeline_models,
         threshold_policy:
             "none; metrics and paired deltas are observations for an explicit product decision",
         categories,
@@ -476,7 +760,11 @@ fn build_report(
     }
 }
 
-fn score_case(fixture: &CaseFixture, responses: &ResponsePair) -> CaseReport {
+fn score_case(
+    fixture: &CaseFixture,
+    responses: &ResponsePair,
+    pipeline: Option<CasePipelineTrace>,
+) -> CaseReport {
     let baseline = score_response(&responses.baseline, fixture, responses.baseline_latency_ms);
     let compiled = score_response(&responses.compiled, fixture, responses.compiled_latency_ms);
     let injection = score_injection(fixture);
@@ -495,6 +783,7 @@ fn score_case(fixture: &CaseFixture, responses: &ResponsePair) -> CaseReport {
         compiled_injection: compiled,
         injection,
         delta_compiled_minus_no_injection: delta,
+        pipeline,
     }
 }
 
@@ -715,6 +1004,13 @@ fn render_markdown(report: &RecipientValueReport) -> String {
     if let Some(model) = &report.model {
         out.push_str(&format!("- Live replay model: `{}`\n", model));
     }
+    if let Some(models) = &report.pipeline_models {
+        out.push_str(&format!("- Pipeline project: `{}`\n", models.project));
+        out.push_str(&format!(
+            "- Pipeline models: SELECT `{}`; COMPILE `{}`\n",
+            models.select, models.compile
+        ));
+    }
     out.push_str("- Threshold policy: none. The table exposes observations and paired deltas for a later product decision.\n\n");
     out.push_str("| case | category | canary role | required facts no/compiled | harmful facts no/compiled | persona leaks no/compiled | duplicate sentences no/compiled | injected ~tokens | repeated lines from recent |\n");
     out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|\n");
@@ -735,6 +1031,39 @@ fn render_markdown(report: &RecipientValueReport) -> String {
             case.injection.estimated_tokens,
             case.injection.repeated_lines_from_recent_context,
         ));
+    }
+    if report.cases.iter().any(|case| case.pipeline.is_some()) {
+        out.push_str("\n## Compiled-pipeline telemetry\n\n");
+        out.push_str("| case | retrieve ms | select ms | compile ms | total ms | provider calls | retrieved/catalog/selected | delivered chars/~tokens | outcome |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        for case in &report.cases {
+            let Some(pipeline) = &case.pipeline else {
+                continue;
+            };
+            let t = &pipeline.telemetry;
+            let outcome = if let Some(failure) = &pipeline.failure {
+                format!("failed: {}", failure.stage)
+            } else if t.abstained {
+                "abstained".to_string()
+            } else {
+                "delivered".to_string()
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {}/{}/{} | {}/{} | {} |\n",
+                escape_table(&case.id),
+                t.retrieval_latency_ms,
+                optional_number(t.select_latency_ms),
+                optional_number(t.compile_latency_ms),
+                t.total_latency_ms,
+                optional_number(t.provider_call_count),
+                t.retrieval_candidates,
+                optional_number(t.selection_candidates),
+                optional_number(t.selected_sources),
+                t.delivered_chars,
+                t.estimated_delivered_tokens,
+                escape_table(&outcome),
+            ));
+        }
     }
     let aggregate = &report.aggregate;
     out.push_str("\n## Aggregate observations\n\n");
@@ -788,6 +1117,12 @@ fn escape_table(value: &str) -> String {
     value.replace('|', "\\|")
 }
 
+fn optional_number<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn print_summary(report: &RecipientValueReport) {
     let aggregate = &report.aggregate;
     println!(
@@ -817,6 +1152,30 @@ fn print_summary(report: &RecipientValueReport) {
         aggregate.repeated_lines_from_recent_context,
         aggregate.duplicate_lines_within_injection
     );
+    let pipeline_cases = report
+        .cases
+        .iter()
+        .filter_map(|case| case.pipeline.as_ref())
+        .collect::<Vec<_>>();
+    if !pipeline_cases.is_empty() {
+        let failed = pipeline_cases
+            .iter()
+            .filter(|case| case.telemetry.failed)
+            .count();
+        let abstained = pipeline_cases
+            .iter()
+            .filter(|case| case.telemetry.abstained)
+            .count();
+        let delivered = pipeline_cases.len().saturating_sub(failed + abstained);
+        let known_provider_calls: usize = pipeline_cases
+            .iter()
+            .filter_map(|case| case.telemetry.provider_call_count)
+            .sum();
+        println!(
+            "eval: pipeline delivered/abstained/failed = {}/{}/{}; known provider calls = {}",
+            delivered, abstained, failed, known_provider_calls
+        );
+    }
     println!("eval: no pass threshold applied");
 }
 
@@ -878,6 +1237,7 @@ mod tests {
                 baseline_latency_ms: 0,
                 compiled_latency_ms: 0,
             },
+            None,
         );
 
         assert_eq!(report.no_injection.required_fact_hits, 2);
@@ -898,7 +1258,15 @@ mod tests {
     fn weak_match_and_long_session_canaries_measure_pollution_and_repetition() {
         let fixtures = fixtures();
         let responses = frozen_responses(&fixtures);
-        let report = build_report(&fixtures, &responses, "embedded", "frozen", None);
+        let report = build_report(
+            &fixtures,
+            &responses,
+            "embedded",
+            "frozen",
+            None,
+            None,
+            None,
+        );
 
         let weak = report
             .cases
@@ -959,12 +1327,83 @@ mod tests {
     fn markdown_states_that_thresholds_are_deferred() {
         let fixtures = fixtures();
         let responses = frozen_responses(&fixtures);
-        let report = build_report(&fixtures, &responses, "embedded", "frozen", None);
+        let report = build_report(
+            &fixtures,
+            &responses,
+            "embedded",
+            "frozen",
+            None,
+            None,
+            None,
+        );
         let markdown = render_markdown(&report);
 
         assert!(markdown.contains("Threshold policy: none"));
         assert!(!markdown.contains("PASS"));
         assert!(!markdown.contains("FAIL"));
+    }
+
+    #[test]
+    fn pipeline_report_exposes_resource_telemetry_without_thresholds() {
+        let fixtures = fixtures();
+        let responses = frozen_responses(&fixtures);
+        let traces = fixtures
+            .iter()
+            .map(|_| CasePipelineTrace {
+                retrieval_query: "current request".to_string(),
+                retrieval_candidates: vec![],
+                navigation: Some(crate::inject::PipelineNavigationTrace {
+                    candidates: vec![],
+                    selection_response: Some("NOTHING_RELEVANT".to_string()),
+                    selected_keys: vec![],
+                    selected_sources: vec![],
+                    select_latency_ms: Some(3),
+                    compile_latency_ms: None,
+                    provider_call_count: 1,
+                    outcome: "selector_abstained".to_string(),
+                    compiled_artifact: None,
+                }),
+                telemetry: PipelineTelemetry {
+                    retrieval_latency_ms: 2,
+                    navigation_latency_ms: Some(3),
+                    select_latency_ms: Some(3),
+                    compile_latency_ms: None,
+                    total_latency_ms: 5,
+                    provider_call_count: Some(1),
+                    retrieval_candidates: 0,
+                    selection_candidates: Some(0),
+                    selected_sources: Some(0),
+                    delivered_chars: 0,
+                    estimated_delivered_tokens: 0,
+                    abstained: true,
+                    failed: false,
+                },
+                failure: None,
+            })
+            .collect::<Vec<_>>();
+        let report = build_report(
+            &fixtures,
+            &responses,
+            "embedded",
+            "live_pipeline",
+            Some("recipient:model".to_string()),
+            Some(PipelineModels {
+                project: "/tmp/project".to_string(),
+                select: "select:model".to_string(),
+                compile: "compile:model".to_string(),
+            }),
+            Some(&traces),
+        );
+        let markdown = render_markdown(&report);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert!(markdown.contains("Compiled-pipeline telemetry"));
+        assert!(markdown.contains("provider calls"));
+        assert!(markdown.contains("abstained"));
+        assert!(!markdown.contains("PASS"));
+        assert!(!markdown.contains("FAIL"));
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["cases"][0]["pipeline"]["telemetry"]["provider_call_count"], 1);
     }
 
     #[test]
