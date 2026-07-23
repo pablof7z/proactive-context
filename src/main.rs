@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 mod alias;
 mod usage;
+mod artifact_safety;
 mod archeologist;
 mod tenex;
 mod codex;
