@@ -515,14 +515,27 @@ fn generate_live_responses(
 }
 
 fn generate_live_pipeline(
-    fixtures: &mut [CaseFixture],
+    fixtures: &mut Vec<CaseFixture>,
     project: &Path,
     cfg: &Config,
 ) -> Result<(Vec<CasePipelineTrace>, PipelineModels)> {
     let root = resolve_project_root(&project.to_path_buf());
     let store = crate::project_store::ensure_project_store(&root)
         .map_err(|error| anyhow::anyhow!("resolve project store for replay: {error}"))?;
-    let project_dir = store.state_dir;
+    let project_dir = store.state_dir.clone();
+    let wiki_dir = store.wiki_dir();
+    let noun_probe = noun_alias_probe_fixture(&wiki_dir);
+    if let Some((fixture, source_key)) = noun_probe.as_ref() {
+        println!(
+            "eval: adding noun-alias coverage probe for {} -> {}",
+            fixture.prompt, source_key
+        );
+        fixtures.push(fixture.clone());
+    } else {
+        println!(
+            "eval: WARNING — no unambiguous promoted noun is available for noun-alias coverage"
+        );
+    }
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
     let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
     let openrouter_key = cfg.openrouter_api_key.as_deref().unwrap_or("");
@@ -610,8 +623,11 @@ fn generate_live_pipeline(
         ));
         let navigation_latency_ms = navigation_started.elapsed().as_millis() as u64;
         match navigated {
-            Ok((outcome, navigation)) => {
-                let compiled_context = match outcome {
+            Ok(crate::inject::PipelineReplayOutcome::Completed {
+                result,
+                trace: navigation,
+            }) => {
+                let compiled_context = match result {
                     crate::inject::NavigateResult::Briefing { text, .. } => {
                         let (_, body) = crate::inject::strip_title_line(text.trim());
                         let body = body.trim();
@@ -650,6 +666,41 @@ fn generate_live_pipeline(
                     failure: None,
                 });
             }
+            Ok(crate::inject::PipelineReplayOutcome::Failed {
+                error,
+                trace: navigation,
+            }) => {
+                fixture.compiled_context.clear();
+                let failure_stage = match navigation.outcome.as_str() {
+                    "select_provider_error" | "selection_parse_error" => "selection",
+                    "compile_error" => "compilation",
+                    _ => "selection_or_compilation",
+                };
+                traces.push(CasePipelineTrace {
+                    retrieval_query,
+                    retrieval_candidates: retrieval_candidates.clone(),
+                    telemetry: PipelineTelemetry {
+                        retrieval_latency_ms,
+                        navigation_latency_ms: Some(navigation_latency_ms),
+                        select_latency_ms: navigation.select_latency_ms,
+                        compile_latency_ms: navigation.compile_latency_ms,
+                        total_latency_ms: total_started.elapsed().as_millis() as u64,
+                        provider_call_count: Some(navigation.provider_call_count),
+                        retrieval_candidates: retrieval_candidates.len(),
+                        selection_candidates: Some(navigation.candidates.len()),
+                        selected_sources: Some(navigation.selected_sources.len()),
+                        delivered_chars: 0,
+                        estimated_delivered_tokens: 0,
+                        abstained: false,
+                        failed: true,
+                    },
+                    navigation: Some(navigation),
+                    failure: Some(PipelineFailureTrace {
+                        stage: failure_stage.to_string(),
+                        error: crate::events::truncate(&error, 300),
+                    }),
+                });
+            }
             Err(error) => {
                 fixture.compiled_context.clear();
                 traces.push(CasePipelineTrace {
@@ -680,6 +731,27 @@ fn generate_live_pipeline(
         }
     }
 
+    if let Some((fixture, source_key)) = noun_probe {
+        let probe_index = fixtures
+            .iter()
+            .position(|candidate| candidate.id == fixture.id)
+            .expect("appended noun probe fixture");
+        let exercised = traces
+            .get(probe_index)
+            .and_then(|trace| trace.navigation.as_ref())
+            .is_some_and(|navigation| {
+                navigation.candidates.iter().any(|candidate| {
+                    candidate.kind == "noun-entry" && candidate.source_key == source_key
+                })
+            });
+        if !exercised {
+            bail!(
+                "recipient-value noun-alias coverage probe `{}` did not admit its scored alias",
+                fixture.id
+            );
+        }
+    }
+
     Ok((
         traces,
         PipelineModels {
@@ -688,6 +760,61 @@ fn generate_live_pipeline(
             compile: cfg.inject_compile_model.clone(),
         },
     ))
+}
+
+fn noun_alias_probe_fixture(wiki_dir: &Path) -> Option<(CaseFixture, String)> {
+    let index_rows = crate::wiki::read_index(wiki_dir);
+    let mut realness = crate::nouns::read_realness_registry(wiki_dir)
+        .into_iter()
+        .filter(|noun| noun.is_real())
+        .collect::<Vec<_>>();
+    realness.sort_by(|left, right| left.name.cmp(&right.name));
+
+    for noun in realness {
+        let mut matching = index_rows
+            .iter()
+            .filter(|row| {
+                crate::alias::canonical_key(&row.title) == noun.canonical
+                    || crate::alias::canonical_key(&row.slug) == noun.canonical
+            })
+            .filter(|row| crate::wiki::guide_path(wiki_dir, &row.slug).is_file())
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| left.slug.cmp(&right.slug));
+        matching.dedup_by(|left, right| left.slug == right.slug);
+        if matching.len() != 1 {
+            continue;
+        }
+        let row = matching[0];
+        let expected = if row.summary.trim().is_empty() {
+            noun.name.clone()
+        } else {
+            row.summary.clone()
+        };
+        return Some((
+            CaseFixture {
+                id: format!("noun-alias-coverage-{}", crate::nouns::slugify(&noun.name)),
+                category: "noun_alias_coverage".to_string(),
+                canary_role: "coverage".to_string(),
+                description:
+                    "Dynamic live probe proving recipient-value replay admits a safe noun alias."
+                        .to_string(),
+                prompt: format!("what is {}?", noun.name),
+                recent_context: String::new(),
+                compiled_context: String::new(),
+                expected_injection: ExpectedInjection::Present,
+                required_facts: vec![Probe {
+                    label: format!("{} guide grounding", noun.name),
+                    any_of: vec![expected.clone()],
+                }],
+                harmful_facts: vec![],
+                persona_leaks: vec![],
+                baseline_response: String::new(),
+                compiled_response: expected,
+            },
+            row.slug.clone(),
+        ));
+    }
+    None
 }
 
 fn trace_hit(hit: &QueryResult) -> RetrievalCandidateTrace {
@@ -1404,6 +1531,111 @@ mod tests {
         assert!(!markdown.contains("FAIL"));
         assert_eq!(json["schema_version"], 2);
         assert_eq!(json["cases"][0]["pipeline"]["telemetry"]["provider_call_count"], 1);
+    }
+
+    #[test]
+    fn pipeline_report_preserves_noun_mapping_when_navigation_fails() {
+        let fixtures = vec![fixtures().into_iter().next().unwrap()];
+        let responses = frozen_responses(&fixtures);
+        let traces = vec![CasePipelineTrace {
+            retrieval_query: "what is PurplePages?".to_string(),
+            retrieval_candidates: vec![],
+            navigation: Some(crate::inject::PipelineNavigationTrace {
+                candidates: vec![crate::inject::PipelineCandidateTrace {
+                    key: "noun:purplepages".to_string(),
+                    source_key: "purplepages".to_string(),
+                    title: "PurplePages".to_string(),
+                    summary: "Public directory".to_string(),
+                    score: Some(0.91),
+                    kind: "noun-entry".to_string(),
+                    currentness: "current".to_string(),
+                    authority: "unknown".to_string(),
+                }],
+                selection_response: None,
+                selected_keys: vec![],
+                selected_sources: vec![],
+                select_latency_ms: Some(4),
+                compile_latency_ms: None,
+                provider_call_count: 1,
+                outcome: "select_provider_error".to_string(),
+                compiled_artifact: None,
+            }),
+            telemetry: PipelineTelemetry {
+                retrieval_latency_ms: 2,
+                navigation_latency_ms: Some(4),
+                select_latency_ms: Some(4),
+                compile_latency_ms: None,
+                total_latency_ms: 6,
+                provider_call_count: Some(1),
+                retrieval_candidates: 0,
+                selection_candidates: Some(1),
+                selected_sources: Some(0),
+                delivered_chars: 0,
+                estimated_delivered_tokens: 0,
+                abstained: false,
+                failed: true,
+            },
+            failure: Some(PipelineFailureTrace {
+                stage: "selection".to_string(),
+                error: "provider unavailable".to_string(),
+            }),
+        }];
+        let report = build_report(
+            &fixtures,
+            &responses,
+            "embedded",
+            "live_pipeline",
+            Some("recipient:model".to_string()),
+            None,
+            Some(&traces),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        let pipeline = &json["cases"][0]["pipeline"];
+        assert_eq!(
+            pipeline["navigation"]["candidates"][0]["key"],
+            "noun:purplepages"
+        );
+        assert_eq!(
+            pipeline["navigation"]["candidates"][0]["source_key"],
+            "purplepages"
+        );
+        assert_eq!(
+            pipeline["navigation"]["outcome"],
+            "select_provider_error"
+        );
+        assert_eq!(pipeline["telemetry"]["delivered_chars"], 0);
+        assert_eq!(pipeline["failure"]["stage"], "selection");
+    }
+
+    #[test]
+    fn recipient_value_builds_noun_probe_only_for_one_live_canonical_guide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let first = crate::wiki::guide_path(&wiki, "aster");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(
+            &first,
+            "---\ntitle: Aster\nslug: aster\ntopic: product\nsummary: Aster coordinates signed envelopes.\ntags: [aster]\nvolatility: cold\nverified: 2026-07-23\n---\n\n# Aster\n\nAster coordinates signed envelopes.\n",
+        )
+        .unwrap();
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[crate::nouns::RealnessNoun::new("Aster", 3)],
+        )
+        .unwrap();
+        crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let (probe, source_key) = noun_alias_probe_fixture(&wiki).unwrap();
+        assert_eq!(probe.prompt, "what is Aster?");
+        assert_eq!(source_key, "aster");
+
+        let ambiguous = crate::wiki::guide_path(&wiki, "aster-alias");
+        fs::write(
+            ambiguous,
+            "---\ntitle: Aster\nslug: aster-alias\ntopic: product\nsummary: A second Aster definition.\ntags: [aster]\nvolatility: cold\nverified: 2026-07-23\n---\n\n# Aster\n\nA second Aster definition.\n",
+        )
+        .unwrap();
+        crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        assert!(noun_alias_probe_fixture(&wiki).is_none());
     }
 
     #[test]

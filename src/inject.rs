@@ -1351,6 +1351,31 @@ pub(crate) struct PipelineNavigationTrace {
     pub compiled_artifact: Option<String>,
 }
 
+#[derive(Debug)]
+struct PipelineNavigationFailure {
+    error: anyhow::Error,
+    trace: Option<PipelineNavigationTrace>,
+}
+
+impl std::fmt::Display for PipelineNavigationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PipelineNavigationFailure {}
+
+pub(crate) enum PipelineReplayOutcome {
+    Completed {
+        result: NavigateResult,
+        trace: PipelineNavigationTrace,
+    },
+    Failed {
+        error: String,
+        trace: PipelineNavigationTrace,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PipelineModelStage {
     Select,
@@ -1728,20 +1753,26 @@ fn noun_catalog_seeds(
             if !candidate.entry.has_definition() {
                 return None;
             }
-            let guide_refs = candidate
-                .entry
-                .source_refs
+
+            // Resolve against every live guide row, not the C3 enrichment entry. C3 intentionally
+            // collapses alias-normalized nouns for primer experiments, so using its one retained
+            // source ref here would hide ambiguity and make admission depend on registry order.
+            let canonical = crate::alias::canonical_key(&candidate.entry.name);
+            let mut matching_guides = index_rows
                 .iter()
-                .filter_map(|source_ref| source_ref.strip_prefix("guide:"))
-                .collect::<HashSet<_>>();
-            if guide_refs.len() != 1 {
+                .filter(|row| {
+                    crate::alias::canonical_key(&row.title) == canonical
+                        || crate::alias::canonical_key(&row.slug) == canonical
+                })
+                .filter(|row| guide_path(wiki_dir, &row.slug).is_file())
+                .collect::<Vec<_>>();
+            matching_guides.sort_by(|left, right| left.slug.cmp(&right.slug));
+            matching_guides.dedup_by(|left, right| left.slug == right.slug);
+            if matching_guides.len() != 1 {
                 return None;
             }
-            let source_key = (*guide_refs.iter().next()?).to_string();
-            let row = index_rows.iter().find(|row| row.slug == source_key)?;
-            if !guide_path(wiki_dir, &source_key).is_file() {
-                return None;
-            }
+            let row = matching_guides[0];
+            let source_key = row.slug.clone();
             Some(NounCatalogSeed {
                 key: ContentKind::NounEntry.render_key(&candidate.entry.slug),
                 source_key,
@@ -2283,6 +2314,7 @@ async fn wiki_navigate_and_compile(
         false,
     )
     .await
+    .map_err(|failure| failure.error)
     .map(|(result, _trace)| result)
 }
 
@@ -2303,7 +2335,10 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     require_relevance_evidence: bool,
     overlap: &crate::context_overlap::ContextOverlap,
     capture_trace: bool,
-) -> Result<(NavigateResult, Option<PipelineNavigationTrace>)> {
+) -> std::result::Result<
+    (NavigateResult, Option<PipelineNavigationTrace>),
+    PipelineNavigationFailure,
+> {
     // ── Build the candidate catalog (committed md ∪ wiki guides) ───────────────
     // PC_CLAIM_CATALOG: when on, build_catalog needs an embedder for cluster retrieval. We build
     // it lazily here (only when the flag is set) to avoid the ONNX model-load cost on every
@@ -2423,14 +2458,34 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     }
 
     let select_started = Instant::now();
-    let selection = backend
+    let selection = match backend
         .complete(PipelineModelRequest {
             stage: PipelineModelStage::Select,
             system: preamble,
             user: current_prompt.to_string(),
             max_tokens: 300,
         })
-        .await?;
+        .await
+    {
+        Ok(selection) => selection,
+        Err(error) => {
+            let select_latency_ms = select_started.elapsed().as_millis() as u64;
+            return Err(PipelineNavigationFailure {
+                error,
+                trace: capture_trace.then(|| PipelineNavigationTrace {
+                    candidates,
+                    selection_response: None,
+                    selected_keys: vec![],
+                    selected_sources: vec![],
+                    select_latency_ms: Some(select_latency_ms),
+                    compile_latency_ms: None,
+                    provider_call_count: 1,
+                    outcome: "select_provider_error".to_string(),
+                    compiled_artifact: None,
+                }),
+            });
+        }
+    };
     let select_latency_ms = select_started.elapsed().as_millis() as u64;
 
     let sel = selection.trim();
@@ -2456,7 +2511,25 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
 
     // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
     let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
-    let selected = parse_selection_decision(sel, &valid, catalog.len())?;
+    let selected = match parse_selection_decision(sel, &valid, catalog.len()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return Err(PipelineNavigationFailure {
+                error,
+                trace: capture_trace.then(|| PipelineNavigationTrace {
+                    candidates,
+                    selection_response: Some(selection),
+                    selected_keys: vec![],
+                    selected_sources: vec![],
+                    select_latency_ms: Some(select_latency_ms),
+                    compile_latency_ms: None,
+                    provider_call_count: 1,
+                    outcome: "selection_parse_error".to_string(),
+                    compiled_artifact: None,
+                }),
+            });
+        }
+    };
     crate::inject_trace::record_decision(
         "selected_sources",
         serde_json::json!({"sources": selected}),
@@ -2587,7 +2660,7 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         Vec::new()
     };
     let compile_started = Instant::now();
-    let artifact = compile_briefing_with_backend(
+    let artifact = match compile_briefing_with_backend(
         backend,
         focal,
         recent,
@@ -2598,7 +2671,27 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
         Some(project_dir),
         max_tokens,
     )
-    .await?;
+    .await
+    {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            let compile_latency_ms = compile_started.elapsed().as_millis() as u64;
+            return Err(PipelineNavigationFailure {
+                error,
+                trace: capture_trace.then(|| PipelineNavigationTrace {
+                    candidates,
+                    selection_response: Some(selection),
+                    selected_keys: selected,
+                    selected_sources,
+                    select_latency_ms: Some(select_latency_ms),
+                    compile_latency_ms: Some(compile_latency_ms),
+                    provider_call_count: 2,
+                    outcome: "compile_error".to_string(),
+                    compiled_artifact: None,
+                }),
+            });
+        }
+    };
     let compile_latency_ms = compile_started.elapsed().as_millis() as u64;
     Ok((
         NavigateResult::Briefing {
@@ -2658,12 +2751,28 @@ fn parse_selection_decision(
 }
 
 /// Eval-only entry point: run the FULL inject path (build_catalog + SELECT + compile) against a
-/// single prompt and a wiki store, with no RAG hits, no recent context, and no query resolution.
+/// single prompt and a wiki store, with deterministic floor-scored guide hits, no recent context,
+/// and no query resolution.
 /// Used by the Phase 3 source-type eval arms to exercise the typed catalog + SELECT semantics that
-/// the legacy probe scorer bypasses. With empty `hits` the catalog still enumerates the whole wiki
-/// (guides/episodes/research/nouns) — fine for the small eval corpus — so SELECT sees every typed
-/// row. `root` is set to the wiki dir (no committed-markdown rows). Behavior of the live path is
+/// the legacy probe scorer bypasses. The eval deliberately enumerates every current guide at the
+/// production relevance floor; this gives a prompt-matched noun alias the same explicit backing
+/// score its guide row receives instead of claiming to enumerate nouns while silently excluding
+/// all of them as unscored. `root` is the wiki dir (no committed-markdown rows). The live path is
 /// unaffected: this is a separate caller of the same orchestration.
+fn eval_catalog_hits(index_rows: &[IndexRow]) -> Vec<QueryResult> {
+    index_rows
+        .iter()
+        .filter(|row| row.slug != "_index")
+        .map(|row| QueryResult {
+            path: format!("pc-memory/guides/{}.md", row.slug),
+            chunk_index: 0,
+            content: row.summary.clone(),
+            content_hash: String::new(),
+            score: MINIMUM_RELEVANCE_SCORE,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn navigate_and_compile_for_eval(
     api_key: &str,
@@ -2677,6 +2786,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
     max_tokens: usize,
 ) -> Result<NavigateResult> {
     let index_rows = crate::wiki::read_index(wiki_dir);
+    let hits = eval_catalog_hits(&index_rows);
     // Eval path: no claim catalog (PC_CLAIM_CATALOG is evaluated inside build_catalog; the eval
     // corpus has no claims store, so even if the flag were on, retrieve_top_clusters returns []).
     // Pass a temp dir as project_dir — it will never be read unless the flag is set.
@@ -2690,7 +2800,7 @@ pub(crate) async fn navigate_and_compile_for_eval(
         compile_spec,
         prompt,
         "",        // no recent context in eval
-        &[],       // no RAG hits — catalog enumerates the full wiki
+        &hits,     // deterministic floor-scored enumeration, including noun backing guides
         wiki_dir,
         &index_rows,
         wiki_dir,  // root = wiki dir → no committed-markdown rows
@@ -2726,7 +2836,7 @@ pub(crate) async fn navigate_and_compile_for_replay(
     max_tokens: usize,
     resolve_query: bool,
     already_injected: &str,
-) -> Result<(NavigateResult, PipelineNavigationTrace)> {
+) -> Result<PipelineReplayOutcome> {
     let wiki_dir = crate::wiki::wiki_dir(root);
     let index_rows = crate::wiki::read_index(&wiki_dir);
     let mut backend = LivePipelineModelBackend {
@@ -2742,29 +2852,47 @@ pub(crate) async fn navigate_and_compile_for_replay(
         "recipient-value-replay",
         0,
     );
-    wiki_navigate_and_compile_with_backend(
-        &mut backend,
-        prompt,
-        recent,
-        hits,
-        &wiki_dir,
-        &index_rows,
-        root,
-        project_dir,
-        max_guides,
-        max_tokens,
-        resolve_query,
-        already_injected,
-        true,
-        &overlap,
-        true,
+    replay_outcome_from_navigation(
+        wiki_navigate_and_compile_with_backend(
+            &mut backend,
+            prompt,
+            recent,
+            hits,
+            &wiki_dir,
+            &index_rows,
+            root,
+            project_dir,
+            max_guides,
+            max_tokens,
+            resolve_query,
+            already_injected,
+            true,
+            &overlap,
+            true,
+        )
+        .await,
     )
-    .await
-    .and_then(|(result, trace)| {
-        trace
-            .map(|trace| (result, trace))
-            .context("compiled-pipeline replay trace was not captured")
-    })
+}
+
+fn replay_outcome_from_navigation(
+    navigation: std::result::Result<
+        (NavigateResult, Option<PipelineNavigationTrace>),
+        PipelineNavigationFailure,
+    >,
+) -> Result<PipelineReplayOutcome> {
+    match navigation {
+        Ok((result, Some(trace))) => Ok(PipelineReplayOutcome::Completed { result, trace }),
+        Ok((_result, None)) => anyhow::bail!("compiled-pipeline replay trace was not captured"),
+        Err(PipelineNavigationFailure {
+            error,
+            trace: Some(trace),
+        }) => Ok(PipelineReplayOutcome::Failed {
+            error: error.to_string(),
+            trace,
+        }),
+        Err(PipelineNavigationFailure { error, trace: None }) => Err(error)
+            .context("compiled-pipeline replay failed before a navigation trace was captured"),
+    }
 }
 
 // ─── Source rendering (compile model input) ───────────────────────────────────
@@ -3735,6 +3863,122 @@ related_claims: []\nsource_lines:\n  - 1-2\ncaptured_at: 2026-06-12T09:00:00Z\n-
         );
         assert!(!catalog.iter().any(|item| item.key == "noun:routing"));
         assert!(!catalog.iter().any(|item| item.key == "noun:claimwidget"));
+    }
+
+    #[test]
+    fn noun_catalog_excludes_two_live_guides_with_the_same_canonical_identity() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for (slug, summary) in [
+            ("purple-pages", "The public directory."),
+            ("purplepages", "The internal directory."),
+        ] {
+            let guide = crate::wiki::guide_path(&wiki, slug);
+            fs::create_dir_all(guide.parent().unwrap()).unwrap();
+            fs::write(
+                guide,
+                format!(
+                    "---\ntitle: PurplePages\nslug: {slug}\ntopic: product\nsummary: {summary}\n---\n\n# PurplePages\n\n{summary}\n"
+                ),
+            )
+            .unwrap();
+        }
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[crate::nouns::RealnessNoun::new("PurplePages", 3)],
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let hits = vec![
+            query_hit("pc-memory/guides/purple-pages.md", 0, 0.96),
+            query_hit("pc-memory/guides/purplepages.md", 0, 0.95),
+        ];
+
+        for rows in [
+            index_rows.clone(),
+            index_rows.iter().cloned().rev().collect::<Vec<_>>(),
+        ] {
+            let catalog = build_catalog(
+                root,
+                &wiki,
+                &project_dir,
+                &rows,
+                &hits,
+                150,
+                "what is PurplePages?",
+                "",
+                None,
+            );
+            assert!(
+                !catalog
+                    .iter()
+                    .any(|item| item.key == "noun:purplepages"),
+                "ambiguous live guides must exclude the noun alias regardless of row order"
+            );
+            assert!(
+                !noun_direct_activation(
+                    &wiki,
+                    &project_dir,
+                    &rows,
+                    "what is PurplePages?",
+                    "",
+                ),
+                "ambiguity must not bypass the trivial-prompt gate"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_catalog_enumeration_gives_prompt_matched_noun_its_backing_guide_score() {
+        let _g = VARIANT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PC_NOUN_CATALOG");
+        std::env::remove_var("PC_RESEARCH_CATALOG");
+        std::env::remove_var("PC_CLAIM_CATALOG");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wiki = root.join("wiki");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let guide = crate::wiki::guide_path(&wiki, "purplepages");
+        fs::create_dir_all(guide.parent().unwrap()).unwrap();
+        fs::write(
+            guide,
+            "---\ntitle: PurplePages\nslug: purplepages\ntopic: product\nsummary: The project's public directory.\n---\n\n# PurplePages\n\nThe project's public directory.\n",
+        )
+        .unwrap();
+        crate::nouns::write_realness_registry(
+            &wiki,
+            &[crate::nouns::RealnessNoun::new("PurplePages", 3)],
+        )
+        .unwrap();
+        let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let hits = super::eval_catalog_hits(&index_rows);
+        let catalog = build_catalog(
+            root,
+            &wiki,
+            &project_dir,
+            &index_rows,
+            &hits,
+            150,
+            "what is PurplePages?",
+            "",
+            None,
+        );
+        let noun = catalog
+            .iter()
+            .find(|item| item.key == "noun:purplepages")
+            .expect("eval enumeration must exercise the noun alias path");
+        assert_eq!(noun.source_key, "purplepages");
+        assert_eq!(noun.score, Some(crate::query::MINIMUM_RELEVANCE_SCORE));
     }
 
     #[test]
@@ -4801,6 +5045,37 @@ The live route is POST /v2/session.\n",
         assert!(matches!(outcome, super::NavigateResult::ShortCircuit { .. }));
         assert_eq!(abstaining.calls.len(), 1, "COMPILE must not run after abstention");
 
+        let mut malformed_selection = ScriptedPipelineBackend {
+            replies: VecDeque::from(["I might choose PurplePages.".to_string()]),
+            calls: vec![],
+        };
+        let malformed = runtime.block_on(super::wiki_navigate_and_compile_with_backend(
+            &mut malformed_selection,
+            "what is PurplePages?",
+            "",
+            &hits,
+            &wiki,
+            &index_rows,
+            &root,
+            &project_dir,
+            4,
+            300,
+            false,
+            "",
+            true,
+            &overlap,
+            true,
+        ));
+        let malformed = match malformed {
+            Ok(_) => panic!("malformed SELECT output must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            malformed.trace.as_ref().unwrap().outcome,
+            "selection_parse_error"
+        );
+        assert_eq!(malformed_selection.calls.len(), 1);
+
         let mut invalid_compile = ScriptedPipelineBackend {
             replies: VecDeque::from([
                 "noun:purplepages".to_string(),
@@ -4809,27 +5084,55 @@ The live route is POST /v2/session.\n",
             calls: vec![],
         };
         let result = runtime.block_on(super::wiki_navigate_and_compile_with_backend(
-                &mut invalid_compile,
-                "what is PurplePages?",
-                "",
-                &hits,
-                &wiki,
-                &index_rows,
-                &root,
-                &project_dir,
-                4,
-                300,
-                false,
-                "",
-                true,
-                &overlap,
-                true,
-            ));
-        let error = match result {
+            &mut invalid_compile,
+            "what is PurplePages?",
+            "",
+            &hits,
+            &wiki,
+            &index_rows,
+            &root,
+            &project_dir,
+            4,
+            300,
+            false,
+            "",
+            true,
+            &overlap,
+            true,
+        ));
+        let compile_failure = match result {
             Ok(_) => panic!("invalid uncited compile must fail closed"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("malformed_compile_response"));
+        assert!(
+            compile_failure
+                .to_string()
+                .contains("malformed_compile_response")
+        );
+        let compile_trace = compile_failure
+            .trace
+            .as_ref()
+            .expect("replay capture must survive compile validation failure");
+        assert_eq!(compile_trace.outcome, "compile_error");
+        assert_eq!(compile_trace.provider_call_count, 2);
+        assert_eq!(compile_trace.selected_keys, vec!["noun:purplepages"]);
+        assert_eq!(compile_trace.selected_sources.len(), 1);
+        assert_eq!(
+            compile_trace.selected_sources[0].source_key,
+            "purplepages"
+        );
+        let compile_replay =
+            super::replay_outcome_from_navigation(Err(compile_failure)).unwrap();
+        match compile_replay {
+            super::PipelineReplayOutcome::Failed { error, trace } => {
+                assert!(error.contains("malformed_compile_response"));
+                assert_eq!(trace.outcome, "compile_error");
+                assert_eq!(trace.candidates.len(), 2);
+            }
+            super::PipelineReplayOutcome::Completed { .. } => {
+                panic!("compile failure must remain a replay failure")
+            }
+        }
         assert_eq!(invalid_compile.calls.len(), 2);
 
         let mut failing = FailingPipelineBackend { calls: 0 };
@@ -4855,6 +5158,33 @@ The live route is POST /v2/session.\n",
             Err(error) => error,
         };
         assert!(failure.to_string().contains("scripted provider failure"));
+        let provider_trace = failure
+            .trace
+            .as_ref()
+            .expect("replay capture must survive SELECT provider failure");
+        assert_eq!(provider_trace.outcome, "select_provider_error");
+        assert_eq!(provider_trace.provider_call_count, 1);
+        let noun = provider_trace
+            .candidates
+            .iter()
+            .find(|candidate| candidate.key == "noun:purplepages")
+            .expect("noun candidate mapping must survive provider failure");
+        assert_eq!(noun.source_key, "purplepages");
+        let provider_replay = super::replay_outcome_from_navigation(Err(failure)).unwrap();
+        match provider_replay {
+            super::PipelineReplayOutcome::Failed { error, trace } => {
+                assert!(error.contains("scripted provider failure"));
+                assert_eq!(trace.outcome, "select_provider_error");
+                assert!(trace
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.key == "noun:purplepages"
+                        && candidate.source_key == "purplepages"));
+            }
+            super::PipelineReplayOutcome::Completed { .. } => {
+                panic!("provider failure must remain a replay failure")
+            }
+        }
         assert_eq!(failing.calls, 1, "failure must not invoke a fallback model path");
     }
 }
