@@ -10,6 +10,7 @@
 
 use crate::config::project_context_dir;
 use crate::events::now_rfc3339;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const SESSION_LEDGER_FILE_RETENTION: usize = 512;
@@ -24,6 +26,8 @@ pub(crate) const SESSION_LEDGER_FILE_RETENTION: usize = 512;
 #[derive(Clone, Serialize, Deserialize)]
 struct LedgerEntry {
     ts: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    run_id: String,
     #[serde(default)]
     title: String,
     body: String,
@@ -369,17 +373,48 @@ fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn delivered_lines(entries: &[LedgerEntry]) -> HashSet<String> {
-    entries
-        .iter()
-        .flat_map(|entry| entry.body.lines())
-        .map(normalize_line)
-        .filter(|line| !line.is_empty())
+fn citation_regex() -> &'static Regex {
+    static CITATION: OnceLock<Regex> = OnceLock::new();
+    CITATION.get_or_init(|| {
+        Regex::new(r"\(([^()\r\n]+):([0-9]+)(?:-([0-9]+))?\)")
+            .expect("static citation regex")
+    })
+}
+
+/// Convert every citation into a stable fact identity. A one-line citation and
+/// its explicit one-line range form intentionally collapse to the same key.
+fn citation_identities(line: &str) -> Vec<String> {
+    citation_regex()
+        .captures_iter(line)
+        .map(|capture| {
+            let source = capture
+                .get(1)
+                .expect("source capture")
+                .as_str()
+                .trim();
+            let start = capture.get(2).expect("line capture").as_str();
+            let end = capture.get(3).map(|value| value.as_str()).unwrap_or(start);
+            format!("{source}:{start}-{end}")
+        })
         .collect()
 }
 
+fn delivered_identities(entries: &[LedgerEntry]) -> (HashSet<String>, HashSet<String>) {
+    let mut lines = HashSet::new();
+    let mut citations = HashSet::new();
+    for line in entries.iter().flat_map(|entry| entry.body.lines()) {
+        let normalized = normalize_line(line);
+        if normalized.is_empty() {
+            continue;
+        }
+        lines.insert(normalized);
+        citations.extend(citation_identities(line));
+    }
+    (lines, citations)
+}
+
 fn suppress_delivered_lines(entries: &[LedgerEntry], body: &str) -> String {
-    let mut seen = delivered_lines(entries);
+    let (mut seen_lines, mut seen_citations) = delivered_identities(entries);
     let mut kept = Vec::new();
     let mut pending_blank = false;
 
@@ -389,9 +424,15 @@ fn suppress_delivered_lines(entries: &[LedgerEntry], body: &str) -> String {
             pending_blank = !kept.is_empty();
             continue;
         }
-        if !seen.insert(normalized) {
+        let citations = citation_identities(line);
+        let repeats_cited_fact = citations
+            .iter()
+            .any(|citation| seen_citations.contains(citation));
+        if seen_lines.contains(&normalized) || repeats_cited_fact {
             continue;
         }
+        seen_lines.insert(normalized);
+        seen_citations.extend(citations);
         if pending_blank {
             kept.push(String::new());
         }
@@ -429,10 +470,12 @@ pub fn commit_unique(
     }
     ledger.append(&LedgerEntry {
         ts: now_rfc3339(),
+        run_id: crate::events::log_cfg_path_and_req().0,
         title: title.unwrap_or("").to_string(),
         body: unique.clone(),
     })?;
     drop(ledger);
+    crate::inject_trace::record_ledger(&path, title, &unique);
     prune_project_ledgers(root, &path);
     Ok(unique)
 }
@@ -446,12 +489,14 @@ pub fn append(root: &Path, session_id: &str, title: Option<&str>, body: &str) {
     let path = ledger_path(root, session_id);
     let entry = LedgerEntry {
         ts: now_rfc3339(),
+        run_id: crate::events::log_cfg_path_and_req().0,
         title: title.unwrap_or("").to_string(),
         body: body.trim().to_string(),
     };
     if let Ok(mut ledger) = LockedLedger::open(&path) {
         if ledger.append(&entry).is_ok() {
             drop(ledger);
+            crate::inject_trace::record_ledger(&path, title, body);
             prune_project_ledgers(root, &path);
         }
     }
@@ -585,6 +630,56 @@ mod tests {
     }
 
     #[test]
+    fn commit_unique_suppresses_paraphrases_with_the_same_citation_identity() {
+        let project = isolated_project();
+        let root = project.root.path();
+        let session = "sess-citation-identity";
+
+        let first = commit_unique(
+            root,
+            session,
+            Some("First"),
+            "Sessions use POST /v2/session. (./docs/auth.md:12-14)\n\
+             Mint is the project noun.",
+        )
+        .unwrap();
+        assert!(first.contains("POST /v2/session"));
+        assert!(first.contains("Mint is the project noun."));
+
+        let second = commit_unique(
+            root,
+            session,
+            Some("Second"),
+            "Create sessions through the v2 endpoint. (./docs/auth.md:12-14)\n\
+             A different cited fact remains. (./docs/auth.md:15)\n\
+             Mint   is the project noun.",
+        )
+        .unwrap();
+        assert_eq!(
+            second,
+            "A different cited fact remains. (./docs/auth.md:15)",
+            "cited paraphrases and whitespace-only noun repeats must be session-absolute"
+        );
+    }
+
+    #[test]
+    fn citation_identity_normalizes_single_line_ranges_within_one_payload() {
+        let project = isolated_project();
+        let root = project.root.path();
+
+        let committed = commit_unique(
+            root,
+            "sess-single-line-range",
+            Some("Citation"),
+            "First wording. (./docs/auth.md:21)\n\
+             Paraphrased wording. (./docs/auth.md:21-21)",
+        )
+        .unwrap();
+
+        assert_eq!(committed, "First wording. (./docs/auth.md:21)");
+    }
+
+    #[test]
     fn commit_unique_serializes_concurrent_delivery() {
         let project = isolated_project();
         let root = project.root.path().to_path_buf();
@@ -613,6 +708,29 @@ mod tests {
             .filter(|body| !body.is_empty())
             .count();
         assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn commit_unique_persists_the_active_injection_run_id() {
+        let project = isolated_project();
+        let root = project.root.path();
+        crate::events::init_context_with_request(
+            "canonical-project",
+            "sess-run-id",
+            "run-correlation".to_string(),
+        );
+
+        commit_unique(
+            root,
+            "sess-run-id",
+            Some("Correlated"),
+            "Correlated fact. (guide.md:1)",
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(ledger_path(root, "sess-run-id")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(entry["run_id"], "run-correlation");
     }
 
     #[test]

@@ -86,6 +86,116 @@ fn project_path(home: &Path, subject: &Path) -> PathBuf {
 }
 
 #[test]
+fn injection_trace_links_canonical_project_events_and_cli_lookup() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("pc-home");
+    let subject = tmp.path().join("subject");
+    init_subject(&subject);
+
+    let config_output = run_pc(&home, &subject, &["config"]);
+    assert!(config_output.status.success());
+    let _ = project_path(&home, &subject);
+    let config_path = home.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["inject_select_model"] = serde_json::Value::String("ollama:test-select".into());
+    config["inject_compile_model"] = serde_json::Value::String("ollama:test-compile".into());
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let input = format!(
+        "{{\"cwd\":{},\"session_id\":\"trace-session\",\"prompt\":\"ok\"}}",
+        serde_json::to_string(subject.to_str().unwrap()).unwrap()
+    );
+    let output = run_hook(
+        &home,
+        &subject,
+        &["hook", "inject", "--harness", "codex"],
+        &input,
+        false,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let project_uuid = git(&subject, &["config", "--local", "--get", "pc.projectUuid"]);
+    let project_id = git(&subject, &["config", "--local", "--get", "pc.projectId"]);
+    let traces = home
+        .join("state")
+        .join(&project_uuid)
+        .join("logs")
+        .join("inject-runs");
+    let trace_path = fs::read_dir(&traces)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let run_id = trace_path.file_stem().unwrap().to_str().unwrap();
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(&trace_path).unwrap()).unwrap();
+
+    assert_eq!(trace["run_id"], run_id);
+    assert_eq!(trace["project"]["project_id"], project_id);
+    assert_eq!(trace["project"]["project_uuid"], project_uuid);
+    assert_eq!(trace["hook"]["prompt_chars"], 2);
+    assert!(trace["hook"]["prompt_sha256"].as_str().unwrap().len() == 64);
+    assert_eq!(trace["final_outcome"]["reason"], "no_index");
+    assert!(!trace.to_string().contains("\"prompt\":\"ok\""));
+
+    let event_log = fs::read_to_string(home.join("state/events.jsonl")).unwrap();
+    let event: serde_json::Value =
+        serde_json::from_str(event_log.lines().next().unwrap()).unwrap();
+    assert_eq!(event["req"], run_id);
+    assert_eq!(event["project"], project_id);
+
+    let inspected = run_pc(&home, &subject, &["debug", "trace", run_id]);
+    assert!(inspected.status.success());
+    let inspected_trace: serde_json::Value =
+        serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected_trace, trace);
+}
+
+#[test]
+fn disabled_logging_creates_neither_events_nor_injection_traces() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("pc-home");
+    let subject = tmp.path().join("subject");
+    init_subject(&subject);
+
+    let config_output = run_pc(&home, &subject, &["config"]);
+    assert!(config_output.status.success());
+    let _ = project_path(&home, &subject);
+    let config_path = home.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["logging_enabled"] = serde_json::Value::Bool(false);
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let input = format!(
+        "{{\"cwd\":{},\"session_id\":\"trace-disabled\",\"prompt\":\"ok\"}}",
+        serde_json::to_string(subject.to_str().unwrap()).unwrap()
+    );
+    let output = run_hook(
+        &home,
+        &subject,
+        &["hook", "inject", "--harness", "codex"],
+        &input,
+        false,
+    );
+    assert!(output.status.success());
+
+    let project_uuid = git(&subject, &["config", "--local", "--get", "pc.projectUuid"]);
+    assert!(!home.join("state/events.jsonl").exists());
+    assert!(
+        !home
+            .join("state")
+            .join(project_uuid)
+            .join("logs")
+            .join("inject-runs")
+            .exists()
+    );
+}
+
+#[test]
 fn non_git_hooks_are_exact_silent_noops_before_config_or_logging() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("pc-home");

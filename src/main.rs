@@ -50,6 +50,7 @@ mod git_hooks;
 mod harness;
 mod health;
 mod inject;
+mod inject_trace;
 mod ledger;
 mod openrouter;
 mod provider;
@@ -629,6 +630,13 @@ enum DebugAction {
         wiki_dir: Option<PathBuf>,
     },
 
+    /// Inspect one injection end-to-end by its stable run ID.
+    Trace {
+        /// Run ID printed as `req` in the event log and used by LLM sidecars.
+        #[arg(value_name = "RUN_ID")]
+        run_id: String,
+    },
+
     /// Follow the proactive-context event log live (replaces top-level `pc tail`).
     Tail {
         /// Only show events for this project (substring match against normalized path)
@@ -987,6 +995,12 @@ fn main() -> Result<()> {
                 let wiki = wiki_dir.unwrap_or_else(|| crate::wiki::wiki_dir(&root));
                 let proj_dir = project_context_dir(&root);
                 crate::taxonomy_report::run(&root, &wiki, &proj_dir)?;
+            }
+            DebugAction::Trace { run_id } => {
+                let store = crate::project_store::bound_project_store(&root)
+                    .map_err(anyhow::Error::from)?
+                    .context("this project has no proactive-context store binding")?;
+                crate::inject_trace::inspect(&store, &run_id)?;
             }
             DebugAction::Tail {
                 project,

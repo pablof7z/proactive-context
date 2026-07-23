@@ -2,11 +2,11 @@ use crate::artifact_safety::{
     SourceDocument, escape_markup_text, render_untrusted_sources, validate_compiled_artifact,
 };
 use crate::config::{
-    ConfigScope, load_config, normalize_path, project_context_dir, project_db_path,
-    resolve_project_root, validate_config,
+    ConfigScope, load_config, project_context_dir, project_db_path, resolve_project_root,
+    validate_config,
 };
 use crate::content_kind::{ContentKind, Currentness};
-use crate::events::{init_context, log_event, truncate};
+use crate::events::{init_context_with_request, log_event, truncate};
 use crate::openrouter::{chat_once, make_client, system_msg, user_msg};
 use crate::provider::{ModelSpec, Provider, build_ollama_client};
 use crate::query::{run_query, QueryResult, MINIMUM_RELEVANCE_SCORE};
@@ -370,8 +370,7 @@ enum OutMode {
 fn emit(out: &OutMode, context_block: Option<&str>, verbose_msg: &str) {
     use crate::harness::OutputDialect;
 
-
-    match out {
+    let (dialect, rendered) = match out {
         OutMode::Verbose => {
             let obj = if let Some(block) = context_block {
                 serde_json::json!({
@@ -384,36 +383,41 @@ fn emit(out: &OutMode, context_block: Option<&str>, verbose_msg: &str) {
             } else {
                 serde_json::json!({ "systemMessage": verbose_msg })
             };
-            print!("{}", serde_json::to_string(&obj).unwrap_or_default());
+            ("verbose-json", Some(serde_json::to_string(&obj).unwrap_or_default()))
         }
         OutMode::Plain(dialect) => {
             let Some(block) = context_block else { return };
             match dialect {
-                OutputDialect::RawText => print!("{}", block),
-                OutputDialect::AdditionalContextJson => print!(
-                    "{}",
-                    serde_json::json!({
+                OutputDialect::RawText => ("raw-text", Some(block.to_string())),
+                OutputDialect::AdditionalContextJson => (
+                    "additional-context-json",
+                    Some(serde_json::json!({
                         "hookSpecificOutput": {
                             "hookEventName": "UserPromptSubmit",
                             "additionalContext": block
                         }
-                    })
+                    }).to_string()),
                 ),
-                OutputDialect::ContextJson => {
-                    print!("{}", serde_json::json!({ "context": block }))
-                }
+                OutputDialect::ContextJson => (
+                    "context-json",
+                    Some(serde_json::json!({ "context": block }).to_string()),
+                ),
             }
         }
+    };
+    if let Some(rendered) = rendered {
+        crate::inject_trace::record_delivery(dialect, &rendered, context_block);
+        print!("{rendered}");
     }
 }
 
 fn emit_warning(message: &str) {
-    print!(
-        "{}",
-        serde_json::json!({
-            "systemMessage": message
-        })
-    );
+    let rendered = serde_json::json!({
+        "systemMessage": message
+    })
+    .to_string();
+    crate::inject_trace::record_delivery("system-message-json", &rendered, None);
+    print!("{rendered}");
 }
 
 struct CommittedContext {
@@ -843,13 +847,20 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
     };
 
     let root = resolve_project_root(&PathBuf::from(&input.cwd));
-    if crate::project_store::ensure_project_store(&root).is_err() {
-        return Ok(());
-    }
+    let store = match crate::project_store::ensure_project_store(&root) {
+        Ok(store) => store,
+        Err(_) => return Ok(()),
+    };
     // Seed event context as soon as stdin gives us cwd/session. Every later early-exit is
     // now session-visible instead of looking like pre-API silence.
-    let project = normalize_path(&root);
-    init_context(&project, &input.session_id);
+    let run_id = crate::inject_trace::begin(
+        &store,
+        harness,
+        &input.session_id,
+        &input.prompt,
+        input.transcript_path.is_some(),
+    );
+    init_context_with_request(&store.manifest.project_id, &input.session_id, run_id);
     warn_missing_session_id(&input.session_id);
 
     let cfg = match load_config() {
@@ -1082,6 +1093,7 @@ pub fn run_inject(verbose: bool, harness: &str) -> Result<()> {
         "minimum_score": MINIMUM_RELEVANCE_SCORE,
         "rerank": cfg.inject_rerank
     }));
+    crate::inject_trace::record_retrieval(&hits);
 
     let select_spec = ModelSpec::parse(&cfg.inject_select_model);
     let compile_spec = ModelSpec::parse(&cfg.inject_compile_model);
@@ -2254,6 +2266,13 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     let resolved_query: Option<String> =
         if resolve_query { sel.lines().find_map(parse_query_line) } else { None };
     if let Some(ref q) = resolved_query {
+        crate::inject_trace::record_decision(
+            "resolved_query",
+            serde_json::json!({
+                "chars": q.len(),
+                "sha256": crate::inject_trace::sha256_text(q)
+            }),
+        );
         log_event("inject.resolve", None, serde_json::json!({
             "raw": truncate(current_prompt, 200),
             "resolved": truncate(q, 200)
@@ -2264,6 +2283,10 @@ async fn wiki_navigate_and_compile_with_backend<B: PipelineModelBackend>(
     // Validate returned keys against the catalog set (drop hallucinated / out-of-set paths).
     let valid: HashSet<&str> = catalog.iter().map(|c| c.key.as_str()).collect();
     let selected = parse_selection_decision(sel, &valid, catalog.len())?;
+    crate::inject_trace::record_decision(
+        "selected_sources",
+        serde_json::json!({"sources": selected}),
+    );
 
     if selected.is_empty() {
         return Ok((
@@ -3763,6 +3786,8 @@ The live route is POST /v2/session.\n",
         )
         .unwrap();
         let index_rows = crate::wiki::rebuild_index(&wiki, "2026-07-23").unwrap();
+        let source_label =
+            super::source_label_for_key(&root, &wiki, Some(&project_dir), "auth-flow");
         let hits = vec![crate::query::QueryResult {
             path: "auth-flow.md".to_string(),
             chunk_index: 0,
@@ -3773,8 +3798,9 @@ The live route is POST /v2/session.\n",
         let mut backend = ScriptedPipelineBackend {
             replies: VecDeque::from([
                 "auth-flow".to_string(),
-                "TITLE: current auth route\nUse POST /v2/session. (./auth-flow.md:14)"
-                    .to_string(),
+                format!(
+                    "TITLE: current auth route\nUse POST /v2/session. ({source_label}:14)"
+                ),
             ]),
             calls: vec![],
         };

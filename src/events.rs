@@ -28,10 +28,15 @@ fn ctx() -> &'static RwLock<Ctx> {
 
 /// Seed project + session + a fresh req at subcommand entry (inject/capture/query).
 pub fn init_context(project: &str, session_id: &str) {
+    init_context_with_request(project, session_id, new_request_id());
+}
+
+/// Seed correlation context with a caller-owned stable request/run ID.
+pub fn init_context_with_request(project: &str, session_id: &str, request_id: String) {
     if let Ok(mut c) = ctx().write() {
         c.project = project.to_string();
         c.session_id = session_id.to_string();
-        c.req = new_request_id();
+        c.req = request_id;
     }
 }
 
@@ -81,6 +86,14 @@ fn log_cfg() -> &'static LogCfg {
     })
 }
 
+/// Whether durable observability is enabled for this process.
+///
+/// Injection traces share the event-log switch so disabling logging cannot
+/// leave a second, unexpectedly persistent observability surface behind.
+pub fn logging_enabled() -> bool {
+    log_cfg().enabled
+}
+
 fn default_log_path() -> PathBuf {
     crate::config::config_dir()
         .unwrap_or_else(|_| PathBuf::from("/tmp/.pc"))
@@ -109,6 +122,7 @@ pub fn log_event(event: &str, lat_ms: Option<u64>, payload: Value) {
     if !cfg.enabled {
         return;
     }
+    crate::inject_trace::record_event(event, lat_ms, &payload);
 
     // Read ambient context
     let (project, session_id, req) = {
